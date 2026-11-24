@@ -1,11 +1,16 @@
-use crate::style::Prop;
+use crate::css;
+use crate::css::properties::Prop;
+use crate::css::value::transform::Matrix;
+use crate::css::value::transform::angle;
+use crate::css::value::transform::origin;
+use crate::css::value::transform::transform;
+use crate::css::value::transform::translate;
 use crate::{
+    css::{properties::Style, value::tokens::components, value::units::Lengths},
     dom::Document,
-    style::{self, Lengths, Style, components, parser},
 };
 use renderer::{BlendMode, Color, Corners, Length, PaintEffect, Pixels, Radii, Rect, point, px};
 
-pub(crate) type Matrix = [f32; 16];
 // A transform at the origin and the size it is for.
 pub(crate) type Local = std::cell::Cell<Option<Box<([f32; 2], Option<Matrix>)>>>;
 
@@ -46,262 +51,6 @@ pub(crate) fn index<'a>(
         }
         map
     })
-}
-
-pub(crate) const IDENTITY: Matrix = [
-    1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
-];
-
-pub(crate) fn multiply(a: &Matrix, b: &Matrix) -> Matrix {
-    std::array::from_fn(|index| {
-        let (column, row) = (index / 4, index % 4);
-        (0..4).map(|k| a[k * 4 + row] * b[column * 4 + k]).sum()
-    })
-}
-
-pub(crate) fn translate(x: f32, y: f32, z: f32) -> Matrix {
-    let mut m = IDENTITY;
-    m[12] = x;
-    m[13] = y;
-    m[14] = z;
-    m
-}
-
-fn scale(x: f32, y: f32, z: f32) -> Matrix {
-    let mut m = IDENTITY;
-    m[0] = x;
-    m[5] = y;
-    m[10] = z;
-    m
-}
-
-fn rotate(axis: [f32; 3], angle: f32) -> Option<Matrix> {
-    let length = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
-    if length < 1e-6 {
-        return None;
-    }
-    let [x, y, z] = axis.map(|value| value / length);
-    // Quarter turns are exact, like in browsers, so `rotate(90deg)` stays a 2D matrix.
-    let quarter = angle / std::f32::consts::FRAC_PI_2;
-    let (s, c) = if (quarter - quarter.round()).abs() < 1e-6 {
-        [(0., 1.), (1., 0.), (0., -1.), (-1., 0.)][(quarter.round() as i64).rem_euclid(4) as usize]
-    } else {
-        angle.sin_cos()
-    };
-    if [x, y, z] == [0., 0., 1.] {
-        let mut m = IDENTITY;
-        [m[0], m[1], m[4], m[5]] = [c, s, -s, c];
-        return Some(m);
-    }
-    let t = 1. - c;
-    Some([
-        t * x * x + c,
-        t * x * y + s * z,
-        t * x * z - s * y,
-        0.,
-        t * x * y - s * z,
-        t * y * y + c,
-        t * y * z + s * x,
-        0.,
-        t * x * z + s * y,
-        t * y * z - s * x,
-        t * z * z + c,
-        0.,
-        0.,
-        0.,
-        0.,
-        1.,
-    ])
-}
-
-fn perspective(distance: f32) -> Matrix {
-    let mut m = IDENTITY;
-    m[11] = -1. / distance.max(1.);
-    m
-}
-
-pub(crate) fn origin(value: &str, units: &Lengths, size: [f32; 2]) -> [f32; 3] {
-    let parts = components(value, ' ');
-    let (x, y) = match parts.as_slice() {
-        [only] if matches!(*only, "top" | "bottom") => ("center", *only),
-        [only] => (*only, "center"),
-        [a, b, ..] if matches!(*a, "top" | "bottom") || matches!(*b, "left" | "right") => (*b, *a),
-        [a, b, ..] => (*a, *b),
-        [] => ("center", "center"),
-    };
-    let [x, y] = [(x, size[0]), (y, size[1])].map(|(token, extent)| match token {
-        "left" | "top" => 0.,
-        "center" => extent / 2.,
-        "right" | "bottom" => extent,
-        value => units.resolve(value, extent).unwrap_or(extent / 2.),
-    });
-    let z = parts
-        .get(2)
-        .and_then(|value| units.resolve(value, 0.))
-        .unwrap_or(0.);
-    [x, y, z]
-}
-
-pub(crate) fn transform(
-    style: &Style,
-    units: &Lengths,
-    bounds: Rect<Pixels>,
-    parent_perspective: Option<(f32, [f32; 2])>,
-) -> Option<Matrix> {
-    let size = [f32::from(bounds.size.width), f32::from(bounds.size.height)];
-    let number = |value: &str| {
-        if let Some(percent) = value.strip_suffix('%') {
-            return percent.parse::<f32>().ok().map(|value| value / 100.);
-        }
-        match units.math(value, 100., &[])? {
-            (value, parser::Kind::Number) => Some(value as f32),
-            (percent, parser::Kind::Length)
-                if units.math(value, 0., &[]) == Some((0., parser::Kind::Length)) =>
-            {
-                Some(percent as f32 / 100.)
-            }
-            _ => None,
-        }
-    };
-    let angle = |value: &str| {
-        units
-            .math(value, 0., &[])
-            .filter(|(value, kind)| *kind == parser::Kind::Angle || *value == 0.)
-            .map(|(value, _)| (value as f32).to_radians())
-    };
-    let length = |value: &str, base: f32| units.resolve(value, base);
-    let mut matrix = IDENTITY;
-    let mut changed = false;
-    let mut then = |next: Matrix| {
-        matrix = multiply(&matrix, &next);
-        changed = true;
-    };
-    if let Some(value) = style.get(Prop::TRANSLATE).filter(|value| *value != "none") {
-        let parts = components(value, ' ');
-        then(translate(
-            length(parts.first()?, size[0])?,
-            parts.get(1).map_or(Some(0.), |y| length(y, size[1]))?,
-            parts.get(2).map_or(Some(0.), |z| length(z, 0.))?,
-        ));
-    }
-    if let Some(value) = style.get(Prop::ROTATE).filter(|value| *value != "none") {
-        let parts = components(value, ' ');
-        let (last, rest) = parts.split_last()?;
-        let axis = match rest {
-            [] | ["z"] => [0., 0., 1.],
-            ["x"] => [1., 0., 0.],
-            ["y"] => [0., 1., 0.],
-            [x, y, z] => [number(x)?, number(y)?, number(z)?],
-            _ => return None,
-        };
-        then(rotate(axis, angle(last)?)?);
-    }
-    if let Some(value) = style.get(Prop::SCALE).filter(|value| *value != "none") {
-        let parts = components(value, ' ');
-        let x = number(parts.first()?)?;
-        then(scale(
-            x,
-            parts.get(1).map_or(Some(x), |y| number(y))?,
-            parts.get(2).map_or(Some(1.), |z| number(z))?,
-        ));
-    }
-    for part in components(style.get(Prop::TRANSFORM).unwrap_or(""), ' ') {
-        let Some((name, args)) = part.strip_suffix(')').and_then(|part| part.split_once('('))
-        else {
-            continue;
-        };
-        let args = components(args, ',');
-        let next = match (name.to_ascii_lowercase().as_str(), args.as_slice()) {
-            ("translate" | "translatex", [x]) => translate(length(x, size[0])?, 0., 0.),
-            ("translate", [x, y]) => translate(length(x, size[0])?, length(y, size[1])?, 0.),
-            ("translatey", [y]) => translate(0., length(y, size[1])?, 0.),
-            ("translatez", [z]) => translate(0., 0., length(z, 0.)?),
-            ("translate3d", [x, y, z]) => {
-                translate(length(x, size[0])?, length(y, size[1])?, length(z, 0.)?)
-            }
-            ("scale", [x]) => scale(number(x)?, number(x)?, 1.),
-            ("scale", [x, y]) => scale(number(x)?, number(y)?, 1.),
-            ("scalex", [x]) => scale(number(x)?, 1., 1.),
-            ("scaley", [y]) => scale(1., number(y)?, 1.),
-            ("scalez", [z]) => scale(1., 1., number(z)?),
-            ("scale3d", [x, y, z]) => scale(number(x)?, number(y)?, number(z)?),
-            ("rotate" | "rotatez", [a]) => rotate([0., 0., 1.], angle(a)?)?,
-            ("rotatex", [a]) => rotate([1., 0., 0.], angle(a)?)?,
-            ("rotatey", [a]) => rotate([0., 1., 0.], angle(a)?)?,
-            ("rotate3d", [x, y, z, a]) => rotate([number(x)?, number(y)?, number(z)?], angle(a)?)?,
-            ("skew" | "skewx", [x]) => {
-                let mut m = IDENTITY;
-                m[4] = angle(x)?.tan();
-                m
-            }
-            ("skew", [x, y]) => {
-                let mut m = IDENTITY;
-                m[4] = angle(x)?.tan();
-                m[1] = angle(y)?.tan();
-                m
-            }
-            ("skewy", [y]) => {
-                let mut m = IDENTITY;
-                m[1] = angle(y)?.tan();
-                m
-            }
-            ("matrix", [a, b, c, d, e, f]) => {
-                let mut m = IDENTITY;
-                [m[0], m[1], m[4], m[5], m[12], m[13]] = [
-                    number(a)?,
-                    number(b)?,
-                    number(c)?,
-                    number(d)?,
-                    number(e)?,
-                    number(f)?,
-                ];
-                m
-            }
-            ("matrix3d", values) if values.len() == 16 => {
-                let mut m = IDENTITY;
-                for (slot, value) in m.iter_mut().zip(values) {
-                    *slot = number(value)?;
-                }
-                m
-            }
-            ("perspective", [d]) => match *d {
-                "none" => IDENTITY,
-                d => perspective(length(d, 0.)?),
-            },
-            _ => continue,
-        };
-        then(next);
-    }
-    if !changed && parent_perspective.is_none() {
-        return None;
-    }
-    let [ox, oy, oz] = origin(
-        style.get(Prop::TRANSFORM_ORIGIN).unwrap_or("50% 50%"),
-        units,
-        size,
-    );
-    let (x, y) = (
-        f32::from(bounds.origin.x) + ox,
-        f32::from(bounds.origin.y) + oy,
-    );
-    let mut result = multiply(
-        &translate(x, y, oz),
-        &multiply(&matrix, &translate(-x, -y, -oz)),
-    );
-    if let Some((distance, [px, py])) = parent_perspective {
-        result = multiply(
-            &translate(px, py, 0.),
-            &multiply(
-                &perspective(distance),
-                &multiply(&translate(-px, -py, 0.), &result),
-            ),
-        );
-    }
-    result
-        .iter()
-        .all(|value| value.is_finite())
-        .then_some(result)
-        .filter(|result| *result != IDENTITY)
 }
 
 // The matrix of a box moved by `[x, y]`: `translate(x, y) * matrix * translate(-x, -y)`, without the rounding of
@@ -390,7 +139,7 @@ pub(crate) fn backface(matrix: &Matrix, bounds: Rect<Pixels>) -> bool {
     (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) < 0.
 }
 
-fn color_matrix(filter: Option<style::Filter>, opacity: f32) -> Option<[f32; 20]> {
+fn color_matrix(filter: Option<css::value::Filter>, opacity: f32) -> Option<[f32; 20]> {
     if filter.is_none() && opacity >= 1. {
         return None;
     }
@@ -443,7 +192,7 @@ pub(crate) fn filters(value: &str, units: &Lengths, doc: &Document, ids: &Ids) -
             }
             "drop-shadow" => {
                 // Chrome uses the blur length as the standard deviation, not half of it as box-shadow does.
-                for shadow in units.shadows(args, false) {
+                for shadow in css::value::box_shadows(units, args, false) {
                     effects.push(PaintEffect {
                         shadow: Some((shadow.offset, shadow.blur_radius * 2., shadow.color)),
                         ..Default::default()
@@ -452,7 +201,7 @@ pub(crate) fn filters(value: &str, units: &Lengths, doc: &Document, ids: &Ids) -
             }
             "url" => effects.extend(svg_filter(args, units, doc, ids)),
             _ => {
-                let (filter, opacity) = style::Filter::parse(part, units);
+                let (filter, opacity) = css::value::Filter::parse(part, units);
                 let Some(matrix) = color_matrix(filter, opacity) else {
                     continue;
                 };
@@ -524,7 +273,7 @@ fn svg_filter(reference: &str, units: &Lengths, doc: &Document, ids: &Ids) -> Ve
                 let color = node
                     .attrs
                     .get("flood-color")
-                    .and_then(|value| style::color(value))
+                    .and_then(|value| css::value::color::color(value))
                     .unwrap_or((0, 255));
                 let opacity = numbers("flood-opacity").first().copied().unwrap_or(1.);
                 let mut ink: Color = renderer::Color::hex(color.0 << 8 | color.1 as u32);
@@ -558,7 +307,7 @@ fn svg_filter(reference: &str, units: &Lengths, doc: &Document, ids: &Ids) -> Ve
                     matrix[15..18].copy_from_slice(&[0.2125, 0.7154, 0.0721]);
                     Some(matrix)
                 } else {
-                    let (filter, opacity) = style::Filter::parse(&css, units);
+                    let (filter, opacity) = css::value::Filter::parse(&css, units);
                     color_matrix(filter, opacity)
                 };
                 if let Some(matrix) = matrix {
@@ -648,7 +397,7 @@ pub(crate) fn clip(
     let svg = Clip::Shape;
     match name.to_ascii_lowercase().as_str() {
         "inset" | "rect" | "xywh" => {
-            let (rect, radii) = style::clip_path(value, units, size)?;
+            let (rect, radii) = css::value::clip_path(value, units, size)?;
             let round = args.split_once(" round ").map(|(_, round)| round.trim());
             let Some(round) = round.filter(|round| round.contains(['%', '/'])) else {
                 return Some(Clip::Rounded(rect, radii));
@@ -711,7 +460,7 @@ pub(crate) fn clip(
             )))
         }
         "circle" | "ellipse" => {
-            let (rect, radii) = style::clip_path(value, units, size)?;
+            let (rect, radii) = css::value::clip_path(value, units, size)?;
             if (rect[2] - rect[3]).abs() <= rect[2].max(rect[3]) * 1e-4 {
                 return Some(Clip::Rounded(rect, radii));
             }
@@ -859,7 +608,7 @@ pub(crate) fn radii(style: &Style, units: &Lengths, basis: impl Fn() -> [f32; 2]
             None if first.contains('%') => length(first, 1),
             None => *x,
         };
-        match style.get(shape).and_then(style::corner_shape) {
+        match style.get(shape).and_then(css::value::corner_shape) {
             // Like Chrome, a corner of 16 or more is square, with no radius.
             Some(k) if k >= 16. => (*x, *y) = (Length::Px(px(0.)), Length::Px(px(0.))),
             Some(k) => *code = renderer::corner_shape(k as f32),
@@ -878,17 +627,8 @@ pub(crate) fn corners(radii: [f32; 4]) -> Corners<Pixels> {
     }
 }
 
-fn angle(value: &str, units: &Lengths) -> Option<f32> {
-    units
-        .math(value, 0., &[])
-        .filter(|(value, kind)| {
-            *kind == parser::Kind::Angle || *kind == parser::Kind::Number && *value == 0.
-        })
-        .map(|(value, _)| value as f32)
-}
-
 fn first_argument(body: &str) -> (String, Option<String>) {
-    let parts = style::components(body, ',');
+    let parts = css::value::tokens::components(body, ',');
     let words: Vec<&str> = parts
         .first()
         .map_or("", |part| part.trim())
@@ -942,7 +682,7 @@ pub(crate) fn tile(
     height: f32,
     natural: Option<[f32; 2]>,
 ) -> [[f32; 2]; 2] {
-    let dims = style::components(size, ' ');
+    let dims = css::value::tokens::components(size, ' ');
     let [tw, th] = match (dims.as_slice(), natural) {
         ([fit @ ("cover" | "contain")], Some([nw, nh])) => {
             let [x, y] = [width / nw, height / nh];
@@ -966,7 +706,7 @@ pub(crate) fn tile(
         }
     }
     .map(|side| side.max(0.1));
-    let tokens = style::components(position, ' ');
+    let tokens = css::value::tokens::components(position, ' ');
     // Three and four values give each keyword an offset from its edge.
     let mut pairs: Vec<(&str, Option<&str>)> = Vec::with_capacity(2);
     for token in tokens.iter().copied() {
@@ -1006,7 +746,7 @@ pub(crate) fn tile(
 
 /// The offset of a CSS `<position>` in `free`, the room left around the placed box.
 pub(crate) fn place(position: &str, free: [f32; 2], units: &Lengths) -> [f32; 2] {
-    let tokens = style::components(position, ' ');
+    let tokens = css::value::tokens::components(position, ' ');
     let keyword = |token: &str| matches!(token, "left" | "right" | "top" | "bottom" | "center");
     let offset = |token: &str, axis: usize| match token {
         "left" | "top" => 0.,
@@ -1052,11 +792,15 @@ fn gradient_stops<S: AsRef<str>>(
     extent: f32,
     wide: bool,
 ) -> Option<Vec<(f32, (u32, u8))>> {
-    let color = if wide { style::wide_rgb } else { style::color };
+    let color = if wide {
+        css::value::color::wide_rgb
+    } else {
+        css::value::color::color
+    };
     let mut stops: Vec<(Option<f32>, (u32, u8))> = Vec::new();
     let mut hints = Vec::new();
     for stop in parts.iter().map(AsRef::as_ref).skip(usize::from(prelude)) {
-        let tokens = style::components(stop.trim(), ' ');
+        let tokens = css::value::tokens::components(stop.trim(), ' ');
         let Some(ink) = tokens.iter().find_map(|token| color(token)) else {
             // A lone position between two colors moves their midpoint.
             if let [token] = tokens.as_slice()
@@ -1070,7 +814,7 @@ fn gradient_stops<S: AsRef<str>>(
         };
         let offsets: Vec<f32> = tokens
             .iter()
-            .filter(|token| style::color(token).is_none())
+            .filter(|token| css::value::color::color(token).is_none())
             .filter_map(|token| units.resolve(token, extent).or_else(|| angle(token, units)))
             .take(2)
             .collect();
@@ -1151,7 +895,7 @@ fn gradient_stops<S: AsRef<str>>(
 }
 
 pub(super) fn axis_mask(
-    style: &style::Style,
+    style: &css::properties::Style,
     units: &Lengths,
     [width, height]: [f32; 2],
     raster: [u32; 2],
@@ -1159,10 +903,12 @@ pub(super) fn axis_mask(
     let get =
         |[prop, webkit]: [Prop; 2]| style.get(prop).or_else(|| style.get(webkit)).unwrap_or("");
     let plain = |value: &str, defaults: &[&str]| {
-        style::components(value, ',').iter().all(|part| {
-            let part = part.trim();
-            part.is_empty() || defaults.contains(&part)
-        })
+        css::value::tokens::components(value, ',')
+            .iter()
+            .all(|part| {
+                let part = part.trim();
+                part.is_empty() || defaults.contains(&part)
+            })
     };
     if !plain(
         get([Prop::MASK_SIZE, Prop::WEBKIT_MASK_SIZE]),
@@ -1173,8 +919,10 @@ pub(super) fn axis_mask(
     ) {
         return None;
     }
-    let images = style::components(get([Prop::MASK_IMAGE, Prop::WEBKIT_MASK_IMAGE]), ',');
-    let composites = style::components(style.get(Prop::MASK_COMPOSITE).unwrap_or(""), ',');
+    let images =
+        css::value::tokens::components(get([Prop::MASK_IMAGE, Prop::WEBKIT_MASK_IMAGE]), ',');
+    let composites =
+        css::value::tokens::components(style.get(Prop::MASK_COMPOSITE).unwrap_or(""), ',');
     let mut layers = Vec::with_capacity(images.len());
     for image in &images {
         let mut axes = [
@@ -1185,7 +933,7 @@ pub(super) fn axis_mask(
             .trim()
             .strip_prefix("linear-gradient(")?
             .strip_suffix(')')?;
-        let parts = style::components(body, ',');
+        let parts = css::value::tokens::components(body, ',');
         let (first, space) = first_argument(body);
         if space.is_some() {
             return None;
@@ -1197,9 +945,9 @@ pub(super) fn axis_mask(
             "to left" | "270deg" => (0, true, true),
             other
                 if other.is_empty()
-                    || style::components(other, ' ')
+                    || css::value::tokens::components(other, ' ')
                         .first()
-                        .is_some_and(|part| style::color(part).is_some()) =>
+                        .is_some_and(|part| css::value::color::color(part).is_some()) =>
             {
                 (1, false, false)
             }
@@ -1297,7 +1045,7 @@ impl Gradient<'_> {
     // The sRGB color of a stop, or its Display P3 color when the gradient is wide.
     fn output(&self, ink: u32, alpha: u8) -> u32 {
         match self.wide {
-            true => style::p3(&stop_css(true, ink, alpha)).map_or(ink, |(ink, _)| ink),
+            true => css::value::color::p3(&stop_css(true, ink, alpha)).map_or(ink, |(ink, _)| ink),
             false => ink,
         }
     }
@@ -1629,7 +1377,7 @@ fn gradient<'a>(
     let ([[tw, th], [x, y]], steps) =
         tile_repeat(size, position, repeat, &units, area[2], area[3], None);
     let [x, y] = [x + area[0], y + area[1]];
-    let parts = style::components(body, ',');
+    let parts = css::value::tokens::components(body, ',');
     let (first, space) = first_argument(body);
     let first = first.as_str();
     let repeating = kind.starts_with("repeating-");
@@ -1671,7 +1419,7 @@ fn gradient<'a>(
                     .any(|word| first.contains(word))
                 || first.starts_with("at")
                 || !first.is_empty()
-                    && style::color(first).is_none()
+                    && css::value::color::color(first).is_none()
                     && first
                         .split_whitespace()
                         .all(|part| units.resolve(part, tw).is_some());
@@ -1746,17 +1494,17 @@ fn gradient<'a>(
         }
         _ => return None,
     };
-    // Like Chrome on a wide-gamut screen, colors outside sRGB keep their gamut. Then stops are `style::wide_rgb`, and
+    // Like Chrome on a wide-gamut screen, colors outside sRGB keep their gamut. Then stops are `css::value::color::wide_rgb`, and
     // the image is Display P3.
     let wide = cfg!(target_os = "macos")
         && (parts.iter()).any(|part| {
-            style::components(part, ' ')
+            css::value::tokens::components(part, ' ')
                 .iter()
-                .any(|token| style::wide(token))
+                .any(|token| css::value::color::wide(token))
         });
     let color = match wide {
-        true => style::wide_rgb as fn(&str) -> _,
-        false => style::color as fn(&str) -> _,
+        true => css::value::color::wide_rgb as fn(&str) -> _,
+        false => css::value::color::color as fn(&str) -> _,
     };
     let css = |ink, alpha| stop_css(wide, ink, alpha);
     let stops = gradient_stops(&parts, prelude, &units, extent, wide)?;
@@ -1937,7 +1685,7 @@ pub(super) fn push_bits(key: &mut String, size: [f32; 2], units: &Lengths) {
     }
 }
 
-pub(super) fn opacity(style: &style::Style) -> f32 {
+pub(super) fn opacity(style: &css::properties::Style) -> f32 {
     style
         .get(Prop::OPACITY)
         .and_then(|value| {
@@ -2069,12 +1817,13 @@ pub(crate) fn establishes(style: &Style) -> Establishes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::css::value::transform::multiply;
     use renderer::size;
 
     fn style(pairs: &[(&str, &str)]) -> Style {
         pairs
             .iter()
-            .map(|(key, value)| (crate::style::Prop::new(key), (*value).into()))
+            .map(|(key, value)| (crate::css::properties::Prop::new(key), (*value).into()))
             .collect()
     }
 

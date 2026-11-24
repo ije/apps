@@ -1,12 +1,18 @@
-use super::{
-    Declaration, Declarations, MediaQuery, Prop, Rule, Selector, SelectorList, Stylesheet,
+use crate::css::{
+    properties::Prop, sheet::Declaration, sheet::Declarations, sheet::MediaQuery, sheet::Rule,
+    sheet::Stylesheet, value::grammar::computed, value::grammar::supports,
+    value::grammar::syntax_matches, value::tokens::components,
 };
+use crate::css::{selector::Selector, selector::SelectorList, value::units::Lengths};
 use cssparser::{
     AtRuleParser, CowRcStr, DeclarationParser, Delimiter, ParseError, Parser, ParserState,
     QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser, StyleSheetParser, Token,
     TokenSerializationType, parse_important,
 };
 use std::rc::Rc;
+
+pub(crate) const FONT_FORMATS: [&str; 5] = ["collection", "opentype", "truetype", "woff", "woff2"];
+pub(crate) const FONT_TECHS: [&str; 2] = ["features-opentype", "variations"];
 
 type Checked = (Vec<u8>, rustc_hash::FxHashMap<Box<[u8]>, bool>);
 
@@ -74,7 +80,7 @@ impl Declarations {
         Self::parse_input(&mut Parser::new(source), true)
     }
 
-    fn parse_input(input: &mut Parser<'_>, descriptors: bool) -> Self {
+    pub(crate) fn parse_input(input: &mut Parser<'_>, descriptors: bool) -> Self {
         let mut parser = Rules {
             declarations_only: true,
             descriptors,
@@ -92,7 +98,7 @@ impl Declarations {
 }
 
 impl Rules {
-    fn body(&mut self, input: &mut Parser<'_>) -> Vec<Rule> {
+    pub(crate) fn body(&mut self, input: &mut Parser<'_>) -> Vec<Rule> {
         let theme = self.theme;
         let mut rules = Vec::new();
         for item in RuleBodyParser::new(input, self) {
@@ -178,7 +184,7 @@ impl<'i> DeclarationParser<'i> for Rules {
         };
         // Like Chrome, a font weight is `normal`, `bold`, `auto`, or one or two numbers in [1, 1000].
         if self.descriptors && name == "font-weight" {
-            let weights = super::components(&value, ' ');
+            let weights = components(&value, ' ');
             if weights.len() > 2
                 || weights.iter().any(|weight| match weight.parse::<f64>() {
                     Ok(weight) => !(1. ..=1000.).contains(&weight),
@@ -208,7 +214,7 @@ impl<'i> DeclarationParser<'i> for Rules {
 }
 
 // Sheets and `var()` results repeat declarations, so each `property:value` is checked once.
-pub(super) fn invalid(name: &str, plain: &str) -> bool {
+pub(crate) fn invalid(name: &str, plain: &str) -> bool {
     VALID.with_borrow_mut(|(key, valid)| {
         // An exact key starts with a zero byte. A miss also tries the shared key that follows it.
         key.clear();
@@ -264,7 +270,7 @@ pub(super) fn invalid(name: &str, plain: &str) -> bool {
             !["env(", "attr(", "theme(", "--spacing(", "--alpha("]
                 .iter()
                 .any(|function| plain.contains(function))
-                && super::supports(name, plain) == Some(false)
+                && supports(name, plain) == Some(false)
         });
         if valid.len() > 8192 {
             valid.clear();
@@ -452,7 +458,7 @@ impl<'i> AtRuleParser<'i> for Rules {
             // Class names keep adjacent tokens as written, like `py-1.5`.
             source(input, &mut value, "")?;
             return Ok(Item::Declaration(Declaration::Apply(
-                super::components(&value, ' ')
+                components(&value, ' ')
                     .into_iter()
                     .map(str::to_owned)
                     .collect(),
@@ -712,10 +718,8 @@ impl<'i> AtRuleParser<'i> for Rules {
                 if syntax.trim() != "*" {
                     // The initial value must not depend on an element, so `2em` drops the rule.
                     let Some((value, true)) = initial
-                        .filter(|value| {
-                            !value.contains("var(") && super::syntax_matches(&syntax, value)
-                        })
-                        .map(|value| super::computed(&syntax, &value))
+                        .filter(|value| !value.contains("var(") && syntax_matches(&syntax, value))
+                        .map(|value| computed(&syntax, &value))
                     else {
                         return Err(ParseError::unexpected_token());
                     };
@@ -793,16 +797,16 @@ fn condition(
             if supports {
                 let supported = match selector.as_deref() {
                     Some("selector") => !Selector::parse(text, None).is_empty(),
-                    Some("font-format") => super::FONT_FORMATS
+                    Some("font-format") => FONT_FORMATS
                         .iter()
                         .any(|format| text.eq_ignore_ascii_case(format)),
-                    Some("font-tech") => super::FONT_TECHS
+                    Some("font-tech") => FONT_TECHS
                         .iter()
                         .any(|tech| text.eq_ignore_ascii_case(tech)),
                     Some(_) => false,
                     None => text.split_once(':').is_some_and(|(name, value)| {
                         let value = value.trim();
-                        super::supports(
+                        crate::css::value::grammar::supports(
                             &name.trim().to_ascii_lowercase(),
                             value
                                 .strip_suffix("!important")
@@ -1077,454 +1081,6 @@ fn source(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct FontUnits {
-    pub em: f32,
-    pub ch: f32,
-    pub ex: f32,
-    pub cap: f32,
-    pub ic: f32,
-    pub lh: f32,
-    pub absolute: bool,
-}
-
-impl FontUnits {
-    pub fn new(em: f32) -> Self {
-        Self {
-            em,
-            ch: em * 0.5,
-            ex: em * 0.5,
-            cap: em * 0.8,
-            ic: em,
-            lh: em * 1.2,
-            absolute: false,
-        }
-    }
-
-    pub fn bits(self) -> [u32; 7] {
-        let [em, ch, ex, cap, ic, lh] =
-            [self.em, self.ch, self.ex, self.cap, self.ic, self.lh].map(f32::to_bits);
-        [em, ch, ex, cap, ic, lh, u32::from(self.absolute)]
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Lengths {
-    pub font: FontUnits,
-    pub root: FontUnits,
-    pub viewport: [f32; 2],
-    pub container: Option<[f32; 2]>,
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct NodeLengths {
-    ids: super::Chunked<u32>,
-    list: Vec<Lengths>,
-    last: u32,
-}
-
-impl NodeLengths {
-    pub(crate) fn reset(&mut self, count: usize, lengths: Lengths) {
-        self.ids.clear();
-        self.ids.resize(count, 0);
-        self.list.clear();
-        self.list.push(lengths);
-        self.last = 0;
-    }
-
-    pub(crate) fn set(&mut self, id: usize, lengths: Lengths) {
-        if self.list[self.last as usize] != lengths {
-            // Only the newest values are searched, or a page with a font size per node gets quadratic.
-            let mut newest = self.list.iter().enumerate().rev().take(32);
-            self.last = match newest.find(|(_, old)| **old == lengths) {
-                Some((index, _)) => index as u32,
-                None => {
-                    self.list.push(lengths);
-                    self.list.len() as u32 - 1
-                }
-            };
-        }
-        self.ids.set(id, self.last, u32::eq);
-    }
-
-    pub(crate) fn get(&self, id: usize) -> Option<&Lengths> {
-        self.ids.get(id).map(|&index| &self.list[index as usize])
-    }
-
-    pub(crate) fn grow(&mut self, count: usize) {
-        self.ids.resize(count, 0);
-    }
-
-    pub(crate) fn unset(&mut self, id: usize) {
-        self.ids[id] = 0;
-    }
-
-    pub(crate) fn list_len(&self) -> usize {
-        self.list.len()
-    }
-}
-
-impl std::ops::Index<usize> for NodeLengths {
-    type Output = Lengths;
-
-    fn index(&self, id: usize) -> &Lengths {
-        &self.list[self.ids[id] as usize]
-    }
-}
-
-impl Lengths {
-    pub fn new(font: f32, vw: f32, vh: f32) -> Self {
-        Self {
-            font: FontUnits::new(font),
-            root: FontUnits::new(16.),
-            viewport: [vw, vh],
-            container: None,
-        }
-    }
-
-    pub fn parse(&self, source: &str, base: f32) -> Option<(f32, bool)> {
-        let (value, kind) = self.math(source, base, &[])?;
-        let value = value as f32;
-        (matches!(kind, Kind::Number | Kind::Length) && value.is_finite())
-            .then_some((value, kind == Kind::Length))
-    }
-
-    pub fn math(&self, source: &str, base: f32, vars: &[(&str, f64)]) -> Option<(f64, Kind)> {
-        self.math_unclamped(source, base, vars)
-            .map(|(value, kind)| (value.clamp(-33_554_428., 33_554_428.), kind))
-    }
-
-    pub fn math_unclamped(
-        &self,
-        source: &str,
-        base: f32,
-        vars: &[(&str, f64)],
-    ) -> Option<(f64, Kind)> {
-        let mut parser = Math {
-            rest: source.trim(),
-            units: self,
-            base,
-            depth: 0,
-            vars,
-        };
-        let value = parser.atom()?;
-        (parser.rest.trim().is_empty() && !value.0.is_nan()).then_some(value)
-    }
-
-    pub fn resolve(&self, source: &str, base: f32) -> Option<f32> {
-        let (value, dimensional) = self.parse(source, base)?;
-        (dimensional || value == 0.).then_some(value)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum Kind {
-    Number,
-    Length,
-    Angle,
-    Time,
-}
-
-struct Math<'a> {
-    rest: &'a str,
-    units: &'a Lengths,
-    base: f32,
-    depth: usize,
-    vars: &'a [(&'a str, f64)],
-}
-
-impl Math<'_> {
-    fn expression(&mut self, minimum: u8) -> Option<(f64, Kind)> {
-        self.depth += 1;
-        if self.depth > 64 {
-            return None;
-        }
-        let mut left = self.atom()?;
-        loop {
-            let rest = self.rest.trim_start();
-            let operator = rest.as_bytes().first().copied().unwrap_or(0);
-            let precedence = match operator {
-                b'+' | b'-' => 1,
-                b'*' | b'/' => 2,
-                _ => break,
-            };
-            if precedence < minimum {
-                break;
-            }
-            if precedence == 1
-                && (rest.len() == self.rest.len()
-                    || !rest.as_bytes().get(1).is_some_and(u8::is_ascii_whitespace))
-            {
-                return None;
-            }
-            self.rest = &rest[1..];
-            let right = self.expression(precedence + 1)?;
-            left = match (operator, left.1, right.1) {
-                (b'+', a, b) if a == b => (left.0 + right.0, a),
-                (b'-', a, b) if a == b => (left.0 - right.0, a),
-                (b'*', kind, Kind::Number) | (b'*', Kind::Number, kind) => (left.0 * right.0, kind),
-                (b'/', kind, Kind::Number) if right.0 != 0. => (left.0 / right.0, kind),
-                (b'/', a, b) if a == b && right.0 != 0. => (left.0 / right.0, Kind::Number),
-                _ => return None,
-            };
-            if left.0.is_nan() {
-                return None;
-            }
-        }
-        self.depth -= 1;
-        Some(left)
-    }
-
-    fn atom(&mut self) -> Option<(f64, Kind)> {
-        self.rest = self.rest.trim_start();
-        if let Some(rest) = self.rest.strip_prefix('-')
-            && rest.starts_with(|c: char| c.is_ascii_alphabetic() || c == '(')
-        {
-            self.rest = rest;
-            let (value, kind) = self.atom()?;
-            return Some((-value, kind));
-        }
-        let end = if self.rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
-            self.rest
-                .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
-                .unwrap_or(self.rest.len())
-        } else {
-            0
-        };
-        let name = &self.rest[..end];
-        let lower;
-        let name = if name.bytes().any(|c| c.is_ascii_uppercase()) {
-            lower = name.to_ascii_lowercase();
-            lower.as_str()
-        } else {
-            name
-        };
-        if end > 0 && !self.rest[end..].starts_with('(') {
-            self.rest = &self.rest[end..];
-            if let Some((_, value)) = self.vars.iter().find(|(var, _)| *var == name) {
-                return Some((*value, Kind::Number));
-            }
-            let value = match name {
-                "e" if self.depth > 0 => std::f64::consts::E,
-                "pi" if self.depth > 0 => std::f64::consts::PI,
-                "infinity" if self.depth > 0 => f64::INFINITY,
-                "nan" if self.depth > 0 => f64::NAN,
-                _ => return None,
-            };
-            return Some((value, Kind::Number));
-        }
-        if end > 0 || self.rest.starts_with('(') {
-            if end == 0 && self.depth == 0 {
-                return None;
-            }
-            self.rest = &self.rest[end + 1..];
-            let strategy = ["nearest", "up", "down", "to-zero"]
-                .into_iter()
-                .filter(|_| name == "round")
-                .find_map(|keyword| {
-                    let rest = self.rest.trim_start();
-                    let rest = rest
-                        .get(..keyword.len())
-                        .filter(|word| word.eq_ignore_ascii_case(keyword))
-                        .and(rest.get(keyword.len()..))?;
-                    self.rest = rest.trim_start().strip_prefix(',')?;
-                    Some(keyword)
-                })
-                .unwrap_or("nearest");
-            let mut args = [self.expression(0)?; 3];
-            let mut count = 1;
-            loop {
-                self.rest = self.rest.trim_start();
-                if let Some(rest) = self.rest.strip_prefix(')') {
-                    self.rest = rest;
-                    break;
-                }
-                self.rest = self.rest.strip_prefix(',')?;
-                let value = self.expression(0)?;
-                match name {
-                    "min" | "max" | "hypot" if value.1 == args[0].1 => {
-                        args[0].0 = match name {
-                            "min" => args[0].0.min(value.0),
-                            "max" => args[0].0.max(value.0),
-                            _ => args[0].0.hypot(value.0),
-                        }
-                    }
-                    "clamp" | "round" | "mod" | "rem" | "atan2" | "pow" | "log" if count < 3 => {
-                        args[count] = value;
-                        count += 1;
-                    }
-                    _ => return None,
-                }
-            }
-            let [(a, kind), (b, other), (c, last)] = args;
-            let same = kind == other;
-            let number = kind == Kind::Number;
-            return Some(match (name, count) {
-                ("" | "calc" | "min" | "max", _) => args[0],
-                ("hypot", _) => (a.abs(), kind),
-                ("clamp", 3) if same && kind == last => (a.max(b.min(c)), kind),
-                ("round", 1 | 2) => {
-                    let step = if count == 2 && same {
-                        b.abs()
-                    } else if count == 1 {
-                        1.
-                    } else {
-                        return None;
-                    };
-                    let value = a / step;
-                    let value = match strategy {
-                        "up" => value.ceil(),
-                        "down" => value.floor(),
-                        "to-zero" => value.trunc(),
-                        _ => (value + 0.5).floor(),
-                    };
-                    (value * step, kind)
-                }
-                ("mod", 2) if same => (a - b * (a / b).floor(), kind),
-                ("rem", 2) if same => (a % b, kind),
-                ("abs", 1) => (a.abs(), kind),
-                ("sign", 1) => (f64::from(i8::from(a > 0.) - i8::from(a < 0.)), Kind::Number),
-                ("sin" | "cos" | "tan", 1) if matches!(kind, Kind::Number | Kind::Angle) => {
-                    let radians = if number { a } else { a.to_radians() };
-                    let value = match name {
-                        "sin" => radians.sin(),
-                        "cos" => radians.cos(),
-                        _ => radians.tan(),
-                    };
-                    (value, Kind::Number)
-                }
-                ("asin", 1) if number => (a.asin().to_degrees(), Kind::Angle),
-                ("acos", 1) if number => (a.acos().to_degrees(), Kind::Angle),
-                ("atan", 1) if number => (a.atan().to_degrees(), Kind::Angle),
-                ("atan2", 2) if same => (a.atan2(b).to_degrees(), Kind::Angle),
-                ("pow", 2) if number && same => (a.powf(b), Kind::Number),
-                ("sqrt", 1) if number => (a.sqrt(), Kind::Number),
-                ("exp", 1) if number => (a.exp(), Kind::Number),
-                ("log", 1) if number => (a.ln(), Kind::Number),
-                ("log", 2) if number && same => (a.ln() / b.ln(), Kind::Number),
-                _ => return None,
-            })
-            .filter(|value| !value.0.is_nan());
-        }
-        let bytes = self.rest.as_bytes();
-        let mut end = usize::from(bytes.first().is_some_and(|b| matches!(b, b'+' | b'-')));
-        let start = end;
-        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
-            end += 1;
-        }
-        let mut digits = end - start;
-        if bytes.get(end) == Some(&b'.') {
-            end += 1;
-            let start = end;
-            while bytes.get(end).is_some_and(u8::is_ascii_digit) {
-                end += 1;
-            }
-            if start == end {
-                return None;
-            }
-            digits += end - start;
-        }
-        if digits == 0 {
-            return None;
-        }
-        if bytes.get(end).is_some_and(|b| matches!(b, b'e' | b'E')) {
-            let mut exponent = end + 1;
-            if bytes
-                .get(exponent)
-                .is_some_and(|b| matches!(b, b'+' | b'-'))
-            {
-                exponent += 1;
-            }
-            if bytes.get(exponent).is_some_and(u8::is_ascii_digit) {
-                end = exponent + 1;
-                while bytes.get(end).is_some_and(u8::is_ascii_digit) {
-                    end += 1;
-                }
-            }
-        }
-        let value = self.rest[..end].parse::<f64>().ok()?;
-        self.rest = &self.rest[end..];
-        let end = if self.rest.starts_with('%') {
-            1
-        } else {
-            self.rest
-                .find(|c: char| !c.is_ascii_alphabetic())
-                .unwrap_or(self.rest.len())
-        };
-        let unit = &self.rest[..end];
-        self.rest = &self.rest[end..];
-        let lower;
-        let unit = if unit.bytes().any(|c| c.is_ascii_uppercase()) {
-            lower = unit.to_ascii_lowercase();
-            lower.as_str()
-        } else {
-            unit
-        };
-        let font = self.units.font;
-        let root = self.units.root;
-        let [vw, vh] = self.units.viewport;
-        let (scale, kind) = match unit {
-            "" => (1., Kind::Number),
-            "deg" => (1., Kind::Angle),
-            "grad" => (0.9, Kind::Angle),
-            "rad" => (180. / std::f64::consts::PI, Kind::Angle),
-            "turn" => (360., Kind::Angle),
-            "s" => (1., Kind::Time),
-            "ms" => (0.001, Kind::Time),
-            "%" => (f64::from(self.base) / 100., Kind::Length),
-            _ => {
-                let scale = match unit {
-                    "px" => 1.,
-                    "em" => font.em,
-                    "rem" => root.em,
-                    "ch" => font.ch,
-                    "rch" => root.ch,
-                    "ex" => font.ex,
-                    "rex" => root.ex,
-                    "cap" => font.cap,
-                    "rcap" => root.cap,
-                    "ic" => font.ic,
-                    "ric" => root.ic,
-                    "lh" => font.lh,
-                    "rlh" => root.lh,
-                    "vw" | "svw" | "lvw" | "dvw" | "vi" | "svi" | "lvi" | "dvi" => vw / 100.,
-                    "vh" | "svh" | "lvh" | "dvh" | "vb" | "svb" | "lvb" | "dvb" => vh / 100.,
-                    "cqw" | "cqi" => self.units.container.unwrap_or(self.units.viewport)[0] / 100.,
-                    "cqh" | "cqb" => self.units.container.unwrap_or(self.units.viewport)[1] / 100.,
-                    "cqmin" => {
-                        self.units
-                            .container
-                            .unwrap_or(self.units.viewport)
-                            .into_iter()
-                            .fold(f32::INFINITY, f32::min)
-                            / 100.
-                    }
-                    "cqmax" => {
-                        self.units
-                            .container
-                            .unwrap_or(self.units.viewport)
-                            .into_iter()
-                            .fold(0., f32::max)
-                            / 100.
-                    }
-                    "vmin" | "svmin" | "lvmin" | "dvmin" => vw.min(vh) / 100.,
-                    "vmax" | "svmax" | "lvmax" | "dvmax" => vw.max(vh) / 100.,
-                    "in" => 96.,
-                    "cm" => 96. / 2.54,
-                    "mm" => 96. / 25.4,
-                    "q" => 96. / 101.6,
-                    "pt" => 96. / 72.,
-                    "pc" => 16.,
-                    _ => return None,
-                };
-                (f64::from(scale), Kind::Length)
-            }
-        };
-        let value = value * scale;
-        value.is_finite().then_some((value, kind))
-    }
-}
-
 struct Keyframes;
 impl<'i> AtRuleParser<'i> for Keyframes {
     type Prelude = ();
@@ -1559,9 +1115,23 @@ impl<'i> QualifiedRuleParser<'i> for Keyframes {
     }
 }
 
+pub(crate) fn supports_condition(condition: &str) -> bool {
+    let evaluate = |source: String| match Stylesheet::parse(&source).0.as_slice() {
+        [rule] => match **rule {
+            Rule::Supports(_, supported, _) => Some(supported),
+            _ => None,
+        },
+        _ => None,
+    };
+    evaluate(format!("@supports {condition}{{}}"))
+        .or_else(|| evaluate(format!("@supports ({condition}){{}}")))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::css::{value::units::FontUnits, value::units::Lengths};
 
     #[test]
     fn numbers_with_exponents_keep_their_own_validity() {

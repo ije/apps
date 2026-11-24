@@ -710,7 +710,7 @@ fn window_titles_follow_the_document() {
                 "test",
             )
             .unwrap();
-        assert!(desktop.host.borrow().dom[&1].computed.is_some());
+        assert!(desktop.host.borrow().dom[&1].styles.computed.is_some());
         desktop.command(serde_json::json!({
             "op":"window", "args":["load",1,"<html><body style='color:purple'>New page</body></html>"]
         }));

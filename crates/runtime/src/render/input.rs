@@ -1,7 +1,8 @@
 use super::inspect::{Tool, tool};
 use super::{PageState, PageView};
+use crate::css;
+use crate::css::properties::Prop;
 use crate::style;
-use crate::style::Prop;
 use anyhow::{Context as _, Result, ensure};
 use renderer::{App, Event, Pixels, Point, Rect, Utf16Selection, Window, point, px, size};
 use std::{
@@ -830,17 +831,17 @@ impl renderer::View for PageView {
             );
         }
         let bounds = dom.bounds.get(&id)?;
-        let style = dom.computed.as_ref()?.values.get(id)?;
+        let style = dom.styles.computed.as_ref()?.values.get(id)?;
         let face = style::font(style);
         let text = state["text"].as_str()?;
-        let font_size = style::length(
+        let font_size = css::value::length(
             style.get(Prop::FONT_SIZE).unwrap_or("16px"),
             16.,
             16.,
             bounds[2],
             bounds[3],
         );
-        let line_height = style::length(
+        let line_height = css::value::length(
             style.get(Prop::LINE_HEIGHT).unwrap_or("20px"),
             font_size,
             font_size,

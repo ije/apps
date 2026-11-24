@@ -40,7 +40,7 @@ impl Desktop {
             .filter(|_| cfg!(target_os = "macos"));
         let background = options["backgroundColor"]
             .as_str()
-            .and_then(crate::style::color)
+            .and_then(crate::css::value::color::color)
             .unwrap_or(if transparent || vibrancy.is_some() {
                 (0, 0)
             } else {

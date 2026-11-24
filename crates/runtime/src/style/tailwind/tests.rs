@@ -1,4 +1,5 @@
-use super::super::{Prop, StyleCache, compute_styles, length};
+use super::super::{StyleCache, compute_styles};
+use crate::css::{properties::Prop, value::length};
 use crate::dom::Document;
 use std::{collections::HashMap, fmt::Write, rc::Rc};
 
@@ -8,7 +9,7 @@ fn computed(source: &str, hovered: Option<&str>) -> (Document, super::super::Com
         let id = (0..doc.nodes.len())
             .find(|&id| doc.matches(id, selector))
             .unwrap();
-        doc.nodes[id].state = crate::dom::HOVER;
+        doc.nodes[id].state = crate::css::selector::HOVER;
     }
     let styles = compute_styles(
         &doc,
@@ -39,7 +40,7 @@ fn generated(author: &str, classes: &[&str]) -> Vec<String> {
         .iter()
         .map(|class| {
             config
-                .compile(class, &super::escape(class))
+                .compile(class, &super::value::escape(class))
                 .map(|compiled| super::css(&compiled.rules))
                 .unwrap_or_default()
         })
@@ -460,7 +461,12 @@ fn utilities_and_variants_sort_like_tailwind() {
     ] {
         let sorts: Vec<_> = chain
             .split(' ')
-            .map(|class| config.compile(class, &super::escape(class)).unwrap().sort)
+            .map(|class| {
+                config
+                    .compile(class, &super::value::escape(class))
+                    .unwrap()
+                    .sort
+            })
             .collect();
         assert!(sorts.is_sorted_by(|a, b| a < b), "{chain}");
     }
@@ -1061,7 +1067,11 @@ fn bg_glass_tint_tracks_runtime_theme_overrides_and_apply() {
         doc.nodes[root]
             .attrs
             .set("class", if night { "night" } else { "" });
-        doc.nodes[hovered].state = if night { crate::dom::HOVER } else { 0 };
+        doc.nodes[hovered].state = if night {
+            crate::css::selector::HOVER
+        } else {
+            0
+        };
         let styles = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
         let fresh = compute_styles(
             &doc,
@@ -1694,7 +1704,7 @@ fn incremental_inserts_match_a_fresh_compile() {
 
 #[test]
 fn standalone_pages_get_their_theme_base_and_classes() {
-    let css = super::super::tailwind(
+    let css = super::page_css(
         "@import 'tailwindcss';@theme{--color-box:#1d1d20}.caret{rotate:90deg}",
         "<p class=\"flex bg-box\">const flex = `hover:text-red-500 px-[3px]`</p>",
     );

@@ -1,5 +1,7 @@
 use super::effects::{self, Establishes};
-use crate::style::{self, Lengths, Prop, Style};
+use crate::css;
+use crate::css::{properties::Prop, properties::Style, value::units::Lengths};
+use crate::style;
 use renderer::{Color, Pixels, Radii};
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
@@ -31,7 +33,7 @@ impl Plan {
                 .iter()
                 .any(|&prop| style.get(prop).is_some_and(|value| value.contains('%')))
         };
-        let ink = style.get(Prop::COLOR).and_then(style::paint);
+        let ink = style.get(Prop::COLOR).and_then(css::value::color::paint);
         let text = ink.unwrap_or(Color::BLACK);
         let borders = units.borders(style, 0.);
         let corners = [
@@ -64,17 +66,22 @@ impl Plan {
             ink,
             background: style
                 .get(Prop::BACKGROUND_COLOR)
-                .and_then(style::paint)
+                .and_then(css::value::color::paint)
                 .filter(|color| color.a > 0.),
             selection: style::selection_colors(style, None),
-            padding: (!relative(&style::PADDING)).then(|| {
+            padding: (!relative(&css::properties::PADDING)).then(|| {
                 units
-                    .edges(style, style::PADDING, 0.)
+                    .edges(style, css::properties::PADDING, 0.)
                     .map(|value| value.max(0.))
             }),
-            borders: (!relative(&style::BORDERS.map(|[width, ..]| width))).then_some(borders),
-            border_colors: style::BORDERS
-                .map(|[_, _, name]| style.get(name).and_then(style::paint).unwrap_or(text)),
+            borders: (!relative(&css::properties::BORDERS.map(|[width, ..]| width)))
+                .then_some(borders),
+            border_colors: css::properties::BORDERS.map(|[_, _, name]| {
+                style
+                    .get(name)
+                    .and_then(css::value::color::paint)
+                    .unwrap_or(text)
+            }),
             radii: (!relative(&corners)).then(|| effects::radii(style, units, || [0.; 2])),
             shareable: matches!(
                 style.get(Prop::DISPLAY),

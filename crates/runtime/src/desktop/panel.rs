@@ -30,7 +30,7 @@ fn page() -> Result<&'static str> {
     let html = crate::native::devtools::text(false)?;
     let (head, rest) = html.split_once("<style>").unwrap_or((html, ""));
     let (css, body) = rest.split_once("</style>").unwrap_or_default();
-    let css = crate::style::tailwind(css, body);
+    let css = crate::style::tailwind::page_css(css, body);
     Ok(PAGE.get_or_init(|| format!("{head}<style>{css}</style>{body}")))
 }
 

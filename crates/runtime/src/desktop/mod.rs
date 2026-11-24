@@ -430,12 +430,13 @@ impl Desktop {
                         let key = args[2].as_str().unwrap_or_default();
                         if action == "insertCSS" {
                             let css = args[3].as_str().unwrap_or_default();
-                            let sheet = Rc::new(crate::style::Stylesheet::parse(css));
+                            let sheet = Rc::new(crate::css::sheet::Stylesheet::parse(css));
                             state
+                                .styles
                                 .inserted
                                 .push((key.to_owned(), sheet, args[4] == true));
                         } else {
-                            state.inserted.retain(|(old, ..)| old != key);
+                            state.styles.inserted.retain(|(old, ..)| old != key);
                         }
                         state.invalidate();
                         page.dirty = true;
@@ -546,7 +547,7 @@ impl Desktop {
                     "background" => {
                         let color = args[2]
                             .as_str()
-                            .and_then(crate::style::color)
+                            .and_then(crate::css::value::color::color)
                             .unwrap_or((0xffffff, 255));
                         self.host.borrow_mut().set_background(id, color);
                         if let (Some(handle), Some(cx)) =

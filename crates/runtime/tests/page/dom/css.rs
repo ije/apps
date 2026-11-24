@@ -23,7 +23,7 @@ fn utility_classes_follow_dom_changes() {
             .position(|n| n.attrs.get("id").is_some_and(|v| v == "dot"))
             .unwrap();
         let styles = apps_runtime::style::styles(doc, 800., 600.);
-        let px = |value: &str| apps_runtime::style::length(value, 0., 16., 800., 600.);
+        let px = |value: &str| apps_runtime::css::value::length(value, 0., 16., 800., 600.);
         assert_eq!(px(&styles[id]["height"]), 32.);
         assert_eq!(px(&styles[id]["width"]), 32.);
         assert_eq!(styles[id]["background-color"], "#123456");

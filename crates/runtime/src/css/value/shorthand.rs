@@ -1,4 +1,4 @@
-use super::components;
+use crate::css::{value::tokens::components, value::units::Kind, value::units::Lengths};
 
 pub(crate) const BORDER_IMAGE: [&str; 5] = [
     "border-image-source",
@@ -26,7 +26,7 @@ pub(crate) fn border_image(value: &str) -> Option<[String; 5]> {
             }
         }
     }
-    let units = super::Lengths::new(16., 100., 100.);
+    let units = Lengths::new(16., 100., 100.);
     // 0: number, 1: percentage, 2: length, 3: `auto`, 4: a sum of a length and a percentage.
     let kind = |token: &str| -> Option<u8> {
         let lower = token.to_ascii_lowercase();
@@ -36,9 +36,9 @@ pub(crate) fn border_image(value: &str) -> Option<[String; 5]> {
                 .any(|function| lower.starts_with(function))
         {
             return match units.math(&lower, 100., &[])? {
-                (_, super::parser::Kind::Number) => Some(0),
-                (_, super::parser::Kind::Length) if !lower.contains('%') => Some(2),
-                (_, super::parser::Kind::Length) => Some(if units.math(&lower, 0., &[])?.0 == 0. {
+                (_, Kind::Number) => Some(0),
+                (_, Kind::Length) if !lower.contains('%') => Some(2),
+                (_, Kind::Length) => Some(if units.math(&lower, 0., &[])?.0 == 0. {
                     1
                 } else {
                     4
@@ -642,7 +642,7 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                             ),
                             None => {
                                 part.eq_ignore_ascii_case("currentcolor")
-                                    || super::color(part).is_some()
+                                    || crate::css::value::color::color(part).is_some()
                             }
                         }
                     {
@@ -710,11 +710,9 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                             && (matches!(part, "bold" | "bolder" | "lighter")
                                 || part.parse::<f32>().is_ok_and(|weight| weight != 0.)
                                 || part.starts_with("calc(")
-                                    && super::Lengths::new(16., 100., 100.)
+                                    && Lengths::new(16., 100., 100.)
                                         .math(part, f32::NAN, &[])
-                                        .is_some_and(|(_, kind)| {
-                                            kind == super::parser::Kind::Number
-                                        })) =>
+                                        .is_some_and(|(_, kind)| kind == Kind::Number)) =>
                         {
                             return true;
                         }
@@ -735,9 +733,9 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                         },
                         // Math keeps its text, and the computed value is clamped to [1, 1000].
                         _ if part.starts_with("calc(")
-                            && super::Lengths::new(16., 100., 100.)
+                            && Lengths::new(16., 100., 100.)
                                 .math(part, f32::NAN, &[])
-                                .is_some_and(|(_, kind)| kind == super::parser::Kind::Number) =>
+                                .is_some_and(|(_, kind)| kind == Kind::Number) =>
                         {
                             values[2] = part.into()
                         }

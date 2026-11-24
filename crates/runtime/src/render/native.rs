@@ -1,6 +1,8 @@
+use crate::css;
 use crate::{
+    css::properties::Prop,
     dom::{Document, Node},
-    style::{self, Prop},
+    style,
 };
 use renderer::{ControlEvent, ControlKind, ControlSink, NativeControl, Pixels, Rect};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -22,7 +24,7 @@ impl Node {
     }
 
     /// The AppKit control of an input with `appearance: system`, on macOS.
-    pub(crate) fn native_control(&self, style: &style::Style) -> Option<ControlKind> {
+    pub(crate) fn native_control(&self, style: &css::properties::Style) -> Option<ControlKind> {
         if style.get(Prop::APPEARANCE) != Some("system") {
             return None;
         }
@@ -87,7 +89,7 @@ pub(super) fn register(controls: &std::cell::RefCell<Controls>, id: usize) {
 pub(super) fn sync(
     controls: &std::cell::RefCell<Controls>,
     doc: &Document,
-    styles: &style::Chunked<std::rc::Rc<style::Style>>,
+    styles: &style::Chunked<std::rc::Rc<css::properties::Style>>,
 ) {
     let mut controls = controls.borrow_mut();
     if !controls.shown.is_empty() {
@@ -104,7 +106,7 @@ pub(super) fn paint(
     view: &super::PageState,
     id: usize,
     bounds: Rect<Pixels>,
-    style: &style::Style,
+    style: &css::properties::Style,
     window: &mut renderer::Window,
 ) {
     let controls = view.controls.borrow();

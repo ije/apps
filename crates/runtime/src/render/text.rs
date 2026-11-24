@@ -1,5 +1,6 @@
+use crate::css;
+use crate::css::properties::Prop;
 use crate::style;
-use crate::style::Prop;
 use anyhow::Result;
 use renderer::{AlignItems, Color, Pixels, Point, Rect, SharedString, Window, point, px, size};
 use std::{ops::Range, rc::Rc};
@@ -486,7 +487,7 @@ fn inline_box(
     text: &str,
     rows: &[crate::dom::Row],
     range: &std::ops::Range<usize>,
-    style: Option<(&style::Style, style::Lengths)>,
+    style: Option<(&css::properties::Style, css::value::units::Lengths)>,
     base: Pixels,
     window: &Window,
 ) -> Option<(Point<Pixels>, Point<Pixels>, Pixels, Pixels)> {
@@ -563,7 +564,7 @@ pub(crate) fn text_index(
 }
 
 fn first_line(
-    data: &style::InlineText,
+    data: &crate::render::inline::InlineText,
     width: Option<Pixels>,
     font_size: Pixels,
     text_system: &renderer::TextSystem,
@@ -601,8 +602,8 @@ fn first_line(
 }
 
 pub(super) struct InlineText {
-    pub(super) data: Rc<style::InlineText>,
-    /// Rows can grow around runs or fallback glyphs, see `style::InlineText::mixed`.
+    pub(super) data: Rc<crate::render::inline::InlineText>,
+    /// Rows can grow around runs or fallback glyphs, see `crate::render::inline::InlineText::mixed`.
     pub(super) mixed: bool,
     pub(super) view: Rc<super::PageState>,
     pub(super) atoms: Rc<[AtomSlot]>,
@@ -694,7 +695,7 @@ impl renderer::Hooks for AtomBox {
 }
 
 fn with_atoms(
-    data: &style::InlineText,
+    data: &crate::render::inline::InlineText,
     sizes: impl Fn(usize) -> f32,
     runs: &mut [renderer::TextRun],
 ) {
@@ -711,7 +712,7 @@ fn with_atoms(
 type MeasuredSize = ((bool, Option<Pixels>), renderer::Size<Pixels>);
 
 struct Measured {
-    data: Rc<style::InlineText>,
+    data: Rc<crate::render::inline::InlineText>,
     atoms: Box<[([f32; 3], Option<AlignItems>)]>,
     styled: std::cell::RefCell<Option<renderer::TextStyle>>,
     measured: std::cell::Cell<[Pixels; 2]>,
@@ -880,7 +881,12 @@ impl From<InlineText> for renderer::Node {
 }
 
 // The mirror of a node of the text. A spliced inline box has a part in each line of text, which its block joins.
-fn place(dom: &mut crate::dom::State, data: &style::InlineText, id: usize, rect: [f32; 4]) {
+fn place(
+    dom: &mut crate::dom::State,
+    data: &crate::render::inline::InlineText,
+    id: usize,
+    rect: [f32; 4],
+) {
     if !data.cuts.contains(&id) {
         dom.bounds.insert(id, rect);
         return;
@@ -889,7 +895,7 @@ fn place(dom: &mut crate::dom::State, data: &style::InlineText, id: usize, rect:
 }
 
 // Drops the parts that the text gave its spliced boxes before it gives them again.
-fn unplace(dom: &mut crate::dom::State, data: &style::InlineText) {
+fn unplace(dom: &mut crate::dom::State, data: &crate::render::inline::InlineText) {
     for cut in &data.cuts {
         if let Some(pieces) = dom.pieces.get_mut(cut) {
             pieces.retain(|(key, _)| *key != data.key);
@@ -1032,7 +1038,7 @@ impl renderer::Hooks for InlineText {
                     .last_styles()?
                     .values
                     .get(up)?
-                    .get(crate::style::Prop::DISPLAY);
+                    .get(crate::css::properties::Prop::DISPLAY);
                 (!display
                     .is_some_and(|display| display.ends_with("flex") || display.ends_with("grid")))
                 .then(|| px(inner[0]))
@@ -1538,7 +1544,7 @@ impl renderer::Hooks for InlineText {
                 );
                 // The border box of an inline box on each of its rows, with its left and right sides.
                 let fragments = |index: usize,
-                                 inline: Option<&style::InlineBox>,
+                                 inline: Option<&crate::render::inline::InlineBox>,
                                  window: &Window| {
                     let (id, range) = &self.data.ranges[index];
                     let (style, units) = (&styles.values[*id], styles.lengths[*id]);
@@ -1600,7 +1606,9 @@ impl renderer::Hooks for InlineText {
                     });
                     Some((style, units, b.x - a.x, parts))
                 };
-                let radii = |style: &style::Style, units: style::Lengths, width: Pixels| {
+                let radii = |style: &css::properties::Style,
+                             units: css::value::units::Lengths,
+                             width: Pixels| {
                     [
                         Prop::BORDER_TOP_LEFT_RADIUS,
                         Prop::BORDER_TOP_RIGHT_RADIUS,
@@ -1635,7 +1643,11 @@ impl renderer::Hooks for InlineText {
                     let radii = radii(style, units, width);
                     // A spliced box has no box of its own, so each part draws its shadow.
                     let mut shadows = match shadowed {
-                        true => units.shadows(style.get(Prop::BOX_SHADOW).unwrap_or("none"), false),
+                        true => css::value::box_shadows(
+                            &units,
+                            style.get(Prop::BOX_SHADOW).unwrap_or("none"),
+                            false,
+                        ),
                         false => Vec::new(),
                     };
                     for shadow in &mut shadows {
@@ -1721,7 +1733,7 @@ impl renderer::Hooks for InlineText {
                     };
                     let color = [Prop::OUTLINE_COLOR, Prop::COLOR]
                         .into_iter()
-                        .find_map(|prop| style.get(prop).and_then(style::paint))
+                        .find_map(|prop| style.get(prop).and_then(css::value::color::paint))
                         .unwrap_or(Color::BLACK);
                     let offset = style
                         .get(Prop::OUTLINE_OFFSET)
@@ -1740,11 +1752,12 @@ impl renderer::Hooks for InlineText {
                             } else {
                                 0.
                             };
-                        let under = Color::hex(if style::dark(style) {
-                            0x101010ff
-                        } else {
-                            0xffffffff
-                        });
+                        let under =
+                            Color::hex(if style::dark(style, crate::native::theme_state()) {
+                                0x101010ff
+                            } else {
+                                0xffffffff
+                            });
                         let rings =
                             vec![(at + 2., 2., under, "solid"), (at + 1., 2., color, "solid")];
                         (rings, (at, 1., 4.))
@@ -1812,7 +1825,9 @@ impl renderer::Hooks for InlineText {
                     if caret {
                         let ink = [Prop::CARET_COLOR, Prop::COLOR]
                             .into_iter()
-                            .find_map(|prop| style::color(styles.values[*id].get(prop)?))
+                            .find_map(|prop| {
+                                css::value::color::color(styles.values[*id].get(prop)?)
+                            })
                             .map_or(0x000000ff, |(color, alpha)| color << 8 | alpha as u32);
                         if let Some(position) = text_position(layout, &self.data.text, rows, start)
                         {

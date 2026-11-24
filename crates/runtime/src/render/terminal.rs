@@ -1,7 +1,9 @@
 //! Draws the grid of a `<terminal>` element.
 
 use super::PageState;
-use crate::style::{self, Prop};
+use crate::css;
+use crate::css::properties::Prop;
+use crate::style;
 use crate::web::terminal::{
     BOLD, Cell, FAINT, Frame, INVERSE, INVISIBLE, ITALIC, OVERLINE, Placement, SCROLL_ROW,
     SELECTED, SPACER, STRIKETHROUGH, Terminals, UNDERLINE,
@@ -52,11 +54,11 @@ const PALETTE: [Prop; 16] = [
 ];
 
 pub(super) fn look(
-    style: &style::Style,
-    selection: Option<&Rc<style::Style>>,
-    units: &style::Lengths,
+    style: &css::properties::Style,
+    selection: Option<&Rc<css::properties::Style>>,
+    units: &css::value::units::Lengths,
 ) -> Look {
-    let pick = |prop: Prop| style.get(prop).and_then(style::color);
+    let pick = |prop: Prop| style.get(prop).and_then(css::value::color::color);
     let set = |(rgb, _): (u32, u8)| 1 << 24 | rgb;
     let foreground = pick(Prop::COLOR).unwrap_or((0, 255));
     let luminance = |rgb: u32| {
@@ -306,7 +308,7 @@ impl Grid {
             host.pages
                 .get(&self.view.id)
                 .and_then(|page| page.doc.nodes.get(self.id))
-                .is_some_and(|node| node.state & crate::dom::FOCUS != 0)
+                .is_some_and(|node| node.state & crate::css::selector::FOCUS != 0)
         });
         let scale = cx.window.scale_factor();
         if drawn

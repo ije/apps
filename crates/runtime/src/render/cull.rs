@@ -1,5 +1,6 @@
-use crate::style::Prop;
-use crate::{dom::Document, style};
+use crate::css;
+use crate::css::properties::Prop;
+use crate::dom::Document;
 use renderer::{Child, px};
 use std::{cell::Cell, rc::Rc};
 
@@ -28,7 +29,7 @@ pub(crate) const SHOWN: u32 = 131072;
 
 // The box can skip its contents, or remember its size for `contain-intrinsic-size: auto`. Like in Chrome, tables
 // show their contents.
-pub(crate) fn skippable(tag: &str, style: &style::Style) -> bool {
+pub(crate) fn skippable(tag: &str, style: &css::properties::Style) -> bool {
     (matches!(style.get(Prop::CONTENT_VISIBILITY), Some("hidden" | "auto"))
         || [
             Prop::CONTAIN_INTRINSIC_WIDTH,
@@ -63,7 +64,7 @@ pub(crate) fn skippable(tag: &str, style: &style::Style) -> bool {
 // The box skips its contents: with `content-visibility: hidden`, or `auto` until it comes near the view.
 pub(crate) fn skips(
     flags: u32,
-    style: &style::Style,
+    style: &css::properties::Style,
     id: usize,
     measured: &super::grid::Measurements,
     forced: bool,
@@ -77,7 +78,7 @@ pub(crate) fn skips(
         }
 }
 
-pub(crate) fn reads_height(style: &style::Style) -> bool {
+pub(crate) fn reads_height(style: &css::properties::Style) -> bool {
     [
         Prop::HEIGHT,
         Prop::MIN_HEIGHT,
@@ -195,7 +196,7 @@ pub(super) struct Run {
     pub(super) clear: u8,
 }
 
-pub(super) fn cosmetic(old: &style::Style, new: &style::Style) -> bool {
+pub(super) fn cosmetic(old: &css::properties::Style, new: &css::properties::Style) -> bool {
     fn rule(prop: Prop) -> bool {
         let name = prop.name();
         prop.is_custom()
@@ -288,7 +289,10 @@ pub(super) fn cosmetic(old: &style::Style, new: &style::Style) -> bool {
     }
 }
 
-pub(super) fn content(node: &crate::dom::Node, style: &crate::style::Style) -> (u64, u64) {
+pub(super) fn content(
+    node: &crate::dom::Node,
+    style: &crate::css::properties::Style,
+) -> (u64, u64) {
     use std::hash::{BuildHasher, Hash, Hasher};
     let mut shape = rustc_hash::FxHasher::default();
     node.tag.hash(&mut shape);
@@ -324,7 +328,12 @@ pub(super) fn replaced(tag: &str) -> bool {
     )
 }
 
-pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, margin: f32) -> u32 {
+pub(super) fn flags(
+    tag: &str,
+    style: &css::properties::Style,
+    units: &css::value::units::Lengths,
+    margin: f32,
+) -> u32 {
     let display = style.get(Prop::DISPLAY).unwrap_or("inline");
     let position = style.get(Prop::POSITION).unwrap_or("static");
     let auto = |prop| style.get(prop).is_none_or(|value| value == "auto");
@@ -343,7 +352,7 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
             .get(Prop::CONTAINER_TYPE)
             .is_some_and(|value| value != "normal")
         || style.get(Prop::BOX_SHADOW).is_some_and(|value| {
-            units.shadows(value, false).iter().any(|shadow| {
+            css::value::box_shadows(units, value, false).iter().any(|shadow| {
                 f32::from(shadow.offset.y.abs() + shadow.blur_radius + shadow.spread_radius)
                     >= margin
             })
@@ -930,7 +939,13 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn page(html: &str) -> (Document, Rc<style::ComputedStyles>, impl Fn(&str) -> usize) {
+    fn page(
+        html: &str,
+    ) -> (
+        Document,
+        Rc<crate::style::ComputedStyles>,
+        impl Fn(&str) -> usize,
+    ) {
         let mut doc = Document::parse(html);
         let styles = crate::dom::styles(&mut doc, &mut Default::default(), [800., 600.]);
         let ids: HashMap<String, usize> = (0..doc.nodes.len())
@@ -1020,7 +1035,7 @@ mod tests {
 
     #[test]
     fn paint_only_changes_keep_the_geometry() {
-        let style = |source: &str| -> style::Style {
+        let style = |source: &str| -> css::properties::Style {
             source
                 .split(';')
                 .filter_map(|pair| pair.split_once(':'))
@@ -1063,7 +1078,7 @@ mod tests {
                     .filter(|node| !node.attrs.iter().next().is_none())
                     .nth(index)
                     .unwrap(),
-                &crate::style::Style::default(),
+                &crate::css::properties::Style::default(),
             )
             .0
         };
@@ -1074,7 +1089,7 @@ mod tests {
 
     #[test]
     fn content_hash_tells_what_can_resize_a_box() {
-        let style = crate::style::Style::default();
+        let style = crate::css::properties::Style::default();
         let (mut doc, ..) = page("<p class=x data-v=1 id=a>text</p>");
         let id = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
         let start = content(&doc.nodes[id], &style);

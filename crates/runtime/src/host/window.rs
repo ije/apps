@@ -44,7 +44,10 @@ fn validate(args: &Value) -> Result<()> {
                     "titleBarStyle" => {
                         matches!(value.as_str(), Some("default" | "hidden" | "hiddenInset"))
                     }
-                    "backgroundColor" => value.as_str().and_then(crate::style::color).is_some(),
+                    "backgroundColor" => value
+                        .as_str()
+                        .and_then(crate::css::value::color::color)
+                        .is_some(),
                     "trafficLightPosition" => position(&value["x"]) && position(&value["y"]),
                     _ => bail!("Unsupported BrowserWindow option: {key}"),
                 };
@@ -89,7 +92,10 @@ fn validate(args: &Value) -> Result<()> {
             "Invalid vibrancy"
         ),
         "background" => ensure!(
-            args[2].as_str().and_then(crate::style::color).is_some(),
+            args[2]
+                .as_str()
+                .and_then(crate::css::value::color::color)
+                .is_some(),
             "Invalid background color"
         ),
         "load" | "loadFile" => ensure!(
