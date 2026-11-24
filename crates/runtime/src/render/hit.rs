@@ -228,7 +228,7 @@ pub(crate) fn hit_test(
         }
         // The fallback content of a canvas has no boxes, and skipped contents take no pointer.
         if node.tag == "canvas" && !canvas
-            || crate::render::skipping(doc, state, computed, id, false)
+            || crate::render::frame::visibility::skipping(doc, state, computed, id, false)
         {
             continue;
         }

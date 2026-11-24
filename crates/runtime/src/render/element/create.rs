@@ -4921,7 +4921,7 @@ pub(super) fn create(
                 decoration = decoration.hooks(super::super::paint::Effected {
                     effect: renderer::PaintEffect {
                         opacity: super::super::effects::opacity(pseudo),
-                        key: Some(super::super::pseudo_key(id, index as u8 + 1)),
+                        key: Some(super::super::effects::pseudo_key(id, index as u8 + 1)),
                         ..Default::default()
                     },
                     backdrop: None,
@@ -4951,7 +4951,7 @@ pub(super) fn create(
                 }),
                 None => decoration,
             };
-            let decoration = if super::super::TRANSFORM_PROPS
+            let decoration = if super::super::effects::TRANSFORM_PROPS
                 .iter()
                 .any(|&prop| pseudo.get(prop).is_some_and(|value| value != "none"))
             {
@@ -5003,7 +5003,7 @@ pub(super) fn create(
                         view: view.clone(),
                         anchor: None,
                         place: Some(super::super::paint::Contained {
-                            key: super::super::pseudo_key(id, index as u8 + 1) as usize,
+                            key: super::super::effects::pseudo_key(id, index as u8 + 1) as usize,
                             container,
                             viewport: units.viewport,
                             sized: sized.then_some(size),
@@ -5453,7 +5453,7 @@ pub(super) fn create(
             && matches!(position, "static" | "relative")
             && el.style_ref().overflow.x == renderer::Overflow::Visible
             && el.style_ref().overflow.y == renderer::Overflow::Visible
-            && super::super::TRANSFORM_PROPS
+            && super::super::effects::TRANSFORM_PROPS
                 .iter()
                 .all(|&prop| style.get(prop).is_none_or(|value| value == "none"))
             && style

@@ -307,7 +307,7 @@ pub(super) fn skipped(
             return Ok(json!(-1));
         }
         if at != id
-            && (crate::render::skipping(doc, state, &computed, at, false)
+            && (crate::render::frame::visibility::skipping(doc, state, &computed, at, false)
                 || hidden
                     && style.get(Prop::CONTENT_VISIBILITY) == Some("auto")
                     && state.layout.auto_box(at))

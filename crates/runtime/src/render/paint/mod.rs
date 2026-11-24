@@ -1021,7 +1021,7 @@ impl Hooks for DomBox {
 
     fn reach(&self, size: Size<Pixels>, corners: [Point<Pixels>; 2]) -> [Point<Pixels>; 2] {
         if self.drawn
-            || super::TRANSFORM_PROPS
+            || super::effects::TRANSFORM_PROPS
                 .iter()
                 .all(|&prop| self.style.get(prop).is_none_or(|value| value == "none"))
         {

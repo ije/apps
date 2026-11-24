@@ -69,7 +69,7 @@ impl SvgSource<'_> {
         // resvg doesn't take CSS transforms, `transform-box` or `transform-origin`, so they become a matrix.
         if transform
             && element != root
-            && super::super::TRANSFORM_PROPS
+            && super::super::effects::TRANSFORM_PROPS
                 .iter()
                 .any(|&prop| own.get(prop).is_some())
         {

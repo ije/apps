@@ -455,7 +455,7 @@ fn rendered_text(
             }
             _ => {}
         }
-        if crate::render::skipping(doc, state, computed, node, false) {
+        if crate::render::frame::visibility::skipping(doc, state, computed, node, false) {
             continue;
         }
         let blockify =

@@ -349,7 +349,7 @@ pub(super) fn computed(
             .timeline(id, 0, &styles, &[now], &[])
             .pop()?;
         let paints = current.iter().all(|(prop, value)| {
-            crate::render::composited(prop) || last.get(prop) == Some(&**value)
+            crate::render::effects::composited(prop) || last.get(prop) == Some(&**value)
         });
         paints.then_some(current)
     });

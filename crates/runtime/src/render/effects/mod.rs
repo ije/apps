@@ -186,6 +186,40 @@ pub(crate) fn border_style(kind: &str) -> renderer::BorderStyle {
     }
 }
 
+pub(crate) const TRANSFORM_PROPS: [Prop; 4] =
+    [Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE];
+
+// Must list every property that `effects::opacity` and `crate::css::value::transform::transform` read.
+pub(crate) const COMPOSITED_PROPS: [Prop; 6] = [
+    Prop::OPACITY,
+    Prop::TRANSFORM,
+    Prop::TRANSLATE,
+    Prop::ROTATE,
+    Prop::SCALE,
+    Prop::TRANSFORM_ORIGIN,
+];
+
+// The filter and the backdrop filter, in the order paint reads them.
+pub(crate) const BLURS: [[Prop; 2]; 2] = [
+    [Prop::FILTER, Prop::WEBKIT_FILTER],
+    [Prop::BACKDROP_FILTER, Prop::WEBKIT_BACKDROP_FILTER],
+];
+
+/// Whether the compositor can play an animation of the property between page frames.
+pub(crate) fn composited(prop: Prop) -> bool {
+    COMPOSITED_PROPS.contains(&prop) || BLURS.as_flattened().contains(&prop)
+}
+
+/// The filter (0) or backdrop filter (1) of a style.
+pub(crate) fn filter(style: &css::properties::Style, which: usize) -> Option<&str> {
+    BLURS[which].iter().find_map(|&prop| style.get(prop))
+}
+
+/// The layer key of the `::before` (slot 1) or `::after` (slot 2) of a node. Element layers use the node id.
+pub(crate) fn pseudo_key(id: usize, slot: u8) -> u64 {
+    id as u64 | u64::from(slot) << 56
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
