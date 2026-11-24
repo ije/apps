@@ -296,7 +296,12 @@ impl Desktop {
                 source
             })
             .collect::<Vec<_>>();
-        self.host.borrow_mut().load_page(id, doc);
+        {
+            let mut host = self.host.borrow_mut();
+            host.load_page(id, doc);
+            // Preload scripts see the page URL, like page scripts.
+            host.dom.entry(id).or_default().base = url::Url::parse(&location).ok();
+        }
         let view = self.views.get_mut(&id).context("Window is closed")?;
         view.focused = true;
         if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
@@ -345,7 +350,6 @@ impl Desktop {
         if !view.focused {
             renderer.eval("__appsDispatch('window:blur',[],{quiet:true})", "apps:blur")?;
         }
-        self.host.borrow_mut().dom.entry(id).or_default().base = url::Url::parse(&location).ok();
         renderer.eval("__appsSyncBridge()", "apps:bridge")?;
         if let Err(error) = renderer.eval("__appsImages(document)", "apps:images") {
             eprintln!("apps: {error}");
