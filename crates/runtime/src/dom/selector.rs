@@ -294,7 +294,7 @@ impl SelectorCache {
         });
         (self.walked, self.latest) = (walk.serial, doc.nodes.latest());
         self.forgotten.clear();
-        let mut every = walk.nodes.iter().map(|node| node.0 as usize);
+        let mut every = walk.order().iter().map(|node| node.0 as usize);
         let mut some = listed.iter().flatten().copied();
         let nodes: &mut dyn Iterator<Item = usize> = match &listed {
             Some(_) if !cfg!(debug_assertions) && !renamed => &mut some,

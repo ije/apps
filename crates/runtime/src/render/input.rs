@@ -796,7 +796,7 @@ impl renderer::View for PageView {
             let to = super::text::text_position(layout, text, rows, end)
                 .filter(|to| to.y == at.y && to.x >= at.x)
                 .unwrap_or(at);
-            let [dx, dy] = dom.scroll_shift(node);
+            let [dx, dy] = dom.geometry.scroll_shift(&dom.styles.walk, node);
             return Some(Rect::new(
                 at + point(px(dx), px(dy)),
                 size(to.x - at.x, layout.line_height()),
@@ -827,7 +827,7 @@ impl renderer::View for PageView {
         let host = self.host.borrow();
         let dom = host.dom.get(&self.id)?;
         if let Some((layout, text, span, rows, _)) = dom.layout.text_layouts.get(&id) {
-            let [dx, dy] = dom.scroll_shift(id);
+            let [dx, dy] = dom.geometry.scroll_shift(&dom.styles.walk, id);
             let point = point - renderer::point(px(dx), px(dy));
             let index = super::text::text_index(layout, text, rows, point, false)
                 .unwrap_or_else(|index| index)

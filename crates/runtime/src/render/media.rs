@@ -50,3 +50,21 @@ pub struct Media {
     // The last drawing of each drawable element of a canvas, with its device pixels per CSS pixel.
     pub(crate) snapshots: rustc_hash::FxHashMap<usize, (Rc<tiny_skia::Pixmap>, f32)>,
 }
+
+impl Media {
+    pub(crate) fn forget(&mut self, id: usize) {
+        self.retired.extend(self.images.remove(&id));
+        self.retired.extend(
+            self.canvases
+                .remove(&id)
+                .filter(|canvas| canvas.present)
+                .map(|canvas| canvas.image),
+        );
+        self.placeholders.remove(&id);
+        self.snapshots.remove(&id);
+        self.svg_sources.remove(&id);
+        self.svg_images.remove(&id);
+        self.sources.get_mut().remove(&id);
+        self.decoding.remove(&id);
+    }
+}

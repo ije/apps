@@ -485,7 +485,7 @@ impl Hooks for PseudoBox {
             .scroll
             .get(&self.element)
             .map_or(Point::default(), |handle| {
-                crate::dom::painted_offset(handle, scale)
+                crate::dom::geometry::painted_offset(handle, scale)
             });
         let shift = self
             .shift
@@ -1405,7 +1405,7 @@ impl Hooks for DomBox {
             return false;
         }
         let [x, y] = [by.x, by.y].map(f32::from);
-        let nodes = walk.nodes.clone();
+        let nodes = walk.snapshot();
         let mut reach = view.reach.borrow_mut();
         for &(id, _) in &nodes[range] {
             let id = id as usize;
@@ -1684,7 +1684,7 @@ impl DomBox {
             && host
                 .dom
                 .get(&view.id)
-                .and_then(|dom| dom.last_styles())
+                .and_then(|dom| dom.styles.last())
                 .is_none_or(|styles| styles.blended());
         let needed = outer.transform.is_some()
             || outer.opacity < 1.

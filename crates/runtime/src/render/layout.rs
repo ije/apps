@@ -113,3 +113,94 @@ pub struct Rasters {
     pub(crate) layer_sources: HashMap<(usize, usize), Arc<renderer::RenderImage>>,
     pub(crate) gradients: Vec<(String, Arc<renderer::RenderImage>)>,
 }
+
+impl Layout {
+    // A node left the page and waits for a GC: its layout data can go.
+    pub(crate) fn forget_removed(&mut self, id: usize) {
+        self.measurements.shown.remove(&id);
+        self.autos.remove(&id);
+        self.measurements.remembered.remove(&id);
+        self.measurements.texts.remove(&id);
+        if !self.pseudo_boxes.is_empty() {
+            for pseudo in 1..3 {
+                self.pseudo_boxes
+                    .remove(&crate::render::inline::atom_key(id, pseudo));
+            }
+        }
+        if let Some(node) = self.layout_nodes.get_mut(id) {
+            *node = None;
+        }
+    }
+
+    // A node is freed and its ID can come back for another node.
+    pub(crate) fn forget(&mut self, id: usize) {
+        self.cull.widths.remove(&id);
+        self.text_layouts.remove(&id);
+        self.cull.offsets.remove(&id);
+        self.grids.remove(&id);
+        self.baselines.remove(&id);
+        if let Some(node) = self.layout_nodes.get_mut(id) {
+            *node = None;
+        }
+        self.measurements.texts.remove(&id);
+        self.cull.spills.remove(&id);
+        self.measurements.naturals.remove(&id);
+        self.anchors.remove(&id);
+        self.blocks.remove(&id);
+        self.containers.remove(&id);
+        self.flexed_grids.remove(&id);
+        self.grid_widest.remove(&id);
+        for pseudo in 0..3 {
+            self.atoms
+                .remove(&crate::render::inline::atom_key(id, pseudo));
+        }
+        if let Some(order) = self.painted.get_mut(id) {
+            *order = 0;
+        }
+    }
+
+    pub(crate) fn forget_all(&mut self, gone: &rustc_hash::FxHashSet<usize>) {
+        self.measurements
+            .sizes
+            .retain(|(node, ..), _| !gone.contains(node));
+    }
+
+    pub(crate) fn trim(&mut self, len: usize) {
+        self.measurements.texts = Default::default();
+        self.layout_nodes.truncate(len);
+        self.layout_nodes.shrink_to_fit();
+        self.painted.truncate(len);
+        self.painted.shrink_to_fit();
+        self.cull.trim(len);
+    }
+}
+
+impl Rasters {
+    pub(crate) fn forget(&mut self, id: usize, retired: &mut Vec<Arc<renderer::RenderImage>>) {
+        retired.extend(
+            self.svgs
+                .remove(&id)
+                .map(|(_, image)| image)
+                .filter(|image| Arc::strong_count(image) == 1),
+        );
+        for slot in 0..3 {
+            retired.extend(self.masks.remove(&(id, slot)).and_then(|(_, image)| image));
+        }
+        self.svg_boxes.remove(&id);
+        self.svg_trees.remove(&id);
+    }
+
+    pub(crate) fn forget_all(
+        &mut self,
+        gone: &rustc_hash::FxHashSet<usize>,
+        retired: &mut Vec<Arc<renderer::RenderImage>>,
+    ) {
+        self.backgrounds.retain(|(node, _), (_, image)| {
+            let keep = !gone.contains(node);
+            if !keep {
+                retired.push(image.clone());
+            }
+            keep
+        });
+    }
+}

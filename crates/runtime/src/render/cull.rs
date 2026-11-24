@@ -653,7 +653,9 @@ pub(super) fn spacer(
             let x = dom.geometry.mirror.get(&parent).map(|rect| {
                 rect[0]
                     + dom.geometry.scroll.get(&parent).map_or(0., |handle| {
-                        f32::from(crate::dom::painted_offset(handle, window.scale_factor()).x)
+                        f32::from(
+                            crate::dom::geometry::painted_offset(handle, window.scale_factor()).x,
+                        )
                     })
             });
             let resized = x.is_none()

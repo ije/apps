@@ -132,7 +132,7 @@ impl StyleCache {
                 let mut trees = vec![(0, usize::MAX)];
                 let mut lists = vec![Vec::new()];
                 let mut tables = Vec::new();
-                for &(id, _) in walk.walk.nodes.iter() {
+                for &(id, _) in walk.walk.order().iter() {
                     let id = id as usize;
                     let node = &doc.nodes[id];
                     let index = match node.parent {
@@ -325,7 +325,7 @@ pub(crate) fn compute_styles(
     let shadows = context.map_or_else(Default::default, |context| context.shadows.clone());
     style_cache.shadows = shadows.clone();
     let walk = style_cache.walk(doc, &shadows);
-    let order = walk.walk.nodes.as_slice();
+    let order = walk.walk.order();
     let stored = context.is_some_and(|context| context.animated.is_empty());
     let previous = context
         .and_then(|context| context.previous.as_deref())
@@ -603,7 +603,7 @@ pub(crate) fn compute_styles(
         }
         style_cache.full = false;
         style_cache.styled = Some(Styled {
-            nodes: walk.walk.nodes.clone(),
+            nodes: walk.walk.snapshot(),
             serial: walk.walk.serial,
             tree: walk.tree.clone(),
             trees: walk.trees.clone(),

@@ -17,11 +17,11 @@ pub(crate) fn mark_moves(
     recount: &mut bool,
     (unstyled, empty): (&Rc<Style>, &Vars),
 ) {
-    let order = walk.walk.nodes.as_slice();
+    let order = walk.walk.order();
     if changed.len() < doc.nodes.len() {
         changed.resize(doc.nodes.len(), 0);
     }
-    if let Some(old) = styled.filter(|old| !Rc::ptr_eq(&old.nodes, &walk.walk.nodes)) {
+    if let Some(old) = styled.filter(|old| !walk.walk.holds(&old.nodes)) {
         // Text and comments that move need no new count.
         let changed = walk.walk.changed_since(old.serial).map_or(0, <[u32]>::len);
         *recount = walk.walk.since(old.serial).is_none_or(|touched| {

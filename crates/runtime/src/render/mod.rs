@@ -467,8 +467,8 @@ impl PageView {
             state.fonts.system = Some(window.text_system().clone());
             state.pixel_ratio = window.scale_factor();
             state.window = window.window_state();
-            state.unshift();
-            state.sync_scroll();
+            state.geometry.unshift();
+            state.geometry.sync_scroll();
             state.geometry.mirror.touch();
             let hash = |value: &dyn Fn(&mut rustc_hash::FxHasher)| {
                 let mut hasher = rustc_hash::FxHasher::default();
@@ -770,10 +770,7 @@ impl PageView {
         let seen = (doc.nodes.latest(), dom.interaction.focus);
         // Remove cull.seen's extra Rc during the frame so animated styles can swap values without copying.
         let last = dom.layout.cull.seen.take();
-        let (walked, serial) = (
-            dom.layout.cull.walk.nodes.clone(),
-            dom.layout.cull.walk.serial,
-        );
+        let (walked, serial) = (dom.layout.cull.walk.snapshot(), dom.layout.cull.walk.serial);
         // Animated values that the last frame swapped in are gone from `styles`, so their nodes changed.
         let same = dom.layout.cull.swapped.is_empty()
             && last.as_ref().is_some_and(|(latest, focus, computed)| {
@@ -792,7 +789,7 @@ impl PageView {
                 value == Some("auto"),
             )
         };
-        let rewalked = !Rc::ptr_eq(&dom.layout.cull.walk.nodes, &walked);
+        let rewalked = !dom.layout.cull.walk.holds(&walked);
         // A patched walk changes the visibility of the nodes it touched only. Table cells also show their rows,
         // so their lists must be the same.
         let touched = dom.layout.cull.walk.since(serial).filter(|_| patched);
@@ -839,7 +836,7 @@ impl PageView {
             placed.sort_unstable();
             placed.dedup();
             for (at, id) in placed {
-                let (id, parent) = (id as usize, walk.nodes[at as usize].1);
+                let (id, parent) = (id as usize, walk.order()[at as usize].1);
                 let style = &styles.values[id];
                 let shown = (parent == u32::MAX
                     || visible[parent as usize]
@@ -924,8 +921,8 @@ impl PageView {
         }
         let flipped = previous.is_some();
         if let Some(previous) = previous {
-            if walked.len() + dom.layout.cull.walk.nodes.len() < visible.len() {
-                let walks = walked.iter().chain(dom.layout.cull.walk.nodes.iter());
+            if walked.len() + dom.layout.cull.walk.order().len() < visible.len() {
+                let walks = walked.iter().chain(dom.layout.cull.walk.order().iter());
                 let nodes = walks
                     .map(|&(id, _)| id as usize)
                     .chain(previous.len()..visible.len());
@@ -1353,7 +1350,7 @@ impl PageView {
             let walk = std::mem::take(&mut dom.layout.cull.walk);
             let mut marked = std::mem::take(&mut dom.layout.cull.marked);
             let (mut partial, mut list, mut placing) = (false, Vec::new(), false);
-            let rewalked = !Rc::ptr_eq(&walk.nodes, &walked);
+            let rewalked = !walk.holds(&walked);
             // Composed children can change the walk of a node without a new revision. A patched walk lists
             // those nodes, another new walk doesn't.
             let touched = walk.since(serial);
@@ -1375,7 +1372,7 @@ impl PageView {
                     }
                     None if rewalked => {
                         let mut present = vec![false; doc.nodes.len()];
-                        for &(id, _) in walk.nodes.iter() {
+                        for &(id, _) in walk.order().iter() {
                             present[id as usize] = true;
                         }
                         for &(id, _) in walked.iter() {
@@ -1492,7 +1489,7 @@ impl PageView {
                 .collect();
             order.sort_unstable_by(|a, b| b.cmp(a));
             let mut some = order.iter().map(|place| place.1);
-            let mut every = walk.nodes.iter().rev().map(|node| node.0 as usize);
+            let mut every = walk.order().iter().rev().map(|node| node.0 as usize);
             debug_assert!(
                 !partial || some.clone().eq(every.clone().filter(|&id| marked[id])),
                 "marked nodes differ"
@@ -2186,7 +2183,7 @@ impl PageView {
         }
         let autos = !dom.layout.autos.is_empty();
         let measured = RefCell::new(std::mem::take(&mut dom.layout.measurements));
-        let walk = dom.styles.walk.nodes.clone();
+        let walk = dom.styles.walk.snapshot();
         for text in warnings {
             host.log(serde_json::json!({"method":"Runtime.consoleAPICalled","params":{"type":"error","text":text,"context":crate::jsc::Role::Renderer(self.id)}}));
         }
@@ -2626,7 +2623,7 @@ impl PageView {
                         node.state &= !crate::dom::LEAVING;
                     }
                 }
-                dom.invalidate();
+                dom.styles.invalidate();
             }
             // Allow at most one extra pass per frame to bound container-query resize loops.
             let changed = dom.update_containers(&doc);
@@ -2695,8 +2692,8 @@ impl PageView {
                         if let Ok(mut host) = data.host.try_borrow_mut()
                             && let Some(dom) = host.dom.get_mut(&data.id)
                         {
-                            dom.sync_scroll();
-                            dom.prepainted();
+                            dom.geometry.sync_scroll();
+                            dom.geometry.prepainted(dom.pixel_ratio);
                         }
                     },
                     |_, _, _| (),
@@ -3348,7 +3345,7 @@ fn walk(
     let mut parents = vec![u32::MAX; doc.nodes.len()];
     let mut kinds = vec![0; doc.nodes.len()];
     let mut lists = [const { Vec::new() }; 3];
-    for &(id, parent) in cull.walk.nodes.iter() {
+    for &(id, parent) in cull.walk.order().iter() {
         let id = id as usize;
         parents[id] = parent;
         kinds[id] = kind(id);
@@ -3397,7 +3394,7 @@ fn visibility(
     styles: &style::ComputedStyles,
 ) -> Vec<bool> {
     let mut visible = vec![false; doc.nodes.len()];
-    for &(node, parent) in dom.layout.cull.walk.nodes.iter() {
+    for &(node, parent) in dom.layout.cull.walk.order().iter() {
         let node = node as usize;
         if parent != u32::MAX
             && (!visible[parent as usize] || skipping(doc, dom, styles, parent as usize, true))

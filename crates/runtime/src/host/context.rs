@@ -1029,7 +1029,7 @@ mod tests {
             "ab,false,1,40,true,x"
         );
         let host = host.borrow();
-        let used = host.pages[&1].doc.nodes.len() - host.dom[&1].tree.free.len();
+        let used = host.pages[&1].doc.nodes.len() - host.dom[&1].tree.free_count();
         assert!(used < 400, "{used}");
     }
 

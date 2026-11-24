@@ -5,7 +5,7 @@ use std::rc::Rc;
 pub(crate) struct Walk {
     tree: u64,
     composed: rustc_hash::FxHashMap<usize, Vec<usize>>,
-    pub(crate) nodes: Rc<Vec<(u32, u32)>>,
+    nodes: Rc<Vec<(u32, u32)>>,
     // The position and subtree length of each node in `nodes`, by ID. An absent node has the position ABSENT.
     index: Rc<Vec<[u32; 2]>>,
     pub(crate) serial: u64,
@@ -119,6 +119,21 @@ impl Walk {
     pub(crate) fn changed_since(&self, serial: u64) -> Option<&[u32]> {
         let (_, _, moved) = self.delta.as_ref()?;
         Some(&self.since(serial)?[*moved..])
+    }
+
+    // Each node with its parent, in the composed order.
+    pub(crate) fn order(&self) -> &[(u32, u32)] {
+        &self.nodes
+    }
+
+    // The order, kept by the caller without a copy.
+    pub(crate) fn snapshot(&self) -> Rc<Vec<(u32, u32)>> {
+        self.nodes.clone()
+    }
+
+    // Whether the order is this snapshot, so the walk did not change since it.
+    pub(crate) fn holds(&self, snapshot: &Rc<Vec<(u32, u32)>>) -> bool {
+        Rc::ptr_eq(&self.nodes, snapshot)
     }
 
     pub(crate) fn contains(&self, id: usize) -> bool {

@@ -438,7 +438,7 @@ impl Desktop {
                         } else {
                             state.styles.inserted.retain(|(old, ..)| old != key);
                         }
-                        state.invalidate();
+                        state.styles.invalidate();
                         page.dirty = true;
                     }
                     "devtools" | "hud" | "inspect" => {

@@ -14,28 +14,6 @@ use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc};
 
 pub(crate) const WORKER_PAGE: u64 = 0;
 
-pub(crate) fn reaches(
-    doc: &Document,
-    hosts: &rustc_hash::FxHashMap<usize, usize>,
-    mut id: usize,
-    to: usize,
-) -> bool {
-    loop {
-        if id == to {
-            return true;
-        }
-        match doc
-            .nodes
-            .get(id)
-            .and_then(|node| node.parent)
-            .or_else(|| hosts.get(&id).copied())
-        {
-            Some(parent) => id = parent,
-            None => return false,
-        }
-    }
-}
-
 #[derive(Default)]
 pub struct Page {
     pub doc: Document,
@@ -96,7 +74,7 @@ impl Host {
                         attached += 1;
                         pending.extend(&page.doc.nodes[node].children);
                     }
-                    let free = self.dom.get(id).map_or(0, |state| state.tree.free.len());
+                    let free = self.dom.get(id).map_or(0, |state| state.tree.free_count());
                     (
                         format!("window {id}"),
                         json!({"attached": attached, "allocated": page.doc.nodes.len(), "free": free}),
@@ -152,7 +130,7 @@ impl Host {
             page.dirty = true;
         }
         for state in self.dom.values_mut() {
-            state.invalidate();
+            state.styles.invalidate();
         }
     }
 
@@ -259,9 +237,9 @@ impl Host {
                                 .parent
                                 .is_none_or(|parent| doc.nodes[parent].tag != "style"))
                             && state.styles.computed.is_some()
-                            && reaches(doc, &state.tree.hosts, id, 0)
+                            && state.tree.reaches(doc, id, 0)
                         {
-                            state.invalidate();
+                            state.styles.invalidate();
                         }
                         if doc.nodes[id].children.is_empty()
                             && let Some(current) = doc.nodes.edit(id)
@@ -296,14 +274,14 @@ impl Host {
                             "Reference is not a child"
                         );
                         ensure!(
-                            !reaches(doc, &state.tree.hosts, parent, child),
+                            !state.tree.reaches(doc, parent, child),
                             "Cannot create a DOM cycle"
                         );
                         if state.styles.computed.is_some()
-                            && (reaches(doc, &state.tree.hosts, parent, 0)
-                                || reaches(doc, &state.tree.hosts, child, 0))
+                            && (state.tree.reaches(doc, parent, 0)
+                                || state.tree.reaches(doc, child, 0))
                         {
-                            state.invalidate();
+                            state.styles.invalidate();
                         }
                         if before == Some(child) {
                             return Ok(false);
@@ -361,10 +339,8 @@ impl Host {
                         {
                             prune(doc, previous);
                         }
-                        if state.styles.computed.is_some()
-                            && reaches(doc, &state.tree.hosts, parent, 0)
-                        {
-                            state.invalidate();
+                        if state.styles.computed.is_some() && state.tree.reaches(doc, parent, 0) {
+                            state.styles.invalidate();
                         }
                         doc.nodes[child].parent = None;
                         state.tree.detached.push(child);
@@ -377,9 +353,8 @@ impl Host {
                         if doc.nodes[id].attrs.get(key).map(String::as_str) == value {
                             return Ok(false);
                         }
-                        if state.styles.computed.is_some() && reaches(doc, &state.tree.hosts, id, 0)
-                        {
-                            state.invalidate();
+                        if state.styles.computed.is_some() && state.tree.reaches(doc, id, 0) {
+                            state.styles.invalidate();
                         }
                         // Kept walks of the tree read these attributes, so their edits must use `get_mut` and
                         // count as tree changes.
@@ -414,13 +389,11 @@ impl Host {
                             "Shadow root already exists"
                         );
                         ensure!(
-                            !reaches(doc, &state.tree.hosts, host, root),
+                            !state.tree.reaches(doc, host, root),
                             "Cannot create a DOM cycle"
                         );
-                        if state.styles.computed.is_some()
-                            && reaches(doc, &state.tree.hosts, host, 0)
-                        {
-                            state.invalidate();
+                        if state.styles.computed.is_some() && state.tree.reaches(doc, host, 0) {
+                            state.styles.invalidate();
                         }
                         state.tree.shadows.insert(host, root);
                         state.tree.hosts.insert(root, host);
@@ -442,9 +415,9 @@ impl Host {
                         };
                         if state.styles.computed.is_some()
                             && empty(current.value.as_ref()) != empty(value.as_ref())
-                            && reaches(doc, &state.tree.hosts, id, 0)
+                            && state.tree.reaches(doc, id, 0)
                         {
-                            state.invalidate();
+                            state.styles.invalidate();
                         }
                         if let Some(current) = doc.nodes.edit(id) {
                             current.value = value;
@@ -492,9 +465,8 @@ impl Host {
                         } else {
                             0
                         };
-                        if state.styles.computed.is_some() && reaches(doc, &state.tree.hosts, id, 0)
-                        {
-                            state.invalidate();
+                        if state.styles.computed.is_some() && state.tree.reaches(doc, id, 0) {
+                            state.styles.invalidate();
                         }
                         if let Some(node) = doc.nodes.edit(id) {
                             node.state = node.state & !(mask | LEAVING) | bits | leaving;

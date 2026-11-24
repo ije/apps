@@ -75,6 +75,29 @@ pub(crate) struct Pending {
 }
 
 impl Styles {
+    // The styles of the last frame, also after a change that asks the next frame for new ones.
+    pub(crate) fn last(&self) -> Option<&Rc<ComputedStyles>> {
+        self.computed.as_ref().or(self.previous.as_ref())
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        if let Some(computed) = self.computed.take() {
+            self.previous = Some(computed);
+        }
+    }
+
+    // A node joins the arena with `len` nodes.
+    pub(crate) fn place(&mut self, id: usize, len: usize) {
+        if let Some(cached) = &mut self.computed {
+            // Grow every per-node list here. Initialize detached nodes as a full style pass does.
+            if let Some(computed) = Rc::get_mut(cached) {
+                computed.place(id, len);
+            } else if id >= cached.values.len() {
+                self.invalidate();
+            }
+        }
+    }
+
     // The last pass when it still holds, or else what the next pass needs.
     pub(crate) fn begin(
         &mut self,
@@ -237,7 +260,7 @@ impl Styles {
                 })
             });
             if !kept || cfg!(debug_assertions) {
-                let nodes = self.walk.nodes.iter();
+                let nodes = self.walk.order().iter();
                 let nodes = nodes.map(|&(id, _)| id as usize);
                 let lists = (
                     nodes.clone().filter(|&id| editable(id)).collect::<Vec<_>>(),
@@ -309,7 +332,7 @@ impl Styles {
             for &id in &self.inert {
                 marks[id] |= OWN_INERT;
             }
-            for &(id, parent) in walk.nodes.iter() {
+            for &(id, parent) in walk.order().iter() {
                 settle(marks, select, id as usize, parent);
             }
         };
@@ -369,7 +392,7 @@ impl Styles {
                             None => break,
                         }
                     }
-                    let (id, parent) = walk.nodes[next];
+                    let (id, parent) = walk.order()[next];
                     if settle(&mut marks, &mut select, id as usize, parent) {
                         scan = scan.max(next + walk.span(id as usize));
                     }
@@ -393,24 +416,24 @@ impl Styles {
                 select.clear();
                 select.resize(doc.nodes.len(), (super::UserSelect::None, 0));
                 all(&mut marks, &mut select);
-                for &(id, _) in walk.nodes.iter() {
+                for &(id, _) in walk.order().iter() {
                     mirror(page.bounds, id as usize, marks[id as usize]);
                 }
             }
         }
         #[cfg(debug_assertions)]
-        for &(id, _) in walk.nodes.iter() {
+        for &(id, _) in walk.order().iter() {
             let shown = !unfocusable(id as usize, marks[id as usize]);
             let mirrored = !page.bounds.inert(id as usize);
             assert!(shown == mirrored, "kept inert mirror differs");
         }
         let mut flatten = contents.unwrap_or_else(|| {
-            let mut nodes = walk.nodes.iter();
+            let mut nodes = walk.order().iter();
             nodes.any(|&(id, _)| result.flags[id as usize] & super::DISPLAY_CONTENTS != 0)
         });
         #[cfg(debug_assertions)]
         {
-            let mut nodes = walk.nodes.iter();
+            let mut nodes = walk.order().iter();
             let any =
                 nodes.any(|&(id, _)| result.flags[id as usize] & super::DISPLAY_CONTENTS != 0);
             assert!(flatten || !any, "kept display contents scan differs");
@@ -421,7 +444,7 @@ impl Styles {
             let contents = |child: usize| result.flags[child] & super::DISPLAY_CONTENTS != 0;
             let mut parents = vec![false; doc.nodes.len()];
             flatten = false;
-            for &(id, parent) in self.walk.nodes.iter() {
+            for &(id, parent) in self.walk.order().iter() {
                 if contents(id as usize) {
                     flatten = true;
                     if parent != u32::MAX {
@@ -429,7 +452,7 @@ impl Styles {
                     }
                 }
             }
-            for &(id, _) in self.walk.nodes.iter().rev() {
+            for &(id, _) in self.walk.order().iter().rev() {
                 let id = id as usize;
                 if parents[id] {
                     let children = result.children.get(&id).unwrap_or(&doc.nodes[id].children);

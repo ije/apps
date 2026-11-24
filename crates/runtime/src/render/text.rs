@@ -1040,7 +1040,8 @@ impl renderer::Hooks for InlineText {
                 .find_map(|up| Some((up, dom.layout.cull.widths.get(&up)?)))?;
                 // The text of a flex or grid container is an anonymous item that fits its content.
                 let display = dom
-                    .last_styles()?
+                    .styles
+                    .last()?
                     .values
                     .get(up)?
                     .get(crate::css::properties::Prop::DISPLAY);
@@ -1163,7 +1164,7 @@ impl renderer::Hooks for InlineText {
                         .borrow()
                         .dom
                         .get(&view.id)
-                        .and_then(|dom| dom.last_styles().cloned())
+                        .and_then(|dom| dom.styles.last().cloned())
                 })
                 .as_ref()
                 .is_some_and(|styles| {
@@ -1229,7 +1230,7 @@ impl renderer::Hooks for InlineText {
         let shift = exact.origin - bounds.origin;
         let mut host = view.host.borrow_mut();
         let dom = host.dom.entry(view.id).or_default();
-        let computed = dom.last_styles().cloned();
+        let computed = dom.styles.last().cloned();
         let mut spans: Option<Vec<(usize, Pixels)>> = None;
         unplace(dom, &self.data);
         let (mut layouts, mut rects) = {
@@ -1540,7 +1541,7 @@ impl renderer::Hooks for InlineText {
             let view = &*self.view;
             let host = view.host.borrow();
             let dom = &host.dom[&view.id];
-            if let Some(styles) = dom.last_styles() {
+            if let Some(styles) = dom.styles.last() {
                 let base = window.text_system().baseline(
                     strut,
                     text_style.font_size,
@@ -1816,7 +1817,8 @@ impl renderer::Hooks for InlineText {
                     };
                     // A selection changes without a new box, so this text draws again in each frame.
                     window.paint_volatile();
-                    if styles.user_select[*id].0 == style::UserSelect::None || dom.inert(*id) {
+                    if styles.user_select[*id].0 == style::UserSelect::None || dom.styles.inert(*id)
+                    {
                         continue;
                     }
                     let caret = dom.interaction.selection_caret == Some(*id);

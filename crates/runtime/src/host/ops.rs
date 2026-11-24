@@ -1,5 +1,5 @@
 use super::context::{Binding, CLIPBOARD, NATIVE, REFLOW, binding};
-use super::{Host, WORKER_PAGE, link::Target, reaches, window};
+use super::{Host, WORKER_PAGE, link::Target, window};
 use crate::jsc::{self, Ptr, Role, encoding, payload};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -208,7 +208,7 @@ pub(super) unsafe extern "C" fn call(
             if values.get(2).is_some_and(|&value| api.to_bool(ctx, value)) {
                 crate::dom::layout_flags(&mut page.doc, state, viewport);
             }
-            state.sync_scroll();
+            state.geometry.sync_scroll();
             if !values.get(1).is_some_and(|&value| api.to_bool(ctx, value)) {
                 return Ok(api.make_null(ctx));
             }
@@ -635,7 +635,7 @@ fn report_nodes(binding: &Binding, ctx: Ptr, id: u64) {
         .host
         .try_borrow_mut()
         .ok()
-        .and_then(|mut host| Some(std::mem::take(&mut host.dom.get_mut(&id)?.tree.created)));
+        .and_then(|mut host| Some(host.dom.get_mut(&id)?.tree.take_created()));
     if let Some(created) = created.filter(|&created| created > 0) {
         // Count only wrapped nodes: JSC resets this cost only after a full GC.
         binding.api.add_memory(ctx, created * 65536);
@@ -963,9 +963,9 @@ impl Host {
                 || op == "dom.html"
                     && args[0]
                         .as_u64()
-                        .is_some_and(|id| reaches(&page.doc, &state.tree.hosts, id as usize, 0))
+                        .is_some_and(|id| state.tree.reaches(&page.doc, id as usize, 0))
             {
-                state.invalidate();
+                state.styles.invalidate();
             }
             let result = crate::dom::call(
                 op,

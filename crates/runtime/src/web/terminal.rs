@@ -648,7 +648,7 @@ impl crate::host::Host {
         let world = usize::from(preload);
         if op == "poll" {
             let (changed, events) = terminals.poll(page.doc.nodes.latest(), world, |node| {
-                crate::host::reaches(&page.doc, &state.tree.hosts, node, 0)
+                state.tree.reaches(&page.doc, node, 0)
             })?;
             page.dirty |= changed;
             return Ok(json!(events));
