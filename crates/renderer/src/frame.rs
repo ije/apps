@@ -115,19 +115,20 @@ pub struct RenderFrame {
     // after a scrolled content, so a scroll draws again only what changed there and what paints after it.
     pub keeps_under: bool,
     under: Option<KeptUnder>,
-    // A target that the first copies into cover whole, so its old pixels need no load.
-    pub covered: Option<Target>,
     // Draws only the items of the window layer before the split of `Under`, or only those after it.
     half: Option<([u32; 2], bool)>,
 }
 
-// Two textures that take turns, since a scroll copies one into the other moved.
+// A window-size texture. In the viewport of the scroll its rows and columns turn like a ring, so a scroll moves
+// `ring` and not the pixels: the window place `p` in the viewport is at the texel
+// `view.xy + (p - view.xy + ring) mod view.wh`, and the other places at `p`.
 struct KeptUnder {
     scroll: u64,
-    ids: [u64; 2],
-    turn: usize,
+    id: u64,
     count: u32,
     window: [u32; 2],
+    view: [i32; 4],
+    ring: [i32; 2],
 }
 
 // The pixels of a layer from an earlier frame, which draw again while its digest and place stay.
@@ -177,7 +178,7 @@ impl<T> Pool<T> {
         for (.., idle, id) in &mut self.textures {
             if *id != 0
                 && !frame.cache.iter().any(|cached| cached.id == *id)
-                && !(frame.under.as_ref()).is_some_and(|under| under.ids.contains(id))
+                && !(frame.under.as_ref()).is_some_and(|under| under.id == *id)
             {
                 (*idle, *id) = (0, 0);
             }
@@ -365,18 +366,13 @@ impl RenderFrame {
         for cached in &mut self.cache {
             cached.used = false;
         }
-        self.covered = None;
         let under = self.record_under(scene);
         let whole = [0, 0, window[0] as i32, window[1] as i32];
         if self.damage.is_empty() {
             self.bases.push(Target::Frame);
             match under {
-                Some((kept, split)) => {
-                    self.commands.push(Command::Copy {
-                        src: kept,
-                        dst: Target::Frame,
-                        region: whole,
-                    });
+                Some(split) => {
+                    self.copy_kept(Target::Frame, whole, false);
                     self.half = Some((split, true));
                     self.record_layer(scene, 0, Target::Frame, false, 0);
                     self.half = None;
@@ -390,12 +386,8 @@ impl RenderFrame {
             let region = self.damage[at];
             let base = self.region_base(region);
             match under {
-                Some((kept, split)) => {
-                    self.commands.push(Command::Copy {
-                        src: kept,
-                        dst: base,
-                        region,
-                    });
+                Some(split) => {
+                    self.copy_kept(base, region, false);
                     self.record_region(scene, base, region, Some((split, true)), false);
                 }
                 None => self.record_region(scene, base, region, None, true),
@@ -455,9 +447,9 @@ impl RenderFrame {
         }
     }
 
-    // Brings the kept window below the items after a scrolled content up to this scene, and returns it with the
-    // split, or forgets it when the scene has none.
-    fn record_under(&mut self, scene: &Scene) -> Option<(Target, [u32; 2])> {
+    // Brings the kept window below the items after a scrolled content up to this scene, and returns the split, or
+    // forgets it when the scene has none.
+    fn record_under(&mut self, scene: &Scene) -> Option<[u32; 2]> {
         let Some(info) = scene.under.as_ref().filter(|_| self.keeps_under) else {
             self.under = None;
             return None;
@@ -474,17 +466,23 @@ impl RenderFrame {
             return None;
         }
         if !valid {
-            self.ids += 2;
+            self.ids += 1;
             self.under = Some(KeptUnder {
                 scroll: info.scroll,
-                ids: [self.ids - 1, self.ids],
-                turn: 0,
+                id: self.ids,
                 count,
                 window,
+                view: [0; 4],
+                ring: [0; 2],
             });
         }
         let split = info.split;
-        let regions = valid
+        let kept = self.under.as_mut()?;
+        kept.count = count;
+        let id = kept.id;
+        // A ring turns only in its own viewport.
+        let turns = (scene.shift).is_none_or(|(view, _)| kept.ring == [0; 2] || kept.view == view);
+        let regions = (valid && turns)
             .then(|| {
                 let reads = (scene.reads.iter())
                     .filter(|read| !Under::after(split, read.1))
@@ -492,71 +490,69 @@ impl RenderFrame {
                 regions_of(&info.damage, reads, window, &[])
             })
             .flatten();
-        let kept = self.under.as_mut()?;
-        kept.count = count;
         let Some(regions) = regions else {
-            let target = {
-                let kept = self.under.as_ref()?;
-                let id = kept.ids[kept.turn];
-                self.kept_layer(id, [0, 0])
-            };
+            kept.ring = [0; 2];
+            let target = self.kept_layer(id, [0, 0]);
             self.bases.push(target);
             self.half = Some((split, false));
             self.record_layer(scene, 0, target, true, 0);
             self.half = None;
-            return Some((target, split));
+            return Some(split);
         };
+        // The viewport shows the pixels that were `by` further, and the scene damaged the edges that it had none for.
+        if let Some((view, by)) = scene.shift {
+            let kept = self.under.as_mut()?;
+            kept.view = view;
+            kept.ring =
+                [0, 1].map(|axis| (kept.ring[axis] + by[axis]).rem_euclid(view[axis + 2].max(1)));
+        }
         let mut copies = Vec::with_capacity(regions.len());
         for region in regions {
             let base = self.region_base(region);
             self.record_region(scene, base, region, Some((split, false)), true);
             copies.push((base, region));
         }
-        let target = match scene.shift {
-            Some(([x, y, width, height], by)) => {
-                let kept = self.under.as_mut()?;
-                let (old, new) = (kept.ids[kept.turn], kept.ids[kept.turn ^ 1]);
-                kept.turn ^= 1;
-                let target = self.kept_layer(new, [0, 0]);
-                self.covered = Some(target);
-                let (source, moved) = (
-                    self.kept_layer(old, [0, 0]),
-                    self.kept_layer(old, [-by[0], -by[1]]),
-                );
-                // The viewport copies the pixels that were `by` further, and the rest of the window stays.
-                let area = [
-                    x + (-by[0]).max(0),
-                    y + (-by[1]).max(0),
-                    width - by[0].abs(),
-                    height - by[1].abs(),
-                ];
-                let [right, bottom] = [window[0] as i32, window[1] as i32];
-                let [x, y, width, height] = area;
-                for (src, region) in [
-                    (source, [0, 0, right, y]),
-                    (source, [0, y + height, right, bottom - y - height]),
-                    (source, [0, y, x, height]),
-                    (source, [x + width, y, right - x - width, height]),
-                    (moved, area),
-                ] {
-                    if region[2] > 0 && region[3] > 0 {
-                        self.commands.push(Command::Copy {
-                            src,
-                            dst: target,
-                            region,
-                        });
-                    }
-                }
-                target
-            }
-            None => {
-                let kept = self.under.as_ref()?;
-                let id = kept.ids[kept.turn];
-                self.kept_layer(id, [0, 0])
-            }
+        for &(base, region) in &copies {
+            self.copy_kept(base, region, true);
+        }
+        for &(base, _) in &copies {
+            self.release(base);
+        }
+        Some(split)
+    }
+
+    // Copies a window region out of the kept window into `other`, or into it from `other`. The places where the ring
+    // turns split the region, and its parts outside the viewport stay in place.
+    fn copy_kept(&mut self, other: Target, [x, y, width, height]: [i32; 4], into: bool) {
+        let Some(kept) = self.under.as_ref() else {
+            return;
         };
-        self.copy_bases(&copies, target);
-        Some((target, split))
+        let (id, [vx, vy, vw, vh], [rx, ry]) = (kept.id, kept.view, kept.ring);
+        let parts = |start: i32, size: i32, view: i32, length: i32, ring: i32| {
+            let turn = view + length - ring;
+            [
+                (start, view, None),
+                (view, turn, Some(ring)),
+                (turn, view + length, Some(ring - length)),
+                (view + length, start + size, None),
+            ]
+            .map(|(low, high, by)| (low.max(start), high.min(start + size), by))
+        };
+        for (left, right, dx) in parts(x, width, vx, vw, rx) {
+            for (top, bottom, dy) in parts(y, height, vy, vh, ry) {
+                if left >= right || top >= bottom {
+                    continue;
+                }
+                let origin = dx.zip(dy).map_or([0, 0], |(dx, dy)| [-dx, -dy]);
+                let view = self.kept_layer(id, origin);
+                let (src, dst) = if into { (other, view) } else { (view, other) };
+                self.commands.push(Command::Copy {
+                    src,
+                    dst,
+                    region: [left, top, right - left, bottom - top],
+                });
+            }
+        }
     }
 
     fn copy_bases(&mut self, copies: &[(Target, [i32; 4])], dst: Target) {
@@ -576,10 +572,16 @@ impl RenderFrame {
     // A window-size texture that stays across frames, with the window at `origin`.
     fn kept_layer(&mut self, id: u64, origin: [i32; 2]) -> Target {
         let size = self.window;
-        self.textures.push(size);
-        self.kept.push(id);
+        let texture = match self.kept.iter().position(|&kept| kept == id) {
+            Some(texture) => texture,
+            None => {
+                self.textures.push(size);
+                self.kept.push(id);
+                self.textures.len() - 1
+            }
+        };
         self.layers.push(Layer {
-            texture: self.textures.len() - 1,
+            texture,
             origin,
             scale: 1.,
             bounds: [

@@ -1416,8 +1416,7 @@ impl Renderer {
         let pipelines = self.pipelines;
         // The target of the open copy pass.
         let mut copying: Option<Target> = None;
-        // Only the first pass into it skips the load.
-        let mut covered = frame.covered;
+        let mut blit: Option<Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>> = None;
         for (at, command) in frame.commands.iter().enumerate() {
             if at == frame.shot_commands && wide.replace(false) {
                 end!();
@@ -1427,7 +1426,50 @@ impl Renderer {
                 end!();
                 copying = None;
             }
+            // A copy between layers blits only its region, since a pass loads and stores all of its target.
+            let blits = matches!(command, Command::Copy { src, dst, .. }
+                if frame.texture(*src).is_some() && frame.texture(*dst).is_some());
+            if !blits && let Some(open) = blit.take() {
+                open.endEncoding();
+            }
             match command {
+                Command::Copy { src, dst, region } if blits => {
+                    if blit.is_none() {
+                        end!();
+                        copying = None;
+                        current.1 = false;
+                        blit = Some(commands.blitCommandEncoder().context("no blit encoder")?);
+                    }
+                    let (source, target) = (texture(*src), texture(*dst));
+                    let (from, to) = (frame.origin(*src), frame.origin(*dst));
+                    // The texels of the region in each texture, cut to both.
+                    let [mut x, mut y, mut width, mut height] = *region;
+                    for (origin, texture) in [(from, source), (to, target)] {
+                        let [left, top] = [x.max(origin[0]), y.max(origin[1])];
+                        let right = (x + width).min(origin[0] + texture.width() as i32);
+                        let bottom = (y + height).min(origin[1] + texture.height() as i32);
+                        [x, y, width, height] = [left, top, right - left, bottom - top];
+                    }
+                    if width > 0 && height > 0 {
+                        let at = |origin: [i32; 2]| MTLOrigin {
+                            x: (x - origin[0]) as usize,
+                            y: (y - origin[1]) as usize,
+                            z: 0,
+                        };
+                        let size = MTLSize {
+                            width: width as usize,
+                            height: height as usize,
+                            depth: 1,
+                        };
+                        // SAFETY: the region is inside both textures, which share a format, and the command buffer
+                        // retains them.
+                        unsafe {
+                            blit.as_deref().unwrap().copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                                source, 0, 0, at(from), size, target, 0, 0, at(to),
+                            );
+                        }
+                    }
+                }
                 Command::Pass(target, false)
                     if let Some(encoder) = &encoder
                         && frame.texture(*target) == frame.texture(current.0) =>
@@ -1493,10 +1535,7 @@ impl Renderer {
                         current.1 = false;
                         // A pooled texture can hold other layers, so the rest of it is loaded.
                         let first = starts(*dst);
-                        let whole = covered
-                            .take_if(|whole| frame.texture(*whole) == frame.texture(*dst))
-                            .is_some();
-                        let load = if first || whole {
+                        let load = if first {
                             MTLLoadAction::DontCare
                         } else {
                             MTLLoadAction::Load
@@ -1550,6 +1589,9 @@ impl Renderer {
             }
         }
         end!();
+        if let Some(open) = blit {
+            open.endEncoding();
+        }
         if pending.get() {
             let open = pipelines.copy_pass(commands, drawable, MTLLoadAction::DontCare)?;
             draw_prelude(&open);
@@ -2259,8 +2301,9 @@ mod tests {
         use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandQueue};
         let (send, receive) = std::sync::mpsc::channel();
         // Scroll offsets in device pixels, and a change: 1 and 2 recolor a row (2 one under the bar), 3 the bar. A
-        // part of a pixel can't be copied, and a change inside the content draws it.
-        let steps: [(f32, u8); 13] = [
+        // part of a pixel can't be copied, and a change inside the content draws it. The kept window turns past its
+        // viewport height both ways.
+        let steps: [(f32, u8); 15] = [
             (0., 0),
             (6., 0),
             (12., 0),
@@ -2274,6 +2317,8 @@ mod tests {
             (14., 0),
             (14., 3),
             (8., 0),
+            (48., 0),
+            (88., 0),
         ];
         let job = move || {
             let size = objc2_core_foundation::CGSize::new(200., 120.);
