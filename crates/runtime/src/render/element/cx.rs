@@ -38,6 +38,10 @@ pub(super) struct Cx<'a> {
     pub(super) flexbox: bool,
     pub(super) editable: bool,
     pub(super) stacking: bool,
+    pub(super) parent: Option<usize>,
+    pub(super) block_size: Option<[f32; 2]>,
+    pub(super) opacity: f32,
+    pub(super) effect_layer: Option<f32>,
     pub(super) selection_colors: (Option<u32>, u32),
     pub(super) broken: bool,
     pub(super) alt: Option<&'a String>,
@@ -92,6 +96,39 @@ pub(super) struct Frame {
 }
 
 impl Frame {
+    /// The automatic minimum size of a flex item on its main axis: `size`, cut to its max size.
+    pub(super) fn floor(&self, cx: &Cx<'_>, axis: usize, size: f32) -> Option<f32> {
+        let Cx {
+            reader,
+            id,
+            style,
+            units,
+            containing,
+            ..
+        } = *cx;
+        let (flex_parent, extra) = (reader.flex_parent, self.extra);
+        let [min, max] = [
+            [Prop::MIN_WIDTH, Prop::MAX_WIDTH],
+            [Prop::MIN_HEIGHT, Prop::MAX_HEIGHT],
+        ][axis];
+        if !flex_parent
+            || style.get(min).is_some_and(|value| value != "auto")
+            || reader
+                .parent(id, Prop::FLEX_DIRECTION)
+                .is_some_and(|value| value.starts_with("column"))
+                != (axis == 1)
+        {
+            return None;
+        }
+        match style.get(max).filter(|value| *value != "none") {
+            Some(value) if value.contains('%') => None,
+            Some(value) => units
+                .resolve(value, containing[axis])
+                .map(|max| size.min(max + extra[axis])),
+            None => Some(size),
+        }
+    }
+
     pub(super) fn content_box(&self, cx: &Cx<'_>) -> [f32; 2] {
         let Frame {
             padding,

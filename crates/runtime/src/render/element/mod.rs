@@ -11,6 +11,7 @@ pub(crate) mod native;
 pub(crate) mod oracle;
 pub(crate) mod paragraph;
 pub(crate) mod plan;
+pub(crate) mod props;
 pub(crate) mod pseudos;
 pub(crate) mod query;
 pub(crate) mod replaced;
