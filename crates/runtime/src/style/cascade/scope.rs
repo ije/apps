@@ -1,11 +1,20 @@
+use crate::css::Style;
 use crate::css::{
     Declarations, Declared, MediaQuery, Prop, Registry, Rule, Selector, SelectorList, Stylesheet,
 };
 use crate::dom::{Document, SelectorCache};
+use crate::style::StyleCache;
+use crate::style::cascade::TreeWalk;
 use crate::style::cascade::container::style_query;
 use crate::style::cascade::memo::CachedNode;
+use crate::style::cascade::memo::CachedStyle;
+use crate::style::cascade::rank::AGENT;
 use crate::style::cascade::rank::AUTHOR;
+use crate::style::cascade::rank::USER;
 use crate::style::cascade::shadow::{PART, SLOTTED};
+#[cfg(target_os = "macos")]
+use crate::style::ua::GLASS_SHEET;
+use crate::style::ua::{FULLSCREEN_SHEET, UA_SHEET};
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -505,5 +514,539 @@ impl<'a> Collect<'a> {
                 }
             }
         }
+    }
+}
+
+impl StyleCache {
+    // Chooses the scope of each tree of the walk: an equal one, one patched with the changed rules, or a new one.
+    // Returns the ids of the chosen scopes, the `color-scheme` of the page and the Tailwind theme of the document.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn choose_scopes(
+        &mut self,
+        doc: &Document,
+        walk: &TreeWalk,
+        cache: &mut HashMap<Rc<str>, Rc<Stylesheet>>,
+        inserted: &[(Rc<Stylesheet>, bool)],
+        fullscreen: bool,
+        fast: &mut bool,
+        [width, height]: [f32; 2],
+        reduced_motion: bool,
+        native_theme: u32,
+    ) -> (Vec<usize>, Option<Rc<str>>, Option<Rc<Style>>) {
+        let blank = || Collect {
+            width,
+            height,
+            reduced_motion,
+            native_theme,
+            rules: Vec::new(),
+            container: None,
+            media: None,
+            blocks: Vec::new(),
+            layers: Vec::new(),
+            keyframes: HashMap::new(),
+            properties: Registry::default(),
+            layered: HashMap::new(),
+        };
+        let user = |sheet: &Rc<Stylesheet>| {
+            inserted
+                .iter()
+                .any(|(inserted, user)| *user && Rc::ptr_eq(inserted, sheet))
+        };
+        let mut scheme = None;
+        let mut theme = None;
+        let mut chosen = Vec::with_capacity(walk.trees.len());
+        let mut lists: FxHashMap<Vec<usize>, usize> = FxHashMap::default();
+        let (mut sheets, mut list) = (Vec::new(), Vec::new());
+        for (tree, &(root, _)) in walk.trees.iter().enumerate() {
+            sheets.clear();
+            #[cfg(target_os = "macos")]
+            sheets.push(GLASS_SHEET.with(Clone::clone));
+            for &id in &walk.special[tree] {
+                let node = &doc.nodes[id];
+                if node.tag == "meta"
+                    && tree == 0
+                    && node
+                        .attrs
+                        .get("name")
+                        .is_some_and(|name| name.eq_ignore_ascii_case("color-scheme"))
+                {
+                    scheme = node
+                        .attrs
+                        .get("content")
+                        .map(|content| Rc::<str>::from(content.trim()));
+                }
+                if node.tag != "style"
+                    && !(node.tag == "link"
+                        && node.stylesheet.is_some()
+                        && node.attrs.get("rel").is_some_and(|rel| {
+                            rel.split_ascii_whitespace()
+                                .any(|token| token.eq_ignore_ascii_case("stylesheet"))
+                        }))
+                {
+                    continue;
+                }
+                let mut ancestor = node.parent;
+                while let Some(parent) = ancestor {
+                    if matches!(doc.nodes[parent].tag.as_str(), "template" | "noscript") {
+                        break;
+                    }
+                    ancestor = doc.nodes[parent].parent;
+                }
+                if ancestor.is_some() || node.attrs.contains_key("disabled") {
+                    continue;
+                }
+                if let Some(media) = node
+                    .attrs
+                    .get("media")
+                    .filter(|media| !media.trim().is_empty())
+                {
+                    let source = format!("@media {media}{{}}");
+                    let query = match cache.get(source.as_str()) {
+                        Some(sheet) => sheet.clone(),
+                        None => {
+                            let sheet = Rc::new(Stylesheet::parse(&source));
+                            cache.insert(source.into(), sheet.clone());
+                            sheet
+                        }
+                    };
+                    if !query.matches_media(width, height, native_theme) {
+                        continue;
+                    }
+                }
+                sheets.extend(self.sheet(doc, id, cache));
+            }
+            if let Some(adopted) = self.adopted.get(&root) {
+                sheets.extend(
+                    adopted
+                        .iter()
+                        .filter_map(|id| self.constructed.get(id).cloned()),
+                );
+            }
+            if tree == 0 {
+                sheets.extend(inserted.iter().map(|(sheet, _)| sheet.clone()));
+            }
+            list.clear();
+            list.extend(sheets.iter().map(|sheet| Rc::as_ptr(sheet) as usize));
+            if let Some(&scope) = lists.get(list.as_slice()) {
+                chosen.push(scope);
+                continue;
+            }
+            let mut collected = blank();
+            let tailwind = self.tailwind.update(&mut sheets, doc, &walk.walk.nodes);
+            if let Some(update) = &tailwind
+                && !(update.replaced.is_empty() && update.added.is_empty())
+            {
+                let mut added = blank();
+                for rule in &update.rules {
+                    added.rule(rule, None, None);
+                }
+                let old: Vec<_> = update
+                    .replaced
+                    .iter()
+                    .chain(update.added.iter().map(|(old, _)| old))
+                    .collect();
+                let count = self.scopes.len();
+                let (matches, styled) = (&mut self.matches, &mut self.styled);
+                let plain = added.keyframes.is_empty() && added.properties.is_empty();
+                self.scopes.retain_mut(|scope| {
+                    if lists.values().any(|&id| id == scope.id)
+                        || !scope
+                            .sheets
+                            .iter()
+                            .any(|sheet| old.iter().any(|old| Rc::ptr_eq(sheet, old)))
+                    {
+                        return true;
+                    }
+                    let local = scope.insert(update, &added.rules, &added.blocks, doc, matches);
+                    // The dirty marks stand for the new rules in the last stored pass.
+                    match styled.as_mut().filter(|_| plain && local == Some(true)) {
+                        Some(styled) => {
+                            for old in styled.scopes.iter_mut().filter(|old| old.1 == scope.id) {
+                                old.2 = scope.rules.len();
+                            }
+                        }
+                        None => *fast = false,
+                    }
+                    local.is_some()
+                });
+                if self.scopes.len() < count {
+                    self.matches.forget_selectors();
+                }
+                if !update.replaced.is_empty() {
+                    self.queries.clear();
+                }
+            }
+            if tree == 0 {
+                theme = tailwind.as_ref().map(|update| update.root.clone());
+            }
+            // Collect built-in sheets last so author sheets define layer order. Keep built-in rules first within
+            // each layer.
+            let builtin = usize::from(cfg!(target_os = "macos"));
+            let sources = (builtin..sheets.len()).chain(0..builtin);
+            let exact = self.scopes.iter().position(|cached| {
+                cached.fullscreen == fullscreen
+                    && cached.sheets.len() == sheets.len()
+                    && cached
+                        .sheets
+                        .iter()
+                        .zip(&sheets)
+                        .all(|(a, b)| Rc::ptr_eq(a, b))
+            });
+            type Fresh = (Vec<Vec<bool>>, Vec<(Rc<Stylesheet>, usize)>);
+            let fresh = |old: &[Rc<Stylesheet>]| -> Option<Fresh> {
+                let mut next = 0;
+                let mut fresh = Vec::new();
+                let mut gone = Vec::new();
+                for sheet in &sheets {
+                    let mut flags = vec![false; sheet.0.len()];
+                    match old.get(next) {
+                        Some(previous) if Rc::ptr_eq(previous, sheet) => next += 1,
+                        Some(previous)
+                            if self.derived.get(&Rc::as_ptr(sheet)).is_some_and(
+                                |(weak, base, ..)| {
+                                    weak.as_ptr() == Rc::as_ptr(sheet) && Rc::ptr_eq(base, previous)
+                                },
+                            ) =>
+                        {
+                            next += 1;
+                            let (_, base, inserted, removed) = &self.derived[&Rc::as_ptr(sheet)];
+                            for &index in inserted {
+                                *flags.get_mut(index)? = true;
+                            }
+                            gone.extend(removed.iter().map(|&index| (base.clone(), index)));
+                        }
+                        // A sheet in the place of one that left, like a `<style>` with new text, loses all old rules.
+                        Some(previous)
+                            if !sheets.iter().any(|sheet| Rc::ptr_eq(sheet, previous))
+                                && !old.iter().any(|previous| Rc::ptr_eq(previous, sheet)) =>
+                        {
+                            next += 1;
+                            flags.fill(true);
+                            gone.extend(
+                                (0..previous.0.len()).map(|index| (previous.clone(), index)),
+                            );
+                        }
+                        _ if old.iter().any(|previous| Rc::ptr_eq(previous, sheet)) => return None,
+                        _ => flags.fill(true),
+                    }
+                    fresh.push(flags);
+                }
+                (next == old.len()).then_some((fresh, gone))
+            };
+            let incremental = exact
+                .is_none()
+                .then(|| {
+                    self.scopes.iter().enumerate().find_map(|(index, cached)| {
+                        (lists.values().all(|&id| id != cached.id)
+                            && cached.fullscreen == fullscreen)
+                            .then(|| fresh(&cached.sheets))
+                            .flatten()
+                            .map(|fresh| (index, fresh))
+                    })
+                })
+                .flatten();
+            let scope = match (exact, incremental) {
+                (Some(scope), _) => scope,
+                (None, Some((index, (fresh, gone)))) => {
+                    let mut new = Vec::new();
+                    for index in sources.clone() {
+                        let (sheet, flags) = (&sheets[index], &fresh[index]);
+                        let first = collected.rules.len();
+                        for (rule, &flag) in sheet.0.iter().zip(flags) {
+                            let start = collected.rules.len();
+                            collected.rule(rule, None, None);
+                            new.extend(std::iter::repeat_n(flag, collected.rules.len() - start));
+                        }
+                        if builtin != 0 && index == 0 {
+                            let count = collected.rules.len() - first;
+                            collected.rules.rotate_right(count);
+                            new.rotate_right(count);
+                        }
+                        if user(sheet) {
+                            for rule in &mut collected.rules[first..] {
+                                rule.2.origin = USER;
+                            }
+                        }
+                    }
+                    collected.rank();
+                    let mut removed = blank();
+                    for (sheet, index) in &gone {
+                        if let Some(rule) = sheet.0.get(*index) {
+                            removed.rule(rule, None, None);
+                        }
+                    }
+                    let cached = &mut self.scopes[index];
+                    let removed: rustc_hash::FxHashSet<_> = removed
+                        .rules
+                        .iter()
+                        .map(|rule| Rc::as_ptr(rule.0))
+                        .collect();
+                    let mut deleted: Vec<bool> = (cached.rules.iter())
+                        .map(|rule| removed.contains(&Rc::as_ptr(&rule.0)))
+                        .collect();
+                    // Preserve deleted rule positions with DELETED origin and no declarations or keys.
+                    let mut author: Vec<usize> = (0..cached.rules.len())
+                        .filter(|&order| {
+                            !matches!(cached.rules[order].2.origin, AGENT | DELETED)
+                                && !deleted[order]
+                        })
+                        .collect();
+                    let dead = (cached.rules.iter().zip(&deleted))
+                        .filter(|(rule, deleted)| **deleted || rule.2.origin == DELETED)
+                        .count();
+                    author.sort_by_key(|&order| cached.keys[order]);
+                    let old = new.iter().filter(|flag| !**flag).count();
+                    let same = old == author.len()
+                        && collected.layers == cached.layers
+                        && collected
+                            .rules
+                            .iter()
+                            .zip(&new)
+                            .filter(|(_, flag)| !**flag)
+                            .zip(&author)
+                            .all(|(((selectors, ..), _), &order)| {
+                                Rc::ptr_eq(selectors, &cached.rules[order].0)
+                            });
+                    // A scope with more deleted rules than live ones is built again, so it does not grow.
+                    let mut room = same && dead * 2 <= cached.rules.len() + new.len() - old;
+                    let mut keys = Vec::new();
+                    let mut inserted = Vec::new();
+                    let mut pending = Vec::new();
+                    if same {
+                        let generated = |key: u128| {
+                            cached
+                                .block
+                                .is_some_and(|block| (key >> 64) as u64 == block && key as u64 != 0)
+                        };
+                        let mut olds = author.iter().copied();
+                        let mut previous = cached
+                            .keys
+                            .iter()
+                            .zip(&cached.rules)
+                            .filter(|(_, rule)| rule.2.origin == AGENT)
+                            .map(|(key, _)| *key)
+                            .max()
+                            .unwrap_or(0);
+                        for (rule, &flag) in collected.rules.iter().zip(&new) {
+                            if flag {
+                                pending.push(rule.clone());
+                                continue;
+                            }
+                            let next = cached.keys[olds.next().unwrap_or_default()];
+                            if !pending.is_empty() {
+                                let step =
+                                    ((next - previous) / (pending.len() as u128 + 1)).min(1 << 20);
+                                room &= step > 0 && !generated(previous) && !generated(next);
+                                for (index, rule) in pending.drain(..).enumerate() {
+                                    keys.push(previous + step * (index as u128 + 1));
+                                    inserted.push(rule);
+                                }
+                            }
+                            previous = next;
+                        }
+                    }
+                    if room {
+                        let start = cached.rules.len();
+                        cached.push(inserted, None, &mut self.matches.attributes);
+                        for (order, key) in (start..).zip(keys) {
+                            cached.keys[order] = key;
+                        }
+                        cached.push(pending, None, &mut self.matches.attributes);
+                        let local = cached.rematch(start, doc, &mut self.matches.dirty);
+                        let Collect {
+                            keyframes,
+                            properties,
+                            blocks,
+                            ..
+                        } = std::mem::replace(&mut collected, blank());
+                        let plain = local
+                            && cached.keyframes == keyframes
+                            && cached.properties == properties;
+                        // The dirty marks stand for the new rules in the last stored pass.
+                        match self.styled.as_mut().filter(|_| plain) {
+                            Some(styled) => {
+                                for old in styled.scopes.iter_mut().filter(|old| old.1 == cached.id)
+                                {
+                                    old.2 = cached.rules.len();
+                                }
+                            }
+                            None => *fast = false,
+                        }
+                        if deleted.contains(&true) {
+                            deleted.resize(cached.rules.len(), false);
+                            for order in (0..deleted.len()).filter(|&order| deleted[order]) {
+                                cached.rules[order].1 = Rc::new([]);
+                                cached.rules[order].2.origin = DELETED;
+                                cached.elements[order].clear();
+                            }
+                            let gone = |entry: &usize| {
+                                if *entry >= PSEUDO {
+                                    deleted[cached.pseudos[entry & !PSEUDO].2]
+                                } else {
+                                    deleted[entry >> SELECTOR]
+                                }
+                            };
+                            for bucket in &mut cached.buckets {
+                                bucket.retain(|_, list| {
+                                    list.retain(|entry| !gone(entry));
+                                    !list.is_empty()
+                                });
+                            }
+                            cached.universal.retain(|entry| !gone(entry));
+                            let stale = |rules: &[(usize, [usize; 3])], pseudos: &[usize]| {
+                                rules.iter().any(|&(order, _)| deleted[order])
+                                    || pseudos
+                                        .iter()
+                                        .any(|&index| deleted[cached.pseudos[index].2])
+                            };
+                            // A fast pass styles these nodes again by their dirty marks.
+                            for (id, matched) in cached.nodes.iter_mut().enumerate() {
+                                if matched
+                                    .as_ref()
+                                    .is_some_and(|matched| stale(&matched.rules, &matched.pseudos))
+                                {
+                                    *matched = None;
+                                    self.matches.mark(id, false);
+                                }
+                            }
+                            self.values.retain(|key, _| {
+                                key.scope != cached.id || !stale(&key.rules.0, &key.pseudos)
+                            });
+                            // The interaction states come from the rules that are left.
+                            let mut lists: Vec<_> = (cached.rules.iter())
+                                .filter(|rule| rule.2.origin != DELETED)
+                                .map(|rule| rule.0.clone())
+                                .collect();
+                            let (mut seen, mut parents, mut subject) =
+                                (std::collections::HashSet::new(), Vec::new(), true);
+                            cached.states = 0;
+                            while let Some(list) = lists.pop().or_else(|| {
+                                subject = false;
+                                parents.pop()
+                            }) {
+                                if seen.insert((Rc::as_ptr(&list), subject)) {
+                                    for selector in list.iter() {
+                                        cached.states |= selector.states(&mut parents);
+                                    }
+                                }
+                            }
+                        }
+                        if cached.keyframes != keyframes {
+                            let animated = |value: &CachedStyle| {
+                                value.style.contains(Prop::ANIMATION)
+                                    || value.style.contains(Prop::ANIMATION_NAME)
+                            };
+                            for node in cached.nodes.iter_mut().flatten() {
+                                if node
+                                    .cached
+                                    .as_ref()
+                                    .is_some_and(|node| animated(&node.value))
+                                {
+                                    node.cached = None;
+                                }
+                            }
+                            self.values.retain(|key, values| {
+                                key.scope != cached.id || {
+                                    values.retain(|value| !animated(value));
+                                    !values.is_empty()
+                                }
+                            });
+                        }
+                        cached.sheets = sheets.clone();
+                        let mut seen = std::collections::HashSet::new();
+                        cached.blocks = cached
+                            .medias
+                            .iter()
+                            .flatten()
+                            .flat_map(|stack| stack.iter())
+                            .chain(blocks.iter().filter(|block| block.fixed))
+                            .filter(|block| seen.insert(Rc::as_ptr(block)))
+                            .cloned()
+                            .collect();
+                        cached.keyframes = keyframes;
+                        cached.properties = properties;
+                        index
+                    } else {
+                        collected.rules.clear();
+                        collected.layers.clear();
+                        collected.keyframes.clear();
+                        collected.properties.clear();
+                        collected.layered.clear();
+                        collected.blocks.clear();
+                        usize::MAX
+                    }
+                }
+                (None, None) => usize::MAX,
+            };
+            let scope = if scope != usize::MAX {
+                scope
+            } else {
+                for index in sources {
+                    let sheet = &sheets[index];
+                    let first = collected.rules.len();
+                    for rule in &sheet.0 {
+                        collected.rule(rule, None, None);
+                    }
+                    if builtin != 0 && index == 0 {
+                        let count = collected.rules.len() - first;
+                        collected.rules.rotate_right(count);
+                    }
+                    if user(sheet) {
+                        for rule in &mut collected.rules[first..] {
+                            rule.2.origin = USER;
+                        }
+                    }
+                }
+                let author = std::mem::take(&mut collected.rules);
+                let ua = if fullscreen {
+                    &FULLSCREEN_SHEET
+                } else {
+                    &UA_SHEET
+                }
+                .with(Clone::clone);
+                for rule in &ua.0 {
+                    collected.rule(rule, None, None);
+                }
+                for rule in &mut collected.rules {
+                    rule.2.origin = AGENT;
+                }
+                collected.rules.extend(author);
+                collected.rank();
+                let Collect {
+                    rules,
+                    keyframes,
+                    properties,
+                    layers,
+                    blocks,
+                    ..
+                } = collected;
+                self.next += 1;
+                let mut scope = StyleScope {
+                    id: self.next,
+                    fullscreen,
+                    sheets: sheets.clone(),
+                    layers,
+                    blocks,
+                    keyframes,
+                    properties,
+                    ..Default::default()
+                };
+                scope.push(
+                    rules,
+                    tailwind.as_ref().map(|update| update.keys),
+                    &mut self.matches.attributes,
+                );
+                self.scopes.push(scope);
+                self.scopes.len() - 1
+            };
+            let scoped = &mut self.scopes[scope];
+            scoped.used = self.pass;
+            if scoped.nodes.len() < doc.nodes.len() {
+                scoped.nodes.resize_with(doc.nodes.len(), || None);
+            }
+            lists.insert(list.clone(), scoped.id);
+            chosen.push(scoped.id);
+        }
+        (chosen, scheme, theme)
     }
 }
