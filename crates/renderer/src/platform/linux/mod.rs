@@ -268,7 +268,7 @@ impl Platform {
         crate::native::quit_handler();
     }
 
-    pub fn quit(&self) {
+    pub fn quit() {
         // Main decides, and it can't run while the app calls this.
         soon(|| {
             if crate::native::should_quit() {
@@ -277,7 +277,7 @@ impl Platform {
         });
     }
 
-    pub fn activate(&self, _: bool) {}
+    pub fn activate(_: bool) {}
 
     pub fn read_clipboard(&self) -> Option<String> {
         self.display.read_clipboard()
@@ -377,7 +377,7 @@ impl Window {
 
     fn wait(&self) {
         let calls = self.calls;
-        crate::app::timer(QUIET, move |_| calls.release()).detach();
+        crate::platform::timer(QUIET, move || calls.release()).detach();
     }
 
     pub fn release(&self) {

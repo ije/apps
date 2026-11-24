@@ -169,6 +169,13 @@ pub fn bytes<T: Plain>(items: &[T]) -> &[u8] {
     unsafe { slice::from_raw_parts(start, length) }
 }
 
+/// The pixels of a layer of `Window::with_snapshot`, as premultiplied RGBA.
+pub struct Snapshot {
+    pub key: u64,
+    pub size: [u32; 2],
+    pub pixels: Vec<u8>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

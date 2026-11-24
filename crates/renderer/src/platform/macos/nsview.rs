@@ -544,7 +544,7 @@ impl AppsView {
         };
         let composing = down && callbacks.composition().is_some();
         // Main can block the key. A blocked key still goes to an active input method, which must not pass it on.
-        let blocked = crate::app::native::key(callbacks.id, &input, &|| {
+        let blocked = crate::native::key(callbacks.id, &input, &|| {
             composing || !down && callbacks.composition().is_some()
         });
         let Event::KeyDown {

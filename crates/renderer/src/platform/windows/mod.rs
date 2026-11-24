@@ -212,7 +212,7 @@ impl Platform {
         crate::native::quit_handler();
     }
 
-    pub fn quit(&self) {
+    pub fn quit() {
         // The quit handlers need the app, which is in use while this runs.
         run_after(Duration::ZERO, || {
             if crate::native::should_quit() {
@@ -224,7 +224,7 @@ impl Platform {
         });
     }
 
-    pub fn activate(&self, _: bool) {}
+    pub fn activate(_: bool) {}
 
     pub fn read_clipboard(&self) -> Option<String> {
         // SAFETY: the clipboard handle stays locked while its text is copied, and the copy stops at the

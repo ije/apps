@@ -253,7 +253,7 @@ pub(crate) struct Window {
     pub(crate) renderer: Renderer,
     pacer: Shared<Pacer>,
     idle: u32,
-    quiet: Option<crate::app::Timer>,
+    quiet: Option<crate::Timer>,
     presents: Arc<Latest<Present>>,
     controls_sent: Vec<crate::NativeControl>,
     controls: Arc<Latest<Controls>>,
@@ -357,7 +357,7 @@ impl Window {
         }
         self.renderer.trim();
         let callbacks = self.callbacks;
-        let release = crate::app::timer(QUIET, move |_| callbacks.release());
+        let release = crate::platform::timer(QUIET, move || callbacks.release());
         self.quiet = Some(release);
     }
 

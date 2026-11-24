@@ -30,7 +30,7 @@ use std::{
     sync::{Mutex, MutexGuard, PoisonError},
 };
 
-pub(crate) use controls::control_size;
+pub use controls::control_size;
 pub(crate) use glass::available as supports_glass;
 pub(crate) use metal::prewarm;
 pub(crate) use text::TextSystem;
@@ -138,14 +138,14 @@ impl Platform {
         autoreleasepool(|_| NSApp(mtm).run());
     }
 
-    pub fn quit(&self) {
+    pub fn quit() {
         // After the current event: terminating closes windows, and their callbacks need the app.
         native_post(Box::new(|| {
             threads::post_local(|| NSApp(MainThreadMarker::new().unwrap()).terminate(None))
         }));
     }
 
-    pub fn activate(&self, ignoring_other_apps: bool) {
+    pub fn activate(ignoring_other_apps: bool) {
         native_post(Box::new(move || {
             #[allow(deprecated)]
             NSApp(MainThreadMarker::new().unwrap()).activateIgnoringOtherApps(ignoring_other_apps);

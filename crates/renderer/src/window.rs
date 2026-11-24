@@ -1,7 +1,7 @@
 use crate::{
     App, Backdrop, BorderStyle, BoxShadow, Child, Clip, Color, Cursor, Edges, Event, Key,
     Modifiers, NodeKey, PaintEffect, Pixels, Point, Radii, Rect, RenderImage, ScrollRef, Size,
-    Tree, Utf16Selection, WheelPhase,
+    Snapshot, Tree, Utf16Selection, WheelPhase, WindowChange, WindowControl, WindowId, WindowState,
     atlas::TileKey,
     geometry::{Plane, compose, invert, plane_of, project, snap, snap_width},
     platform, point, px,
@@ -26,9 +26,6 @@ use std::{
 #[path = "paint.rs"]
 mod paint;
 pub use paint::*;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct WindowId(pub u64);
 
 /// Text input calls use UTF-16 offsets.
 pub trait View: 'static {
@@ -68,97 +65,11 @@ pub trait View: 'static {
     fn index_at(&mut self, at: Point<Pixels>, window: &mut Window, app: &mut App) -> Option<usize>;
 }
 
-#[derive(Clone, Debug)]
-pub struct WindowOptions {
-    pub bounds: Rect,
-    // `bounds` includes the title bar and frame.
-    pub outer_size: bool,
-    pub title: String,
-    pub titlebar_hidden: bool,
-    pub buttons_at: Option<Point<Pixels>>,
-    pub frameless: bool,
-    pub transparent: bool,
-    pub show: bool,
-    pub resizable: bool,
-    pub minimizable: bool,
-    pub movable: bool,
-}
-
-impl Default for WindowOptions {
-    fn default() -> Self {
-        Self {
-            bounds: crate::rect(px(0.), px(0.), px(800.), px(600.)),
-            outer_size: true,
-            title: String::new(),
-            titlebar_hidden: false,
-            buttons_at: None,
-            frameless: false,
-            transparent: false,
-            show: true,
-            resizable: true,
-            minimizable: true,
-            movable: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct WindowState {
-    pub frame: Rect,
-    pub content: Rect,
-    pub minimized: bool,
-    pub maximized: bool,
-    pub fullscreen: bool,
-    pub visible: bool,
-    pub resizing: bool,
-    pub display: Rect,
-    pub work_area: Rect,
-}
-
-pub use crate::platform::WindowControl;
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum WindowChange {
-    Frame(Rect),
-    Center,
-    Show(bool),
-    Hide,
-    Blur,
-    Restore,
-    SizeLimits(Size<Pixels>, Size<Pixels>),
-    /// An `NSWindowLevel`, where 0 is normal.
-    AlwaysOnTop(isize),
-    Resizable(bool),
-    Minimizable(bool),
-    Maximizable(bool),
-    Closable(bool),
-    Movable(bool),
-    Background(Color),
-    Opacity(f32),
-    Shadow(bool),
-    IgnoreMouse(bool, bool),
-    AllWorkspaces(bool, bool),
-    ContentProtection(bool),
-    Focusable(bool),
-    AspectRatio(f32, Size<Pixels>),
-    Parent(Option<raw_window_handle::RawWindowHandle>, bool),
-    Vibrancy(Option<isize>, isize),
-    Edited(bool),
-    CancelComposition,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub enum Scope {
     Clip(Option<Clip<Pixels>>),
     Offset(Point<Pixels>),
     Opacity(Option<f32>),
-}
-
-/// The pixels of a layer of `Window::with_snapshot`, as premultiplied RGBA.
-pub struct Snapshot {
-    pub key: u64,
-    pub size: [u32; 2],
-    pub pixels: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -449,8 +360,6 @@ pub(crate) struct ScrollGesture {
     pub(crate) speed: Point<f32>,
     pub(crate) edge: Option<(ScrollRef, Point<Pixels>)>,
 }
-
-pub const CARET_BLINK: Duration = Duration::from_millis(500);
 
 #[cfg(target_os = "macos")]
 struct Caret {

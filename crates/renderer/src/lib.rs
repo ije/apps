@@ -14,14 +14,19 @@ pub mod text;
 mod tree;
 mod window;
 
-pub use app::{App, THREAD_PER_APP, Timer, native, run, spawn};
+pub use app::{App, THREAD_PER_APP, run, spawn};
 pub use color::*;
 pub use control::*;
 pub use geometry::*;
+pub use gpu::Snapshot;
 pub use input::*;
 pub use node::{
     Child, Hooks, Node, NodeCx, NodeKey, ScrollRef, canvas, canvas_watching, canvas_within, layers,
     node, shared, text,
+};
+pub use platform::{
+    CARET_BLINK, Timer, WindowChange, WindowControl, WindowId, WindowOptions, WindowState,
+    control_size, native,
 };
 pub(crate) use scene::Scene;
 pub use scene::{Backdrop, BlendMode, BorderStyle, Glass, PaintEffect, RenderImage};

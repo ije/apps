@@ -764,8 +764,9 @@ impl Shared {
             self.wants_frames.set(false);
             want_frames(self.hwnd, false);
             let callbacks = self.callbacks;
-            self.quiet
-                .set(Some(crate::app::timer(QUIET, move |_| callbacks.release())));
+            self.quiet.set(Some(crate::platform::timer(QUIET, move || {
+                callbacks.release()
+            })));
         }
         true
     }
