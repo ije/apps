@@ -223,7 +223,7 @@ impl Desktop {
             let _ = std::thread::Builder::new()
                 .name("apps-warm".into())
                 .spawn(|| {
-                    use renderer::text::{Font, TextRun, TextSystem};
+                    use renderer::{Font, TextRun, TextSystem};
                     #[link(name = "CoreGraphics", kind = "framework")]
                     unsafe extern "C" {
                         fn CGMainDisplayID() -> u32;
@@ -656,7 +656,7 @@ impl Desktop {
                                 continue;
                             }
                         };
-                        renderer::text::warm(crate::style::font_lists(&doc));
+                        renderer::warm(crate::style::font_lists(&doc));
                         // Only bundled pages can run Node preloads. Never enable them for user files or HTML
                         // strings.
                         let trusted = location.starts_with("apps:///")

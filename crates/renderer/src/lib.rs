@@ -6,7 +6,7 @@ mod gpu;
 mod input;
 mod platform;
 mod style;
-pub mod text;
+mod text;
 
 pub use app::window::node::{
     Child, Hooks, Node, NodeCx, NodeKey, canvas, canvas_watching, canvas_within, layers, node,
@@ -31,7 +31,7 @@ pub use style::*;
 pub use text::{
     Decoration, DecorationStyle, Font, FontId, FontStyle, FontWeight, Glyph, GlyphId, Line,
     Paragraph, SUBPIXEL_STEPS, SharedString, TextAlign, TextLine, TextOverrides, TextRun,
-    TextStyle, TextSystem, TextWrap, WhiteSpace, WordBreak, Wrapping, widest_piece,
+    TextStyle, TextSystem, TextWrap, WhiteSpace, WordBreak, Wrapping, warm, widest_piece,
 };
 
 pub fn supports_glass() -> bool {
