@@ -93,7 +93,7 @@ fn render_group(
     render_nodes(group, max_bbox, transform, &mut sub_pixmap.as_mut());
 
     for filter in group.filters() {
-        filter::apply(filter, transform, &mut sub_pixmap, render_nodes);
+        filter::apply(filter, transform, &mut sub_pixmap);
     }
 
     if let Some(clip_path) = group.clip_path() {

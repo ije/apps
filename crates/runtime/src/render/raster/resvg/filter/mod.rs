@@ -249,20 +249,18 @@ impl Image {
 }
 
 // `feImage` draws its nodes with `render`, the tree walk of the parent module.
-pub(super) type Render = fn(&usvg::Group, IntRect, tiny_skia::Transform, &mut tiny_skia::PixmapMut);
 
 pub(super) fn apply(
     filter: &usvg::filter::Filter,
     ts: tiny_skia::Transform,
     source: &mut tiny_skia::Pixmap,
-    render: Render,
 ) {
     let (width, height) = (source.width(), source.height());
     let Some(empty) = tiny_skia::Pixmap::new(1, 1) else {
         return;
     };
     let graphic = Rc::new(std::mem::replace(source, empty));
-    let result = apply_inner(filter, ts, graphic, render).and_then(|image| {
+    let result = apply_inner(filter, ts, graphic).and_then(|image| {
         Ok(image
             .into_color_space(usvg::filter::ColorInterpolation::SRGB)
             .fit(width, height)?
@@ -286,7 +284,6 @@ fn apply_inner(
     filter: &usvg::filter::Filter,
     ts: usvg::Transform,
     source: Rc<tiny_skia::Pixmap>,
-    render: Render,
 ) -> Result<Image, Error> {
     let source = &source;
     let region = filter
@@ -342,7 +339,7 @@ fn apply_inner(
                 let input = get_input(fe.input(), region, source, &results)?;
                 apply_tile(input, region)
             }
-            usvg::filter::Kind::Image(fe) => apply_image(fe, region, subregion, ts, render),
+            usvg::filter::Kind::Image(fe) => apply_image(fe, region, subregion, ts),
             usvg::filter::Kind::ComponentTransfer(fe) => {
                 let input = get_input(fe.input(), region, source, &results)?;
                 apply_component_transfer(fe, cs, input)
@@ -735,7 +732,6 @@ fn apply_image(
     region: IntRect,
     subregion: IntRect,
     ts: usvg::Transform,
-    render: Render,
 ) -> Result<Image, Error> {
     let mut pixmap = new_pixmap(region.width(), region.height())?;
 
@@ -750,7 +746,7 @@ fn apply_image(
     );
 
     let max_bbox = tiny_skia::IntRect::from_xywh(0, 0, region.width(), region.height()).unwrap();
-    render(fe.root(), max_bbox, transform, &mut pixmap.as_mut());
+    super::render_nodes(fe.root(), max_bbox, transform, &mut pixmap.as_mut());
 
     Ok(Image::from_image(
         pixmap,

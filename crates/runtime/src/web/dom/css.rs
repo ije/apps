@@ -436,13 +436,13 @@ pub(super) fn computed(
     // Container units: the width of the nearest container, the height of the nearest size container.
     let mut sizes = [None, None];
     let queried =
-        !state.layout.containers().is_empty() && style.own().any(|(_, value)| value.contains("cq"));
+        state.layout.has_containers() && style.own().any(|(_, value)| value.contains("cq"));
     for node in std::iter::successors(doc.nodes[id].parent, |&node| doc.nodes[node].parent)
         .take_while(|_| queried)
     {
         let kind = styles.values[node].get(Prop::CONTAINER_TYPE);
         if let (Some(kind @ ("size" | "inline-size")), Some(size)) =
-            (kind, state.layout.containers().get(&node))
+            (kind, state.layout.container_size(node))
         {
             sizes[0] = sizes[0].or(Some(size[0]));
             if kind == "size" {

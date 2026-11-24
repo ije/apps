@@ -206,7 +206,7 @@ On macOS, inputs with `appearance: system` use AppKit controls and Liquid Glass 
 
 ## Canvas, WebGPU, and media
 
-[Canvas 2D](crates/runtime/src/render/canvas.rs) uses tiny-skia pixel buffers and the platform text system. The page renderer uploads these images. SVG uses usvg and the runtime's rasterizer.
+[Canvas 2D](crates/runtime/src/render/raster/canvas/mod.rs) uses tiny-skia pixel buffers and the platform text system. The page renderer uploads these images. SVG uses usvg and the runtime's rasterizer.
 
 `OffscreenCanvas` and `ImageBitmap` store pixels in detached canvas nodes. Page workers have a hidden document for these resources. A transferred canvas sends its latest frame to the page through a single slot, so a slow page does not accumulate frames.
 
@@ -226,7 +226,7 @@ A preload script creates a session with `terminal.Session` of `@pierre/apps`, an
 
 The library starts the program in a PTY. A thread reads the output of the program and writes it to the terminal, so a program with much output does not stop the page. This thread lets the page take the lock of the terminal first, and it wakes the page one time until the page polls. The page then requests a frame.
 
-The element draws through a [paint hook](crates/runtime/src/render/terminal.rs), like `<canvas>`, so new output needs no style or layout work. The hook reads only the rows that changed since the last frame. For each of these rows, it shapes the text word by word and keeps the glyphs and the background spans. Each frame draws all rows from this data as rectangles and atlas glyphs. A cell is `1ch` wide and `1lh` tall, so the CSS box of the element sets the columns and rows. The hook gives a new size to the terminal and to the PTY in the frame that has it. An element without a session draws nothing. The scroll bar of the element is the one of other boxes. Each frame gives it the place of the screen in the scrollback, and a drag of its knob scrolls the terminal to a row.
+The element draws through a [paint hook](crates/runtime/src/render/paint/terminal.rs), like `<canvas>`, so new output needs no style or layout work. The hook reads only the rows that changed since the last frame. For each of these rows, it shapes the text word by word and keeps the glyphs and the background spans. Each frame draws all rows from this data as rectangles and atlas glyphs. A cell is `1ch` wide and `1lh` tall, so the CSS box of the element sets the columns and rows. The hook gives a new size to the terminal and to the PTY in the frame that has it. An element without a session draws nothing. The scroll bar of the element is the one of other boxes. Each frame gives it the place of the screen in the scrollback, and a drag of its knob scrolls the terminal to a row.
 
 libghostty-vt also keeps the images of the Kitty graphics protocol. It decodes PNG data with the PNG decoder of the runtime, which the library gets as a callback. Each frame lists the images on the screen. The hook copies the pixels of an image out of the terminal one time, when the image is new or its pixels changed, and draws the images below or above the text as the program asks. An animated image on the screen sets a timer for its next picture.
 

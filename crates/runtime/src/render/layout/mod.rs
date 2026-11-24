@@ -91,8 +91,12 @@ pub struct Layout {
 impl Layout {
     // What scripts read of the last layout.
 
-    pub(crate) fn containers(&self) -> &rustc_hash::FxHashMap<usize, [f32; 2]> {
-        &self.containers
+    pub(crate) fn has_containers(&self) -> bool {
+        !self.containers.is_empty()
+    }
+
+    pub(crate) fn container_size(&self, id: usize) -> Option<&[f32; 2]> {
+        self.containers.get(&id)
     }
 
     // The content box size of a box, as its last layout gave it.

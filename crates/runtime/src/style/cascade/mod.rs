@@ -8,6 +8,7 @@ use crate::style::cascade::container::QueryCache;
 use crate::style::cascade::memo::{CachedStyle, Inheritable, StyleKey};
 use crate::style::cascade::node::NodePass;
 use crate::style::cascade::scope::{Collect, MediaBlock, MediaStack, StyleScope};
+#[cfg(debug_assertions)]
 use crate::style::cascade::shadow::Shadowed;
 use crate::style::cascade::sheets::{Cssom, Derived, Sheet};
 use crate::style::cascade::table::CollapsedTable;
