@@ -122,7 +122,7 @@ fn opacity_patches_redraw_only_their_region_like_a_full_frame() {
             renderer.draw(&scene, false);
             scene.drawn();
             let (damage, drawn) = (
-                renderer.frame.damage.clone(),
+                renderer.frame.damage().to_vec(),
                 renderer.frame.instances.len(),
             );
             let last = renderer.last.clone().unwrap();
@@ -397,7 +397,7 @@ fn rebuilt_scenes_redraw_only_what_changed_like_a_full_frame() {
             }
             let drawn = (renderer.committed != committed).then(|| {
                 let frame = &renderer.frame;
-                (frame.damage.clone(), frame.instances.len())
+                (frame.damage().to_vec(), frame.instances.len())
             });
             let pixels = read(&renderer);
             let (_, full) = renderer.draw(&scene, true).unwrap().unwrap();
@@ -407,7 +407,7 @@ fn rebuilt_scenes_redraw_only_what_changed_like_a_full_frame() {
                 scene.patch(7, 0.25, None, [None; 2]);
                 renderer.draw(&scene, false);
                 scene.drawn();
-                let drawn = Some((renderer.frame.damage.clone(), 0));
+                let drawn = Some((renderer.frame.damage().to_vec(), 0));
                 let pixels = read(&renderer);
                 let (_, full) = renderer.draw(&scene, true).unwrap().unwrap();
                 send.send(("patched", drawn, pixels == full)).unwrap();
@@ -482,13 +482,13 @@ fn returned_drawables_draw_what_changed_since_their_frame() {
             scene.diff(Some(&[]));
             renderer.draw(&scene, false);
             scene.drawn();
-            let damaged = !renderer.frame.damage.is_empty();
+            let damaged = !renderer.frame.damage().is_empty();
             // A drawable from frames ago draws the steps of the box since then.
             // One frame moves the box 12px, so its own region is 24px wide. A drawable comes back after 3
             // frames at most, so a region never holds more than 3 moves.
-            uncopied += u32::from(renderer.frame.damage.iter().any(|region| region[2] > 24));
-            widest =
-                (renderer.frame.damage.iter()).fold(widest, |widest, region| widest.max(region[2]));
+            uncopied += u32::from(renderer.frame.damage().iter().any(|region| region[2] > 24));
+            widest = (renderer.frame.damage().iter())
+                .fold(widest, |widest, region| widest.max(region[2]));
             let last = renderer.last.clone().unwrap();
             let commands = renderer.queue.commandBuffer().unwrap();
             let buffer = renderer.read_back(&commands, &last, [200, 120]).unwrap();
@@ -624,10 +624,7 @@ fn scrolled_content_copies_the_last_frame_moved() {
             renderer.draw(&scene, false);
             scene.drawn();
             let kept = renderer.frame.keeps_under_now();
-            let area: i32 = renderer
-                .frame
-                .damage
-                .iter()
+            let area: i32 = (renderer.frame.damage().iter())
                 .map(|region| region[2] * region[3])
                 .sum();
             let pixels = read(&renderer);

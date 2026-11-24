@@ -80,27 +80,27 @@ pub struct RenderFrame {
     pub blurs: Vec<Blur>,
     pub commands: Vec<Command>,
     pub layers: Vec<Layer>,
-    pub textures: Vec<[u32; 2]>,
+    textures: Vec<[u32; 2]>,
     free: Vec<usize>,
     shelves: Vec<Option<Shelf>>,
     deferred: Vec<Vec<Deferred>>,
     window: [u32; 2],
     max_texture: f32,
     copy: bool,
-    pub skip: Vec<usize>,
-    pub content: Vec<usize>,
+    skip: Vec<usize>,
+    content: Vec<usize>,
     // With regions, only the window content that reaches each is drawn, then copied over the last frame.
-    pub damage: Vec<[i32; 4]>,
+    damage: Vec<[i32; 4]>,
     // The targets of the window content.
     pub bases: Vec<Target>,
     cull: Option<Rect<f32>>,
     // For each texture, the id of the cached layer that it keeps, or 0.
-    pub kept: Vec<u64>,
+    kept: Vec<u64>,
     // Sizes of the backend's spare textures, which new layers take before other sizes.
-    pub spare: Vec<[u32; 2]>,
+    spare: Vec<[u32; 2]>,
     cache: Vec<Cached>,
     // Cached layers draw again, for a frame that is drawn twice in different color spaces.
-    pub fresh: bool,
+    fresh: bool,
     // Layer keys drawn lately, by frame. A layer is kept when it draws the same in a later frame.
     seen: rustc_hash::FxHashMap<u64, u32>,
     count: u32,
@@ -112,7 +112,7 @@ pub struct RenderFrame {
     pub shot_commands: usize,
     // Set by a backend that draws damage regions over the last frame: it then keeps the window below what paints
     // after a scrolled content, so a scroll draws again only what changed there and what paints after it.
-    pub keeps_under: bool,
+    keeps_under: bool,
     under: Option<KeptUnder>,
     // A target that the first copies into cover whole, so its old pixels need no load.
     pub covered: Option<Target>,
@@ -292,6 +292,31 @@ impl RenderFrame {
     #[cfg(target_os = "macos")]
     pub(crate) fn take_spare<T>(&mut self, pool: &Pool<T>) {
         pool.spare(&mut self.spare);
+    }
+
+    // What the backend asks of the next frames. It draws the `skip` layers itself, and the frame draws the content of
+    // the `content` ones in targets of their own. `damage` lists the window regions to draw over the last frame, or
+    // none for the whole window. `fresh` draws cached layers again, and `keeps_under` keeps the window below what
+    // paints after a scrolled content.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn prepare(
+        &mut self,
+        skip: &[usize],
+        content: &[usize],
+        damage: Vec<[i32; 4]>,
+        fresh: bool,
+        keeps_under: bool,
+    ) {
+        self.skip.clear();
+        self.skip.extend_from_slice(skip);
+        self.content.clear();
+        self.content.extend_from_slice(content);
+        (self.damage, self.fresh, self.keeps_under) = (damage, fresh, keeps_under);
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn damage(&self) -> &[[i32; 4]] {
+        &self.damage
     }
 
     pub fn record(&mut self, scene: &Scene, window: [u32; 2], max_texture: u32, copy: bool) {
