@@ -5,7 +5,9 @@ use super::{
     window::{Shared, Snapshot, cg_size, flip, primary_top},
 };
 use crate::{
-    Event, Pixels, Point, Size, WindowChange, WindowOptions, WindowState, app::Callbacks, px, size,
+    Event, Pixels, Point, Size, WindowChange, WindowOptions, WindowState,
+    platform::{Callbacks, events},
+    px, size,
 };
 use anyhow::{Context as _, Result};
 use objc2::{
@@ -135,7 +137,7 @@ define_class!(
     unsafe impl NSWindowDelegate for AppsWindow {
         #[unsafe(method(windowShouldClose:))]
         fn should_close(&self, _: &AnyObject) -> bool {
-            self.ivars().callbacks.should_close()
+            events().should_close(self.ivars().callbacks)
         }
 
         #[unsafe(method(windowDidResize:))]
@@ -161,7 +163,7 @@ define_class!(
                 false => "bottom",
             };
             let bounds = flip(NSRect::new(frame.origin, size), primary_top(self.mtm()));
-            match self.ivars().callbacks.will_change(edge, bounds) {
+            match events().will_change(self.ivars().callbacks, edge, bounds) {
                 true => frame.size,
                 false => size,
             }
@@ -170,7 +172,7 @@ define_class!(
         #[unsafe(method(windowWillMove:))]
         fn will_move(&self, _: &AnyObject) {
             let bounds = flip(self.frame(), primary_top(self.mtm()));
-            self.ivars().callbacks.will_change("move", bounds);
+            events().will_change(self.ivars().callbacks, "move", bounds);
         }
 
         #[unsafe(method(windowDidChangeOcclusionState:))]
@@ -179,7 +181,7 @@ define_class!(
             if self.on_screen() {
                 self.place_buttons();
             } else {
-                self.ivars().callbacks.release();
+                events().release(self.ivars().callbacks);
             }
             self.report();
         }
@@ -505,7 +507,7 @@ impl AppsWindow {
 
     pub fn report(&self) {
         self.refresh();
-        self.ivars().callbacks.changed();
+        events().changed(self.ivars().callbacks);
     }
 
     fn locate(&self) {
@@ -534,7 +536,7 @@ impl AppsWindow {
             .is_some_and(|screen| screen.canRepresentDisplayGamut(NSDisplayGamut::P3));
         super::metal::set_gamut(layer, p3);
         self.refresh();
-        self.ivars().callbacks.resized(content, scale);
+        events().resized(self.ivars().callbacks, content, scale);
     }
 
     pub fn set_title(&self, title: &str) {
@@ -637,7 +639,7 @@ impl AppsWindow {
             Event::FileLeave => Some(false),
             _ => None,
         };
-        self.ivars().callbacks.input_later(event);
+        events().input_later(self.ivars().callbacks, event);
         if let Some(over) = over {
             self.view().ivars().files_over.set(over);
         }

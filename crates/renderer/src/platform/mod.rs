@@ -21,7 +21,7 @@ pub(crate) use linux::*;
 
 pub mod native;
 
-use crate::{Color, Pixels, Point, Rect, Size, px};
+use crate::{Color, Event, Pixels, Point, Rect, Size, px};
 use std::{cell::Cell, rc::Rc, time::Duration};
 
 /// Cancels its callback when dropped, unless detached.
@@ -56,6 +56,89 @@ pub(crate) fn timer(delay: Duration, job: impl FnOnce() + 'static) -> Timer {
         cancelled,
         detached: false,
     }
+}
+
+/// A native window's link to its app: the window and the thread of the app.
+#[derive(Clone, Copy)]
+pub(crate) struct Callbacks {
+    pub id: WindowId,
+    pub thread: AppThread,
+}
+
+/// The newest pointer move that waits for the app, which later moves replace.
+#[cfg(target_os = "macos")]
+pub(crate) type Motion = std::sync::Arc<std::sync::Mutex<Option<(Event, std::time::Instant)>>>;
+
+/// What native windows ask of the app that owns them. The app sets it once, with `set_events`.
+pub(crate) trait WindowEvents: Sync {
+    fn input(&self, at: Callbacks, event: Event) -> bool;
+    #[cfg(target_os = "macos")]
+    fn input_later(&self, at: Callbacks, event: Event);
+    #[cfg(target_os = "macos")]
+    fn input_motion(&self, at: Callbacks, motion: Motion);
+    #[cfg(target_os = "macos")]
+    fn hold_key(&self, at: Callbacks, key: Event, composing: bool);
+    /// The input method took the held key.
+    #[cfg(target_os = "macos")]
+    fn ime_took_key(&self, at: Callbacks);
+    /// `Some(false)` when the window wants no more frames.
+    #[cfg(not(target_os = "macos"))]
+    fn frame(&self, at: Callbacks) -> Option<bool>;
+    /// A display tick at `time`, or a forced frame with `None`.
+    #[cfg(target_os = "macos")]
+    fn tick(&self, at: Callbacks, time: Option<std::time::Instant>);
+    /// Draws a frame of a live resize, and returns its present.
+    #[cfg(target_os = "macos")]
+    fn present_live(&self, at: Callbacks, visible: bool) -> Option<Present>;
+    fn resized(&self, at: Callbacks, size: Size<Pixels>, scale_factor: f32);
+    fn changed(&self, at: Callbacks);
+    #[cfg(target_os = "macos")]
+    fn will_change(&self, at: Callbacks, kind: &str, bounds: Rect) -> bool;
+    fn should_close(&self, at: Callbacks) -> bool;
+    fn appearance_changed(&self, at: Callbacks);
+    fn release(&self, at: Callbacks);
+    /// The GPU device is gone, so all windows draw again.
+    #[cfg(windows)]
+    fn device_lost(&self);
+    #[cfg(windows)]
+    fn in_drag_area(&self, at: Callbacks, point: Point<Pixels>) -> bool;
+    fn accepts_text_input(&self, at: Callbacks) -> bool;
+    fn selection(&self, at: Callbacks) -> Option<crate::Utf16Selection>;
+    fn composition(&self, at: Callbacks) -> Option<std::ops::Range<usize>>;
+    #[cfg(not(target_os = "macos"))]
+    fn clear_composition(&self, at: Callbacks);
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::type_complexity)]
+    fn text_in(
+        &self,
+        at: Callbacks,
+        range: std::ops::Range<usize>,
+    ) -> Option<(String, Option<std::ops::Range<usize>>)>;
+    fn insert(&self, at: Callbacks, range: Option<std::ops::Range<usize>>, text: &str);
+    fn compose(
+        &self,
+        at: Callbacks,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        selected: Option<std::ops::Range<usize>>,
+    );
+    #[cfg(not(windows))]
+    fn end_composition(&self, at: Callbacks);
+    fn rect_of(&self, at: Callbacks, range: std::ops::Range<usize>) -> Option<Rect>;
+    #[cfg(target_os = "macos")]
+    fn index_at(&self, at: Callbacks, point: Point<Pixels>) -> Option<usize>;
+}
+
+static EVENTS: std::sync::OnceLock<&'static dyn WindowEvents> = std::sync::OnceLock::new();
+
+pub(crate) fn set_events(events: &'static dyn WindowEvents) {
+    let _ = EVENTS.set(events);
+}
+
+pub(crate) fn events() -> &'static dyn WindowEvents {
+    *EVENTS
+        .get()
+        .expect("the app sets its window events before it opens windows")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

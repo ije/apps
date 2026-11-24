@@ -1,4 +1,8 @@
-use crate::{Button, Cursor, Event, Key, Modifiers, Pixels, Point, Rect, app::Callbacks, px};
+use crate::{
+    Button, Cursor, Event, Key, Modifiers, Pixels, Point, Rect,
+    platform::{Callbacks, events},
+    px,
+};
 use anyhow::{Result, bail, ensure};
 use std::io::{ErrorKind::Interrupted, Read as _};
 use std::os::{fd::AsRawFd as _, unix::ffi::OsStringExt as _};
@@ -42,16 +46,18 @@ pub(super) enum Ime {
 impl Ime {
     pub fn apply(self, callbacks: Callbacks) {
         match self {
-            Self::Commit(text) => callbacks.insert(None, &text),
-            Self::Compose(text) if !text.is_empty() => callbacks.compose(None, &text, None),
-            Self::Compose(_) | Self::Clear => callbacks.clear_composition(),
-            Self::End => callbacks.end_composition(),
+            Self::Commit(text) => events().insert(callbacks, None, &text),
+            Self::Compose(text) if !text.is_empty() => {
+                events().compose(callbacks, None, &text, None)
+            }
+            Self::Compose(_) | Self::Clear => events().clear_composition(callbacks),
+            Self::End => events().end_composition(callbacks),
         }
     }
 }
 
 pub(super) fn caret(callbacks: Callbacks) -> Option<Rect> {
-    callbacks.rect_of(callbacks.selection()?.range)
+    events().rect_of(callbacks, events().selection(callbacks)?.range)
 }
 
 /// The key filter of main goes first, then the page, then the input changes. A key that nobody took types its text.
@@ -71,13 +77,14 @@ pub(super) fn press(
         repeat,
         ime: !changes.is_empty(),
     };
-    let composing = || callbacks.composition().is_some();
-    let taken = crate::native::key(callbacks.id, &event, &composing) || callbacks.input(event);
+    let composing = || events().composition(callbacks).is_some();
+    let taken =
+        crate::native::key(callbacks.id, &event, &composing) || events().input(callbacks, event);
     for change in changes {
         change.apply(callbacks);
     }
     if !taken && let Some(text) = typed {
-        callbacks.insert(None, &text);
+        events().insert(callbacks, None, &text);
     }
 }
 
@@ -87,9 +94,9 @@ pub(super) fn release(callbacks: Callbacks, key: Key, modifiers: Modifiers) {
         modifiers,
         ime: false,
     };
-    let composing = || callbacks.composition().is_some();
+    let composing = || events().composition(callbacks).is_some();
     if !crate::native::key(callbacks.id, &event, &composing) {
-        callbacks.input(event);
+        events().input(callbacks, event);
     }
 }
 

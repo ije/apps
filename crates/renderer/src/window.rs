@@ -866,8 +866,93 @@ impl Window {
         self.refresh();
     }
 
-    pub(crate) fn take_frame_callbacks(&mut self) -> Vec<FrameCallback> {
-        mem::take(&mut self.frame_callbacks)
+    // The frame of a display tick or a forced frame.
+    pub(crate) fn frame(&mut self, app: &mut App) {
+        for callback in mem::take(&mut self.frame_callbacks) {
+            callback(self, app);
+        }
+        if self.dirty || !self.captures.is_empty() {
+            // The diff damage holds the regions of a patch that was not drawn.
+            self.patch = false;
+            self.draw(app);
+        }
+        self.draw_patch();
+        self.frame_at = None;
+    }
+
+    // A native event, in zoomed pixels. `drop_held` forgets a key that waits for the input method.
+    pub(crate) fn dispatch_native(
+        &mut self,
+        mut event: Event,
+        app: &mut App,
+        drop_held: bool,
+    ) -> bool {
+        if drop_held {
+            self.ime_key = None;
+        }
+        if self.zoom != 1. {
+            event.unzoom(self.zoom);
+        }
+        self.dispatch_event(event, app)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn dispatch_at(&mut self, event: Event, sent: Instant, app: &mut App) {
+        self.event_at = Some(sent);
+        self.dispatch_native(event, app, false);
+        self.event_at = None;
+    }
+
+    // A key that the input method may take. The text it types or composes says what the key was.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn hold_key(&mut self, key: Event, composing: bool) {
+        self.ime_key = Some((key, composing));
+    }
+
+    // `ime` is set when the key typed more than one character or composes, and then the page ignores it.
+    pub(crate) fn send_ime_key(&mut self, app: &mut App, typed: bool) -> bool {
+        let Some((mut key, composing)) = self.ime_key.take() else {
+            return false;
+        };
+        let ime = typed || composing;
+        if let Event::KeyDown { ime: held, .. } = &mut key {
+            *held = ime;
+        }
+        self.dispatch_native(key, app, false) && !ime
+    }
+
+    pub(crate) fn release_gpu(&mut self) {
+        #[cfg(target_os = "macos")]
+        self.platform.release(&self.scene);
+        #[cfg(not(target_os = "macos"))]
+        self.platform.release();
+    }
+
+    // A display tick at `at`. False when the GPU queue is full, and the tick draws no frame.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn start_tick(&mut self, at: Instant) -> bool {
+        let free = !self.platform.renderer.take_congested();
+        self.frame_at = free.then_some(at);
+        free
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn rest(&mut self) {
+        self.platform.rest();
+    }
+
+    // A live resize presents the next frame inside the transaction of AppKit when `visible`.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn live_resize(&mut self, visible: bool) {
+        self.platform
+            .renderer
+            .set_presents_with_transaction(visible);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn end_live_resize(&mut self) -> Option<platform::Present> {
+        self.platform.renderer.set_presents_with_transaction(false);
+        self.platform.renderer.take_present()
     }
 
     pub(crate) fn wants_frame(&self) -> bool {

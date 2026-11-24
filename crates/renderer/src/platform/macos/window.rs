@@ -4,10 +4,11 @@ use super::{
     nsview::AppsView,
     nswindow::{self, AppsWindow},
     threads::{native_post, native_sync, post, post_local},
-    vsync::{Pacer, step},
+    vsync::Pacer,
 };
 use crate::{
-    Pixels, Point, Rect, Scene, Size, WindowChange, WindowOptions, WindowState, app::Callbacks,
+    Pixels, Point, Rect, Scene, Size, WindowChange, WindowOptions, WindowState,
+    platform::{Callbacks, events},
     point, px, rect, size,
 };
 use anyhow::{Context as _, Result};
@@ -342,7 +343,10 @@ impl Window {
 
     pub fn force_frame(&self) {
         let callbacks = self.callbacks;
-        post(callbacks.thread, Box::new(move || step(callbacks)));
+        post(
+            callbacks.thread,
+            Box::new(move || events().tick(callbacks, None)),
+        );
     }
 
     pub(crate) fn rest(&mut self) {
@@ -357,7 +361,7 @@ impl Window {
         }
         self.renderer.trim();
         let callbacks = self.callbacks;
-        let release = crate::platform::timer(QUIET, move || callbacks.release());
+        let release = crate::platform::timer(QUIET, move || events().release(callbacks));
         self.quiet = Some(release);
     }
 

@@ -8,7 +8,10 @@ mod x11;
 
 use super::single::Task;
 use crate::{Cursor, Pixels, Point, Rect, Scene, Size, WindowChange, WindowOptions};
-use crate::{WindowState, app::Callbacks};
+use crate::{
+    WindowState,
+    platform::{Callbacks, events},
+};
 use anyhow::Result;
 use gpu::{Atlas, Capture};
 use raw_window_handle::RawWindowHandle;
@@ -357,7 +360,7 @@ impl Window {
     pub fn force_frame(&self) {
         let calls = self.calls;
         soon(move || {
-            calls.frame();
+            events().frame(calls);
         });
     }
 
@@ -374,7 +377,7 @@ impl Window {
 
     fn wait(&self) {
         let calls = self.calls;
-        crate::platform::timer(QUIET, move || calls.release()).detach();
+        crate::platform::timer(QUIET, move || events().release(calls)).detach();
     }
 
     pub fn release(&self) {

@@ -9,7 +9,7 @@ mod keys;
 mod window;
 
 use super::single::Task;
-use crate::{Cursor, Rect, WindowOptions, app::Callbacks, point, px, size};
+use crate::{Cursor, Rect, WindowOptions, platform::Callbacks, point, px, size};
 use anyhow::Result;
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering::*};

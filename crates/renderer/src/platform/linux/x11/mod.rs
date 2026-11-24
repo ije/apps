@@ -4,7 +4,10 @@ mod window;
 use super::input::{self, Clicks, Composer, Ime, NOTCH_LINES};
 use super::{Display, Opened};
 use crate::{Button, Cursor, Event, Modifiers, Pixels, Point, Rect, WindowOptions};
-use crate::{app::Callbacks, point, px, size};
+use crate::{
+    platform::{Callbacks, events},
+    point, px, size,
+};
 use anyhow::{Context as _, Result, ensure};
 use rustc_hash::FxHashMap;
 use std::os::fd::{AsRawFd as _, RawFd};
@@ -711,7 +714,7 @@ impl Client {
                     live.drag.read = true;
                     live.drag.at
                 };
-                window.calls.input(Event::FileEnter { at, paths });
+                events().input(window.calls, Event::FileEnter { at, paths });
             }
             XEvent::FocusIn(focus) => {
                 let window = self.window(focus.event)?;
@@ -754,9 +757,10 @@ impl Client {
                 }
                 let focus = live.focus?;
                 drop(live);
-                self.window(focus)?
-                    .calls
-                    .input(Event::ModifiersChanged { modifiers: now.0 });
+                events().input(
+                    self.window(focus)?.calls,
+                    Event::ModifiersChanged { modifiers: now.0 },
+                );
             }
             XEvent::KeyPress(press) => {
                 let window = self.window(press.event)?;
@@ -821,12 +825,15 @@ impl Client {
                     detail => {
                         let button = button(detail)?;
                         let clicks = self.live.borrow_mut().clicks.press(button, at);
-                        window.calls.input(Event::PointerDown {
-                            at,
-                            button,
-                            modifiers,
-                            clicks,
-                        });
+                        events().input(
+                            window.calls,
+                            Event::PointerDown {
+                                at,
+                                button,
+                                modifiers,
+                                clicks,
+                            },
+                        );
                         return Some(());
                     }
                 };
@@ -835,7 +842,7 @@ impl Client {
                     .flags
                     .contains(xinput::PointerEventFlags::POINTER_EMULATED)
                 {
-                    window.calls.input(wheel_event(at, wheel, modifiers));
+                    events().input(window.calls, wheel_event(at, wheel, modifiers));
                 }
             }
             XEvent::XinputButtonRelease(release) => {
@@ -844,12 +851,15 @@ impl Client {
                 let clicks = self.live.borrow().clicks.count;
                 let at = self.at(release.event_x, release.event_y);
                 let modifiers = mask_modifiers(release.mods.effective as u16);
-                window.calls.input(Event::PointerUp {
-                    at,
-                    button,
-                    modifiers,
-                    clicks,
-                });
+                events().input(
+                    window.calls,
+                    Event::PointerUp {
+                        at,
+                        button,
+                        modifiers,
+                        clicks,
+                    },
+                );
             }
             XEvent::XinputMotion(motion) => {
                 let window = self.window(motion.event)?;
@@ -872,14 +882,17 @@ impl Client {
                     let held = pressed
                         .into_iter()
                         .find_map(|(bit, button)| (buttons & bit != 0).then_some(button));
-                    window.calls.input(Event::PointerMove {
-                        at,
-                        held,
-                        modifiers,
-                    });
+                    events().input(
+                        window.calls,
+                        Event::PointerMove {
+                            at,
+                            held,
+                            modifiers,
+                        },
+                    );
                 }
                 if let Some(scroll) = scroll {
-                    window.calls.input(wheel_event(at, scroll, modifiers));
+                    events().input(window.calls, wheel_event(at, scroll, modifiers));
                 }
             }
             XEvent::XinputEnter(enter) if enter.mode == xinput::NotifyMode::NORMAL => {
@@ -890,9 +903,7 @@ impl Client {
                 self.forget_scrolls();
                 self.live.borrow_mut().hover = None;
                 let at = self.at(leave.event_x, leave.event_y);
-                self.window(leave.event)?
-                    .calls
-                    .input(Event::PointerLeave { at });
+                events().input(self.window(leave.event)?.calls, Event::PointerLeave { at });
             }
             XEvent::XinputHierarchy(_) => {
                 let old = std::mem::take(&mut self.live.borrow_mut().scrollers);
@@ -928,7 +939,7 @@ impl Client {
         let atoms = &self.atoms;
         let kind = message.type_;
         if kind == atoms.Protocols && first == atoms.DeleteWindow {
-            window.calls.should_close();
+            events().should_close(window.calls);
         } else if kind == atoms.Protocols && first == atoms.SyncRequest {
             window.sync_request(x11rb::protocol::sync::Int64 {
                 lo: third,
@@ -991,11 +1002,11 @@ impl Client {
                 atoms.DndStatus,
                 [message.window, u32::from(files), 0, 0, action],
             );
-            window.calls.input(Event::FileOver { at });
+            events().input(window.calls, Event::FileOver { at });
         } else if kind == atoms.DndLeave {
             let at = std::mem::take(&mut self.live.borrow_mut().drag).at;
-            window.calls.input(Event::FileOver { at });
-            window.calls.input(Event::FileLeave);
+            events().input(window.calls, Event::FileOver { at });
+            events().input(window.calls, Event::FileLeave);
         } else if kind == atoms.DndDrop {
             let drag = std::mem::take(&mut self.live.borrow_mut().drag);
             self.tell(
@@ -1003,11 +1014,14 @@ impl Client {
                 atoms.DndFinished,
                 [message.window, u32::from(drag.read), atoms.DndCopy, 0, 0],
             );
-            window.calls.input(if drag.read {
-                Event::FileDrop { at: drag.at }
-            } else {
-                Event::FileLeave
-            });
+            events().input(
+                window.calls,
+                if drag.read {
+                    Event::FileDrop { at: drag.at }
+                } else {
+                    Event::FileLeave
+                },
+            );
         }
         Some(())
     }

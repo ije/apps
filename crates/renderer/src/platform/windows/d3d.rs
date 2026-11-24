@@ -550,11 +550,7 @@ impl Renderer {
                     // The next frame makes a new device. Every window must draw again on it.
                     self.surface = None;
                     super::run_after(Duration::from_millis(100), || {
-                        crate::app::update(|app| {
-                            for id in app.window_ids() {
-                                app.refresh_window(id);
-                            }
-                        })
+                        crate::platform::events().device_lost()
                     });
                 }
                 capture.then_some(Err(error))

@@ -1,7 +1,7 @@
 use crate::{
     Event, Pixels, Point, Rect, Size, TextSystem, Utf16Selection, View, Window, WindowId,
     WindowOptions, platform,
-    platform::{Timer, native},
+    platform::{Callbacks, Timer, WindowEvents, native},
 };
 use anyhow::Result;
 use std::{
@@ -104,6 +104,7 @@ fn install(platform: Rc<platform::Platform>) {
         on_wake: None,
         wake_pending: Arc::default(),
     };
+    platform::set_events(&Events);
     let home = Home {
         app: RefCell::new(app),
         backlog: RefCell::default(),
@@ -277,154 +278,173 @@ impl App {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct Callbacks {
-    pub id: WindowId,
-    pub thread: platform::AppThread,
-}
-
-pub(crate) fn dispatch(window: &mut Window, app: &mut App, mut event: Event) -> bool {
-    if window.zoom != 1. {
-        event.unzoom(window.zoom);
+// Runs on the app thread and waits for the answer, at most 100 ms from the main thread on macOS.
+fn with<R: Send + 'static>(
+    at: Callbacks,
+    job: impl FnOnce(&mut Window, &mut App) -> R + Send + 'static,
+) -> Option<R> {
+    let id = at.id;
+    let run = move || try_update(|app| app.update_window(id, job)).flatten();
+    match home() {
+        Some(_) => run(),
+        None => platform::ask(at.thread, run).flatten(),
     }
-    window.dispatch_event(event, app)
 }
 
-// `ime` is set when the key typed more than one character or composes, and then the page ignores it.
-pub(crate) fn send_ime_key(window: &mut Window, app: &mut App, typed: bool) -> bool {
-    let Some((mut key, composing)) = window.ime_key.take() else {
-        return false;
+fn queue(at: Callbacks, job: impl FnOnce(&mut Window, &mut App) + Send + 'static) {
+    let id = at.id;
+    let run = move || {
+        update(move |app| {
+            app.update_window(id, job);
+        })
     };
-    let ime = typed || composing;
-    if let Event::KeyDown { ime: held, .. } = &mut key {
-        *held = ime;
+    match home() {
+        Some(_) => run(),
+        None => platform::post(at.thread, Box::new(run)),
     }
-    dispatch(window, app, key) && !ime
 }
 
-impl Callbacks {
-    // Runs on the app thread and waits for the answer, at most 100 ms from the main thread on macOS.
-    pub(crate) fn with<R: Send + 'static>(
-        &self,
-        job: impl FnOnce(&mut Window, &mut App) -> R + Send + 'static,
-    ) -> Option<R> {
-        let id = self.id;
-        let run = move || try_update(|app| app.update_window(id, job)).flatten();
-        match home() {
-            Some(_) => run(),
-            None => platform::ask(self.thread, run).flatten(),
-        }
-    }
+// Frames stop when this returns `Some(false)`, so an idle window gets no calls.
+fn frame(at: Callbacks) -> Option<bool> {
+    with(at, |window, app| window.frame(app))?;
+    let home = home()?;
+    let app = home.app.borrow();
+    let window = app.windows.get(&at.id)?.as_deref();
+    Some(window.is_some_and(Window::wants_frame))
+}
 
-    pub(crate) fn queue(&self, job: impl FnOnce(&mut Window, &mut App) + Send + 'static) {
-        let id = self.id;
-        let run = move || {
-            update(move |app| {
-                app.update_window(id, job);
-            })
-        };
-        match home() {
-            Some(_) => run(),
-            None => platform::post(self.thread, Box::new(run)),
-        }
-    }
+struct Events;
 
-    pub fn input(&self, event: Event) -> bool {
-        self.with(move |window, app| {
-            window.ime_key = None;
-            dispatch(window, app, event)
+impl WindowEvents for Events {
+    fn input(&self, at: Callbacks, event: Event) -> bool {
+        with(at, move |window, app| {
+            window.dispatch_native(event, app, true)
         })
         .unwrap_or(false)
     }
 
     #[cfg(target_os = "macos")]
-    pub fn input_later(&self, event: Event) {
-        self.queue(move |window, app| {
-            dispatch(window, app, event);
+    fn input_later(&self, at: Callbacks, event: Event) {
+        queue(at, move |window, app| {
+            window.dispatch_native(event, app, false);
         });
     }
 
-    // Frames stop when this returns `Some(false)`, so an idle window gets no calls.
-    pub fn frame(&self) -> Option<bool> {
-        self.with(|window, app| {
-            for callback in window.take_frame_callbacks() {
-                callback(window, app);
+    #[cfg(target_os = "macos")]
+    fn input_motion(&self, at: Callbacks, motion: platform::Motion) {
+        queue(at, move |window, app| {
+            if let Some((input, sent)) = platform::lock(&motion).take() {
+                window.dispatch_at(input, sent, app);
             }
-            if window.dirty || !window.captures.is_empty() {
-                // The diff damage holds the regions of a patch that was not drawn.
-                window.patch = false;
-                window.draw(app);
-            }
-            window.draw_patch();
-            window.frame_at = None;
-        })?;
-        let home = home()?;
-        let app = home.app.borrow();
-        let window = app.windows.get(&self.id)?.as_deref();
-        Some(window.is_some_and(Window::wants_frame))
+        });
     }
 
-    pub fn resized(&self, size: Size<Pixels>, scale_factor: f32) {
-        native::window_event(self.id, native::WindowEvent::Changed);
-        self.queue(move |window, app| {
+    #[cfg(target_os = "macos")]
+    fn hold_key(&self, at: Callbacks, key: Event, composing: bool) {
+        queue(at, move |window, _| window.hold_key(key, composing));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn ime_took_key(&self, at: Callbacks) {
+        queue(at, |window, app| {
+            window.send_ime_key(app, false);
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn frame(&self, at: Callbacks) -> Option<bool> {
+        frame(at)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn tick(&self, at: Callbacks, time: Option<std::time::Instant>) {
+        // A tick without a frame takes one frame out of a queue that is too long.
+        if let Some(time) = time
+            && with(at, move |window, _| window.start_tick(time)) != Some(true)
+        {
+            return;
+        }
+        if frame(at) == Some(false) {
+            with(at, |window, _| window.rest());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn present_live(&self, at: Callbacks, visible: bool) -> Option<platform::Present> {
+        with(at, move |window, _| window.live_resize(visible));
+        self.tick(at, None);
+        with(at, |window, _| window.end_live_resize()).flatten()
+    }
+
+    fn resized(&self, at: Callbacks, size: Size<Pixels>, scale_factor: f32) {
+        native::window_event(at.id, native::WindowEvent::Changed);
+        queue(at, move |window, app| {
             window.mark_resized(size, scale_factor);
             window.with_view(app, |view, window, app| view.window_changed(window, app));
         });
     }
 
-    pub fn changed(&self) {
-        native::window_event(self.id, native::WindowEvent::Changed);
-        self.queue(|window, app| {
+    fn changed(&self, at: Callbacks) {
+        native::window_event(at.id, native::WindowEvent::Changed);
+        queue(at, |window, app| {
             window.refresh();
             window.with_view(app, |view, window, app| view.window_changed(window, app));
         });
     }
 
     #[cfg(target_os = "macos")]
-    pub fn will_change(&self, kind: &str, bounds: Rect) -> bool {
-        native::will_change(self.id, kind, bounds)
+    fn will_change(&self, at: Callbacks, kind: &str, bounds: Rect) -> bool {
+        native::will_change(at.id, kind, bounds)
     }
 
     // Main decides, and closes the window itself.
-    pub fn should_close(&self) -> bool {
-        native::window_event(self.id, native::WindowEvent::CloseRequested);
+    fn should_close(&self, at: Callbacks) -> bool {
+        native::window_event(at.id, native::WindowEvent::CloseRequested);
         false
     }
 
-    pub fn appearance_changed(&self) {
-        self.queue(|window, _| window.refresh());
+    fn appearance_changed(&self, at: Callbacks) {
+        queue(at, |window, _| window.refresh());
     }
 
-    pub fn release(&self) {
-        self.queue(|window, _| {
-            #[cfg(target_os = "macos")]
-            window.platform.release(&window.scene);
-            #[cfg(not(target_os = "macos"))]
-            window.platform.release();
-        });
+    fn release(&self, at: Callbacks) {
+        queue(at, |window, _| window.release_gpu());
     }
 
     #[cfg(windows)]
-    pub fn in_drag_area(&self, at: Point<Pixels>) -> bool {
-        self.with(move |window, _| window.in_drag_area(at / window.zoom))
-            .unwrap_or(false)
+    fn device_lost(&self) {
+        update(|app| {
+            for id in app.window_ids() {
+                app.refresh_window(id);
+            }
+        })
     }
 
-    pub fn accepts_text_input(&self) -> bool {
-        self.with(|window, app| window.with_view(app, |_, _, _| ()).is_some())
-            .unwrap_or(false)
+    #[cfg(windows)]
+    fn in_drag_area(&self, at: Callbacks, point: Point<Pixels>) -> bool {
+        with(at, move |window, _| {
+            window.in_drag_area(point / window.zoom)
+        })
+        .unwrap_or(false)
     }
 
-    pub fn selection(&self) -> Option<Utf16Selection> {
-        self.with(|window, app| {
+    fn accepts_text_input(&self, at: Callbacks) -> bool {
+        with(at, |window, app| {
+            window.with_view(app, |_, _, _| ()).is_some()
+        })
+        .unwrap_or(false)
+    }
+
+    fn selection(&self, at: Callbacks) -> Option<Utf16Selection> {
+        with(at, |window, app| {
             window.with_view(app, |view, window, app| view.selection(window, app))
         })
         .flatten()
         .flatten()
     }
 
-    pub fn composition(&self) -> Option<Range<usize>> {
-        self.with(|window, app| {
+    fn composition(&self, at: Callbacks) -> Option<Range<usize>> {
+        with(at, |window, app| {
             window.with_view(app, |view, window, app| view.composition(window, app))
         })
         .flatten()
@@ -432,15 +452,19 @@ impl Callbacks {
     }
 
     #[cfg(not(target_os = "macos"))]
-    pub fn clear_composition(&self) {
-        if let Some(composed) = self.composition() {
-            self.insert(Some(composed), "");
+    fn clear_composition(&self, at: Callbacks) {
+        if let Some(composed) = self.composition(at) {
+            self.insert(at, Some(composed), "");
         }
     }
 
     #[cfg(target_os = "macos")]
-    pub fn text_in(&self, range: Range<usize>) -> Option<(String, Option<Range<usize>>)> {
-        self.with(move |window, app| {
+    fn text_in(
+        &self,
+        at: Callbacks,
+        range: Range<usize>,
+    ) -> Option<(String, Option<Range<usize>>)> {
+        with(at, move |window, app| {
             let mut actual = None;
             let text = window.with_view(app, |view, window, app| {
                 view.text_in(range, &mut actual, window, app)
@@ -450,10 +474,10 @@ impl Callbacks {
         .flatten()
     }
 
-    pub fn insert(&self, range: Option<Range<usize>>, text: &str) {
+    fn insert(&self, at: Callbacks, range: Option<Range<usize>>, text: &str) {
         let text = text.to_owned();
-        self.queue(move |window, app| {
-            if !send_ime_key(window, app, text.encode_utf16().count() > 1) {
+        queue(at, move |window, app| {
+            if !window.send_ime_key(app, text.encode_utf16().count() > 1) {
                 window.with_view(app, |view, window, app| {
                     view.insert(range, &text, window, app)
                 });
@@ -461,10 +485,16 @@ impl Callbacks {
         });
     }
 
-    pub fn compose(&self, range: Option<Range<usize>>, text: &str, selected: Option<Range<usize>>) {
+    fn compose(
+        &self,
+        at: Callbacks,
+        range: Option<Range<usize>>,
+        text: &str,
+        selected: Option<Range<usize>>,
+    ) {
         let text = text.to_owned();
-        self.queue(move |window, app| {
-            send_ime_key(window, app, true);
+        queue(at, move |window, app| {
+            window.send_ime_key(app, true);
             window.with_view(app, |view, window, app| {
                 view.compose(range, &text, selected, window, app)
             });
@@ -472,15 +502,15 @@ impl Callbacks {
     }
 
     #[cfg(not(windows))]
-    pub fn end_composition(&self) {
-        self.queue(|window, app| {
-            send_ime_key(window, app, false);
+    fn end_composition(&self, at: Callbacks) {
+        queue(at, |window, app| {
+            window.send_ime_key(app, false);
             window.with_view(app, |view, window, app| view.end_composition(window, app));
         });
     }
 
-    pub fn rect_of(&self, range: Range<usize>) -> Option<Rect> {
-        self.with(move |window, app| {
+    fn rect_of(&self, at: Callbacks, range: Range<usize>) -> Option<Rect> {
+        with(at, move |window, app| {
             let zoom = window.zoom;
             let rect = window.with_view(app, |view, window, app| view.rect_of(range, window, app));
             Some(rect.flatten()? * zoom)
@@ -489,10 +519,10 @@ impl Callbacks {
     }
 
     #[cfg(target_os = "macos")]
-    pub fn index_at(&self, at: Point<Pixels>) -> Option<usize> {
-        self.with(move |window, app| {
-            let at = at / window.zoom;
-            window.with_view(app, |view, window, app| view.index_at(at, window, app))
+    fn index_at(&self, at: Callbacks, point: Point<Pixels>) -> Option<usize> {
+        with(at, move |window, app| {
+            let point = point / window.zoom;
+            window.with_view(app, |view, window, app| view.index_at(point, window, app))
         })
         .flatten()
         .flatten()

@@ -8,11 +8,10 @@ use super::{
     glass, lock, native_after,
     nswindow::AppsWindow,
     threads::ask_within,
-    vsync::step,
 };
 use crate::{
     Button, Cursor, Event, Key, Modifiers, WheelPhase,
-    app::{Callbacks, dispatch, send_ime_key},
+    platform::{Callbacks, Motion, events},
     point, px,
 };
 use core_foundation_sys::{
@@ -48,7 +47,6 @@ const DRAG_REPEAT: Duration = Duration::from_millis(16);
 
 // The newest pointer move or wheel the app thread has not taken yet, to merge more into it, and
 // when its device sent it.
-type Motion = Arc<Mutex<Option<(Event, Instant)>>>;
 
 pub(crate) struct Input {
     callbacks: Callbacks,
@@ -196,7 +194,7 @@ define_class!(
 
         #[unsafe(method(viewDidChangeEffectiveAppearance))]
         fn appearance_changed(&self) {
-            self.ivars().callbacks.appearance_changed();
+            events().appearance_changed(self.ivars().callbacks);
             if let Some(window) = self.host() {
                 window.place_buttons();
             }
@@ -225,12 +223,7 @@ define_class!(
                 return;
             }
             let present = ask_within(callbacks.thread, RESIZE_WAIT, move || {
-                callbacks.with(move |window, _| window.platform.renderer.set_presents_with_transaction(visible));
-                step(callbacks);
-                callbacks.with(|window, _| {
-                    window.platform.renderer.set_presents_with_transaction(false);
-                    window.platform.renderer.take_present()
-                })
+                events().present_live(callbacks, visible)
             });
             // Presents here, on main, inside the transaction.
             drop(present);
@@ -240,17 +233,17 @@ define_class!(
     unsafe impl NSTextInputClient for AppsView {
         #[unsafe(method(hasMarkedText))]
         fn has_marked_text(&self) -> bool {
-            self.ivars().callbacks.composition().is_some()
+            events().composition(self.ivars().callbacks).is_some()
         }
 
         #[unsafe(method(markedRange))]
         fn marked_range(&self) -> NSRange {
-            ns_range(self.ivars().callbacks.composition())
+            ns_range(events().composition(self.ivars().callbacks))
         }
 
         #[unsafe(method(selectedRange))]
         fn selected_range(&self) -> NSRange {
-            ns_range(self.ivars().callbacks.selection().map(|selection| selection.range))
+            ns_range(events().selection(self.ivars().callbacks).map(|selection| selection.range))
         }
 
         #[unsafe(method_id(validAttributesForMarkedText))]
@@ -260,24 +253,24 @@ define_class!(
 
         #[unsafe(method(insertText:replacementRange:))]
         fn insert_text(&self, text: &AnyObject, replacing: NSRange) {
-            self.ivars().callbacks.insert(span(replacing), &plain(text));
+            events().insert(self.ivars().callbacks, span(replacing), &plain(text));
         }
 
         #[unsafe(method(setMarkedText:selectedRange:replacementRange:))]
         fn set_marked_text(&self, text: &AnyObject, selected: NSRange, replacing: NSRange) {
-            self.ivars().callbacks.compose(span(replacing), &plain(text), span(selected));
+            events().compose(self.ivars().callbacks, span(replacing), &plain(text), span(selected));
         }
 
         #[unsafe(method(unmarkText))]
         fn unmark_text(&self) {
-            self.ivars().callbacks.end_composition();
+            events().end_composition(self.ivars().callbacks);
         }
 
         #[unsafe(method_id(attributedSubstringForProposedRange:actualRange:))]
         fn substring(&self, proposed: NSRange, actual: *mut NSRange) -> Option<Retained<NSAttributedString>> {
             let callbacks = self.ivars().callbacks;
             span(proposed).filter(|range| !range.is_empty()).and_then(|range| {
-                let (text, adjusted) = callbacks.text_in(range.clone())?;
+                let (text, adjusted) = events().text_in(callbacks, range.clone())?;
                 if let Some(adjusted) = adjusted.filter(|adjusted| *adjusted != range)
                     && !actual.is_null()
                 {
@@ -292,7 +285,7 @@ define_class!(
         #[unsafe(method(firstRectForCharacterRange:actualRange:))]
         fn first_rect(&self, range: NSRange, _: *mut NSRange) -> NSRect {
             let top_left = self.content_corner();
-            let Some(rect) = span(range).and_then(|range| self.ivars().callbacks.rect_of(range)) else {
+            let Some(rect) = span(range).and_then(|range| events().rect_of(self.ivars().callbacks, range)) else {
                 return NSRect::ZERO;
             };
             let [x, y, width, height] = [rect.origin.x, rect.origin.y, rect.size.width, rect.size.height]
@@ -304,7 +297,7 @@ define_class!(
         fn index_at(&self, at: CGPoint) -> NSUInteger {
             let top_left = self.content_corner();
             let at = point(px((at.x - top_left.x) as f32), px((top_left.y - at.y) as f32));
-            self.ivars().callbacks.index_at(at).unwrap_or(NOT_FOUND)
+            events().index_at(self.ivars().callbacks, at).unwrap_or(NOT_FOUND)
         }
 
         // AppKit sends the commands of keys that the input method did not take here. Without this method it
@@ -315,7 +308,7 @@ define_class!(
                 return;
             };
             let callbacks = self.ivars().callbacks;
-            let taken = callbacks.input(Event::KeyDown {
+            let taken = events().input(callbacks, Event::KeyDown {
                 key,
                 modifiers,
                 repeat: false,
@@ -542,10 +535,10 @@ impl AppsView {
             Event::KeyUp { .. } => false,
             _ => return false,
         };
-        let composing = down && callbacks.composition().is_some();
+        let composing = down && events().composition(callbacks).is_some();
         // Main can block the key. A blocked key still goes to an active input method, which must not pass it on.
         let blocked = crate::native::key(callbacks.id, &input, &|| {
-            composing || !down && callbacks.composition().is_some()
+            composing || !down && events().composition(callbacks).is_some()
         });
         let Event::KeyDown {
             key,
@@ -554,7 +547,7 @@ impl AppsView {
             ..
         } = &input
         else {
-            return blocked || callbacks.input(input);
+            return blocked || events().input(callbacks, input);
         };
         let modifiers = *modifiers;
         let plain = !modifiers.ctrl() && !modifiers.function() && !modifiers.command();
@@ -582,8 +575,11 @@ impl AppsView {
                 mode && !latin
             }
         };
-        let to_composer =
-            !composing && plain && printable && composer() && callbacks.accepts_text_input();
+        let to_composer = !composing
+            && plain
+            && printable
+            && composer()
+            && events().accepts_text_input(callbacks);
         if blocked && !composing && !to_composer {
             return true;
         }
@@ -596,7 +592,7 @@ impl AppsView {
             let held = !blocked && (composing || to_composer);
             if held {
                 let key = input.clone();
-                callbacks.queue(move |window, _| window.ime_key = Some((key, composing)));
+                events().hold_key(callbacks, key, composing);
             }
             let taken = self.handle_in_context(event);
             ivars.command.replace(None);
@@ -608,15 +604,13 @@ impl AppsView {
             }
             if taken {
                 if held {
-                    callbacks.queue(|window, app| {
-                        send_ime_key(window, app, false);
-                    });
+                    events().ime_took_key(callbacks);
                 }
                 return true;
             }
-            return callbacks.input(input);
+            return events().input(callbacks, input);
         }
-        if callbacks.input(input.clone()) {
+        if events().input(callbacks, input.clone()) {
             return true;
         }
         if *repeat && let Some(text) = &key.text {
@@ -625,7 +619,7 @@ impl AppsView {
             let hold = defaults.objectForKey(&NSString::from_str("ApplePressAndHoldEnabled"));
             // SAFETY: the setting is a boolean.
             if !hold.is_none_or(|hold| unsafe { msg_send![&hold, boolValue] }) {
-                callbacks.insert(None, text);
+                events().insert(callbacks, None, text);
                 return true;
             }
         }
@@ -715,7 +709,7 @@ impl AppsView {
         let callbacks = ivars.callbacks;
         if !matches!(input, Event::PointerMove { .. } | Event::Wheel { .. }) {
             ivars.motion.replace(None);
-            return callbacks.input_later(input);
+            return events().input_later(callbacks, input);
         }
         let merged = ivars.motion.borrow().as_ref().is_some_and(|slot| {
             lock(slot).as_mut().is_some_and(|(waiting, at)| {
@@ -731,13 +725,7 @@ impl AppsView {
         }
         let slot = Arc::new(Mutex::new(Some((input, sent))));
         ivars.motion.replace(Some(slot.clone()));
-        callbacks.queue(move |window, app| {
-            if let Some((input, sent)) = lock(&slot).take() {
-                window.event_at = Some(sent);
-                dispatch(window, app, input);
-                window.event_at = None;
-            }
-        });
+        events().input_motion(callbacks, slot);
     }
 
     pub fn drag_window(&self) {

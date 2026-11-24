@@ -5,7 +5,7 @@
 #![allow(deprecated)]
 
 use super::{lock, threads::post};
-use crate::app::Callbacks;
+use crate::platform::{Callbacks, events};
 use block2::RcBlock;
 use objc2_core_foundation::CFRetained;
 use objc2_core_video::{CVDisplayLink, CVTimeStamp, kCVReturnSuccess};
@@ -145,24 +145,9 @@ impl Pulse {
             self.callbacks.thread,
             Box::new(move || {
                 pulse.waiting.store(false, atomic::Ordering::Release);
-                let callbacks = pulse.callbacks;
-                // A tick without a frame takes one frame out of a queue that is too long.
-                let free = callbacks.with(move |window, _| {
-                    let free = !window.platform.renderer.take_congested();
-                    window.frame_at = free.then_some(at);
-                    free
-                });
-                if free == Some(true) {
-                    step(callbacks);
-                }
+                events().tick(pulse.callbacks, Some(at));
             }),
         );
-    }
-}
-
-pub(crate) fn step(callbacks: Callbacks) {
-    if callbacks.frame() == Some(false) {
-        callbacks.with(|window, _| window.platform.rest());
     }
 }
 

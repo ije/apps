@@ -11,7 +11,7 @@ mod threads;
 mod vsync;
 mod window;
 
-use crate::{Cursor, Rect, WindowOptions, app::Callbacks};
+use crate::{Cursor, Rect, WindowOptions, platform::Callbacks};
 use anyhow::Result;
 use objc2::{
     DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
@@ -30,7 +30,7 @@ use std::{
 
 pub use controls::control_size;
 pub(crate) use glass::available as supports_glass;
-pub(crate) use metal::prewarm;
+pub(crate) use metal::{Present, prewarm};
 pub(crate) use threads::{
     AppThread, app_thread, ask, end_thread, native_after, native_post, native_sync, park_render,
     post, run_after, spawn_render,
