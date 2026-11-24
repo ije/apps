@@ -22,7 +22,7 @@
 
 The runtime separates JavaScript API objects from native state. [js](crates/runtime/js) contains the API implementations and event loop. [src/jsc](crates/runtime/src/jsc) binds JavaScriptCore. [src/host](crates/runtime/src/host) connects contexts to Rust, checks access by context role, and owns page documents, native resources, and commands. [bundle.rs](crates/runtime/src/bundle.rs) describes the app package.
 
-The modules of the runtime crate are layers, and a module uses only the ones below it: `desktop` and `script` (the entries), `host`, `node` and `web`, `render`, `dom`, `style` and `bundle`, `devtools` (the binding of the optional library), and at the bottom `jsc`, `native` and `library`. Render reaches the desktop that drives its views through the `render::Pages` trait.
+The modules of the runtime crate are layers, and a module uses only the ones below it: `desktop` and `script` (the entries), `host`, `node` and `web`, `render`, `dom`, `style` and `bundle`, and at the bottom `jsc` and `native` (the services of the operating system and the optional native libraries, with the binding of the developer tools library). Render reaches the desktop that drives its views through the `render::Pages` trait.
 
 ## Build and startup
 

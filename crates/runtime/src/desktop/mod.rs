@@ -451,7 +451,7 @@ impl Desktop {
                             crate::host::page_stopped(id);
                             self.ended = self.owner == Some(id);
                             if self.ended {
-                                crate::devtools::uninstall();
+                                crate::native::devtools::uninstall();
                             }
                         }
                     }
@@ -659,7 +659,7 @@ impl Desktop {
                 let Some(view) = app.views.get_mut(&id) else {
                     continue;
                 };
-                let focused = focused || crate::devtools::enabled();
+                let focused = focused || crate::native::devtools::enabled();
                 if view.focused != focused
                     && let Some(renderer) = &view.renderer
                 {
@@ -758,7 +758,7 @@ impl Desktop {
                 }
             }
             app.devtools.retain(|_, tools| !tools.is_closed());
-            let mcp = crate::devtools::enabled();
+            let mcp = crate::native::devtools::enabled();
             if !app.devtools.is_empty() || mcp {
                 let logs: Vec<_> = app.host.borrow_mut().logs.drain(..).collect();
                 let main_logs = std::mem::take(&mut app.main_logs);
@@ -766,7 +766,7 @@ impl Desktop {
                     tools.events(&logs)?;
                     tools.events(&main_logs)?;
                 }
-                crate::devtools::logs(&logs);
+                crate::native::devtools::logs(&logs);
             }
             // Page scripts that the tools run can force a layout, like other page tasks.
             let raw: *mut App = cx;
@@ -1171,7 +1171,7 @@ impl Desktop {
         crate::host::NATIVE.set(Some(|op, args| {
             renderer::native::sync(|| crate::native::native_call(op, args))
         }));
-        crate::devtools::install(owner.unwrap_or(0));
+        crate::native::devtools::install(owner.unwrap_or(0));
         let runtime = Rc::new(RefCell::new(Self {
             api,
             host: Rc::new(RefCell::new(template.host(&link))),

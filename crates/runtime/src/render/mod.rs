@@ -2649,12 +2649,12 @@ impl PageView {
                 origin: [0.; 2],
                 quiet: false,
             }))
-            .children(crate::devtools::profiling().then(|| {
+            .children(crate::native::devtools::profiling().then(|| {
                 renderer::canvas(
                     |_, _| (),
                     move |_, _, window| {
                         window.paint_volatile();
-                        crate::devtools::frame(id, started)
+                        crate::native::devtools::frame(id, started)
                     },
                 )
                 .absolute()
@@ -3133,8 +3133,8 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
     };
     animate(&view, dom, next, now, true, window, cx);
     drop(host);
-    if patched && !promoted && crate::devtools::profiling() {
-        crate::devtools::frame(view.id, started);
+    if patched && !promoted && crate::native::devtools::profiling() {
+        crate::native::devtools::frame(view.id, started);
     }
     if !patched || (!promoted || fresh) && !window.present() {
         window.refresh();

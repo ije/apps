@@ -119,7 +119,7 @@ pub fn run(setup: impl FnOnce(&App) -> Result<()>) -> Result<()> {
         !resources.join("app.bundle").is_file() && std::env::var_os("APPS_RUST_DEV").is_some();
     let (bundle, input) = if dev {
         if let Some(path) = std::env::var_os("APPS_RUST_LIBRARIES") {
-            crate::library::set_dev_path(path.into());
+            crate::native::library::set_dev_path(path.into());
         }
         let (bundle, input) =
             crate::bundle::from_stdin().context("Cannot read renderer bundle from apps run")?;

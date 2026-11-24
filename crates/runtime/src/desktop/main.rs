@@ -686,14 +686,14 @@ impl Main {
                 tools.events(&logs)?;
             }
             if !logs.is_empty() {
-                crate::devtools::logs(&logs);
+                crate::native::devtools::logs(&logs);
                 if super::panel::pages_open() {
                     self.link
                         .page(ToPage::All(json!({"op":"logs","args":logs})));
                 }
             }
         }
-        if crate::devtools::poll_main() {
+        if crate::native::devtools::poll_main() {
             delay = delay.min(0);
         }
         if let Some(engine) = &self.engine {

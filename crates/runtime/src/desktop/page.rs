@@ -312,7 +312,7 @@ impl Desktop {
                 state.pixel_ratio = window.scale_factor();
                 state.window = window.window_state();
                 // Like Playwright, pages count as focused while the devtools MCP server runs, so tests in hidden windows get focus events.
-                view.focused = window.is_active() || crate::devtools::enabled();
+                view.focused = window.is_active() || crate::native::devtools::enabled();
             });
         }
         view.preload = None;

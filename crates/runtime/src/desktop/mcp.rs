@@ -34,12 +34,12 @@ static HOST: Host = Host {
 
 pub(crate) fn start(port: u16, link: Link) -> Result<()> {
     let _ = LINK.set(link);
-    crate::devtools::start(port, &HOST)
+    crate::native::devtools::start(port, &HOST)
 }
 
 pub(crate) fn poll(desktop: &Desktop, cx: &mut App) -> bool {
     let mut app = (desktop, cx);
-    crate::devtools::poll((&raw mut app).cast())
+    crate::native::devtools::poll((&raw mut app).cast())
 }
 
 extern "C" fn connect(ctx: usize) -> i32 {

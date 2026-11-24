@@ -27,7 +27,7 @@ fn page() -> Result<&'static str> {
     if let Some(page) = PAGE.get() {
         return Ok(page);
     }
-    let html = crate::devtools::text(false)?;
+    let html = crate::native::devtools::text(false)?;
     let (head, rest) = html.split_once("<style>").unwrap_or((html, ""));
     let (css, body) = rest.split_once("</style>").unwrap_or_default();
     let css = crate::style::tailwind(css, body);
@@ -374,7 +374,7 @@ impl super::Desktop {
 // Calls the script that inspects a context from inside it. A new context gets the script on its first call.
 pub(crate) fn agent(engine: &JsContext, method: &str, params: &Value) -> Result<Value> {
     if engine.eval_page("typeof this.__appsAgent", "apps:devtools")? != "function" {
-        let source = format!("this.__appsAgent={}", crate::devtools::text(true)?);
+        let source = format!("this.__appsAgent={}", crate::native::devtools::text(true)?);
         engine.eval_page(&source, "apps:devtools")?;
     }
     let call = format!(

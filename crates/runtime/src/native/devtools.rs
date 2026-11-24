@@ -16,7 +16,7 @@ pub(crate) fn load() -> Result<&'static libloading::Library> {
         return Ok(library);
     }
     let name = libloading::library_filename("apps_devtools");
-    let library = crate::library::load(
+    let library = crate::native::library::load(
         &name.to_string_lossy(),
         "developer tools",
         b"apps_devtools_abi\0",

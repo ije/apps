@@ -1,4 +1,7 @@
+// The services of the operating system, and the optional native libraries next to the runtime.
 pub(crate) mod browser;
+pub(crate) mod devtools;
+pub mod library;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
@@ -70,7 +73,7 @@ fn validate_menu(template: &Value) -> Result<()> {
     Ok(())
 }
 
-pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
+pub(crate) fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
     if operation.starts_with("tray.") {
         ensure!(
             arguments["id"].as_u64().is_some_and(|id| id > 0),
