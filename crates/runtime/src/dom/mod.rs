@@ -1,6 +1,6 @@
 mod document;
-mod entities;
 pub(crate) mod geometry;
+mod html;
 mod interaction;
 mod mirror;
 mod selector;
