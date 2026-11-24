@@ -857,7 +857,7 @@ impl Host {
                 let image =
                     if let Some(canvas) = state.media.canvases.get(&node) {
                         state.media.placeholders.contains_key(&node).then(|| {
-                            crate::render::canvas::render_image(&canvas.pixels, Vec::new())
+                            crate::render::raster::render_image(&canvas.pixels, Vec::new())
                         })
                     } else if let Some(gpu) = self.graphics.get_mut(&id) {
                         let start = std::time::Instant::now();

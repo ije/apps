@@ -128,14 +128,14 @@ pub(super) fn layer(id: usize, look: Look, view: Rc<super::ViewState>) -> Child 
                 let Some(source) = svg(&look, width, height) else {
                     return;
                 };
-                let limit = super::canvas::RASTER_MAX as f32;
+                let limit = super::raster::RASTER_MAX as f32;
                 let [rw, rh] =
                     [width, height].map(|side| (side * scale).ceil().clamp(1., limit) as u32);
                 if backgrounds.get(&key).is_none_or(|(old, image)| {
                     old != &source
                         || [image.size().width, image.size().height].map(|side| side as u32)
                             != [rw, rh]
-                }) && let Ok(image) = super::canvas::svg(&source, rw, rh)
+                }) && let Ok(image) = super::raster::svg::svg(&source, rw, rh)
                     && let Some((_, old)) = backgrounds.insert(key, (source, image))
                     && std::sync::Arc::strong_count(&old) == 1
                 {

@@ -1,5 +1,4 @@
 mod background;
-pub mod canvas;
 mod control;
 pub(crate) mod cull;
 pub(crate) mod effects;
@@ -8,7 +7,6 @@ pub mod fonts;
 pub(crate) mod grid;
 pub(crate) mod hit;
 mod hud;
-pub mod image;
 pub(crate) mod inline;
 mod input;
 pub(crate) mod inspect;
@@ -18,7 +16,7 @@ pub(crate) mod native;
 mod page;
 mod paint;
 mod plan;
-mod resvg;
+pub mod raster;
 pub(crate) mod scrollbar;
 pub(crate) mod terminal;
 pub(crate) mod text;
@@ -3588,7 +3586,7 @@ mod tests {
             .collect();
         let [first, second] = [paragraphs[0], paragraphs[1]];
         let styles = dom.restyle(&mut doc, [800., 600.]);
-        let mut drawn = canvas::Canvas::new(2, 2).unwrap();
+        let mut drawn = raster::canvas::Canvas::new(2, 2).unwrap();
         drawn
             .draw(
                 &[4., 7., 21., 0., 0., 2., 2.],

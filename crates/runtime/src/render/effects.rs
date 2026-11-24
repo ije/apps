@@ -1237,7 +1237,7 @@ pub(crate) fn conic_image(
     if tw <= 0. || th <= 0. {
         return None;
     }
-    let [rw, rh] = [rw, rh].map(|side| side.clamp(1, super::canvas::RASTER_MAX));
+    let [rw, rh] = [rw, rh].map(|side| side.clamp(1, super::raster::RASTER_MAX));
     let [sx, sy] = [width / rw as f32, height / rh as f32];
     // One entry per half device pixel at the far corner, so hard stops stay sharp.
     let reach = (tw / sx).hypot(th / sy);
@@ -1905,8 +1905,8 @@ mod tests {
             let source = format!(
                 "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"50\">{layers}</svg>"
             );
-            let tree = super::super::canvas::svg_tree(&source, false).unwrap();
-            let slow = super::super::canvas::svg_pixels(&tree, 100, 50, None).unwrap();
+            let tree = super::super::raster::svg::svg_tree(&source, false).unwrap();
+            let slow = super::super::raster::svg::svg_pixels(&tree, 100, 50, None).unwrap();
             let fast = fast.unwrap_or_else(|| vec![255; 100 * 50 * 4]);
             let worst = fast
                 .as_chunks::<4>()
@@ -2169,7 +2169,7 @@ mod tests {
             .unwrap();
             let svg =
                 gradient_svg(kind, body, size, position, repeat, units, 60., 40., area).unwrap();
-            let svg = super::super::canvas::svg_gradient(svg, 120, 80).unwrap();
+            let svg = super::super::raster::svg::svg_gradient(svg, 120, 80).unwrap();
             let far = (image.bytes().as_chunks::<4>().0.iter())
                 .zip(svg.bytes().as_chunks::<4>().0)
                 .filter(|(a, b)| a.iter().zip(*b).any(|(a, b)| a.abs_diff(*b) > 24))

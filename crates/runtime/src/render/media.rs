@@ -37,7 +37,7 @@ pub(crate) type CanvasSource = (
 
 #[derive(Default)]
 pub struct Media {
-    pub canvases: rustc_hash::FxHashMap<usize, crate::render::canvas::Canvas>,
+    pub canvases: rustc_hash::FxHashMap<usize, crate::render::raster::canvas::Canvas>,
     pub(crate) terminals: Rc<std::cell::RefCell<crate::web::terminal::Terminals>>,
     pub(crate) sources: std::cell::RefCell<rustc_hash::FxHashMap<usize, CanvasSource>>,
     pub images: rustc_hash::FxHashMap<usize, Arc<renderer::RenderImage>>,
@@ -88,8 +88,8 @@ impl Media {
         &self,
         id: usize,
         size: Option<[u32; 2]>,
-    ) -> Option<crate::render::canvas::Source<'_>> {
-        use crate::render::canvas::{self, Source};
+    ) -> Option<crate::render::raster::canvas::Source<'_>> {
+        use crate::render::raster::{self, canvas::Source};
         if let Some(canvas) = self.canvases.get(&id) {
             return Some(Source::Pixels(&canvas.pixels));
         }
@@ -113,9 +113,9 @@ impl Media {
             None => true,
         };
         let pixels = Rc::new(match (image, svg) {
-            (Some(image), _) => canvas::pixmap(image)?,
-            (_, Some((source, _))) => canvas::svg_pixels(
-                &canvas::svg_tree(source, false).ok()?,
+            (Some(image), _) => raster::pixmap(image)?,
+            (_, Some((source, _))) => raster::svg::svg_pixels(
+                &raster::svg::svg_tree(source, false).ok()?,
                 size[0],
                 size[1],
                 None,
@@ -145,13 +145,13 @@ impl Media {
         let request = NEXT.fetch_add(1, Ordering::Relaxed);
         self.decoding.insert(id, request);
         let (decoded, wake) = (self.decoded.clone(), crate::jsc::Waker::current());
-        crate::render::image::decode_later(Box::new(move || {
+        crate::render::raster::image::decode_later(Box::new(move || {
             let result = read().and_then(|bytes| {
                 ensure!(bytes.len() <= 64 * 1024 * 1024, "Image is too large");
-                crate::render::image::decode(&bytes)
+                crate::render::raster::image::decode(&bytes)
                     .map(Ok)
                     .or_else(|error| {
-                        let options = crate::render::canvas::svg_options(false, false);
+                        let options = crate::render::raster::svg::svg_options(false, false);
                         let size = usvg::Tree::from_data(&bytes, &options)
                             .map_err(|_| error)?
                             .size();

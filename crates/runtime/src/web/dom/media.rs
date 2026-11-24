@@ -12,14 +12,15 @@ use std::{
 
 static PLACEHOLDERS: LazyLock<Mutex<HashMap<u64, Placeholder>>> = LazyLock::new(Default::default);
 
-fn new_canvas(node: &Node) -> Result<crate::render::canvas::Canvas> {
+fn new_canvas(node: &Node) -> Result<crate::render::raster::canvas::Canvas> {
     let size = |name, default| {
         node.attrs
             .get(name)
             .and_then(|value| crate::render::dimension(value, true))
             .map_or(default, |value| value as u32)
     };
-    let mut canvas = crate::render::canvas::Canvas::new(size("width", 300), size("height", 150))?;
+    let mut canvas =
+        crate::render::raster::canvas::Canvas::new(size("width", 300), size("height", 150))?;
     canvas.present = node.tag == "canvas";
     Ok(canvas)
 }
@@ -139,7 +140,7 @@ pub(super) fn node(
                     &data,
                     &|(source, size)| match source.checked_sub(SNAPSHOT) {
                         Some(element) => state.media.snapshots.get(&element).map(|(pixels, _)| {
-                            crate::render::canvas::Source::Shared(pixels.clone())
+                            crate::render::raster::canvas::Source::Shared(pixels.clone())
                         }),
                         None => state.media.source_pixels(source, Some(size)),
                     },
@@ -171,8 +172,10 @@ pub(super) fn node(
             use base64::Engine as _;
             let base64 = base64::engine::general_purpose::STANDARD;
             let png = match state.media.source_pixels(id, None) {
-                Some(pixels) => crate::render::image::encode_png(&pixels)?,
-                None => crate::render::image::encode_png(&new_canvas(&doc.nodes[id])?.pixels)?,
+                Some(pixels) => crate::render::raster::image::encode_png(&pixels)?,
+                None => {
+                    crate::render::raster::image::encode_png(&new_canvas(&doc.nodes[id])?.pixels)?
+                }
             };
             let (bytes, mime) = match args[2].as_str() {
                 #[cfg(target_os = "macos")]
@@ -198,7 +201,7 @@ pub(super) fn node(
         "dom.canvasPixels" => {
             let pixels = match state.media.source_pixels(id, None) {
                 Some(pixels) => pixels,
-                None => crate::render::canvas::Source::Shared(Rc::new(
+                None => crate::render::raster::canvas::Source::Shared(Rc::new(
                     new_canvas(&doc.nodes[id])?.pixels,
                 )),
             };
@@ -242,7 +245,7 @@ pub(super) fn node(
             ensure!(to < doc.nodes.len(), "Invalid node id");
             let mut taken = match state.media.canvases.get_mut(&id) {
                 Some(canvas) => {
-                    let mut taken = crate::render::canvas::Canvas::new(
+                    let mut taken = crate::render::raster::canvas::Canvas::new(
                         canvas.pixels.width(),
                         canvas.pixels.height(),
                     )?;
@@ -259,7 +262,7 @@ pub(super) fn node(
             };
             taken.present = doc.nodes[to].tag == "canvas";
             if taken.present {
-                taken.image = crate::render::canvas::render_image(&taken.pixels, Vec::new());
+                taken.image = crate::render::raster::render_image(&taken.pixels, Vec::new());
             }
             state.tree.note_created(taken.pixels.data().len() >> 16);
             state.dirty |= taken.present;
@@ -288,7 +291,7 @@ pub(super) fn node(
             };
             if let Some(to) = args[1].as_u64() {
                 let mut canvas =
-                    crate::render::canvas::Canvas::new(pixels.width(), pixels.height())?;
+                    crate::render::raster::canvas::Canvas::new(pixels.width(), pixels.height())?;
                 canvas.pixels = (*pixels).clone();
                 state.tree.note_created(canvas.pixels.data().len() >> 16);
                 state.media.canvases.insert(to as usize, canvas);
@@ -356,7 +359,7 @@ pub(super) fn node(
             let bytes = crate::web::bytes(&args[1])?;
             Ok(state.media.load_image(id, move || Ok(bytes)))
         }
-        "dom.canvasFont" => Ok(json!(crate::render::canvas::font(
+        "dom.canvasFont" => Ok(json!(crate::render::raster::canvas::text::font(
             args[1].as_str().unwrap_or("")
         ))),
         // As a canvas serializes a color: `#rrggbb`, or `rgba()` with the shortest alpha that rounds back.
@@ -406,17 +409,19 @@ pub(super) fn node(
                 .system
                 .as_ref()
                 .context("Text measurement requires a displayed window")?;
-            let (line, [ascent, descent, em_ascent, em_descent]) = crate::render::canvas::line(
-                system,
-                &state.fonts.aliases,
-                args[2].as_str().unwrap_or("10px sans-serif"),
-                args[1].as_str().context("Expected text")?,
-                [
-                    args[3].as_f64().unwrap_or(0.) as f32,
-                    args[4].as_f64().unwrap_or(0.) as f32,
-                ],
-            );
-            let [left, right, top, bottom] = crate::render::canvas::ink(system, &line);
+            let (line, [ascent, descent, em_ascent, em_descent]) =
+                crate::render::raster::canvas::text::line(
+                    system,
+                    &state.fonts.aliases,
+                    args[2].as_str().unwrap_or("10px sans-serif"),
+                    args[1].as_str().context("Expected text")?,
+                    [
+                        args[3].as_f64().unwrap_or(0.) as f32,
+                        args[4].as_f64().unwrap_or(0.) as f32,
+                    ],
+                );
+            let [left, right, top, bottom] =
+                crate::render::raster::canvas::text::ink(system, &line);
             Ok(json!([
                 f32::from(line.width),
                 left,

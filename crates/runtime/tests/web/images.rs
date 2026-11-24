@@ -50,7 +50,7 @@ fn web_images_decode_in_the_dom() {
         (include_bytes!("../images/gray.jpg"), [110, 110, 110, 255]),
         (include_bytes!("../images/cmyk.jpg"), [224, 128, 32, 255]),
     ] {
-        let image = apps_runtime::render::image::decode(bytes).unwrap();
+        let image = apps_runtime::render::raster::image::decode(bytes).unwrap();
         for pixel in image.bytes().as_chunks::<4>().0 {
             for (value, expected) in pixel.iter().zip(color) {
                 assert!(value.abs_diff(expected) <= 3, "{pixel:?}");
@@ -61,7 +61,7 @@ fn web_images_decode_in_the_dom() {
 
 #[test]
 fn svg_raster_images_decode_through_the_runtime() {
-    use apps_runtime::render::canvas::{svg_pixels, svg_tree};
+    use apps_runtime::render::raster::svg::{svg_pixels, svg_tree};
     use base64::Engine;
     for (kind, bytes) in [
         ("png", include_bytes!("../images/sample.png").as_slice()),
@@ -115,7 +115,7 @@ fn web_image_formats_are_enabled() {
 
 #[test]
 fn avif_rejects_corrupt_data_and_respects_limits() {
-    use apps_runtime::render::image::decode;
+    use apps_runtime::render::raster::image::decode;
     let mut bytes = include_bytes!("../images/corrupt-base.avif").to_vec();
     assert!(decode(&bytes).is_ok());
     bytes[280] ^= 1;
@@ -132,7 +132,7 @@ fn avif_rejects_corrupt_data_and_respects_limits() {
             limits.max_image_width = Some(2);
         }
         assert!(matches!(
-            apps_runtime::render::image::avif::decode_avif(
+            apps_runtime::render::raster::image::avif::decode_avif(
                 include_bytes!("../images/sample.avif"),
                 limits
             ),

@@ -60,9 +60,9 @@ pub(super) fn load(
                     let slot = Decoding::default();
                     decoding.insert(file.into(), (id, slot.clone()));
                     let (path, done) = (path.to_path_buf(), slot.clone());
-                    super::image::decode_later(Box::new(move || {
-                        let image = super::image::read(&path)
-                            .and_then(|bytes| super::image::decode(&bytes))
+                    super::raster::image::decode_later(Box::new(move || {
+                        let image = super::raster::image::read(&path)
+                            .and_then(|bytes| super::raster::image::decode(&bytes))
                             .unwrap_or_else(|_| renderer::RenderImage::new(0, 0, Vec::new()));
                         *done.lock().unwrap_or_else(PoisonError::into_inner) = Some(image);
                     }));
@@ -79,14 +79,14 @@ pub(super) fn load(
     // Undecodable files are SVG or broken, and SVG draws at each size.
     let tree = (bitmap.size().width as u32 == 0)
         .then(|| {
-            super::image::read(path)
+            super::raster::image::read(path)
                 .and_then(|bytes| Ok(String::from_utf8(bytes)?))
                 .and_then(|text| {
                     // A view box keeps its ratio in other tiles.
                     let kept = text.contains("viewBox")
                         && !text.contains("AspectRatio=\"none")
                         && !text.contains("AspectRatio='none");
-                    Ok((super::canvas::svg_tree(&text, false)?, kept))
+                    Ok((super::raster::svg::svg_tree(&text, false)?, kept))
                 })
                 .inspect_err(|error| eprintln!("apps: CSS image {file}: {error}"))
                 .ok()
@@ -155,7 +155,9 @@ fn image_layers(
             .into_iter()
             .map(
                 |image| match image.strip_prefix("url(").and_then(|v| v.strip_suffix(')')) {
-                    Some(source) => ImageLayer::File(super::image::url_file(source, base, assets)),
+                    Some(source) => {
+                        ImageLayer::File(super::raster::image::url_file(source, base, assets))
+                    }
                     None => ImageLayer::Text(image.to_owned()),
                 },
             )
@@ -322,7 +324,7 @@ pub(super) fn css_background(
                             [x, y, ..] => [*x, *y],
                             [] => ["repeat", "repeat"],
                         };
-                        let limit = super::canvas::RASTER_MAX as f32;
+                        let limit = super::raster::RASTER_MAX as f32;
                         let tiles = |natural: [f32; 2]| {
                             let extent = [width + area[2], height + area[3]];
                             let [mut tile, mut at] = super::effects::tile(
@@ -477,7 +479,7 @@ pub(super) fn css_background(
                                             let [fw, fh] = size.map(|side| side * scale);
                                             let [x, y] = [(w - fw) / 2., (h - fh) / 2.];
                                             let fit = ([fw, fh], [1., 0., 0., 1., x, y]);
-                                            match super::canvas::render_svg(
+                                            match super::raster::svg::render_svg(
                                                 &tree, raster[0], raster[1], kept.then_some(fit),
                                             ) {
                                                 Ok(image) => image,
@@ -486,7 +488,7 @@ pub(super) fn css_background(
                                         }
                                         None => bitmap.clone(),
                                     };
-                                    let image = match super::canvas::pixmap(&image)
+                                    let image = match super::raster::pixmap(&image)
                                         .filter(|_| nx * ny > 1.)
                                         .zip(tiny_skia::Pixmap::new(cell[0], cell[1]))
                                     {
@@ -548,7 +550,7 @@ pub(super) fn css_background(
                                                     None,
                                                 );
                                             }
-                                            super::canvas::render_image(&pixels, Vec::new())
+                                            super::raster::render_image(&pixels, Vec::new())
                                         }
                                         None => image,
                                     };
@@ -735,7 +737,7 @@ pub(super) fn css_background(
                 None if tiled.is_some() => ((cw, ch), [0., 0., cw, ch]),
                 None => ((width, height), [area[0], area[1], aw, ah]),
             };
-            let limit = super::canvas::RASTER_MAX as f32;
+            let limit = super::raster::RASTER_MAX as f32;
             let rw = (width * scale).ceil().clamp(1., limit) as u32;
             let rh = (height * scale).ceil().clamp(1., limit) as u32;
             let [rw, rh] = match axis {
@@ -817,7 +819,7 @@ pub(super) fn css_background(
                         false => super::effects::gradient_svg(
                             &kind, &body, size, position, &repeat, units, width, height, within,
                         )
-                        .and_then(|source| super::canvas::svg_gradient(source, rw, rh)),
+                        .and_then(|source| super::raster::svg::svg_gradient(source, rw, rh)),
                     }?;
                     const LIMIT: u32 = 8 << 20;
                     if new && rw * rh * 4 <= LIMIT / 4 {
@@ -972,10 +974,10 @@ pub(super) fn border_image(
                 .get(&view.id)
                 .map(|page| &page.state)
                 .and_then(|state| state.base.clone());
-            let path =
-                super::image::url_file(url, base.as_ref(), &host.app.assets).filter(|path| {
+            let path = super::raster::image::url_file(url, base.as_ref(), &host.app.assets)
+                .filter(|path| {
                     path.to_str()
-                        .is_some_and(|path| path.starts_with(super::image::DATA_PREFIX))
+                        .is_some_and(|path| path.starts_with(super::raster::image::DATA_PREFIX))
                         || path.is_file()
                 })?;
             (path, None)
@@ -1156,7 +1158,7 @@ pub(super) fn border_image(
                     .all(|([s0, s1, t0, t1], _)| s1 > s0 && t1 > t0)
                     .then_some(axes)
             });
-            let limit = super::canvas::RASTER_MAX;
+            let limit = super::raster::RASTER_MAX;
             // An SVG draws each part at the size of its tiles, into one image of three rows and columns, so it stays
             // sharp at every scale. Other images draw their slices from their own pixels.
             let cell = |part: &Part, axis: usize| {
@@ -1213,13 +1215,13 @@ pub(super) fn border_image(
                             h,
                             [0., 0., w, h],
                         )
-                        .and_then(|source| super::canvas::svg_gradient(source, rw, rh))
+                        .and_then(|source| super::raster::svg::svg_gradient(source, rw, rh))
                     }
                     // Each part draws at the size of its tiles, into one image of three rows and columns, so
                     // tiles show no pixels of other parts at their edges, and SVG stays sharp.
                     None => (|| {
                         let (bitmap, tree) = held.as_ref()?;
-                        let bitmap = super::canvas::pixmap(bitmap).filter(|_| tree.is_none());
+                        let bitmap = super::raster::pixmap(bitmap).filter(|_| tree.is_none());
                         let mut pixels =
                             tiny_skia::Pixmap::new(grid[0][3].max(1), grid[1][3].max(1))?;
                         for (index, part) in parts.iter().enumerate() {
@@ -1230,7 +1232,7 @@ pub(super) fn border_image(
                             let tile = match (&bitmap, tree) {
                                 (_, Some((tree, _))) => {
                                     let [kx, ky] = [cw as f32 / (s1 - s0), ch as f32 / (t1 - t0)];
-                                    super::canvas::svg_pixels(
+                                    super::raster::svg::svg_pixels(
                                         tree,
                                         cw,
                                         ch,
@@ -1284,7 +1286,7 @@ pub(super) fn border_image(
                                 );
                             }
                         }
-                        Some(super::canvas::render_image(&pixels, Vec::new()))
+                        Some(super::raster::render_image(&pixels, Vec::new()))
                     })(),
                 };
                 let old = match image {

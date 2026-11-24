@@ -1040,7 +1040,7 @@ impl SvgSource<'_> {
         source.push_str("</defs>");
         source.push_str(&self.doc.serialize_svg(element, false, &attrs));
         source.push_str("</svg>");
-        super::canvas::svg_shape(&source)
+        super::raster::svg::svg_shape(&source)
     }
 }
 pub(super) type Svg = (Vec<Rc<css::properties::Style>>, ([f32; 2], u64));
@@ -9736,7 +9736,7 @@ fn paint_broken_icon(origin: renderer::Point<renderer::Pixels>, window: &mut ren
     let raster = (16. * window.scale_factor()).ceil() as u32;
     let Some(image) = ICON.with_borrow_mut(|icon| {
         if icon.as_ref().is_none_or(|(size, _)| *size != raster) {
-            *icon = super::canvas::svg(SVG, raster, raster)
+            *icon = super::raster::svg::svg(SVG, raster, raster)
                 .ok()
                 .map(|image| (raster, image));
         }
@@ -11186,10 +11186,10 @@ fn svg_layer(
                     {
                         Some((geometry, _)) => geometry.clone(),
                         None => {
-                            let tree = super::canvas::svg_tree(source, false).ok();
+                            let tree = super::raster::svg::svg_tree(source, false).ok();
                             let geometry = tree
                                 .as_ref()
-                                .map(super::canvas::svg_boxes)
+                                .map(super::raster::svg::svg_boxes)
                                 .unwrap_or_default();
                             if let Some(tree) = tree {
                                 state.rasters.svg_trees.insert(id, tree);
@@ -11363,13 +11363,13 @@ fn svg_layer(
                 ) {
                     (Some(image), _) => Ok(image.clone()),
                     (_, Some(tree)) if !moved => {
-                        super::canvas::render_svg(&tree, raster[0], raster[1], None)
+                        super::raster::svg::render_svg(&tree, raster[0], raster[1], None)
                     }
                     (_, tree) if moved => tree
-                        .map_or_else(|| super::canvas::svg_tree(&source, false), Ok)
+                        .map_or_else(|| super::raster::svg::svg_tree(&source, false), Ok)
                         .and_then(|tree| {
                             let [kx, ky] = [raster[0] as f32 / area[2], raster[1] as f32 / area[3]];
-                            super::canvas::render_svg(
+                            super::raster::svg::render_svg(
                                 &tree,
                                 raster[0],
                                 raster[1],
@@ -11379,7 +11379,7 @@ fn svg_layer(
                                 )),
                             )
                         }),
-                    _ => super::canvas::svg(&source, raster[0], raster[1]),
+                    _ => super::raster::svg::svg(&source, raster[0], raster[1]),
                 };
                 match image {
                     Ok(image) => {

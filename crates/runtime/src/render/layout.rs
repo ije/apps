@@ -103,7 +103,7 @@ pub struct Rasters {
     pub(crate) svg_cache: HashMap<
         Rc<str>,
         (
-            crate::render::canvas::SvgGeometry,
+            crate::render::raster::svg::SvgGeometry,
             Vec<Arc<renderer::RenderImage>>,
         ),
     >,

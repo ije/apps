@@ -129,7 +129,7 @@ pub(super) fn page(
         ));
     }
     if op == "dom.path" {
-        return Ok(json!(crate::render::canvas::svg_path(
+        return Ok(json!(crate::render::raster::canvas::path::svg_path(
             args[0].as_str().unwrap_or_default()
         )));
     }
@@ -980,10 +980,13 @@ pub(super) fn node(
                 .unwrap_or(family);
             Ok(json!(
                 matches!(family, "serif" | "sans-serif" | "monospace" | "system-ui")
-                    || crate::render::canvas::fonts(true).0.faces().any(|face| face
-                        .families
-                        .iter()
-                        .any(|(name, _)| name.eq_ignore_ascii_case(family)))
+                    || crate::render::raster::svg::fonts(true)
+                        .0
+                        .faces()
+                        .any(|face| face
+                            .families
+                            .iter()
+                            .any(|(name, _)| name.eq_ignore_ascii_case(family)))
             ))
         }
         _ => anyhow::bail!("Unknown DOM operation: {op}"),

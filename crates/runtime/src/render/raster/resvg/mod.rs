@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 // A copy of resvg 0.46.0, adapted to usvg 0.49.0, whose raster images decode through
-// `render::image`, so it must stay in step with the usvg version.
+// `raster::image`, so it must stay in step with the usvg version.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -184,7 +184,7 @@ fn render_image(
                     let [width, height] = [size.width, size.height].map(|side| side as usize);
                     Some((bitmap.bytes().to_vec(), width, height))
                 }
-                None => crate::render::image::pixels(data)
+                None => crate::render::raster::image::pixels(data)
                     .map_err(|error| log::warn!("Failed to decode an image: {error}."))
                     .ok(),
             };

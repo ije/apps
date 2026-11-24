@@ -1293,6 +1293,6 @@ fn png(
     }
     Ok((
         [image.width(), image.height()],
-        crate::render::image::encode_png(&image)?,
+        crate::render::raster::image::encode_png(&image)?,
     ))
 }

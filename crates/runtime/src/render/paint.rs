@@ -1803,7 +1803,7 @@ pub(super) fn mask(
                     kinds.push(source.map(|(bitmap, tree)| match tree {
                         Some((tree, _)) => usvg::ImageKind::SVG(tree.clone()),
                         None => {
-                            let stub = super::resvg::stub(bitmap);
+                            let stub = super::raster::resvg::stub(bitmap);
                             decoded.push((stub.clone(), bitmap.clone()));
                             usvg::ImageKind::PNG(stub)
                         }
@@ -1824,15 +1824,15 @@ pub(super) fn mask(
                     ),
                     (None, None) => return None,
                 };
-                let mut options = super::canvas::svg_options(false, false);
+                let mut options = super::raster::svg::svg_options(false, false);
                 options.image_href_resolver.resolve_string = Box::new(move |href, _| {
                     kinds.get(href.strip_prefix("apps-mask:")?.parse::<usize>().ok()?)?.clone()
                 });
                 match usvg::Tree::from_str(&source, &options)
                     .map_err(anyhow::Error::from)
                     .and_then(|tree| {
-                        super::resvg::decoded(decoded, || {
-                            super::canvas::render_svg(&tree, raster[0], raster[1], None)
+                        super::raster::resvg::decoded(decoded, || {
+                            super::raster::svg::render_svg(&tree, raster[0], raster[1], None)
                         })
                     }) {
                     Ok(image) => Some(image),
@@ -1914,7 +1914,7 @@ pub(super) fn mask_svg<'a>(
         let layer = if let Some(source) =
             image.strip_prefix("url(").and_then(|v| v.strip_suffix(')'))
         {
-            let Some(path) = super::image::url_file(source, base, assets) else {
+            let Some(path) = super::raster::image::url_file(source, base, assets) else {
                 continue;
             };
             let aspect = match size {

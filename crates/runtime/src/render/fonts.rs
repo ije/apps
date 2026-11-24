@@ -285,9 +285,15 @@ mod tests {
         // Added faces go under their CSS family, so no alias is needed.
         assert!(!state.fonts.aliases.contains_key("Ranked"));
         let width = |state: &PageState, font: &str, text: &str| {
-            crate::render::canvas::line(&system, &state.fonts.aliases, font, text, [0.; 2])
-                .0
-                .width
+            crate::render::raster::canvas::text::line(
+                &system,
+                &state.fonts.aliases,
+                font,
+                text,
+                [0.; 2],
+            )
+            .0
+            .width
         };
         for family in ["Fallback", "Brand", "Ranked"] {
             assert_eq!(
@@ -343,9 +349,15 @@ mod tests {
         for (weight, width) in [(400, 15.), (500, 7.5), (600, 7.5)] {
             let font = format!("{weight} 10px Brand");
             assert_eq!(
-                crate::render::canvas::line(&system, &state.fonts.aliases, &font, "AB", [0.; 2])
-                    .0
-                    .width,
+                crate::render::raster::canvas::text::line(
+                    &system,
+                    &state.fonts.aliases,
+                    &font,
+                    "AB",
+                    [0.; 2]
+                )
+                .0
+                .width,
                 renderer::px(width),
                 "{font}"
             );
@@ -401,7 +413,7 @@ pub(crate) fn add_font(state: &mut PageState, family: &str, bytes: Vec<u8>) -> R
         }
         _ => anyhow::bail!("Unsupported font format"),
     };
-    let mut fonts = crate::render::canvas::fonts(false);
+    let mut fonts = crate::render::raster::svg::fonts(false);
     let database = std::sync::Arc::make_mut(&mut fonts.0);
     let ids = database.load_font_source(usvg::fontdb::Source::Binary(std::sync::Arc::new(
         bytes.clone(),
