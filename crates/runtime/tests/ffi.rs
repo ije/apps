@@ -2,7 +2,8 @@
 #[test]
 fn native_calls_callbacks_memory_and_lifecycle() {
     use apps_runtime::{
-        host::{Host, Role},
+        host::Host,
+        jsc::Role,
         jsc::{JavaScriptCore, JsContext},
     };
     use std::{cell::RefCell, process::Command, rc::Rc};

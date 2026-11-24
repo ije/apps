@@ -324,7 +324,7 @@ impl Grid {
             terminal.drawn.scale = scale;
             terminal.resize(grid, look.cell, scale);
             // The page reads the new size in its next task.
-            crate::host::Waker::current().wake();
+            crate::jsc::Waker::current().wake();
         }
         let focused = focused && cx.window.is_active();
         if focused != terminal.focused {

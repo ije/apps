@@ -2,8 +2,8 @@ use anyhow::{Context, Result, bail, ensure};
 use apps_runtime::{
     bundle::script_source,
     dom::Document,
-    host::{Role, Waker},
     jsc::{JavaScriptCore, JsContext},
+    jsc::{Role, Waker},
 };
 use bbtree::unsync::BBTreeMap;
 use oxc_allocator::{Allocator, ArenaVec, TakeIn};

@@ -1,6 +1,7 @@
 use apps_runtime::{
     dom::Document,
-    host::{Host, Page, Role},
+    host::{Host, Page},
+    jsc::Role,
     jsc::{JavaScriptCore, JsContext},
 };
 use std::time::{Duration, Instant};

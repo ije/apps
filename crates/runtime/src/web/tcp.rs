@@ -205,7 +205,7 @@ async fn run(
     mut commands: mpsc::UnboundedReceiver<Command>,
     mut paused: watch::Receiver<bool>,
     output: mpsc::Sender<Payload>,
-    wake: &crate::host::Waker,
+    wake: &crate::jsc::Waker,
 ) -> Result<(), Failure> {
     let events = async |event: Payload| {
         let sent = output.send(event).await.is_ok();
@@ -393,7 +393,7 @@ impl State {
         let (commands, incoming) = mpsc::unbounded_channel();
         let (paused, pausing) = watch::channel(false);
         let (output, events) = mpsc::channel(64);
-        let wake = crate::host::Waker::current();
+        let wake = crate::jsc::Waker::current();
         let task = crate::web::network()?.spawn(async move {
             let result =
                 async { run(future.await?, incoming, pausing, output.clone(), &wake).await }.await;
@@ -552,7 +552,7 @@ impl State {
                 let listener = Arc::new(Mutex::new(Some(listener)));
                 let accepting = listener.clone();
                 let (sender, events) = mpsc::channel(64);
-                let wake = crate::host::Waker::current();
+                let wake = crate::jsc::Waker::current();
                 let task = runtime.spawn(async move {
                     loop {
                         let accepted =

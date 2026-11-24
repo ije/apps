@@ -28,6 +28,8 @@ pub mod desktop;
 pub mod dom;
 pub mod host;
 pub mod jsc;
+pub mod library;
+pub(crate) mod native;
 pub mod node;
 pub mod render;
 pub mod style;

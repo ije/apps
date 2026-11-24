@@ -1,6 +1,7 @@
 use apps_runtime::{
     dom::Document,
-    host::{Host, Page, Role},
+    host::{Host, Page},
+    jsc::Role,
     jsc::{JavaScriptCore, JsContext},
 };
 use std::{cell::RefCell, rc::Rc};
@@ -1223,7 +1224,7 @@ fn shadow_cycles_child_access_release_and_retired_images() {
 
 fn offscreen_page(source: &str) -> (Rc<RefCell<Host>>, JsContext, String) {
     let (wake, woken) = std::sync::mpsc::channel();
-    apps_runtime::host::Waker::install(move || {
+    apps_runtime::jsc::Waker::install(move || {
         let _ = wake.send(());
     });
     let host = Rc::new(RefCell::new(Host::default()));
@@ -1723,7 +1724,7 @@ fn bitmaps_free_their_pixels() {
 #[test]
 fn images_decode_on_workers_and_load_after_a_wake() {
     let (wake, woken) = std::sync::mpsc::channel();
-    apps_runtime::host::Waker::install(move || {
+    apps_runtime::jsc::Waker::install(move || {
         let _ = wake.send(());
     });
     let directory = tempfile::tempdir().unwrap();

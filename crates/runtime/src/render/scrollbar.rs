@@ -109,7 +109,7 @@ impl Look {
             return None;
         }
         let scheme = style.get(Prop::COLOR_SCHEME).unwrap_or("");
-        let system = || crate::desktop::native::theme_state() & 1 != 0;
+        let system = || crate::native::theme_state() & 1 != 0;
         let mut look = Look {
             dark: match (scheme.contains("dark"), scheme.contains("light")) {
                 (true, false) => true,

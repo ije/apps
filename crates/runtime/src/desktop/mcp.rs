@@ -3,7 +3,7 @@ use super::{
     link::{Link, state_json},
     png,
 };
-use crate::{host::Role, jsc};
+use crate::{jsc, jsc::Role};
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use renderer::{App, Button, Event, Key, Modifiers, WheelPhase, WindowId, point, px};
 use serde_json::{Value, json};
@@ -489,7 +489,8 @@ fn memory(args: &Value, desktop: &Desktop) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        host::{Host, Role},
+        host::Host,
+        jsc::Role,
         jsc::{self, JavaScriptCore, JsContext},
     };
 

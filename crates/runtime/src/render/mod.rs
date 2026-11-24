@@ -98,7 +98,7 @@ pub(crate) struct PageState {
 }
 
 pub(crate) struct Frame {
-    pub(crate) browser: crate::desktop::browser::Browser,
+    pub(crate) browser: apps_webview::Browser,
     loaded: String,
     pub(crate) bounds: [f64; 4],
     revision: u64,
@@ -1127,7 +1127,7 @@ impl PageView {
             let frame = match frames.entry(node) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    match crate::desktop::browser::Browser::new(
+                    match apps_webview::Browser::new(
                         window,
                         &serde_json::json!({"javascript":attrs.get("sandbox").is_none_or(|s|s.split_whitespace().any(|s|s=="allow-scripts")),"inspectable":inspectable}),
                     ) {
@@ -1201,7 +1201,7 @@ impl PageView {
             .and_then(|id| styles.values[id].get(Prop::COLOR_SCHEME))
             .is_some_and(|scheme| {
                 scheme.contains("dark")
-                    && (!scheme.contains("light") || crate::desktop::native::theme_state() & 1 != 0)
+                    && (!scheme.contains("light") || crate::native::theme_state() & 1 != 0)
             });
         let source = background::canvas_source(&doc, &styles);
         // The html and body boxes read each other's background, which their kept builds don't track.
@@ -2126,7 +2126,7 @@ impl PageView {
         let measured = RefCell::new(std::mem::take(&mut dom.measurements));
         let walk = dom.style_walk.nodes.clone();
         for text in warnings {
-            host.log(serde_json::json!({"method":"Runtime.consoleAPICalled","params":{"type":"error","text":text,"context":crate::host::Role::Renderer(self.id)}}));
+            host.log(serde_json::json!({"method":"Runtime.consoleAPICalled","params":{"type":"error","text":text,"context":crate::jsc::Role::Renderer(self.id)}}));
         }
         drop(host);
         let text_system = window.text_system().clone();

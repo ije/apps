@@ -142,7 +142,7 @@ fn rejects_invalid_streamed_bundles_and_conflicting_arguments() {
 #[ignore = "release performance measurement"]
 fn engine_launch() {
     use apps_runtime::{
-        host::Role,
+        jsc::Role,
         jsc::{JavaScriptCore, JsContext},
     };
     let api = JavaScriptCore::load().unwrap();

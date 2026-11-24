@@ -1,7 +1,7 @@
 #[test]
 fn browser_window_rejects_remote_urls_and_loads_local_urls() {
     use apps_runtime::{
-        host::Role,
+        jsc::Role,
         jsc::{JavaScriptCore, JsContext},
     };
     let host = std::rc::Rc::new(std::cell::RefCell::new(apps_runtime::host::Host::default()));
@@ -72,7 +72,7 @@ fn web_contents_view_matches_electron_api() {
     let engine = apps_runtime::jsc::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         std::rc::Rc::default(),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     engine

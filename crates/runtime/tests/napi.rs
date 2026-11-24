@@ -2,7 +2,8 @@
 #[test]
 fn native_addons_values_callbacks_and_contexts() {
     use apps_runtime::{
-        host::{Host, Role},
+        host::Host,
+        jsc::Role,
         jsc::{JavaScriptCore, JsContext},
     };
     use std::{cell::RefCell, process::Command, rc::Rc};

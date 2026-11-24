@@ -1,6 +1,7 @@
 use crate::{
     bundle::Bundle,
-    host::{Host, Role},
+    host::Host,
+    jsc::Role,
     jsc::{JavaScriptCore, JsContext},
 };
 use anyhow::{Context, Result};
@@ -21,7 +22,7 @@ pub fn run(mut bundle: Bundle, argv: Vec<String>) -> Result<i32> {
     };
     drop(bundle.files.remove("app.js"));
     let (wake, wakes) = mpsc::channel();
-    crate::host::Waker::install(move || {
+    crate::jsc::Waker::install(move || {
         let _ = wake.send(());
     });
     let package = bundle.files.get("package.json").map(String::as_str);
@@ -67,7 +68,7 @@ pub fn run(mut bundle: Bundle, argv: Vec<String>) -> Result<i32> {
             }
             continue;
         }
-        crate::host::idle(true);
+        crate::jsc::idle(true);
         let wait = if api.shrink_pending() && !(0..1000).contains(&delay) {
             1000
         } else {
@@ -86,7 +87,7 @@ pub fn run(mut bundle: Bundle, argv: Vec<String>) -> Result<i32> {
             crate::malloc::flush();
         }
         while wakes.try_recv().is_ok() {}
-        crate::host::idle(false);
+        crate::jsc::idle(false);
     };
     std::mem::forget(engine);
     Ok(code)

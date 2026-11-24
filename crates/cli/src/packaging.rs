@@ -625,7 +625,7 @@ mod tests {
         ];
         for name in &names {
             fs::copy(
-                apps_runtime::app::library_exe(name)
+                apps_runtime::library::exe(name)
                     .unwrap()
                     .with_file_name(name),
                 dir.path().join(name),
@@ -681,7 +681,7 @@ mod tests {
         let error = build(r#"["webgpu"]"#).unwrap_err();
         assert!(error.to_string().contains("WebGPU library"), "{error}");
         fs::copy(
-            apps_runtime::app::library_exe(name)
+            apps_runtime::library::exe(name)
                 .unwrap()
                 .with_file_name(name),
             dir.path().join(name),
@@ -736,7 +736,7 @@ mod tests {
         ];
         for name in names {
             fs::copy(
-                apps_runtime::app::library_exe(name)
+                apps_runtime::library::exe(name)
                     .unwrap()
                     .with_file_name(name),
                 dir.path().join(name),

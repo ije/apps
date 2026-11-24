@@ -1,5 +1,5 @@
 use apps_runtime::{
-    host::Role,
+    jsc::Role,
     jsc::{JavaScriptCore, JsContext},
 };
 use std::{

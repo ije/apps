@@ -2449,7 +2449,7 @@ api!(napi_queue_async_work(env, work: Ptr) {
     let item = &*work.cast::<AsyncWork>();
     check(item.state.compare_exchange(IDLE, QUEUED, Ordering::AcqRel, Ordering::Acquire).is_ok(), 1)?;
     let (execute, data, state) = (item.execute, item.data as usize, item.state.clone());
-    let (ready, wake, raw, work) = (env.ready.clone(), crate::host::Waker::current(), ptr::from_ref(env) as usize, work as usize);
+    let (ready, wake, raw, work) = (env.ready.clone(), crate::jsc::Waker::current(), ptr::from_ref(env) as usize, work as usize);
     crate::node::blocking(move || {
         let run = state.compare_exchange(QUEUED, RUNNING, Ordering::AcqRel, Ordering::Acquire).is_ok();
         if run {
@@ -2488,7 +2488,7 @@ struct Threadsafe {
     finalized: AtomicBool,
     referenced: AtomicBool,
     ready: Arc<Mutex<Vec<Ready>>>,
-    wake: crate::host::Waker,
+    wake: crate::jsc::Waker,
 }
 impl Threadsafe {
     // The flag changes under the queue lock, so a blocked caller can't miss the wakeup.
@@ -2547,7 +2547,7 @@ api!(napi_create_threadsafe_function(
         finalized: false.into(),
         referenced: true.into(),
         ready: env.ready.clone(),
-        wake: crate::host::Waker::current(),
+        wake: crate::jsc::Waker::current(),
     });
     // Each acquiring thread and threadsafe_live own references. Keep the allocation alive after another
     // thread aborts.
@@ -2762,7 +2762,7 @@ mod tests {
         let api = JavaScriptCore::load().unwrap();
         let host = Rc::new(RefCell::new(Host::default()));
         let _engine =
-            crate::jsc::JsContext::new(api.clone(), host.clone(), crate::host::Role::Main).unwrap();
+            crate::jsc::JsContext::new(api.clone(), host.clone(), crate::jsc::Role::Main).unwrap();
         let root = CONTEXTS
             .with(|contexts| contexts.borrow().values().find_map(Weak::upgrade))
             .unwrap();

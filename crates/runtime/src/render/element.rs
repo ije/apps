@@ -676,7 +676,7 @@ impl<'a> Build<'a> {
             Query::Collapse => hashed(collapses(doc, styles, id)),
             Query::Value(node) => hashed(&doc.nodes[node as usize].value),
             Query::Viewport => hashed(styles.lengths[id].viewport.map(f32::to_bits)),
-            Query::Theme => hashed(crate::desktop::native::theme_state() & 1),
+            Query::Theme => hashed(crate::native::theme_state() & 1),
             Query::LineBase(node) => hashed(definite_line(doc, styles, node as usize)),
             Query::Shrinks(node) => hashed(shrinks_around(doc, styles, node as usize)),
         };
@@ -2986,11 +2986,7 @@ fn create(
             .get(Prop::COLOR_SCHEME)
             .is_some_and(|value| value.contains("dark") && value.contains("light"))
         {
-            reader.log(
-                Query::Theme,
-                0,
-                hashed(crate::desktop::native::theme_state() & 1),
-            );
+            reader.log(Query::Theme, 0, hashed(crate::native::theme_state() & 1));
         }
         style::dark(style)
     };
@@ -3396,11 +3392,7 @@ fn create(
             backdrop.map_or(1, |(provider, _)| reader.scope_of(id, provider)),
             hashed(backdrop),
         );
-        reader.log(
-            Query::Theme,
-            0,
-            hashed(crate::desktop::native::theme_state() & 1),
-        );
+        reader.log(Query::Theme, 0, hashed(crate::native::theme_state() & 1));
         scrollbar::Look::new(
             style,
             styles.scrollbars.get(&id).map(|parts| &**parts),

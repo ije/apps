@@ -193,7 +193,7 @@ pub fn library_name(platform: &str) -> &'static str {
 }
 
 fn load() -> Result<Library> {
-    let library = super::gpu::library(
+    let library = crate::library::load(
         library_name(std::env::consts::OS),
         "terminal",
         b"apps_terminal_abi\0",

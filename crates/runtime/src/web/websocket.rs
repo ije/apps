@@ -47,7 +47,7 @@ async fn run(
     mut commands: mpsc::UnboundedReceiver<Message>,
     events: mpsc::Sender<crate::jsc::payload::Payload>,
     written: Arc<AtomicUsize>,
-    wake: crate::host::Waker,
+    wake: crate::jsc::Waker,
 ) -> Result<()> {
     let (writer, mut reader) = socket.split();
     let writer = tokio::sync::Mutex::new(writer);
@@ -134,7 +134,7 @@ impl State {
         let (event_tx, events) = mpsc::channel(64);
         let written = Arc::new(AtomicUsize::new(0));
         let counter = written.clone();
-        let wake = crate::host::Waker::current();
+        let wake = crate::jsc::Waker::current();
         let task = crate::web::network()?.spawn(async move {
             let result = async {
                 let (socket, protocol) = open.await?;

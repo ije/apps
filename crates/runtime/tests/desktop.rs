@@ -8,7 +8,7 @@ fn native_desktop_dispatches_application_events() {
     let engine = apps_runtime::jsc::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         std::rc::Rc::default(),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     engine
@@ -74,7 +74,7 @@ fn application_menu_defaults_and_overrides() {
     let engine = apps_runtime::jsc::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         std::rc::Rc::default(),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     engine
@@ -88,7 +88,7 @@ fn native_theme_properties_and_events() {
     let engine = apps_runtime::jsc::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         std::rc::Rc::default(),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     engine
@@ -104,7 +104,7 @@ fn power_save_blocker_and_system_preferences() {
     let engine = apps_runtime::jsc::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         std::rc::Rc::default(),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     engine

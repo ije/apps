@@ -580,7 +580,8 @@ pub(crate) mod map {
 mod tests {
     use super::*;
     use crate::{
-        host::{Host, Page, Role},
+        host::{Host, Page},
+        jsc::Role,
         style,
     };
     use serde_json::json;

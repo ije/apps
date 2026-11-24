@@ -1,5 +1,6 @@
 use apps_runtime::{
-    host::{Host, Role},
+    host::Host,
+    jsc::Role,
     jsc::{JavaScriptCore, JsContext},
 };
 use std::{
@@ -286,7 +287,7 @@ fn native_events_wake_the_event_loop() {
     };
     let wakes = Arc::new(AtomicUsize::new(0));
     let counter = wakes.clone();
-    apps_runtime::host::Waker::install(move || {
+    apps_runtime::jsc::Waker::install(move || {
         counter.fetch_add(1, Ordering::SeqCst);
     });
     let engine = JsContext::new(

@@ -495,7 +495,7 @@ impl State {
                 let (demand, mut demand_rx) = mpsc::channel(1);
                 let (upload, upload_rx) = mpsc::channel::<Option<bytes::Bytes>>(16);
                 let mut upload_rx = (args[0]["stream"] == true).then_some(upload_rx);
-                let wake = crate::host::Waker::current();
+                let wake = crate::jsc::Waker::current();
                 let task = network.spawn(async move {
                     let result: Result<()> = async {
                         if upload_rx.is_some() { for _ in 0..16 { if events_tx.send(json!({"kind":"upload"}).into()).await.is_err() { return Ok(()); } } wake.wake(); }

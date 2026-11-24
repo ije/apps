@@ -1,6 +1,7 @@
 use crate::{
     dom::Document,
-    host::{Host, Page, Role},
+    host::{Host, Page},
+    jsc::Role,
     jsc::{JavaScriptCore, JsContext, payload::Payload},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -28,7 +29,7 @@ enum Event {
 
 struct Parent {
     events: mpsc::Sender<Event>,
-    wake: crate::host::Waker,
+    wake: crate::jsc::Waker,
     data: Value,
     id: u64,
     stop: Arc<AtomicBool>,
@@ -75,7 +76,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 struct Subscriber {
     names: Vec<String>,
     queue: Vec<(String, Payload)>,
-    wake: crate::host::Waker,
+    wake: crate::jsc::Waker,
 }
 static CHANNELS: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, Subscriber>>> =
     std::sync::LazyLock::new(Default::default);
@@ -203,7 +204,7 @@ impl State {
                     Subscriber {
                         names: Vec::new(),
                         queue: Vec::new(),
-                        wake: crate::host::Waker::current(),
+                        wake: crate::jsc::Waker::current(),
                     },
                 );
                 self.channels.push(id);
@@ -305,10 +306,10 @@ impl State {
                 let cancelled = stop.clone();
                 let running = Running::default();
                 let started = running.clone();
-                let wake = crate::host::Waker::current();
+                let wake = crate::jsc::Waker::current();
                 let own = input.clone();
                 std::thread::Builder::new().name(format!("apps-worker-{id}")).spawn(move || {
-                    crate::host::Waker::install(move || { let _ = own.send(Value::Null.into()); });
+                    crate::jsc::Waker::install(move || { let _ = own.send(Value::Null.into()); });
                     PARENT.with(|parent| *parent.borrow_mut() = Some(Parent { events: output.clone(), wake: wake.clone(), data, id, stop: cancelled.clone(), received, code: None }));
                     let result = (|| -> Result<()> {
                         let host = Rc::new(RefCell::new(Host { app_name: Some(namespace), packaged, disabled, scripts, ..Host::default() }));
@@ -332,7 +333,7 @@ impl State {
                         while !cancelled.load(Ordering::Acquire) {
                             let delay = engine.tick()?;
                             if ends && delay != 0 && engine.call("__appsAlive", &[])? != "true" { break; }
-                            crate::host::idle(true);
+                            crate::jsc::idle(true);
                             let wait = if api.shrink_pending() && !(0..1000).contains(&delay) { 1000 } else { delay };
                             let message = if wait < 0 { inbox.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected) } else { inbox.recv_timeout(Duration::from_millis(wait as u64)) };
                             if api.shrink_due() {
@@ -340,7 +341,7 @@ impl State {
                                 #[cfg(target_os = "macos")]
                                 crate::malloc::flush();
                             }
-                            crate::host::idle(false);
+                            crate::jsc::idle(false);
                             match message {
                                 Ok(message) => for message in std::iter::once(message).chain(inbox.try_iter().take(63)) {
                                     if let Some(text) = message.value[0].as_str() {

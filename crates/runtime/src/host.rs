@@ -1,69 +1,13 @@
 use crate::desktop::link::Target;
 use crate::dom::{Document, Node};
+use crate::jsc::Role;
 use anyhow::{Context, Result, bail, ensure};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::HashMap, io::Write, path::PathBuf};
 
 pub(crate) const WORKER_PAGE: u64 = 0;
 
-#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Debug)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    Main,
-    Preload(u64),
-    Renderer(u64),
-}
-
-#[derive(Clone, Default)]
-pub struct Waker(Option<std::sync::Arc<dyn Fn() + Send + Sync>>);
-
-thread_local! { static WAKER: std::cell::RefCell<Waker> = std::cell::RefCell::default(); }
 static CWD: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
-
-thread_local! {
-    pub(crate) static IDLE: std::cell::Cell<(Option<std::time::Instant>, Option<std::time::Instant>, std::time::Duration)> = std::cell::Cell::default();
-}
-
-pub(crate) fn idle(waiting: bool) {
-    IDLE.with(|idle| {
-        let (start, since, total) = idle.get();
-        let now = std::time::Instant::now();
-        idle.set(if waiting {
-            (start.or(Some(now)), Some(now), total)
-        } else {
-            (
-                start,
-                None,
-                total + since.map_or_else(Default::default, |since| now - since),
-            )
-        });
-    });
-}
-
-impl Waker {
-    pub fn install(wake: impl Fn() + Send + Sync + 'static) {
-        WAKER.set(Self(Some(std::sync::Arc::new(wake))));
-    }
-
-    pub(crate) fn current() -> Self {
-        WAKER.with_borrow(Clone::clone)
-    }
-
-    pub(crate) fn wake(&self) {
-        if let Some(wake) = &self.0 {
-            wake();
-        }
-    }
-}
-
-pub(crate) struct WakeOnDrop(pub(crate) Waker);
-
-impl Drop for WakeOnDrop {
-    fn drop(&mut self) {
-        self.0.wake();
-    }
-}
 
 pub(crate) fn reaches(
     doc: &Document,
@@ -113,7 +57,7 @@ pub struct Host {
     pub dom: rustc_hash::FxHashMap<u64, crate::dom::State>,
     pub bridge: HashMap<u64, HashMap<String, crate::jsc::payload::Payload>>,
     pub dropped: HashMap<u64, Vec<String>>,
-    pub browsers: crate::desktop::browser::State,
+    pub browsers: crate::native::browser::State,
     pub logs: std::collections::VecDeque<Value>,
     pub graphics: HashMap<u64, crate::web::gpu::Gpu>,
     pub media: HashMap<u64, crate::web::media::Media>,
@@ -204,7 +148,7 @@ impl Host {
     }
 
     pub(crate) fn sync_theme(&mut self) {
-        let theme = crate::desktop::native::theme_state();
+        let theme = crate::native::theme_state();
         if self.theme == theme {
             return;
         }
@@ -755,7 +699,7 @@ impl Host {
                         .map(|state| state.pixel_ratio)
                         .filter(|&ratio| ratio > 0.)
                         .unwrap_or(1.),
-                    crate::desktop::native::theme_state()
+                    crate::native::theme_state()
                 ]));
             }
             let state = self.dom.entry(id).or_default();

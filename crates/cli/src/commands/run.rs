@@ -2,7 +2,7 @@ use crate::bundler;
 use anyhow::{Context, Result};
 use apps_runtime::{
     bundle::Bundle,
-    host::Role,
+    jsc::Role,
     jsc::{JavaScriptCore, JsContext},
 };
 use bbtree::unsync::BBTreeMap;

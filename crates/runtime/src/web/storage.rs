@@ -111,7 +111,7 @@ mod tests {
         });
         let wakes = Arc::new(AtomicUsize::new(0));
         let counter = wakes.clone();
-        crate::host::Waker::install(move || {
+        crate::jsc::Waker::install(move || {
             counter.fetch_add(1, Ordering::Relaxed);
         });
         let id = first.call("begin", &json!(["a", "readwrite"])).unwrap()["id"].clone();
@@ -359,7 +359,7 @@ fn wire_key(hex: Option<String>) -> Value {
 type SessionKey = (String, u64);
 type Session = (usize, BTreeMap<String, String>);
 static SESSIONS: OnceLock<Mutex<HashMap<SessionKey, Session>>> = OnceLock::new();
-static WAITING: Mutex<Vec<crate::host::Waker>> = Mutex::new(Vec::new());
+static WAITING: Mutex<Vec<crate::jsc::Waker>> = Mutex::new(Vec::new());
 // Serialize journal-mode changes: SQLite ignores the busy timeout for them, and windows open databases on
 // separate threads.
 static SETUP: Mutex<()> = Mutex::new(());
@@ -572,7 +572,7 @@ impl State {
             "begin"=>{
                 let name=args[0].as_str().context("Expected database name")?.to_owned();let writable=args[1]!="readonly";
                 // Pages also retry on a timer, so a waker is only a shortcut. The list is capped, because another process can hold the lock for as long as it likes.
-                let busy=||{if let Ok(mut waiting)=WAITING.lock()&&waiting.len()<64{waiting.push(crate::host::Waker::current());}Ok(json!({"busy":true}))};
+                let busy=||{if let Ok(mut waiting)=WAITING.lock()&&waiting.len()<64{waiting.push(crate::jsc::Waker::current());}Ok(json!({"busy":true}))};
                 if self.transactions.values().any(|transaction| transaction.name == name) { return busy(); }
                 let database=match self.idle.pop(){Some(database)=>database,None=>{let database=Database::open(&self.path)?;database.query("PRAGMA synchronous=NORMAL",&[])?;database}};
                 match database.query(if writable {"BEGIN IMMEDIATE"}else{"BEGIN"},&[]) {Ok(_)=>{},Err(error) => {

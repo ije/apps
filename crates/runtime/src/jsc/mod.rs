@@ -2,7 +2,7 @@ mod aot;
 pub(crate) mod encoding;
 pub(crate) mod payload;
 
-use crate::host::{Host, Role};
+use crate::host::Host;
 use anyhow::{Context, Result, bail, ensure};
 use bbtree::unsync::BBTreeMap;
 use libloading::Library;
@@ -13,6 +13,63 @@ use std::{
     ptr,
     rc::Rc,
 };
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Main,
+    Preload(u64),
+    Renderer(u64),
+}
+
+#[derive(Clone, Default)]
+pub struct Waker(Option<std::sync::Arc<dyn Fn() + Send + Sync>>);
+
+thread_local! { static WAKER: std::cell::RefCell<Waker> = std::cell::RefCell::default(); }
+
+thread_local! {
+    pub(crate) static IDLE: std::cell::Cell<(Option<std::time::Instant>, Option<std::time::Instant>, std::time::Duration)> = std::cell::Cell::default();
+}
+
+pub(crate) fn idle(waiting: bool) {
+    IDLE.with(|idle| {
+        let (start, since, total) = idle.get();
+        let now = std::time::Instant::now();
+        idle.set(if waiting {
+            (start.or(Some(now)), Some(now), total)
+        } else {
+            (
+                start,
+                None,
+                total + since.map_or_else(Default::default, |since| now - since),
+            )
+        });
+    });
+}
+
+impl Waker {
+    pub fn install(wake: impl Fn() + Send + Sync + 'static) {
+        WAKER.set(Self(Some(std::sync::Arc::new(wake))));
+    }
+
+    pub(crate) fn current() -> Self {
+        WAKER.with_borrow(Clone::clone)
+    }
+
+    pub(crate) fn wake(&self) {
+        if let Some(wake) = &self.0 {
+            wake();
+        }
+    }
+}
+
+pub(crate) struct WakeOnDrop(pub(crate) Waker);
+
+impl Drop for WakeOnDrop {
+    fn drop(&mut self) {
+        self.0.wake();
+    }
+}
 
 type Source = (&'static str, fn() -> &'static str);
 
@@ -1353,7 +1410,7 @@ fn dispatch(
         );
         let result = match NATIVE.get() {
             Some(native) => native(op, &values[0]),
-            None => crate::desktop::native::native_call(op, &values[0]),
+            None => crate::native::native_call(op, &values[0]),
         }?;
         if op == "theme.set" {
             let mut host = host.borrow_mut();

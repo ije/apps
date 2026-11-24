@@ -1,13 +1,12 @@
 pub mod app;
-pub(crate) mod browser;
 pub(crate) mod devtools;
 pub(crate) mod link;
 pub(crate) mod mcp;
-pub(crate) mod native;
 
 use crate::{
     dom::Document,
-    host::{Host, Page, Role},
+    host::{Host, Page},
+    jsc::Role,
     jsc::{JavaScriptCore, JsContext},
     render::PageView,
 };
@@ -251,7 +250,7 @@ impl Desktop {
         let api = JavaScriptCore::load()?;
         let link = Link::new();
         // Install the waker before the app runs, because native producers of this thread capture it then.
-        crate::host::Waker::install({
+        crate::jsc::Waker::install({
             let link = link.clone();
             move || link.wake_main()
         });
@@ -1180,7 +1179,7 @@ impl Desktop {
         if runtime.try_borrow_mut().is_err() {
             return;
         }
-        crate::host::idle(false);
+        crate::jsc::idle(false);
         let result = (|| -> Result<Option<u64>> {
             let mut app = runtime.borrow_mut();
             app.host.borrow_mut().sync_theme();
@@ -1483,7 +1482,7 @@ impl Desktop {
                 runtime.borrow_mut().fail();
             }
         }
-        crate::host::idle(true);
+        crate::jsc::idle(true);
     }
 
     fn fail(&mut self) {
@@ -1671,7 +1670,7 @@ impl Desktop {
                 renderer::native::before_exit();
             }));
             #[cfg(target_os = "macos")]
-            native::observe();
+            crate::native::observe();
             if main.engine.is_some()
                 && let Err(error) = main.eval("__appsEvent('ready')", "apps:ready")
             {
@@ -1731,13 +1730,13 @@ impl Desktop {
         let waker = cx.waker();
         queue.set_wake(move || waker.wake());
         // Without a thread per window this one also runs the main side, which must wake too.
-        let (main, page) = (crate::host::Waker::current(), queue.clone());
-        crate::host::Waker::install(move || {
+        let (main, page) = (crate::jsc::Waker::current(), queue.clone());
+        crate::jsc::Waker::install(move || {
             main.wake();
             page.wake();
         });
         crate::jsc::NATIVE.set(Some(|op, args| {
-            renderer::native::sync(|| native::native_call(op, args))
+            renderer::native::sync(|| crate::native::native_call(op, args))
         }));
         mcp::install(owner.unwrap_or(0));
         let runtime = Rc::new(RefCell::new(Self {

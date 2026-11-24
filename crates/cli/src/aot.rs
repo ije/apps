@@ -295,7 +295,7 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
         let engine = apps_runtime::jsc::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load()?,
             Default::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )?;
         let modules = serde_json::to_string(
             &wasm

@@ -532,7 +532,7 @@ impl Main {
                 (ToMain::Native(command), _) => self.native(command),
                 (ToMain::OpenTools, Some(engine)) => {
                     let tools =
-                        super::devtools::DevTools::new("Main", crate::host::Role::Main, None);
+                        super::devtools::DevTools::new("Main", crate::jsc::Role::Main, None);
                     // The agent keeps the logged values from now on, so their rows can expand.
                     match tools.and_then(|tools| {
                         super::devtools::agent(engine, "poll", &Value::Null)?;
@@ -974,7 +974,7 @@ impl Main {
             self.receive_with(false);
             return;
         }
-        crate::host::idle(false);
+        crate::jsc::idle(false);
         let result = self.turn();
         self.driving.set(false);
         match result {
@@ -1006,7 +1006,7 @@ impl Main {
         if self.api.shrink_pending() && !self.quiet.replace(true) {
             self.shrink_when_quiet();
         }
-        crate::host::idle(true);
+        crate::jsc::idle(true);
     }
 
     fn turn(&self) -> Result<Option<u64>> {
@@ -1084,7 +1084,7 @@ impl Main {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::Role;
+    use crate::jsc::Role;
 
     #[test]
     fn commands_route_by_target_before_and_after_windows_get_threads() {

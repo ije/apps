@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail, ensure};
-pub use apps_webview::Browser;
+use apps_webview::Browser;
 use serde_json::Value;
 use std::collections::HashMap;
 

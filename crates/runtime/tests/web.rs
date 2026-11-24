@@ -1,5 +1,6 @@
 use apps_runtime::{
-    host::{Host, Page, Role},
+    host::{Host, Page},
+    jsc::Role,
     jsc::{JavaScriptCore, JsContext},
 };
 use std::{

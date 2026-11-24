@@ -141,7 +141,10 @@ fn avif_rejects_corrupt_data_and_respects_limits() {
 
 #[test]
 fn svg_and_bundled_images_load_through_the_host() {
-    use apps_runtime::host::{Host, Page, Role};
+    use apps_runtime::{
+        host::{Host, Page},
+        jsc::Role,
+    };
     use std::io::Write;
     let mut doc = Document::parse("<body><img></body>");
     let mut state = dom::State::default();

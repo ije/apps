@@ -1,3 +1,5 @@
+pub(crate) mod browser;
+
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 #[cfg(target_os = "macos")]
@@ -24,13 +26,13 @@ pub(crate) fn theme_state() -> u32 {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn observe() {
-    static WAKER: std::sync::OnceLock<crate::host::Waker> = std::sync::OnceLock::new();
+    static WAKER: std::sync::OnceLock<crate::jsc::Waker> = std::sync::OnceLock::new();
     extern "C" fn wake() {
         if let Some(waker) = WAKER.get() {
             waker.wake();
         }
     }
-    let _ = WAKER.set(crate::host::Waker::current());
+    let _ = WAKER.set(crate::jsc::Waker::current());
     unsafe { apps_theme_observe(wake) };
 }
 

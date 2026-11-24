@@ -1,4 +1,4 @@
-use crate::host::Waker;
+use crate::jsc::Waker;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{

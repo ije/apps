@@ -1,5 +1,5 @@
 use crate::{
-    host::Role,
+    jsc::Role,
     jsc::{JavaScriptCore, Ptr},
 };
 use anyhow::{Context, Result, bail, ensure};

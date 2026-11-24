@@ -109,7 +109,7 @@ impl State {
                 let mut reader = pair.master.try_clone_reader()?;
                 let mut writer = pair.master.take_writer()?;
                 let (tx, events) = mpsc::sync_channel(32);
-                let wake = crate::host::Waker::current();
+                let wake = crate::jsc::Waker::current();
                 let waker = wake.clone();
                 std::thread::Builder::new()
                     .name("apps-pty-read".into())
