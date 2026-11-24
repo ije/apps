@@ -1,6 +1,5 @@
 // Origin values are in precedence order and important ones rank `IMPORTANT - origin`, so don't reorder them.
 use crate::css::{LOGICAL, Prop, Style};
-use crate::style::cascade::scope::Layer;
 use bbtree::unsync::BBTreeMap;
 pub(crate) const AGENT: u8 = 0;
 pub(crate) const USER: u8 = 1;
@@ -122,3 +121,12 @@ pub(crate) fn physical<V: AsRef<str>>(
         }
     }
 }
+// While rules are collected, `rank` is the index of the layer in `Collect.layers`, not its rank.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct Layer {
+    pub(crate) origin: u8,
+    pub(crate) rank: u32,
+}
+
+pub(crate) const DELETED: u8 = u8::MAX;
+pub(crate) const UNLAYERED: u32 = u32::MAX;

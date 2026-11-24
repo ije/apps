@@ -2,9 +2,10 @@ use super::ComputedStyles;
 use crate::css::{Prop, Style};
 use crate::dom::Document;
 use crate::style::animation::effect::{
-    Animated, Clock, DIRECTIONS, Events, FILLS, PAINT, Phase, Playback, TRANSITIONS, Transition,
-    Wake, advance, after, cancel, drop_important, retarget, show,
+    Animated, Clock, DIRECTIONS, Events, FILLS, Phase, Playback, TRANSITIONS, Transition, Wake,
+    advance, after, cancel, drop_important, retarget, show,
 };
+use crate::style::animation::interpolate::PAINT;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{borrow::Cow, collections::HashMap, rc::Rc, time::Instant};
 

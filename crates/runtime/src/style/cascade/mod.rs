@@ -4,14 +4,15 @@ use crate::css::{
 };
 use crate::dom::{Document, SelectorCache};
 use crate::style::animation::Animation;
-use crate::style::cascade::container::{QueryCache, query_containers};
+use crate::style::cascade::container::{ContainerQuery, QueryCache, query_containers};
 use crate::style::cascade::memo::{
     CachedNode, CachedStyle, Inheritable, Inputs, Share, StyleKey, StyleRef,
 };
-use crate::style::cascade::rank::{AGENT, ANIMATION, AUTHOR, CascadeRank, HINT, physical, put};
+use crate::style::cascade::rank::{
+    AGENT, ANIMATION, AUTHOR, CascadeRank, HINT, UNLAYERED, physical, put,
+};
 use crate::style::cascade::scope::{
-    Collect, ContainerQuery, MatchedRules, MediaBlock, MediaStack, PSEUDO, SELECTOR, StyleScope,
-    UNLAYERED, intern,
+    Collect, MatchedRules, MediaBlock, MediaStack, PSEUDO, SELECTOR, StyleScope, intern,
 };
 use crate::style::cascade::shadow::{ELEMENT, PART, SLOTTED, STARTING, ShadowRule, exported_parts};
 use crate::style::cascade::sheets::{Cssom, Derived, Sheet};

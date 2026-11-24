@@ -212,3 +212,4 @@ impl StyleCache {
         true
     }
 }
+pub(crate) type ContainerQuery = Rc<[(Option<String>, bool, MediaQuery)]>;

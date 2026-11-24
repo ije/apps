@@ -85,16 +85,6 @@ pub(crate) struct Cssom {
 pub(crate) type Sheet = (u64, Option<u64>, Rc<str>, Rc<Stylesheet>);
 
 impl StyleCache {
-    pub(crate) fn font_faces(&self) -> Vec<(String, String, Option<String>)> {
-        let mut seen = std::collections::HashSet::new();
-        self.scopes
-            .iter()
-            .flat_map(|scope| &scope.sheets)
-            .filter(|sheet| seen.insert(Rc::as_ptr(sheet)))
-            .flat_map(|sheet| sheet.font_faces())
-            .collect()
-    }
-
     pub(crate) fn sheet(
         &mut self,
         doc: &Document,

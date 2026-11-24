@@ -3,6 +3,7 @@ use crate::css::{
 };
 use crate::dom::Document;
 use crate::style::ComputedStyles;
+use crate::style::animation::interpolate::PAINT;
 use crate::style::animation::interpolate::{
     Lerp, add, animatable, computed, interpolate, keeps_box_in_place, lerp, transitions,
 };
@@ -11,33 +12,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Instant;
-pub(super) const PAINT: &[Prop] = &[
-    Prop::COLOR,
-    Prop::OPACITY,
-    Prop::TRANSFORM,
-    Prop::TRANSLATE,
-    Prop::ROTATE,
-    Prop::SCALE,
-    Prop::BOX_SHADOW,
-    Prop::BACKGROUND_COLOR,
-    Prop::BACKGROUND_POSITION,
-    Prop::BORDER_TOP_COLOR,
-    Prop::BORDER_RIGHT_COLOR,
-    Prop::BORDER_BOTTOM_COLOR,
-    Prop::BORDER_LEFT_COLOR,
-    Prop::OUTLINE_COLOR,
-    Prop::CARET_COLOR,
-    Prop::BORDER_TOP_LEFT_RADIUS,
-    Prop::BORDER_TOP_RIGHT_RADIUS,
-    Prop::BORDER_BOTTOM_RIGHT_RADIUS,
-    Prop::BORDER_BOTTOM_LEFT_RADIUS,
-    Prop::VISIBILITY,
-    Prop::Z_INDEX,
-    Prop::FILTER,
-    Prop::WEBKIT_FILTER,
-    Prop::BACKDROP_FILTER,
-    Prop::WEBKIT_BACKDROP_FILTER,
-];
 
 #[derive(Clone, Debug)]
 pub(crate) struct Animation {

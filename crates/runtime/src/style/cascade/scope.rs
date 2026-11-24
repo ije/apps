@@ -5,9 +5,9 @@ use crate::css::{
 use crate::dom::{Document, SelectorCache};
 use crate::style::StyleCache;
 use crate::style::cascade::TreeWalk;
-use crate::style::cascade::container::style_query;
+use crate::style::cascade::container::{ContainerQuery, style_query};
 use crate::style::cascade::memo::{CachedNode, CachedStyle};
-use crate::style::cascade::rank::{AGENT, AUTHOR, USER};
+use crate::style::cascade::rank::{AGENT, AUTHOR, DELETED, Layer, UNLAYERED, USER};
 use crate::style::cascade::shadow::{PART, SLOTTED};
 use crate::style::ua::{FULLSCREEN_SHEET, GLASS_SHEET, UA_SHEET};
 use rustc_hash::FxHashMap;
@@ -44,16 +44,6 @@ pub(crate) struct StyleScope {
     pub(crate) sequence: u64,
     pub(crate) named: bool,
 }
-
-// While rules are collected, `rank` is the index of the layer in `Collect.layers`, not its rank.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct Layer {
-    pub(crate) origin: u8,
-    pub(crate) rank: u32,
-}
-
-pub(crate) const DELETED: u8 = u8::MAX;
-pub(crate) const UNLAYERED: u32 = u32::MAX;
 
 pub(crate) type Collected<'a> = (
     &'a SelectorList,
@@ -293,7 +283,6 @@ pub(crate) struct MatchedRules {
     pub(crate) pseudos: Rc<[usize]>,
 }
 
-pub(crate) type ContainerQuery = Rc<[(Option<String>, bool, MediaQuery)]>;
 pub(crate) type MediaStack = Rc<[Rc<MediaBlock>]>;
 
 pub(crate) struct MediaBlock {
@@ -1044,5 +1033,17 @@ impl StyleCache {
             chosen.push(scoped.id);
         }
         (chosen, scheme, theme)
+    }
+}
+
+impl StyleCache {
+    pub(crate) fn font_faces(&self) -> Vec<(String, String, Option<String>)> {
+        let mut seen = std::collections::HashSet::new();
+        self.scopes
+            .iter()
+            .flat_map(|scope| &scope.sheets)
+            .filter(|sheet| seen.insert(Rc::as_ptr(sheet)))
+            .flat_map(|sheet| sheet.font_faces())
+            .collect()
     }
 }

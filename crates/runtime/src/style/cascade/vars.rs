@@ -1,5 +1,7 @@
-use crate::css::{LOGICAL, Prop, Registry, Style, Vars, computed, expand, fold, syntax_matches};
-use crate::css::{serialize_color, system_color};
+use crate::css::{
+    LOGICAL, Prop, Registry, Style, Vars, computed, expand, fold, serialize_color, syntax_matches,
+    system_color,
+};
 use crate::style::cascade::used::dark;
 use std::rc::Rc;
 pub(crate) fn var(vars: &Vars, prop: Prop) -> Option<&Rc<str>> {

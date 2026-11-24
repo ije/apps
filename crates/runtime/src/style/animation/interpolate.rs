@@ -1,6 +1,6 @@
-use crate::css::color;
-use crate::css::{Easing, Lengths, Prop, Registry, Style, components, time, timing_function};
-use crate::style::animation::effect::PAINT;
+use crate::css::{
+    Easing, Lengths, Prop, Registry, Style, color, components, time, timing_function,
+};
 use std::borrow::Cow;
 use std::rc::Rc;
 pub(super) fn add(property: &str, under: &str, value: &str, accumulate: bool) -> Option<String> {
@@ -993,3 +993,30 @@ impl Lerp {
         }
     }
 }
+pub(super) const PAINT: &[Prop] = &[
+    Prop::COLOR,
+    Prop::OPACITY,
+    Prop::TRANSFORM,
+    Prop::TRANSLATE,
+    Prop::ROTATE,
+    Prop::SCALE,
+    Prop::BOX_SHADOW,
+    Prop::BACKGROUND_COLOR,
+    Prop::BACKGROUND_POSITION,
+    Prop::BORDER_TOP_COLOR,
+    Prop::BORDER_RIGHT_COLOR,
+    Prop::BORDER_BOTTOM_COLOR,
+    Prop::BORDER_LEFT_COLOR,
+    Prop::OUTLINE_COLOR,
+    Prop::CARET_COLOR,
+    Prop::BORDER_TOP_LEFT_RADIUS,
+    Prop::BORDER_TOP_RIGHT_RADIUS,
+    Prop::BORDER_BOTTOM_RIGHT_RADIUS,
+    Prop::BORDER_BOTTOM_LEFT_RADIUS,
+    Prop::VISIBILITY,
+    Prop::Z_INDEX,
+    Prop::FILTER,
+    Prop::WEBKIT_FILTER,
+    Prop::BACKDROP_FILTER,
+    Prop::WEBKIT_BACKDROP_FILTER,
+];

@@ -4,7 +4,7 @@ use crate::css::{
     declare, length, resolved, specified, supports, supports_condition, syntax_matches,
 };
 use crate::style::cascade::rank::CascadeRank;
-use crate::style::cascade::scope::{DELETED, PSEUDO, SELECTOR};
+use crate::style::cascade::scope::{PSEUDO, SELECTOR};
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::style::cascade::rank::DELETED;
 
 #[test]
 fn selector_dependencies_follow_tree_and_attribute_changes() {
