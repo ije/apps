@@ -2,14 +2,21 @@ use super::*;
 
 // The retained paint that tree drives: copies of the spans and hit regions of the last paint.
 impl Window {
-    // The boxes whose style moved or sized them since the last layout.
-    pub(crate) fn take_unanchored(&mut self) -> rustc_hash::FxHashSet<u64> {
-        mem::take(&mut self.unanchored)
+    pub(crate) fn prepaint_mark(&self) -> PrepaintMark {
+        PrepaintMark {
+            unsettled: self.unsettled,
+            transforms: self.transforms,
+        }
     }
 
-    // The counts of `unsettle` calls and of hit transforms, which prepaint compares around a box.
-    pub(crate) fn prepaint_mark(&self) -> [u32; 2] {
-        [self.unsettled, self.transforms]
+    // Whether the prepaint since `mark` made hit transforms.
+    pub(crate) fn transformed_since(&self, mark: PrepaintMark) -> bool {
+        self.transforms != mark.transforms
+    }
+
+    // Whether the prepaint since `mark` read state outside the tree that changed.
+    pub(crate) fn unsettled_since(&self, mark: PrepaintMark) -> bool {
+        self.unsettled != mark.unsettled
     }
 
     pub(crate) fn with_font_smoothing<R>(&mut self, on: bool, f: impl FnOnce(&mut Self) -> R) -> R {

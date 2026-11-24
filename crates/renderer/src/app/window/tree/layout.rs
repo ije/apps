@@ -1,13 +1,20 @@
 use super::*;
 
 impl Tree {
-    pub(crate) fn layout(&mut self, root: NodeId, viewport: Size<Pixels>, window: &mut Window) {
+    // `unanchored` holds the boxes whose style moved or sized them since the last layout.
+    pub(crate) fn layout(
+        &mut self,
+        root: NodeId,
+        viewport: Size<Pixels>,
+        unanchored: FxHashSet<u64>,
+        window: &mut Window,
+    ) {
         let scale = window.scale_factor();
         let space = taffy::Size {
             width: taffy::AvailableSpace::Definite(viewport.width.0 * scale),
             height: taffy::AvailableSpace::Definite(viewport.height.0 * scale),
         };
-        self.choose_anchors(window);
+        self.choose_anchors(&unanchored, window);
         let mut tree = LayoutTree {
             slots: &mut self.slots,
             window,
@@ -194,8 +201,7 @@ impl Tree {
 
     // Before a layout, the boxes are where the last one put them. A scroll container that a scroll moved since it
     // chose its scroll anchor chooses again there when the content inside lays out again, as in Chrome.
-    fn choose_anchors(&mut self, window: &mut Window) {
-        let unanchored = window.take_unanchored();
+    fn choose_anchors(&mut self, unanchored: &FxHashSet<u64>, window: &mut Window) {
         let scale = window.scale_factor();
         for at in 0..self.anchoring.len() {
             let Some(&index) = self.keys.get(&self.anchoring[at]) else {

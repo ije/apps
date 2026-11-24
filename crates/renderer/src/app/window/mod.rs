@@ -266,6 +266,13 @@ struct Input {
     prepass: Option<u32>,
 }
 
+// The counts of `unsettle` calls and of hit transforms at a place in prepaint.
+#[derive(Clone, Copy)]
+pub(crate) struct PrepaintMark {
+    unsettled: u32,
+    transforms: u32,
+}
+
 // Where a paint span starts: in the scene and in the paint records of the input.
 #[derive(Clone, Copy)]
 pub(crate) struct PaintMark {
@@ -1049,7 +1056,12 @@ impl Window {
                 });
                 self.view = Some(view);
                 if let Some(root) = root {
-                    tree.layout(root, self.viewport_size, self);
+                    tree.layout(
+                        root,
+                        self.viewport_size,
+                        mem::take(&mut self.unanchored),
+                        self,
+                    );
                     tree.prepaint(root, self);
                     self.hovered = self.pending.probe(self.pointer, &mut self.under);
                     let restarting = self.restart && self.restarts < 4;
@@ -1170,7 +1182,12 @@ impl Window {
             self.clear_pending();
             let mut tree = self.tree.take().unwrap_or_default();
             if let Some(root) = self.build(&mut tree, app, &mut render) {
-                tree.layout(root, self.viewport_size, self);
+                tree.layout(
+                    root,
+                    self.viewport_size,
+                    mem::take(&mut self.unanchored),
+                    self,
+                );
                 tree.prepaint(root, self);
             }
             self.tree = Some(tree);

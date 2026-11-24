@@ -172,7 +172,7 @@ impl Tree {
         let [bounds, exact] = self.bounds(index, origin, window);
         let slot = &mut self.slots[index as usize];
         (slot.bounds, slot.exact) = (bounds, exact);
-        let (listed, [_, transforms]) = (self.stacks.last().map(Vec::len), window.prepaint_mark());
+        let (listed, mark) = (self.stacks.last().map(Vec::len), window.prepaint_mark());
         let shifting = mem::replace(&mut self.shifting, true);
         self.visit(
             index,
@@ -180,7 +180,7 @@ impl Tree {
             |hooks, cx, inner| hooks.prepaint(cx, inner),
             |tree, style, window| tree.prepaint_box(index, style, covered, window),
         );
-        self.flatten(index, transforms, shifting, window);
+        self.flatten(index, mark, shifting, window);
         self.reach(index, window.scale_factor());
         if self.slots[index as usize].escaped.is_some() {
             self.unescape(window);
@@ -241,10 +241,10 @@ impl Tree {
     }
 
     // A box is flat when no hit transform is in it and all hooks in it can shift.
-    fn flatten(&mut self, index: u32, transforms: u32, outer: bool, window: &Window) {
+    fn flatten(&mut self, index: u32, mark: PrepaintMark, outer: bool, window: &Window) {
         let slot = &mut self.slots[index as usize];
         slot.flat = mem::replace(&mut self.shifting, outer)
-            && window.prepaint_mark()[1] == transforms
+            && !window.transformed_since(mark)
             && slot.hooks.as_ref().is_none_or(|hooks| hooks.shifts());
         self.shifting &= slot.flat;
     }
@@ -775,8 +775,7 @@ impl Tree {
             ),
         );
         let (regions, listed) = (window.regions_len(), self.stacks.last().map(Vec::len));
-        let (touched, [unsettled, transforms]) =
-            (self.touched.len() as u32, window.prepaint_mark());
+        let (touched, mark) = (self.touched.len() as u32, window.prepaint_mark());
         let shifting = mem::replace(&mut self.shifting, true);
         self.visit(
             index,
@@ -784,8 +783,8 @@ impl Tree {
             |hooks, cx, inner| hooks.kept(cx, inner),
             |tree, style, window| tree.keep_box(index, style, moved, window),
         );
-        self.flatten(index, transforms, shifting, window);
-        self.still &= window.prepaint_mark()[0] == unsettled;
+        self.flatten(index, mark, shifting, window);
+        self.still &= !window.unsettled_since(mark);
         // The volatile boxes inside can reach elsewhere.
         if moved || self.slots[index as usize].lively {
             self.reach(index, window.scale_factor());

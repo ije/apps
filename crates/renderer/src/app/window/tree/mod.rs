@@ -7,7 +7,7 @@ mod paint;
 mod prepaint;
 
 use super::{
-    PaintKey, PaintSpan, Placement,
+    PaintKey, PaintSpan, Placement, PrepaintMark,
     node::{
         Child, Content, Events, MeasureFn, Measurement, Node, NodeCx, NodeKey, NodeStyle, Split,
     },
