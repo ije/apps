@@ -6,18 +6,14 @@ use crate::dom::{Document, SelectorCache};
 use crate::style::StyleCache;
 use crate::style::cascade::TreeWalk;
 use crate::style::cascade::container::style_query;
-use crate::style::cascade::memo::CachedNode;
-use crate::style::cascade::memo::CachedStyle;
-use crate::style::cascade::rank::AGENT;
-use crate::style::cascade::rank::AUTHOR;
-use crate::style::cascade::rank::USER;
+use crate::style::cascade::memo::{CachedNode, CachedStyle};
+use crate::style::cascade::rank::{AGENT, AUTHOR, USER};
 use crate::style::cascade::shadow::{PART, SLOTTED};
-#[cfg(target_os = "macos")]
-use crate::style::ua::GLASS_SHEET;
-use crate::style::ua::{FULLSCREEN_SHEET, UA_SHEET};
+use crate::style::ua::{FULLSCREEN_SHEET, GLASS_SHEET, UA_SHEET};
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::rc::Rc;
+#[cfg(target_os = "macos")]
 pub(crate) type Key = Box<[(u8, String)]>;
 
 pub(crate) const PSEUDO: usize = 1 << (usize::BITS - 1);
