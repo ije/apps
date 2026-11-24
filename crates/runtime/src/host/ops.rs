@@ -1,6 +1,6 @@
-use super::context::{Binding, CLIPBOARD, HOSTS, NATIVE, REFLOW};
+use super::context::{Binding, CLIPBOARD, NATIVE, REFLOW, binding};
 use super::{Host, WORKER_PAGE, link::Target, reaches, window};
-use crate::jsc::{Ptr, Role, encoding, payload, receive, well_formed};
+use crate::jsc::{self, Ptr, Role, encoding, payload};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{collections::HashMap, io::Write, path::PathBuf};
@@ -77,8 +77,7 @@ pub(super) unsafe extern "C" fn call(
     exception: *mut Ptr,
 ) -> Ptr {
     use serde_json::Value;
-    let binding = HOSTS.with(|hosts| hosts.borrow().get(&(ctx as usize)).cloned());
-    let Some(binding) = binding else {
+    let Some(binding) = binding(ctx) else {
         return ptr::null_mut();
     };
     let api = binding.api.clone();
@@ -145,8 +144,7 @@ pub(super) unsafe extern "C" fn call(
                 .transpose()?
                 .unzip();
             let buffers = buffers.unwrap_or_default();
-            let mut json = api.text(ctx, *values.get(2).context("Expected JSON arguments")?);
-            well_formed(&mut json);
+            let json = api.json(ctx, *values.get(2).context("Expected JSON arguments")?);
             if let (Role::Renderer(id), Some(op)) = (binding.role, op.strip_prefix("gpu.")) {
                 return run(buffers, &mut || gpu(&binding, ctx, id, op, json.as_bytes()));
             }
@@ -160,8 +158,6 @@ pub(super) unsafe extern "C" fn call(
             return result;
         }
         let role = binding.role;
-        // A `ShadowRealm` is a new global of this VM, with the module loader of its creator. Its `eval`
-        // keeps it alive.
         if op == "web.realm" {
             ensure!(values.len() == 2, "Expected a module loader");
             ensure!(
@@ -171,15 +167,7 @@ pub(super) unsafe extern "C" fn call(
                     .is_ok_and(|host| host.app.features.has(crate::bundle::Feature::JsExecute)),
                 "ShadowRealm needs the jsExecute feature"
             );
-            let name = api.string("eval");
-            return Ok(unsafe {
-                let realm = (api.create)(api.group, ptr::null_mut());
-                (api.module_loader)(realm, values[1]);
-                let eval = (api.get)(realm, (api.global)(realm), name, ptr::null_mut());
-                (api.string_release)(name);
-                (api.release)(realm);
-                eval
-            });
+            return Ok(api.realm(values[1]));
         }
         // A forced layout builds the page, which borrows the host, so it runs before any borrow.
         if let Role::Renderer(id) = role
@@ -300,30 +288,8 @@ pub(super) unsafe extern "C" fn call(
         ),
         Err(_) => ("Host call failed".into(), None),
     };
-    unsafe {
-        let message = api
-            .utf8(ctx, message.as_bytes())
-            .unwrap_or_else(|_| (api.undefined)(ctx));
-        let error = (api.make_error)(ctx, 1, &message, ptr::null_mut());
-        if let Some(code) = code {
-            let key = api.string("code");
-            let text = api.string(code);
-            (api.set)(
-                ctx,
-                error,
-                key,
-                (api.make_string)(ctx, text),
-                0,
-                ptr::null_mut(),
-            );
-            (api.string_release)(key);
-            (api.string_release)(text);
-        }
-        if !exception.is_null() {
-            *exception = error;
-        }
-        (api.undefined)(ctx)
-    }
+    api.throw_error(ctx, exception, &message, code);
+    unsafe { (api.undefined)(ctx) }
 }
 
 pub(super) fn dispatch(
@@ -502,27 +468,19 @@ pub(super) fn dispatch(
                 _ => {}
             }
         }
-        let destination = HOSTS.with(|hosts| {
-            hosts.borrow().iter().find_map(|(&ctx, binding)| {
-                if Rc::ptr_eq(host, &binding.host) && target == Some(binding.role) {
-                    Some((ctx, binding.api.clone()))
-                } else {
-                    None
-                }
-            })
-        });
+        let destination = jsc::contexts::<Binding>()
+            .into_iter()
+            .find(|(_, binding)| Rc::ptr_eq(host, &binding.host) && target == Some(binding.role));
         if destination.is_none() && matches!(role, Role::Main) && values[1]["kind"] == "event" {
             return Ok(serde_json::Value::Null);
         }
-        let (destination, target_api) = destination.context("Bridge target is unavailable")?;
+        let (destination, target) = destination.context("Bridge target is unavailable")?;
         let mut message = args[1].take();
         message["sender"] = serde_json::to_value(role)?;
-        return Ok(receive(
-            &target_api,
-            destination as Ptr,
-            payload::Payload::snapshot(message),
-        )?
-        .into_value());
+        return Ok(target
+            .api
+            .receive(destination, payload::Payload::snapshot(message))?
+            .into_value());
     }
     if let Some(op) = op.strip_prefix("web.") {
         anyhow::ensure!(

@@ -1,4 +1,5 @@
 pub mod aot;
+pub(crate) mod context;
 pub(crate) mod encoding;
 pub(crate) mod payload;
 
@@ -70,9 +71,9 @@ impl Drop for WakeOnDrop {
     }
 }
 
-type Source = (&'static str, fn() -> &'static str);
+pub(crate) type Source = (&'static str, fn() -> &'static str);
 
-pub(crate) const NODE_SCRIPTS: [Source; 14] = [
+const NODE_SCRIPTS: [Source; 14] = [
     ("apps:ffi", || js!("node/ffi.js")),
     ("apps:sqlite", || js!("node/sqlite.js")),
     ("apps:events", || js!("events.js")),
@@ -88,7 +89,7 @@ pub(crate) const NODE_SCRIPTS: [Source; 14] = [
     ("apps:browser", || js!("browser.js")),
     ("apps:electron", || js!("electron.js")),
 ];
-pub(crate) const WEB_SCRIPTS: [Source; 11] = [
+const WEB_SCRIPTS: [Source; 11] = [
     ("apps:streams", || js!("web/streams.js")),
     ("apps:crypto", || js!("web/crypto.js")),
     ("apps:web", || js!("web/index.js")),
@@ -101,7 +102,7 @@ pub(crate) const WEB_SCRIPTS: [Source; 11] = [
     ("apps:wasm", || js!("web/wasm.js")),
     ("apps:file-system", || js!("web/file_system.js")),
 ];
-pub(crate) const PAGE_SCRIPTS: [Source; 2] = [
+const PAGE_SCRIPTS: [Source; 2] = [
     ("apps:gpu", || js!("web/gpu.js")),
     ("apps:dom", || js!("dom.js")),
 ];
@@ -137,7 +138,7 @@ pub struct JavaScriptCore {
     aot: Option<&'static aot::Image>,
     pub(crate) group: Ptr,
     group_release: unsafe extern "C" fn(Ptr),
-    pub(crate) garbage_collect: unsafe extern "C" fn(Ptr),
+    garbage_collect: unsafe extern "C" fn(Ptr),
     shrink: unsafe extern "C" fn(Ptr),
     drain: unsafe extern "C" fn(Ptr),
     evaluate_latin1: unsafe extern "C" fn(
@@ -157,15 +158,15 @@ pub struct JavaScriptCore {
     quiet: std::cell::Cell<u32>,
     shrunk: std::cell::Cell<std::time::Instant>,
     ticks: std::cell::Cell<(std::time::Duration, u32)>,
-    pub(crate) inspectable: unsafe extern "C" fn(Ptr, bool),
+    inspectable: unsafe extern "C" fn(Ptr, bool),
     pub(crate) extra_memory: unsafe extern "C" fn(Ptr, usize),
     // An older library has no such functions. Buffers are then copied, and shared buffers can't be sent.
     pub(crate) contents: Option<payload::Contents>,
     terminate: Option<unsafe extern "C" fn(Ptr)>,
-    pub(crate) set_name: unsafe extern "C" fn(Ptr, Ptr),
-    pub(crate) execution_limit: Limit,
-    pub(crate) create: unsafe extern "C" fn(Ptr, Ptr) -> Ptr,
-    pub(crate) release: unsafe extern "C" fn(Ptr),
+    set_name: unsafe extern "C" fn(Ptr, Ptr),
+    execution_limit: Limit,
+    create: unsafe extern "C" fn(Ptr, Ptr) -> Ptr,
+    release: unsafe extern "C" fn(Ptr),
     pub(crate) string_create: unsafe extern "C" fn(*const u16, usize) -> Ptr,
     string_create_utf8: unsafe extern "C" fn(*const c_char) -> Ptr,
     pub(crate) string_release: unsafe extern "C" fn(Ptr),
@@ -187,12 +188,12 @@ pub struct JavaScriptCore {
     pub(crate) invoke: unsafe extern "C" fn(Ptr, Ptr, Ptr, usize, *const Ptr, *mut Ptr) -> Ptr,
     pub(crate) protect: unsafe extern "C" fn(Ptr, Ptr),
     pub(crate) unprotect: unsafe extern "C" fn(Ptr, Ptr),
-    pub(crate) object_make: unsafe extern "C" fn(Ptr, Ptr, Ptr) -> Ptr,
+    object_make: unsafe extern "C" fn(Ptr, Ptr, Ptr) -> Ptr,
     pub(crate) global: unsafe extern "C" fn(Ptr) -> Ptr,
     pub(crate) function: unsafe extern "C" fn(Ptr, Ptr, Callback) -> Ptr,
     pub(crate) get: unsafe extern "C" fn(Ptr, Ptr, Ptr, *mut Ptr) -> Ptr,
-    pub(crate) rejection_callback: unsafe extern "C" fn(Ptr, Ptr, *mut Ptr),
-    pub(crate) module_loader: unsafe extern "C" fn(Ptr, Ptr),
+    rejection_callback: unsafe extern "C" fn(Ptr, Ptr, *mut Ptr),
+    module_loader: unsafe extern "C" fn(Ptr, Ptr),
     pub(crate) set: unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, u32, *mut Ptr),
     pub(crate) undefined: unsafe extern "C" fn(Ptr) -> Ptr,
     pub(crate) null: unsafe extern "C" fn(Ptr) -> Ptr,
@@ -210,15 +211,15 @@ pub struct JavaScriptCore {
     pub(crate) buffer_length: unsafe extern "C" fn(Ptr, Ptr, *mut Ptr) -> usize,
     pub(crate) get_index: unsafe extern "C" fn(Ptr, Ptr, u32, *mut Ptr) -> Ptr,
     pub(crate) set_index: unsafe extern "C" fn(Ptr, Ptr, u32, Ptr, *mut Ptr),
-    pub(crate) make_error: unsafe extern "C" fn(Ptr, usize, *const Ptr, *mut Ptr) -> Ptr,
-    pub(crate) make_array: unsafe extern "C" fn(Ptr, usize, *const Ptr, *mut Ptr) -> Ptr,
+    make_error: unsafe extern "C" fn(Ptr, usize, *const Ptr, *mut Ptr) -> Ptr,
+    make_array: unsafe extern "C" fn(Ptr, usize, *const Ptr, *mut Ptr) -> Ptr,
     typed_from_buffer: unsafe extern "C" fn(Ptr, u32, Ptr, *mut Ptr) -> Ptr,
-    pub(crate) memory: unsafe extern "C" fn(Ptr) -> Ptr,
-    pub(crate) proxy_target: unsafe extern "C" fn(Ptr) -> Ptr,
-    pub(crate) json_string: unsafe extern "C" fn(Ptr, Ptr, u32, *mut Ptr) -> Ptr,
+    memory: unsafe extern "C" fn(Ptr) -> Ptr,
+    proxy_target: unsafe extern "C" fn(Ptr) -> Ptr,
+    json_string: unsafe extern "C" fn(Ptr, Ptr, u32, *mut Ptr) -> Ptr,
     get_chars: unsafe extern "C" fn(Ptr, Ptr, *mut usize, *mut bool) -> *const c_void,
     get_bytes: unsafe extern "C" fn(Ptr, Ptr, *mut Ptr, *mut usize) -> bool,
-    pub(crate) eval_enabled: unsafe extern "C" fn(Ptr, bool, Ptr),
+    eval_enabled: unsafe extern "C" fn(Ptr, bool, Ptr),
     make_latin1: unsafe extern "C" fn(Ptr, *const u8, usize) -> Ptr,
     make_utf16: unsafe extern "C" fn(Ptr, *const u16, usize) -> Ptr,
     make_utf8: unsafe extern "C" fn(Ptr, *const c_char, usize) -> Ptr,
@@ -226,8 +227,7 @@ pub struct JavaScriptCore {
     to_utf8: unsafe extern "C" fn(*const c_void, usize, bool, *mut c_char) -> usize,
 }
 
-pub(crate) type Limit =
-    unsafe extern "C" fn(Ptr, f64, Option<unsafe extern "C" fn(Ptr, Ptr) -> bool>, Ptr);
+type Limit = unsafe extern "C" fn(Ptr, f64, Option<unsafe extern "C" fn(Ptr, Ptr) -> bool>, Ptr);
 type InspectorMessage = unsafe extern "C" fn(Ptr, *const c_char, usize);
 type InspectorPause = unsafe extern "C" fn(Ptr, *mut bool);
 
@@ -541,7 +541,7 @@ impl JavaScriptCore {
     }
 
     // JSC keeps pointing at `source` and `bytecode`, so both must outlive the VM.
-    pub(crate) unsafe fn evaluate_latin1(
+    unsafe fn evaluate_latin1(
         &self,
         ctx: Ptr,
         source: &[u8],
@@ -613,7 +613,11 @@ impl JavaScriptCore {
             _ => 1,
         };
         self.ticks.set((busy, ticks));
-        f64::from(ticks) * PAGE_TICK >= PAGE_LIMIT as f64
+        let over = f64::from(ticks) * PAGE_TICK >= PAGE_LIMIT as f64;
+        if over {
+            eprintln!("apps: stopped a page script that ran for more than {PAGE_LIMIT} seconds");
+        }
+        over
     }
 
     pub(crate) fn terminator(&self) -> Option<Terminator> {
@@ -718,7 +722,7 @@ impl JavaScriptCore {
 }
 
 // The bytecode of a runtime script, or nothing yet. The first use builds it on another thread.
-pub(crate) fn runtime_bytecode(url: &'static str, source: &'static str) -> &'static [u8] {
+fn runtime_bytecode(url: &'static str, source: &'static str) -> &'static [u8] {
     let (bytecode, build) = {
         let mut scripts = SCRIPTS.lock().unwrap();
         let found = scripts
@@ -799,7 +803,7 @@ pub(crate) fn add_bytecode(url: &'static str, source: &'static str, bytecode: &'
     });
 }
 
-pub(crate) fn bundled(source: &[u8]) -> Option<&'static [u8]> {
+fn bundled(source: &[u8]) -> Option<&'static [u8]> {
     let scripts = SCRIPTS.lock().unwrap();
     let script = scripts
         .list
@@ -818,7 +822,7 @@ pub(crate) fn add_mapped(bundle: std::sync::Weak<memmap2::Mmap>) {
 }
 
 // JSC reads an ASCII script of a mapped bundle in place, so that mapping stays for the rest of the process.
-pub(crate) fn in_place(source: &[u8]) -> bool {
+fn in_place(source: &[u8]) -> bool {
     let range = source.as_ptr_range();
     let bundle = MAPPED
         .lock()
@@ -838,97 +842,43 @@ pub(crate) fn in_place(source: &[u8]) -> bool {
     }
 }
 
+type Registered = (Rc<JavaScriptCore>, Rc<dyn std::any::Any>);
+
 thread_local! {
-    // The engine of each context of this thread, for callbacks that get only the context.
-    static ENGINES: RefCell<rustc_hash::FxHashMap<usize, Rc<JavaScriptCore>>> = RefCell::default();
+    // The engine of each context of this thread, and the data of the host that made the context, for callbacks
+    // that get only the context.
+    static CONTEXTS: RefCell<rustc_hash::FxHashMap<usize, Registered>> = RefCell::default();
     static INSPECTOR_MESSAGES: RefCell<Vec<(usize, String)>> = const { RefCell::new(Vec::new()) };
 }
 
-pub(crate) fn register(ctx: Ptr, api: Rc<JavaScriptCore>) {
-    ENGINES.with_borrow_mut(|engines| engines.insert(ctx as usize, api));
+pub(crate) fn register(ctx: Ptr, api: Rc<JavaScriptCore>, data: Rc<dyn std::any::Any>) {
+    CONTEXTS.with_borrow_mut(|contexts| contexts.insert(ctx as usize, (api, data)));
 }
 
-pub(crate) fn forget(ctx: Ptr) {
-    ENGINES.with_borrow_mut(|engines| engines.remove(&(ctx as usize)));
+pub(crate) fn forget(ctx: Ptr) -> Option<Rc<dyn std::any::Any>> {
+    CONTEXTS.with_borrow_mut(|contexts| contexts.remove(&(ctx as usize)).map(|(_, data)| data))
 }
 
 pub(crate) fn engine(ctx: Ptr) -> Option<Rc<JavaScriptCore>> {
-    ENGINES.with_borrow(|engines| engines.get(&(ctx as usize)).cloned())
+    CONTEXTS.with_borrow(|contexts| contexts.get(&(ctx as usize)).map(|(api, _)| api.clone()))
 }
 
-pub(crate) fn bridge(
-    api: &JavaScriptCore,
-    context: Ptr,
-    function: &str,
-    payload: payload::Payload,
-) -> Result<Ptr> {
-    let name = api.string(function);
-    let mut error = ptr::null_mut();
-    let receiver = unsafe { (api.get)(context, (api.global)(context), name, &mut error) };
-    unsafe {
-        (api.string_release)(name);
-    }
-    // JSC casts call targets to objects without checking, so a primitive would crash.
-    anyhow::ensure!(
-        error.is_null()
-            && unsafe { (api.value_type)(context, receiver) } == 5
-            && unsafe { (api.is_function)(context, receiver) },
-        "Bridge target is unavailable"
-    );
-    let argument = payload::output(api, context, payload);
-    unsafe {
-        (api.protect)(context, argument);
-    }
-    let result =
-        unsafe { (api.invoke)(context, receiver, ptr::null_mut(), 1, &argument, &mut error) };
-    unsafe {
-        (api.unprotect)(context, argument);
-    }
-    if !error.is_null() {
-        bail!("{}", api.text(context, error));
-    }
-    Ok(result)
+pub(crate) fn data<T: 'static>(ctx: Ptr) -> Option<Rc<T>> {
+    let data = CONTEXTS.with(|contexts| {
+        let contexts = contexts.try_borrow().ok()?;
+        Some(contexts.get(&(ctx as usize))?.1.clone())
+    })?;
+    data.downcast().ok()
 }
 
-pub(crate) fn receive(
-    api: &JavaScriptCore,
-    context: Ptr,
-    payload: payload::Payload,
-) -> Result<payload::Payload> {
-    let result = bridge(api, context, "__appsBridgeReceiveBytes", payload)?;
-    anyhow::ensure!(
-        !result.is_null() && unsafe { (api.value_type)(context, result) } == 5,
-        "Invalid bridge reply"
-    );
-    unsafe {
-        (api.protect)(context, result);
-    }
-    let mut error = ptr::null_mut();
-    let decoded = (|| -> Result<_> {
-        let name = api.string("json");
-        let json = unsafe { (api.get)(context, result, name, &mut error) };
-        unsafe {
-            (api.string_release)(name);
-        }
-        let mut json = api.text(context, json);
-        well_formed(&mut json);
-        let value = serde_json::from_str(&json)?;
-        let name = api.string("buffers");
-        let buffers = unsafe { (api.get)(context, result, name, &mut error) };
-        unsafe {
-            (api.string_release)(name);
-        }
-        let buffers = payload::input(api, context, buffers)?
-            .0
+// The contexts of this thread whose data is a `T`.
+pub(crate) fn contexts<T: 'static>() -> Vec<(Ptr, Rc<T>)> {
+    CONTEXTS.with_borrow(|contexts| {
+        contexts
             .iter()
-            .map(|bytes| bytes::Bytes::copy_from_slice(bytes))
-            .collect();
-        Ok(payload::Payload { value, buffers })
-    })();
-    unsafe {
-        (api.unprotect)(context, result);
-    }
-    decoded
+            .filter_map(|(&ctx, (_, data))| Some((ctx as Ptr, data.clone().downcast().ok()?)))
+            .collect()
+    })
 }
 
 pub(crate) fn inspector_messages() -> Vec<(usize, String)> {
@@ -960,18 +910,8 @@ unsafe extern "C" fn inspector_pause(ctx: Ptr, done: *mut bool) {
     }
 }
 
-pub(crate) fn throw(api: &JavaScriptCore, ctx: Ptr, exception: *mut Ptr, message: &str) {
-    if !exception.is_null() {
-        let message = api.string(message);
-        unsafe {
-            *exception = (api.make_string)(ctx, message);
-            (api.string_release)(message);
-        }
-    }
-}
-
 // Replace lone-surrogate escapes with \ufffd: serde_json rejects them.
-pub(crate) fn well_formed(json: &mut str) {
+fn well_formed(json: &mut str) {
     let mut from = 0;
     while let Some(at) = json.get(from..).and_then(|rest| rest.find('\\')) {
         let at = from + at;
@@ -986,60 +926,164 @@ pub(crate) fn well_formed(json: &mut str) {
     }
 }
 
-pub(crate) fn call_json<T>(
-    api: &JavaScriptCore,
-    ctx: Ptr,
-    name: &str,
-    arguments: &[&str],
-    read: impl FnOnce(Ptr) -> T,
-) -> Result<T> {
-    let key = api.string(name);
-    let mut exception = ptr::null_mut();
-    let function = unsafe { (api.get)(ctx, (api.global)(ctx), key, &mut exception) };
-    unsafe { (api.string_release)(key) };
-    ensure!(
-        exception.is_null()
-            && unsafe { (api.value_type)(ctx, function) } == 5
-            && unsafe { (api.is_function)(ctx, function) },
-        "Missing JavaScript function: {name}"
-    );
-    let values: Vec<Ptr> = arguments
-        .iter()
-        .map(|argument| {
-            let text = api.string(argument);
-            let value = unsafe { (api.json_value)(ctx, text) };
-            unsafe {
-                (api.string_release)(text);
-                // Values kept in a heap Vec are invisible to JSC's stack scan.
-                (api.protect)(ctx, value);
-            }
-            value
-        })
-        .collect();
-    let result = if values.iter().any(|value| value.is_null()) {
-        Err(anyhow::anyhow!("Invalid JSON argument for {name}"))
-    } else {
-        let result = api.timed(|| unsafe {
-            (api.invoke)(
-                ctx,
-                function,
-                ptr::null_mut(),
-                values.len(),
-                values.as_ptr(),
-                &mut exception,
-            )
-        });
-        if exception.is_null() {
-            Ok(read(result))
-        } else {
-            Err(anyhow::anyhow!("{}", api.text(ctx, exception)))
+const PAGE_LIMIT: u64 = 10;
+const PAGE_TICK: f64 = 0.1;
+
+impl JavaScriptCore {
+    pub(crate) fn bridge(
+        &self,
+        context: Ptr,
+        function: &str,
+        payload: payload::Payload,
+    ) -> Result<Ptr> {
+        let name = self.string(function);
+        let mut error = ptr::null_mut();
+        let receiver = unsafe { (self.get)(context, (self.global)(context), name, &mut error) };
+        unsafe {
+            (self.string_release)(name);
         }
-    };
-    for value in values.into_iter().filter(|value| !value.is_null()) {
-        unsafe { (api.unprotect)(ctx, value) };
+        // JSC casts call targets to objects without checking, so a primitive would crash.
+        anyhow::ensure!(
+            error.is_null()
+                && unsafe { (self.value_type)(context, receiver) } == 5
+                && unsafe { (self.is_function)(context, receiver) },
+            "Bridge target is unavailable"
+        );
+        let argument = payload::output(self, context, payload);
+        unsafe {
+            (self.protect)(context, argument);
+        }
+        let result =
+            unsafe { (self.invoke)(context, receiver, ptr::null_mut(), 1, &argument, &mut error) };
+        unsafe {
+            (self.unprotect)(context, argument);
+        }
+        if !error.is_null() {
+            bail!("{}", self.text(context, error));
+        }
+        Ok(result)
     }
-    result
+
+    pub(crate) fn receive(
+        &self,
+        context: Ptr,
+        payload: payload::Payload,
+    ) -> Result<payload::Payload> {
+        let result = self.bridge(context, "__appsBridgeReceiveBytes", payload)?;
+        anyhow::ensure!(
+            !result.is_null() && unsafe { (self.value_type)(context, result) } == 5,
+            "Invalid bridge reply"
+        );
+        unsafe {
+            (self.protect)(context, result);
+        }
+        let mut error = ptr::null_mut();
+        let decoded = (|| -> Result<_> {
+            let name = self.string("json");
+            let json = unsafe { (self.get)(context, result, name, &mut error) };
+            unsafe {
+                (self.string_release)(name);
+            }
+            let mut json = self.text(context, json);
+            well_formed(&mut json);
+            let value = serde_json::from_str(&json)?;
+            let name = self.string("buffers");
+            let buffers = unsafe { (self.get)(context, result, name, &mut error) };
+            unsafe {
+                (self.string_release)(name);
+            }
+            let buffers = payload::input(self, context, buffers)?
+                .0
+                .iter()
+                .map(|bytes| bytes::Bytes::copy_from_slice(bytes))
+                .collect();
+            Ok(payload::Payload { value, buffers })
+        })();
+        unsafe {
+            (self.unprotect)(context, result);
+        }
+        decoded
+    }
+
+    pub(crate) fn throw(&self, ctx: Ptr, exception: *mut Ptr, message: &str) {
+        if !exception.is_null() {
+            let message = self.string(message);
+            unsafe {
+                *exception = (self.make_string)(ctx, message);
+                (self.string_release)(message);
+            }
+        }
+    }
+
+    pub(crate) fn call_json<T>(
+        &self,
+        ctx: Ptr,
+        name: &str,
+        arguments: &[&str],
+        read: impl FnOnce(Ptr) -> T,
+    ) -> Result<T> {
+        let key = self.string(name);
+        let mut exception = ptr::null_mut();
+        let function = unsafe { (self.get)(ctx, (self.global)(ctx), key, &mut exception) };
+        unsafe { (self.string_release)(key) };
+        ensure!(
+            exception.is_null()
+                && unsafe { (self.value_type)(ctx, function) } == 5
+                && unsafe { (self.is_function)(ctx, function) },
+            "Missing JavaScript function: {name}"
+        );
+        let values: Vec<Ptr> = arguments
+            .iter()
+            .map(|argument| {
+                let text = self.string(argument);
+                let value = unsafe { (self.json_value)(ctx, text) };
+                unsafe {
+                    (self.string_release)(text);
+                    // Values kept in a heap Vec are invisible to JSC's stack scan.
+                    (self.protect)(ctx, value);
+                }
+                value
+            })
+            .collect();
+        let result = if values.iter().any(|value| value.is_null()) {
+            Err(anyhow::anyhow!("Invalid JSON argument for {name}"))
+        } else {
+            let result = self.timed(|| unsafe {
+                (self.invoke)(
+                    ctx,
+                    function,
+                    ptr::null_mut(),
+                    values.len(),
+                    values.as_ptr(),
+                    &mut exception,
+                )
+            });
+            if exception.is_null() {
+                Ok(read(result))
+            } else {
+                Err(anyhow::anyhow!("{}", self.text(ctx, exception)))
+            }
+        };
+        for value in values.into_iter().filter(|value| !value.is_null()) {
+            unsafe { (self.unprotect)(ctx, value) };
+        }
+        result
+    }
 }
 
-pub(crate) const PAGE_LIMIT: u64 = 10;
-pub(crate) const PAGE_TICK: f64 = 0.1;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lone_surrogates_become_replacements_and_heap_text_is_not_in_place() {
+        let mut json = r#"["a\ud83d","\\ud83d","\n\udfff","\u001f"]"#.to_owned();
+        well_formed(&mut json);
+        assert_eq!(json, r#"["a\ufffd","\\ud83d","\n\ufffd","\u001f"]"#);
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&json).unwrap(),
+            ["a\u{fffd}", "\\ud83d", "\n\u{fffd}", "\u{1f}"]
+        );
+        assert!(!in_place(b"heap"));
+    }
+}

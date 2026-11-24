@@ -714,6 +714,6 @@ pub(crate) unsafe extern "C" fn url_parts(
             };
             *item = unsafe { (api.number)(ctx, end as f64) };
         }
-        Ok(unsafe { (api.make_array)(ctx, items.len(), items.as_ptr(), std::ptr::null_mut()) })
+        Ok(api.array(ctx, &items))
     })
 }

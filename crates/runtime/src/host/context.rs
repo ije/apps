@@ -1,12 +1,13 @@
 use crate::{
     host::Host,
     jsc::{
-        self, Callback, JavaScriptCore, Limit, NODE_SCRIPTS, PAGE_LIMIT, PAGE_SCRIPTS, PAGE_TICK,
-        Ptr, Role, WEB_SCRIPTS, bridge, bundled, call_json, encoding, in_place, inspector_connect,
-        inspector_disconnect, inspector_dispatch, payload, receive, script_source, throw,
+        self, Callback, JavaScriptCore, Ptr, Role,
+        context::{Context as Engine, Runtime, runtime_sources},
+        encoding, inspector_connect, inspector_disconnect, inspector_dispatch, payload,
+        script_source,
     },
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use bbtree::unsync::BBTreeMap;
 use std::{cell::RefCell, ptr, rc::Rc};
 
@@ -20,8 +21,12 @@ pub(super) struct Binding {
     pub(super) node: RefCell<crate::node::State>,
     pub(super) inspector: std::cell::Cell<Ptr>,
 }
+// The binding of a context of this thread.
+pub(super) fn binding(ctx: Ptr) -> Option<Rc<Binding>> {
+    jsc::data(ctx)
+}
+
 thread_local! {
-    pub(super) static HOSTS: RefCell<rustc_hash::FxHashMap<usize, Rc<Binding>>> = RefCell::default();
     static ARMED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     // The render loop sets this, so engines without windows, like the CLI's, don't link the renderer.
     pub(crate) static REFLOW: std::cell::Cell<Option<fn(u64)>> = const { std::cell::Cell::new(None) };
@@ -36,18 +41,14 @@ type Clipboard = fn(Option<String>) -> Option<String>;
 type NativeCall = fn(&str, &serde_json::Value) -> Result<serde_json::Value>;
 
 pub(crate) fn contexts() -> Vec<(usize, Role)> {
-    HOSTS.with_borrow(|hosts| {
-        hosts
-            .iter()
-            .map(|(&ctx, binding)| (ctx, binding.role))
-            .collect()
-    })
+    jsc::contexts::<Binding>()
+        .into_iter()
+        .map(|(ctx, binding)| (ctx as usize, binding.role))
+        .collect()
 }
 
 pub(crate) fn connect_inspector(ctx: usize) -> Result<bool> {
-    let binding = HOSTS
-        .with_borrow(|hosts| hosts.get(&ctx).cloned())
-        .context("The JavaScript context is closed")?;
+    let binding = binding(ctx as Ptr).context("The JavaScript context is closed")?;
     if !binding.inspector.get().is_null() {
         return Ok(false);
     }
@@ -68,50 +69,31 @@ unsafe extern "C" fn compile(
     args: *const Ptr,
     exception: *mut Ptr,
 ) -> Ptr {
-    let binding = HOSTS.with(|hosts| {
-        hosts
-            .borrow()
-            .get(&(ctx as usize))
-            .map(|binding| (binding.api.clone(), binding.host.clone(), binding.role))
-    });
-    let Some((api, host, role)) = binding else {
+    let Some(binding) = binding(ctx) else {
         return ptr::null_mut();
     };
+    let api = &binding.api;
     // Without jsExecute, pages compile only while Rust evaluates one of their own scripts, never from later strings.
-    if matches!(role, Role::Renderer(_))
+    if matches!(binding.role, Role::Renderer(_))
         && ARMED.get() != ctx as usize
-        && !host
+        && !binding
+            .host
             .try_borrow()
             .is_ok_and(|host| host.app.features.has(crate::bundle::Feature::JsExecute))
     {
-        throw(
-            &api,
+        api.throw(
             ctx,
             exception,
             "EvalError: Code generation is disabled in pages",
         );
         return ptr::null_mut();
     }
-    if count != 2 {
-        return unsafe { (api.undefined)(ctx) };
-    }
-    let source = unsafe { (api.to_string)(ctx, *args, exception) };
-    if source.is_null() {
-        return ptr::null_mut();
-    }
-    let url = unsafe { (api.to_string)(ctx, *args.add(1), exception) };
-    if url.is_null() {
-        unsafe {
-            (api.string_release)(source);
-        }
-        return ptr::null_mut();
-    }
-    let result = unsafe { (api.evaluate)(ctx, source, ptr::null_mut(), url, 1, exception) };
-    unsafe {
-        (api.string_release)(source);
-        (api.string_release)(url);
-    }
-    result
+    let args = if count == 0 || args.is_null() {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(args, count) }
+    };
+    api.compile(ctx, args, exception)
 }
 
 // This runs only scripts of the app bundle, by name, and never arms code generation.
@@ -123,106 +105,30 @@ unsafe extern "C" fn chunk(
     args: *const Ptr,
     exception: *mut Ptr,
 ) -> Ptr {
-    let binding = HOSTS.with(|hosts| {
-        hosts
-            .borrow()
-            .get(&(ctx as usize))
-            .map(|binding| (binding.api.clone(), binding.host.clone()))
-    });
-    let Some((api, host)) = binding else {
+    let Some(binding) = binding(ctx) else {
         return ptr::null_mut();
     };
+    let api = &binding.api;
     let name = if count == 1 {
         api.text(ctx, unsafe { *args })
     } else {
         String::new()
     };
-    let source = host
+    let source = binding
+        .host
         .try_borrow()
         .ok()
         .and_then(|host| host.app.scripts.get(&name).cloned());
-    let Some(source) =
-        source.filter(|source| source.is_ascii() || std::str::from_utf8(source).is_ok())
-    else {
-        throw(
-            &api,
-            ctx,
-            exception,
-            &format!("Error: Missing bundled script: {name}"),
-        );
-        return ptr::null_mut();
-    };
-    match api.compiled_module(&source) {
-        Ok(Some(module)) => return api.run_aot(ctx, module, ptr::null_mut(), exception),
-        Ok(None) => {}
-        Err(error) => {
-            throw(&api, ctx, exception, &format!("Error: {error:#}"));
-            return ptr::null_mut();
+    match source.filter(|source| source.is_ascii() || std::str::from_utf8(source).is_ok()) {
+        Some(source) => api.run_chunk(ctx, &name, source, exception),
+        None => {
+            api.throw(
+                ctx,
+                exception,
+                &format!("Error: Missing bundled script: {name}"),
+            );
+            ptr::null_mut()
         }
-    }
-    let url = api.string(&format!("apps:///{name}"));
-    // Keep these bytes alive for JSC. JSEvaluateScript copies source and uses UTF-16 for NUL or non-ASCII
-    // input.
-    let result = if source.is_ascii() {
-        let bytecode = bundled(&source).unwrap_or_default();
-        let source = std::mem::ManuallyDrop::new(source);
-        unsafe { api.evaluate_latin1(ctx, &source[..], ptr::null_mut(), url, bytecode, exception) }
-    } else {
-        let script = api.string(&String::from_utf8_lossy(&source));
-        let result = unsafe { (api.evaluate)(ctx, script, ptr::null_mut(), url, 1, exception) };
-        unsafe { (api.string_release)(script) };
-        result
-    };
-    unsafe { (api.string_release)(url) };
-    result
-}
-
-unsafe extern "C" fn now(
-    ctx: Ptr,
-    _function: Ptr,
-    _this: Ptr,
-    _count: usize,
-    _args: *const Ptr,
-    _exception: *mut Ptr,
-) -> Ptr {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let api = HOSTS.with(|hosts| {
-        hosts
-            .borrow()
-            .get(&(ctx as usize))
-            .map(|binding| binding.api.clone())
-    });
-    let Some(api) = api else {
-        return ptr::null_mut();
-    };
-    unsafe {
-        (api.number)(
-            ctx,
-            START
-                .get_or_init(std::time::Instant::now)
-                .elapsed()
-                .as_secs_f64()
-                * 1000.,
-        )
-    }
-}
-
-unsafe extern "C" fn is_proxy(
-    ctx: Ptr,
-    _function: Ptr,
-    _this: Ptr,
-    count: usize,
-    args: *const Ptr,
-    _exception: *mut Ptr,
-) -> Ptr {
-    let Some(api) = HOSTS.with(|hosts| hosts.borrow().get(&(ctx as usize)).map(|b| b.api.clone()))
-    else {
-        return ptr::null_mut();
-    };
-    unsafe {
-        let proxy =
-            count > 0 && (api.value_type)(ctx, *args) == 5 && !(api.proxy_target)(*args).is_null();
-        (api.boolean)(ctx, proxy)
     }
 }
 
@@ -234,8 +140,7 @@ unsafe extern "C" fn ffi_call(
     args: *const Ptr,
     exception: *mut Ptr,
 ) -> Ptr {
-    let binding = HOSTS.with(|hosts| hosts.borrow().get(&(ctx as usize)).cloned());
-    let Some(binding) = binding else {
+    let Some(binding) = binding(ctx) else {
         return ptr::null_mut();
     };
     let (api, role, ffi) = (&binding.api, binding.role, &binding.ffi);
@@ -271,22 +176,16 @@ unsafe extern "C" fn ffi_call(
 }
 
 unsafe extern "C" fn page_limit(ctx: Ptr, _: Ptr) -> bool {
-    let binding = HOSTS.with(|hosts| {
-        hosts.try_borrow().ok().and_then(|hosts| {
-            hosts
-                .get(&(ctx as usize))
-                .map(|binding| (binding.api.clone(), binding.role))
-        })
-    });
-    let Some((api, role)) = binding else {
+    let Some(binding) = binding(ctx) else {
         return false;
     };
+    let (api, role) = (&binding.api, binding.role);
     let (Role::Renderer(id) | Role::Preload(id)) = role else {
         return false;
     };
     // The limit ends with this call, so a script that goes on needs a new one.
     let again = || {
-        unsafe { (api.execution_limit)(api.group, PAGE_TICK, Some(page_limit), ptr::null_mut()) };
+        api.limit_pages(page_limit);
         false
     };
     if stopping(id) {
@@ -296,7 +195,6 @@ unsafe extern "C" fn page_limit(ctx: Ptr, _: Ptr) -> bool {
         return again();
     }
     if api.over_limit() {
-        eprintln!("apps: stopped a page script that ran for more than {PAGE_LIMIT} seconds");
         return true;
     }
     again()
@@ -333,19 +231,19 @@ pub(crate) fn stop_pages() {
 
 struct Interrupt {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    group: Ptr,
-    limit: Limit,
+    api: Rc<JavaScriptCore>,
 }
 
 // Bundles run one entry script per call of this source, so callers loop until it returns `false`.
 pub(crate) const NEXT: &str = "this.__appsNext?.()";
 
 pub struct JsContext {
+    engine: Engine,
     api: Rc<JavaScriptCore>,
     ctx: Ptr,
     napi: Option<Rc<crate::node::napi::Root>>,
-    interrupt: Option<Box<Interrupt>>,
-    scope: Ptr,
+    // Kept for the limit callback, which reads it.
+    _interrupt: Option<Box<Interrupt>>,
 }
 
 impl JsContext {
@@ -359,14 +257,8 @@ impl JsContext {
         run_worker: crate::web::worker::Run,
     ) -> Result<Self> {
         let devtools = !host.borrow().app.packaged;
-        let ctx = unsafe { (api.create)(api.group, ptr::null_mut()) };
-        anyhow::ensure!(!ctx.is_null(), "Cannot create a JavaScriptCore context");
-        unsafe {
-            (api.inspectable)(ctx, devtools);
-            let name = api.string(&format!("apps {role:?}"));
-            (api.set_name)(ctx, name);
-            (api.string_release)(name);
-        }
+        let mut engine = Engine::new(api.clone(), &format!("apps {role:?}"), devtools)?;
+        let ctx = engine.ptr();
         let binding = Binding {
             api: api.clone(),
             host: host.clone(),
@@ -386,19 +278,19 @@ impl JsContext {
             .sqlite
             .borrow_mut()
             .set_authorizer_callback(Rc::new(move |id, action, args| {
-                call_json(
-                    &callback_api,
-                    ctx,
-                    "__appsSqliteAuthorize",
-                    &[
-                        &id.to_string(),
-                        &action.to_string(),
-                        &serde_json::to_string(&args)?,
-                    ],
-                    |value| callback_api.text(ctx, value),
-                )?
-                .parse::<i32>()
-                .context("Authorizer must return a SQLite authorization code")
+                callback_api
+                    .call_json(
+                        ctx,
+                        "__appsSqliteAuthorize",
+                        &[
+                            &id.to_string(),
+                            &action.to_string(),
+                            &serde_json::to_string(&args)?,
+                        ],
+                        |value| callback_api.text(ctx, value),
+                    )?
+                    .parse::<i32>()
+                    .context("Authorizer must return a SQLite authorization code")
             }));
         binding.web.borrow_mut().configure_storage(
             &host.borrow().app,
@@ -407,56 +299,39 @@ impl JsContext {
                 Role::Main => None,
             },
         );
-        jsc::register(ctx, api.clone());
-        HOSTS.with(|hosts| hosts.borrow_mut().insert(ctx as usize, Rc::new(binding)));
+        jsc::register(ctx, api.clone(), Rc::new(binding));
         let napi = if matches!(role, Role::Renderer(_)) {
             None
         } else {
             Some(crate::node::napi::Root::new(api.clone(), ctx, &host))
         };
-        let mut engine = Self {
-            api,
-            ctx,
-            napi,
-            interrupt: None,
-            scope: ptr::null_mut(),
-        };
-        if let Some(stop) = interrupt {
-            unsafe extern "C" fn interrupted(_: Ptr, context: Ptr) -> bool {
-                let state = unsafe { &*context.cast::<Interrupt>() };
-                if state.stop.load(std::sync::atomic::Ordering::Acquire) {
-                    return true;
+        let interrupt = match interrupt {
+            Some(stop) => {
+                unsafe extern "C" fn interrupted(_: Ptr, context: Ptr) -> bool {
+                    let state = unsafe { &*context.cast::<Interrupt>() };
+                    if state.stop.load(std::sync::atomic::Ordering::Acquire) {
+                        return true;
+                    }
+                    state.api.limit(0.01, interrupted, context);
+                    false
                 }
-                unsafe { (state.limit)(state.group, 0.01, Some(interrupted), context) };
-                false
+                let mut state = Box::new(Interrupt {
+                    stop,
+                    api: api.clone(),
+                });
+                api.limit(0.01, interrupted, (&mut *state as *mut Interrupt).cast());
+                Some(state)
             }
-            let mut state = Box::new(Interrupt {
-                stop,
-                group: engine.api.group,
-                limit: engine.api.execution_limit,
-            });
-            unsafe {
-                (state.limit)(
-                    state.group,
-                    0.01,
-                    Some(interrupted),
-                    (&mut *state as *mut Interrupt).cast(),
-                )
-            };
-            engine.interrupt = Some(state);
-        } else if matches!(role, Role::Renderer(_)) {
-            // The limit is per context group, which every engine of this thread shares.
-            unsafe {
-                (engine.api.execution_limit)(
-                    engine.api.group,
-                    PAGE_TICK,
-                    Some(page_limit),
-                    ptr::null_mut(),
-                )
-            };
-        }
+            None => {
+                if matches!(role, Role::Renderer(_)) {
+                    // The limit is per context group, which every engine of this thread shares.
+                    api.limit_pages(page_limit);
+                }
+                None
+            }
+        };
         encoding::install(
-            &engine.api,
+            &api,
             ctx,
             &[
                 ("digest", crate::node::system::digest),
@@ -465,68 +340,32 @@ impl JsContext {
         );
         let natives = [
             ("__appsNative", router),
-            ("__appsNow", now),
+            ("__appsNow", jsc::context::now),
             ("__appsLoadAddon", crate::node::napi::load),
             ("__appsFFINative", ffi_call),
-            ("__appsIsProxy", is_proxy),
+            ("__appsIsProxy", jsc::context::is_proxy),
         ];
         let count = if matches!(role, Role::Renderer(_)) {
             2
         } else {
             natives.len()
         };
-        for &(name, callback) in &natives[..count] {
-            let name = engine.api.string(name);
-            unsafe {
-                let callback = (engine.api.function)(ctx, name, callback);
-                (engine.api.set)(
-                    ctx,
-                    (engine.api.global)(ctx),
-                    name,
-                    callback,
-                    0,
-                    ptr::null_mut(),
-                );
-                (engine.api.string_release)(name);
-            }
-        }
+        engine.install(true, &natives[..count]);
         if devtools || matches!(role, Role::Renderer(_)) {
-            let name = engine.api.string("__appsCompile");
-            unsafe {
-                let callback = (engine.api.function)(ctx, name, compile);
-                // Pages get the compiler only as `this` of their own scripts, see `eval_page`.
-                let target = if matches!(role, Role::Renderer(_)) {
-                    engine.scope = (engine.api.object_make)(ctx, ptr::null_mut(), ptr::null_mut());
-                    (engine.api.protect)(ctx, engine.scope);
-                    let flag = engine.api.string("__appsDevtools");
-                    (engine.api.set)(
-                        ctx,
-                        engine.scope,
-                        flag,
-                        (engine.api.boolean)(ctx, devtools),
-                        0,
-                        ptr::null_mut(),
-                    );
-                    (engine.api.string_release)(flag);
-                    engine.scope
-                } else {
-                    (engine.api.global)(ctx)
-                };
-                (engine.api.set)(ctx, target, name, callback, 0, ptr::null_mut());
-                (engine.api.string_release)(name);
+            // Pages get the compiler only as `this` of their own scripts, see `eval_page`.
+            if matches!(role, Role::Renderer(_)) {
+                engine.add_scope(devtools);
             }
+            engine.install(false, &[("__appsCompile", compile)]);
         }
-        let name = engine.api.string("__appsChunk");
-        unsafe {
-            let callback = (engine.api.function)(ctx, name, chunk);
-            let target = if engine.scope.is_null() {
-                (engine.api.global)(ctx)
-            } else {
-                engine.scope
-            };
-            (engine.api.set)(ctx, target, name, callback, 0, ptr::null_mut());
-            (engine.api.string_release)(name);
-        }
+        engine.install(false, &[("__appsChunk", chunk)]);
+        let engine = Self {
+            engine,
+            api,
+            ctx,
+            napi,
+            _interrupt: interrupt,
+        };
         // Bootstrap scripts call into the host, so the host is only borrowed per check.
         let features = host.borrow().app.features;
         let disabled: Vec<_> = crate::bundle::Feature::ALL
@@ -544,75 +383,40 @@ impl JsContext {
         )?;
         engine.api.attach_aot(ctx);
         if !matches!(role, Role::Renderer(_)) {
-            for (url, source) in NODE_SCRIPTS {
+            for (url, source) in runtime_sources(Runtime::Node) {
                 engine.run(source(), url)?;
             }
         }
-        for (url, source) in WEB_SCRIPTS {
+        for (url, source) in runtime_sources(Runtime::Web) {
             engine.run(source(), url)?;
         }
-        let name = engine.api.string("__appsRejection");
-        unsafe {
-            let callback = (engine.api.get)(ctx, (engine.api.global)(ctx), name, ptr::null_mut());
-            (engine.api.rejection_callback)(ctx, callback, ptr::null_mut());
-            (engine.api.string_release)(name);
-        }
-        let name = engine.api.string("__appsModuleLoader");
-        unsafe {
-            (engine.api.module_loader)(
-                ctx,
-                (engine.api.get)(ctx, (engine.api.global)(ctx), name, ptr::null_mut()),
-            );
-            (engine.api.string_release)(name);
-        }
+        engine.engine.take_hooks();
         engine.eval(
             "delete globalThis.__appsRejection;delete globalThis.__appsModuleLoader",
             "apps:rejections",
         )?;
         if matches!(role, Role::Renderer(_)) {
-            for (url, source) in PAGE_SCRIPTS {
-                if url != "apps:gpu" || features.has(crate::bundle::Feature::WebGpu) {
+            for (url, source) in runtime_sources(Runtime::Page) {
+                if *url != "apps:gpu" || features.has(crate::bundle::Feature::WebGpu) {
                     engine.run(source(), url)?;
                 }
             }
             if !features.has(crate::bundle::Feature::JsExecute) {
-                let message = engine.api.string("Code generation is disabled in pages");
-                unsafe {
-                    (engine.api.eval_enabled)(ctx, false, message);
-                    (engine.api.string_release)(message);
-                }
+                engine
+                    .engine
+                    .disable_eval("Code generation is disabled in pages");
             }
         }
         Ok(engine)
     }
 
     pub fn eval(&self, source: &str, url: &str) -> Result<String> {
-        self.evaluate(source, url, ptr::null_mut())
+        self.evaluate(source, url, false)
     }
 
     fn run(&self, source: &'static str, url: &'static str) -> Result<()> {
-        if let Some(module) = self.api.runtime_module(url) {
-            let mut exception = ptr::null_mut();
-            let result = self.api.timed(|| {
-                self.api
-                    .run_aot(self.ctx, module, ptr::null_mut(), &mut exception)
-            });
-            return self.checked(url, result, exception).map(drop);
-        }
-        let bytecode = jsc::runtime_bytecode(url, source);
-        let source_url = self.api.string(url);
         let mut exception = ptr::null_mut();
-        let result = self.api.timed(|| unsafe {
-            self.api.evaluate_latin1(
-                self.ctx,
-                source.as_bytes(),
-                ptr::null_mut(),
-                source_url,
-                bytecode,
-                &mut exception,
-            )
-        });
-        unsafe { (self.api.string_release)(source_url) };
+        let result = self.engine.run(source, url, &mut exception);
         self.checked(url, result, exception).map(drop)
     }
 
@@ -634,7 +438,7 @@ impl JsContext {
             }
         }
         let _armed = Armed(ARMED.replace(self.ctx as usize));
-        self.evaluate(source, url, self.scope)
+        self.evaluate(source, url, self.engine.has_scope())
     }
 
     pub fn addons_pending(&self) -> bool {
@@ -642,40 +446,14 @@ impl JsContext {
     }
 
     pub fn call(&self, name: &str, arguments: &[&str]) -> Result<String> {
-        call_json(&self.api, self.ctx, name, arguments, |value| {
+        self.api.call_json(self.ctx, name, arguments, |value| {
             self.api.text(self.ctx, value)
         })
     }
 
-    fn evaluate(&self, source: &str, url: &str, this: Ptr) -> Result<String> {
-        let compiled = self.api.compiled_module(source.as_bytes())?;
-        let source_url = self.api.string(url);
+    fn evaluate(&self, source: &str, url: &str, scoped: bool) -> Result<String> {
         let mut exception = ptr::null_mut();
-        let result = self.api.timed(|| {
-            let bytecode = bundled(source.as_bytes());
-            match compiled {
-                Some(module) => self.api.run_aot(self.ctx, module, this, &mut exception),
-                None if bytecode.is_some() || in_place(source.as_bytes()) => unsafe {
-                    self.api.evaluate_latin1(
-                        self.ctx,
-                        source.as_bytes(),
-                        this,
-                        source_url,
-                        bytecode.unwrap_or_default(),
-                        &mut exception,
-                    )
-                },
-                _ => {
-                    let script = self.api.string(source);
-                    let result = unsafe {
-                        (self.api.evaluate)(self.ctx, script, this, source_url, 1, &mut exception)
-                    };
-                    unsafe { (self.api.string_release)(script) };
-                    result
-                }
-            }
-        });
-        unsafe { (self.api.string_release)(source_url) };
+        let result = self.engine.evaluate(source, url, scoped, &mut exception)?;
         Ok(self
             .api
             .text(self.ctx, self.checked(url, result, exception)?))
@@ -683,46 +461,36 @@ impl JsContext {
 
     // Calls a global function with JSON arguments. Unlike a script of new text, it compiles nothing.
     pub fn call_logged(&self, name: &str, arguments: &[&str], url: &str) -> Result<()> {
-        call_json(&self.api, self.ctx, name, arguments, drop)
+        self.api
+            .call_json(self.ctx, name, arguments, drop)
             .inspect_err(|error| self.log(url, &error.to_string()))
     }
 
     fn log(&self, url: &str, message: &str) {
-        HOSTS.with(|hosts| {
-            if let Some(binding) = hosts.borrow().get(&(self.ctx as usize))
-                && let Ok(mut host) = binding.host.try_borrow_mut()
-                && !host.app.packaged
-            {
-                host.log(serde_json::json!({"type":"error","message":format!("{url}: {message}")}));
-            }
-        });
+        if let Some(binding) = binding(self.ctx)
+            && let Ok(mut host) = binding.host.try_borrow_mut()
+            && !host.app.packaged
+        {
+            host.log(serde_json::json!({"type":"error","message":format!("{url}: {message}")}));
+        }
     }
 
     pub(crate) fn receive(&self, payload: payload::Payload) -> Result<payload::Payload> {
-        receive(&self.api, self.ctx, payload)
+        self.api.receive(self.ctx, payload)
     }
 
     pub(crate) fn deliver(&self, payload: payload::Payload) -> Result<()> {
-        bridge(&self.api, self.ctx, "__appsBridgeDeliver", payload).map(|_| ())
+        self.api
+            .bridge(self.ctx, "__appsBridgeDeliver", payload)
+            .map(|_| ())
     }
 
     pub(crate) fn heap(&self) -> Result<serde_json::Value> {
-        unsafe {
-            let json =
-                (self.api.json_string)(self.ctx, (self.api.memory)(self.ctx), 0, ptr::null_mut());
-            ensure!(!json.is_null(), "Cannot read heap statistics");
-            let text = self
-                .api
-                .text(self.ctx, (self.api.make_string)(self.ctx, json));
-            (self.api.string_release)(json);
-            Ok(serde_json::from_str(&text)?)
-        }
+        self.engine.heap()
     }
 
     pub fn collect_garbage(&self) {
-        unsafe {
-            (self.api.garbage_collect)(self.ctx);
-        }
+        self.engine.collect_garbage();
     }
 
     pub fn tick(&self) -> Result<i64> {
@@ -733,10 +501,12 @@ impl JsContext {
         // Run one macrotask per call so JSC drains microtasks between tasks. -2 signals a completed
         // macrotask.
         loop {
-            let delay = call_json(&self.api, self.ctx, "__appsTick", &[], |value| unsafe {
-                (self.api.to_number)(self.ctx, value, ptr::null_mut())
-            })
-            .inspect_err(|error| self.log("apps:tick", &error.to_string()))?;
+            let delay = self
+                .api
+                .call_json(self.ctx, "__appsTick", &[], |value| unsafe {
+                    (self.api.to_number)(self.ctx, value, ptr::null_mut())
+                })
+                .inspect_err(|error| self.log("apps:tick", &error.to_string()))?;
             if delay != -2. {
                 // Delays can be fractional, so round up or the loop wakes before the timer is due.
                 return Ok(if delay.is_finite() {
@@ -773,8 +543,8 @@ impl JsContext {
     }
 
     fn install(&self, files: &BBTreeMap<String, String>) -> Result<()> {
-        HOSTS.with(|hosts| {
-            let binding = &hosts.borrow()[&(self.ctx as usize)];
+        {
+            let binding = binding(self.ctx).context("The JavaScript context is closed")?;
             let mut host = binding.host.borrow_mut();
             host.app.install(files)?;
             if !host.app.scripts.is_empty() {
@@ -787,8 +557,8 @@ impl JsContext {
                     .borrow_mut()
                     .configure_storage(&host.app, window);
             }
-            Ok(())
-        })
+        }
+        Ok(())
     }
 }
 
@@ -797,40 +567,20 @@ impl Drop for JsContext {
         if let Some(napi) = &self.napi {
             napi.close();
         }
-        if !self.scope.is_null() {
-            unsafe { (self.api.unprotect)(self.ctx, self.scope) };
-        }
-        jsc::forget(self.ctx);
-        let binding = HOSTS.with(|hosts| hosts.borrow_mut().remove(&(self.ctx as usize)));
+        let binding = jsc::forget(self.ctx).and_then(|data| data.downcast::<Binding>().ok());
         if let Some(binding) = &binding {
             if let Role::Preload(id) = binding.role
                 && let Ok(mut host) = binding.host.try_borrow_mut()
             {
                 host.bridge.remove(&id);
             }
-            let peers = HOSTS.with(|hosts| {
-                hosts
-                    .borrow()
-                    .iter()
-                    .filter(|(_, peer)| Rc::ptr_eq(&binding.host, &peer.host))
-                    .map(|(&ctx, peer)| (ctx, peer.api.clone()))
-                    .collect::<Vec<_>>()
-            });
-            for (ctx, api) in peers {
-                let script = api.string(&format!(
-                    "globalThis.__appsBridgeClosed?.({})",
-                    serde_json::to_string(&binding.role).unwrap()
-                ));
-                unsafe {
-                    (api.evaluate)(
-                        ctx as Ptr,
-                        script,
-                        ptr::null_mut(),
-                        ptr::null_mut(),
-                        1,
-                        ptr::null_mut(),
-                    );
-                    (api.string_release)(script);
+            let closed = format!(
+                "globalThis.__appsBridgeClosed?.({})",
+                serde_json::to_string(&binding.role).unwrap()
+            );
+            for (ctx, peer) in jsc::contexts::<Binding>() {
+                if Rc::ptr_eq(&binding.host, &peer.host) {
+                    peer.api.evaluate_quietly(ctx, &closed);
                 }
             }
         }
@@ -841,9 +591,6 @@ impl Drop for JsContext {
             // A connected inspector keeps the global object alive.
             inspector_disconnect(self.ctx, connection);
         }
-        unsafe {
-            (self.api.release)(self.ctx);
-        }
     }
 }
 
@@ -852,7 +599,7 @@ mod tests {
     use super::*;
     use crate::{
         host::ops::{access, dispatch},
-        jsc::{add_mapped, well_formed},
+        jsc::add_mapped,
     };
 
     fn page_host(id: u64, html: &str) -> Rc<RefCell<Host>> {
@@ -960,7 +707,6 @@ mod tests {
         assert_eq!(run(&wide).unwrap(), "2");
         assert_eq!(std::sync::Arc::strong_count(&ascii), 2);
         assert_eq!(std::sync::Arc::strong_count(&wide), 1);
-        assert!(!in_place(b"heap"));
     }
 
     #[test]
@@ -1105,7 +851,7 @@ mod tests {
         let host = page_host(900, "<body></body>");
         let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
         let page = JsContext::new(api.clone(), host, Role::Renderer(900)).unwrap();
-        unsafe { (api.execution_limit)(api.group, 0.2, Some(page_limit), ptr::null_mut()) };
+        api.limit(0.2, page_limit, ptr::null_mut());
         stop_page(900);
         assert!(page.eval("while(true){}", "test").is_err());
         page_stopped(900);
@@ -1204,13 +950,6 @@ mod tests {
 
     #[test]
     fn json_from_lone_surrogates_and_rooted_bytes() {
-        let mut json = r#"["a\ud83d","\\ud83d","\n\udfff","\u001f"]"#.to_owned();
-        well_formed(&mut json);
-        assert_eq!(json, r#"["a\ufffd","\\ud83d","\n\ufffd","\u001f"]"#);
-        assert_eq!(
-            serde_json::from_str::<Vec<String>>(&json).unwrap(),
-            ["a\u{fffd}", "\\ud83d", "\n\u{fffd}", "\u{1f}"]
-        );
         let api = JavaScriptCore::load().unwrap();
         let host = page_host(1, "<body></body>");
         let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
@@ -1384,7 +1123,7 @@ mod tests {
             ""
         );
         let page = JsContext::new(api, host, Role::Renderer(1)).unwrap();
-        let binding = HOSTS.with(|hosts| hosts.borrow()[&(page.ctx as usize)].clone());
+        let binding = binding(page.ctx).unwrap();
         let open = |args| {
             dispatch(&binding, page.ctx, "dom.open", args)
                 .unwrap_err()
