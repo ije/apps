@@ -18,7 +18,7 @@ pub fn svg(source: &str, width: u32, height: u32) -> Result<Arc<renderer::Render
     render_svg(&svg_tree(source, false)?, width, height, None)
 }
 
-// The image of `effects::gradient_svg`.
+// The image of `effects::gradient::gradient_svg`.
 pub fn svg_gradient(
     (source, p3): (String, bool),
     width: u32,

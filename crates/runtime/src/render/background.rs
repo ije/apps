@@ -327,7 +327,7 @@ pub(super) fn css_background(
                         let limit = super::raster::RASTER_MAX as f32;
                         let tiles = |natural: [f32; 2]| {
                             let extent = [width + area[2], height + area[3]];
-                            let [mut tile, mut at] = super::effects::tile(
+                            let [mut tile, mut at] = super::effects::gradient::tile(
                                 &size,
                                 &position,
                                 &units,
@@ -655,7 +655,7 @@ pub(super) fn css_background(
         else {
             continue;
         };
-        let strip = super::effects::gradient_axis(&kind, &body, &units);
+        let strip = super::effects::gradient::gradient_axis(&kind, &body, &units);
         let modes = match repeat.split_whitespace().collect::<Vec<_>>().as_slice() {
             ["repeat-x"] => ["repeat", "no-repeat"],
             ["repeat-y"] => ["no-repeat", "repeat"],
@@ -694,7 +694,8 @@ pub(super) fn css_background(
             let whole = |value: f32| (value * scale - (value * scale).round()).abs() < 0.01;
             let radii = corners(bounds);
             let [aw, ah] = [width + area[2], height + area[3]];
-            let [[tw, th], at] = super::effects::tile(&size, &position, &units, aw, ah, None);
+            let [[tw, th], at] =
+                super::effects::gradient::tile(&size, &position, &units, aw, ah, None);
             let [x, y] = [at[0] + area[0], at[1] + area[1]];
             let [cw, ch] = [tw, th].map(|side| side * (256. / (side * scale)).ceil().max(1.));
             // A layer that repeats on one axis rasters one row or column of tiles. On the other axis the raster
@@ -706,8 +707,9 @@ pub(super) fn css_background(
                 true => 0.,
                 false => start[axis] - snapped[axis],
             });
-            let grouped =
-                lone || super::effects::tile(&size, "0 0", &units, cw, ch, None)[0] == [tw, th];
+            let grouped = lone
+                || super::effects::gradient::tile(&size, "0 0", &units, cw, ch, None)[0]
+                    == [tw, th];
             let [cw, ch] = if grouped { [cw, ch] } else { [tw, th] };
             let [cw, ch] =
                 [(0, cw, tw), (1, ch, th)].map(|(axis, cell, side)| match repeats[axis] {
@@ -763,7 +765,7 @@ pub(super) fn css_background(
                 inputs.push_str(part);
                 inputs.push('\0');
             }
-            super::effects::push_bits(&mut inputs, [width, height], &units);
+            super::effects::gradient::push_bits(&mut inputs, [width, height], &units);
             let exact = [tw, th, offset[0], offset[1]];
             for value in within.iter().chain(if explicit { &exact[..] } else { &[] }) {
                 inputs.push_str(&value.to_bits().to_string());
@@ -804,7 +806,7 @@ pub(super) fn css_background(
                     .flatten();
                 let image = cached.or_else(|| {
                     let image = match kind.ends_with("conic-gradient") {
-                        true => super::effects::conic_image(
+                        true => super::effects::gradient::conic_image(
                             &kind,
                             &body,
                             size,
@@ -816,7 +818,7 @@ pub(super) fn css_background(
                             [rw, rh],
                             entry.map(|(_, image)| image),
                         ),
-                        false => super::effects::gradient_svg(
+                        false => super::effects::gradient::gradient_svg(
                             &kind, &body, size, position, &repeat, units, width, height, within,
                         )
                         .and_then(|source| super::raster::svg::svg_gradient(source, rw, rh)),
@@ -851,7 +853,7 @@ pub(super) fn css_background(
                     && let Ok(mut old) = Arc::try_unwrap(old)
                 {
                     // A gradient that changes on each frame draws into the pixels of its last image.
-                    super::effects::recycle(old.take_bytes());
+                    super::effects::gradient::recycle(old.take_bytes());
                     window.release_image(Arc::new(old));
                 }
             }
@@ -928,7 +930,7 @@ pub(super) fn css_background(
         group = group.child(color);
     }
     for (layer, index) in layers.into_iter().zip(indexes) {
-        let blend_mode = super::effects::blend_mode(&pick(&modes, index));
+        let blend_mode = super::effects::filter::blend_mode(&pick(&modes, index));
         group = group.child(layer.hooks(Effected {
             effect: renderer::PaintEffect {
                 blend_mode,
@@ -1183,7 +1185,7 @@ pub(super) fn border_image(
             let mut inputs = match &gradient {
                 Some((kind, body)) => {
                     let mut inputs = format!("{kind}\0{body}\0");
-                    super::effects::push_bits(&mut inputs, [w, h], &units);
+                    super::effects::gradient::push_bits(&mut inputs, [w, h], &units);
                     inputs
                 }
                 None => format!(
@@ -1202,7 +1204,7 @@ pub(super) fn border_image(
                     Some((kind, body)) => {
                         let [rw, rh] =
                             [w, h].map(|side| (side * scale).ceil().clamp(1., limit as f32) as u32);
-                        super::effects::gradient_svg(
+                        super::effects::gradient::gradient_svg(
                             kind,
                             body,
                             "",

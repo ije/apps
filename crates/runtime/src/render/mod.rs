@@ -991,7 +991,7 @@ impl PageView {
                     // A step that draws like the base style builds in place, like other paint changes.
                     && !style.iter().eq(styles.values[*id].iter())
                     && filter(style, 1).is_none_or(|value| {
-                        value == "none" || effects::lone_blur(Some(value)).is_some()
+                        value == "none" || effects::filter::lone_blur(Some(value)).is_some()
                     })
                     && style.get(Prop::BACKFACE_VISIBILITY) != Some("hidden")
             })
@@ -2313,7 +2313,7 @@ impl PageView {
                     match [Prop::BACKDROP_FILTER, Prop::WEBKIT_BACKDROP_FILTER]
                         .into_iter()
                         .find_map(|prop| backdrop.get(prop))
-                        .and_then(|value| effects::backdrop(value, &units))
+                        .and_then(|value| effects::filter::backdrop(value, &units))
                     {
                         Some((blur, color_matrix)) => el.hooks(paint::Effected {
                             effect: renderer::PaintEffect {
@@ -2820,7 +2820,7 @@ fn composites(a: &css::properties::Style, b: &css::properties::Style) -> bool {
                     || !clipped
                         && [a, b]
                             .into_iter()
-                            .all(|style| effects::lone_blur(filter(style, which)).is_some())
+                            .all(|style| effects::filter::lone_blur(filter(style, which)).is_some())
             })
 }
 
@@ -2992,7 +2992,7 @@ fn composite(view: Rc<ViewState>, window: &mut Window, cx: &mut App) {
             let blurs = [0, 1].map(|which| {
                 let value = filter(style, which);
                 (filter(old, which) != value)
-                    .then(|| effects::lone_blur(value))
+                    .then(|| effects::filter::lone_blur(value))
                     .flatten()
                     .map(|args| match args {
                         "" => 0.,
@@ -3715,9 +3715,12 @@ mod tests {
         let mut moved = blurs("blur(2px)", "blur(0)");
         moved.insert(Prop::CLIP_PATH, Rc::from("inset(2px)"));
         assert!(!composites(&clipped, &moved));
-        assert_eq!(effects::lone_blur(Some("BLUR( 4px )")), Some("4px"));
-        assert_eq!(effects::lone_blur(Some("blur()")), Some(""));
-        assert_eq!(effects::lone_blur(Some("blur(1px) blur(2px)")), None);
+        assert_eq!(effects::filter::lone_blur(Some("BLUR( 4px )")), Some("4px"));
+        assert_eq!(effects::filter::lone_blur(Some("blur()")), Some(""));
+        assert_eq!(
+            effects::filter::lone_blur(Some("blur(1px) blur(2px)")),
+            None
+        );
     }
 
     #[test]

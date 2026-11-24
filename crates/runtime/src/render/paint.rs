@@ -84,7 +84,7 @@ pub(super) struct Transformed {
     pub(super) style: Rc<css::properties::Style>,
     pub(super) units: css::value::units::Lengths,
     pub(super) matrix: Cell<Option<crate::css::value::transform::Matrix>>,
-    pub(super) local: super::effects::Local,
+    pub(super) local: super::effects::transform::Local,
 }
 
 impl Hooks for Transformed {
@@ -111,11 +111,16 @@ impl Hooks for Transformed {
     }
 
     fn reach(&self, size: Size<Pixels>, corners: [Point<Pixels>; 2]) -> [Point<Pixels>; 2] {
-        super::effects::reach(&self.local, &self.style, &self.units, size, corners)
+        super::effects::transform::reach(&self.local, &self.style, &self.units, size, corners)
     }
 
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
-        let matrix = super::effects::transform_at(&self.local, &self.style, &self.units, cx.bounds);
+        let matrix = super::effects::transform::transform_at(
+            &self.local,
+            &self.style,
+            &self.units,
+            cx.bounds,
+        );
         self.matrix.set(matrix);
         match matrix {
             Some(matrix) => cx.window.with_keyed_hit_transform(matrix, None, inner),
@@ -334,7 +339,7 @@ impl Hooks for Picture {
             let mut fitted = self.fit.place(bounds, image.size());
             if let Some((position, units)) = &self.position {
                 let free = bounds.size - fitted.size;
-                let [x, y] = super::effects::place(
+                let [x, y] = super::effects::gradient::place(
                     position,
                     [f32::from(free.width), f32::from(free.height)],
                     units,
@@ -709,7 +714,7 @@ pub(super) struct DomBox {
     // A drawable element of a canvas, which paints into a snapshot for `drawElementImage()`.
     pub(super) drawn: bool,
     // The transform at the origin for a size, which a moved box places again.
-    pub(super) local: super::effects::Local,
+    pub(super) local: super::effects::transform::Local,
 }
 
 // With its counts, a box's `Rc` must stay within the small blocks of the runtime's allocator.
@@ -1013,7 +1018,7 @@ impl Hooks for DomBox {
         {
             return corners;
         }
-        super::effects::reach(&self.local, &self.style, &self.units, size, corners)
+        super::effects::transform::reach(&self.local, &self.style, &self.units, size, corners)
     }
 
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
@@ -1172,7 +1177,12 @@ impl Hooks for DomBox {
                 bounds,
                 perspective,
             ),
-            None => super::effects::transform_at(&self.local, &self.style, &self.units, bounds),
+            None => super::effects::transform::transform_at(
+                &self.local,
+                &self.style,
+                &self.units,
+                bounds,
+            ),
         }
         .filter(|_| !self.drawn);
         if self.transformed && !self.drawn {
@@ -1183,7 +1193,9 @@ impl Hooks for DomBox {
                 .insert(self.id, (bounds, perspective));
         }
         if !self.transformed
-            && let Some([x, y]) = matrix.as_ref().and_then(super::effects::translation)
+            && let Some([x, y]) = matrix
+                .as_ref()
+                .and_then(super::effects::transform::translation)
         {
             let translation = point(px(x), px(y));
             offset += translation;
@@ -1434,7 +1446,7 @@ impl Hooks for DomBox {
         drop((host, nodes));
         // A transform turns about the new place.
         let matrix = matrix.and_then(|_| {
-            super::effects::transform_at(&self.local, &self.style, &self.units, bounds)
+            super::effects::transform::transform_at(&self.local, &self.style, &self.units, bounds)
         });
         self.placed.set((bounds, matrix));
         let (window_bounds, flags) = self.reached_at.get();
@@ -1467,8 +1479,12 @@ impl Hooks for DomBox {
         if moved {
             // A kept box has its size, so its transform only turns about the new place.
             if matrix.is_some() {
-                matrix =
-                    super::effects::transform_at(&self.local, &self.style, &self.units, bounds);
+                matrix = super::effects::transform::transform_at(
+                    &self.local,
+                    &self.style,
+                    &self.units,
+                    bounds,
+                );
             }
             self.block(cx.exact, offset);
             self.placed.set((bounds, matrix));
@@ -1539,7 +1555,7 @@ impl DomBox {
                 .style
                 .get(Prop::BACKFACE_VISIBILITY)
                 .is_some_and(|value| value == "hidden")
-            && super::effects::backface(matrix, bounds)
+            && super::effects::transform::backface(matrix, bounds)
         {
             return;
         }
@@ -1557,7 +1573,7 @@ impl DomBox {
         transform: Option<crate::css::value::transform::Matrix>,
         window: &mut Window,
     ) -> (Option<renderer::Clip<Pixels>>, Vec<renderer::PaintEffect>) {
-        use super::effects::{self, Clip};
+        use super::effects::{self, clip::Clip};
         let style = &self.style;
         let units = self.units;
         let value = |props: &[Prop]| {
@@ -1573,12 +1589,12 @@ impl DomBox {
         let (doc, state, app) = host.page_parts(view.id);
         let doc = doc.unwrap_or(&empty);
         let mut layers = value(&[Prop::FILTER, Prop::WEBKIT_FILTER])
-            .map(|value| effects::filters(value, &units, doc, &self.ids))
+            .map(|value| effects::filter::filters(value, &units, doc, &self.ids))
             .unwrap_or_default();
         let mut clip = None;
         let mut shapes = None;
         match value(&[Prop::CLIP_PATH, Prop::WEBKIT_CLIP_PATH])
-            .and_then(|value| effects::clip(value, &units, size, doc, &self.ids))
+            .and_then(|value| effects::clip::clip(value, &units, size, doc, &self.ids))
         {
             Some(Clip::Rounded(rect, radii)) => {
                 clip = Some(renderer::Clip::rounded(
@@ -1586,7 +1602,7 @@ impl DomBox {
                         bounds.origin + point(px(rect[0]), px(rect[1])),
                         renderer::size(px(rect[2]), px(rect[3])),
                     ),
-                    effects::corners(radii),
+                    effects::clip::corners(radii),
                 ))
             }
             Some(Clip::Shape(shape)) => shapes = Some(shape),
@@ -1611,15 +1627,15 @@ impl DomBox {
         let backdrop = value(&[Prop::BACKDROP_FILTER, Prop::WEBKIT_BACKDROP_FILTER])
             .filter(|_| shown || self.composited && visible)
             .and_then(|value| {
-                effects::backdrop(value, &units).or_else(|| {
-                    effects::lone_blur(Some(value))
+                effects::filter::backdrop(value, &units).or_else(|| {
+                    effects::filter::lone_blur(Some(value))
                         .filter(|_| self.composited)
                         .map(|_| (px(0.), None))
                 })
             })
             .map(|(blur, color_matrix)| renderer::Backdrop {
                 bounds,
-                corner_radii: effects::radii(style, &units, || size).resolve(bounds.size),
+                corner_radii: effects::clip::radii(style, &units, || size).resolve(bounds.size),
                 blur,
                 color_matrix,
             });
@@ -1633,7 +1649,7 @@ impl DomBox {
                     && matches!(*kind, "regular" | "clear")
             })
             .and_then(|kind| {
-                let radii = effects::radii(style, &units, || size).resolve(bounds.size);
+                let radii = effects::clip::radii(style, &units, || size).resolve(bounds.size);
                 let radius = radii.x.top_left;
                 if radii != renderer::Radii::from(radius) {
                     return None;
@@ -1661,7 +1677,7 @@ impl DomBox {
             opacity: self.effects.unwrap_or(1.),
             blend_mode: value(&[Prop::MIX_BLEND_MODE])
                 .map_or(renderer::BlendMode::Normal, |value| {
-                    effects::blend_mode(value)
+                    effects::filter::blend_mode(value)
                 }),
             mask,
             backdrop,
@@ -1742,7 +1758,7 @@ pub(super) fn mask(
             inputs.push_str(part);
             inputs.push('\0');
         }
-        super::effects::push_bits(&mut inputs, size, &units);
+        super::effects::gradient::push_bits(&mut inputs, size, &units);
         let [width, height] = size;
         let scale = window.scale_factor();
         let raster = [width, height].map(|extent| (extent * scale).ceil().clamp(1., 4096.) as u32);
@@ -1755,7 +1771,7 @@ pub(super) fn mask(
                 })
         }) {
             let image = if shapes.is_none()
-                && let Some(bytes) = super::effects::axis_mask(style, &units, size, raster)
+                && let Some(bytes) = super::effects::gradient::axis_mask(style, &units, size, raster)
             {
                 bytes.map(|bytes| {
                     std::sync::Arc::new(renderer::RenderImage::new(raster[0], raster[1], bytes))
@@ -1899,10 +1915,11 @@ pub(super) fn mask_svg<'a>(
                 "contain" => "xMidYMid meet",
                 _ => "none",
             };
-            let ([[tw, th], at], steps) =
-                super::effects::tile_repeat(size, position, repeat, &units, width, height, None);
+            let ([[tw, th], at], steps) = super::effects::gradient::tile_repeat(
+                size, position, repeat, &units, width, height, None,
+            );
             files.push(path);
-            super::effects::tiled(
+            super::effects::gradient::tiled(
                 steps,
                 [tw, th],
                 at,
@@ -1920,7 +1937,7 @@ pub(super) fn mask_svg<'a>(
             else {
                 continue;
             };
-            let Some((svg, _)) = super::effects::gradient_svg(
+            let Some((svg, _)) = super::effects::gradient::gradient_svg(
                 kind,
                 body,
                 size,

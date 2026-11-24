@@ -167,10 +167,10 @@ pub(crate) fn hit_test(
             let at = renderer::point(renderer::px(x), renderer::px(y));
             let corners = match node.tag.starts_with('#') {
                 true => renderer::Radii::default(),
-                false => {
-                    crate::render::effects::radii(style, &computed.lengths[id], || [width, height])
-                        .resolve(size)
-                }
+                false => crate::render::effects::clip::radii(style, &computed.lengths[id], || {
+                    [width, height]
+                })
+                .resolve(size),
             };
             let selectable = !style
                 .get(Prop::POINTER_EVENTS)

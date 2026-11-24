@@ -133,7 +133,7 @@ pub(crate) fn box_shadows(sizes: &Lengths, value: &str, inset: bool) -> Vec<rend
 pub(crate) struct Filter(pub [[f32; 4]; 3]);
 
 impl Filter {
-    // One filter function: `effects::filters` splits the list and composes the matrices.
+    // One filter function: `effects::filter::filters` splits the list and composes the matrices.
     pub fn parse(value: &str, units: &Lengths) -> (Option<Self>, f32) {
         let identity = Self([[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.]]);
         let Some((name, args)) = value

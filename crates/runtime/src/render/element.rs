@@ -3583,7 +3583,7 @@ fn create(
             let metrics = text.metrics(font);
             let height = metrics.ascent * size_px.0 - metrics.descent * size_px.0;
             let line_height = units.font.lh;
-            let radii = super::effects::radii(style, &units, || containing);
+            let radii = super::effects::clip::radii(style, &units, || containing);
             let (sides, pad_y, fill) = (borders, padding[0] + padding[2], inline_fill);
             let dashed = matches!(border_kinds[0], "dashed");
             el = el.child(
@@ -3956,7 +3956,7 @@ fn create(
                 .all(|side| border_colors[side] == border_colors[first])
         {
             el = el.border_color(border_colors[first]);
-            el.style().border_style = border_style(border_kinds[first]);
+            el.style().border_style = super::effects::border_style(border_kinds[first]);
         } else {
             el = el.border_color(renderer::Color::TRANSPARENT);
         }
@@ -4043,7 +4043,7 @@ fn create(
     };
     let radius = parsed
         .radii
-        .unwrap_or_else(|| super::effects::radii(style, &units, basis));
+        .unwrap_or_else(|| super::effects::clip::radii(style, &units, basis));
     if hit.is_none() {
         el.style().corner_radii = radius;
     }
@@ -5154,7 +5154,7 @@ fn create(
             .and_then(css::value::color::paint)
             .unwrap_or(ink);
         let name = style.get(Prop::OUTLINE_STYLE).unwrap_or("solid");
-        let kind = border_style(name);
+        let kind = super::effects::border_style(name);
         // The top and left sides, then the right and bottom ones, of each band from the outer edge in.
         let bands: Vec<[renderer::Color; 2]> = match name {
             "inset" => vec![[true, false].map(|dark| shade_border(color, dark))],
@@ -5280,7 +5280,7 @@ fn create(
             bands,
             borders,
             radius,
-            border_kinds.map(border_style),
+            border_kinds.map(super::effects::border_style),
             false,
         ));
     }
@@ -6005,7 +6005,7 @@ fn create(
                     pseudo_padding[0] + pseudo_padding[2] + pseudo_borders[0] + pseudo_borders[2],
                 ]
             };
-            let pseudo_radius = super::effects::radii(pseudo, &pseudo_units, || containing);
+            let pseudo_radius = super::effects::clip::radii(pseudo, &pseudo_units, || containing);
             decoration.style().corner_radii = pseudo_radius;
             let colors = sides.map(|(_, _, color)| {
                 pseudo
@@ -6029,8 +6029,9 @@ fn create(
                     decoration = decoration.border_color(colors[first]);
                 } else {
                     decoration = decoration.border_color(renderer::Color::TRANSPARENT);
-                    let kinds =
-                        sides.map(|(_, kind, _)| border_style(pseudo.get(kind).unwrap_or("solid")));
+                    let kinds = sides.map(|(_, kind, _)| {
+                        super::effects::border_style(pseudo.get(kind).unwrap_or("solid"))
+                    });
                     decoration = decoration.child(border_canvas(
                         vec![([0.; 4], pseudo_borders, colors)],
                         pseudo_borders,
@@ -6387,7 +6388,7 @@ fn create(
                 .find_map(|prop| pseudo.get(prop))
                 .filter(|value| *value != "none")
             {
-                for effect in super::effects::filters(value, &pseudo_units, doc, ids) {
+                for effect in super::effects::filter::filters(value, &pseudo_units, doc, ids) {
                     decoration = decoration.hooks(super::paint::Effected {
                         effect,
                         backdrop: None,
@@ -6412,7 +6413,7 @@ fn create(
             {
                 decoration = decoration.hooks(super::paint::Effected {
                     effect: renderer::PaintEffect {
-                        blend_mode: super::effects::blend_mode(value),
+                        blend_mode: super::effects::filter::blend_mode(value),
                         ..Default::default()
                     },
                     backdrop: None,
@@ -6437,7 +6438,7 @@ fn create(
                         .get(Prop::VISIBILITY)
                         .is_none_or(|value| value == "visible")
                 })
-                .and_then(|value| super::effects::backdrop(value, &pseudo_units))
+                .and_then(|value| super::effects::filter::backdrop(value, &pseudo_units))
             {
                 Some((blur, color_matrix)) => decoration.hooks(super::paint::Effected {
                     effect: renderer::PaintEffect {
@@ -10712,7 +10713,7 @@ fn columns(
                 .or_else(|| style.get(Prop::COLOR))
                 .and_then(css::value::color::paint)
                 .unwrap_or(renderer::Color::BLACK);
-            (width, color, border_style(kind))
+            (width, color, super::effects::border_style(kind))
         })
         .filter(|(width, ..)| *width > 0.);
     Some((count, gap, rule))
@@ -10953,15 +10954,6 @@ fn fieldset_border(
     .right(px(-widths[1]))
     .bottom(px(-widths[2]))
     .into()
-}
-
-pub(super) fn border_style(kind: &str) -> renderer::BorderStyle {
-    match kind {
-        "dashed" => renderer::BorderStyle::Dashed,
-        "dotted" => renderer::BorderStyle::Dotted,
-        "double" => renderer::BorderStyle::Double,
-        _ => renderer::BorderStyle::Solid,
-    }
 }
 
 fn shade_border(color: renderer::Color, dark: bool) -> renderer::Color {

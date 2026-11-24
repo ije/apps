@@ -1804,7 +1804,7 @@ impl renderer::Hooks for InlineText {
                                 renderer::Border {
                                     widths: renderer::Edges::all(px(line)),
                                     color,
-                                    style: super::element::border_style(kind),
+                                    style: super::effects::border_style(kind),
                                     sides: 0,
                                 },
                             ));

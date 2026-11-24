@@ -82,7 +82,7 @@ impl Plan {
                     .and_then(css::value::color::paint)
                     .unwrap_or(text)
             }),
-            radii: (!relative(&corners)).then(|| effects::radii(style, units, || [0.; 2])),
+            radii: (!relative(&corners)).then(|| effects::clip::radii(style, units, || [0.; 2])),
             shareable: matches!(
                 style.get(Prop::DISPLAY),
                 None | Some(
