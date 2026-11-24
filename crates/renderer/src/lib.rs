@@ -1,14 +1,11 @@
 mod app;
-mod atlas;
 mod color;
 mod control;
-mod frame;
 mod geometry;
 mod gpu;
 mod input;
 mod node;
 mod platform;
-mod scene;
 mod style;
 pub mod text;
 mod tree;
@@ -19,6 +16,8 @@ pub use color::*;
 pub use control::*;
 pub use geometry::*;
 pub use gpu::Snapshot;
+pub(crate) use gpu::scene::Scene;
+pub use gpu::scene::{Backdrop, BlendMode, Glass, PaintEffect, RenderImage};
 pub use input::*;
 pub use node::{
     Child, Hooks, Node, NodeCx, NodeKey, ScrollRef, canvas, canvas_watching, canvas_within, layers,
@@ -28,8 +27,6 @@ pub use platform::{
     CARET_BLINK, Timer, WindowChange, WindowControl, WindowId, WindowOptions, WindowState,
     control_size, native,
 };
-pub(crate) use scene::Scene;
-pub use scene::{Backdrop, BlendMode, Glass, PaintEffect, RenderImage};
 pub use style::*;
 pub use text::{
     Decoration, DecorationStyle, Font, FontId, FontStyle, FontWeight, Glyph, GlyphId, Line,

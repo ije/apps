@@ -3,11 +3,11 @@ mod effect;
 use crate::{
     BlendMode, Point, Rect, Size,
     geometry::{IDENTITY, invert, plane_of, region},
+    gpu::scene::{NESTED, Nested, Scene, Under},
     gpu::{
         BOX, Blur, COMPOSITE_BACKDROP, COMPOSITE_BLEND, COMPOSITE_CLIP, COMPOSITE_MASK,
         COMPOSITE_MATRIX, COMPOSITE_SHADOW, Composite, Globals, Instance,
     },
-    scene::{NESTED, Nested, Scene, Under},
 };
 use std::ops::Range;
 

@@ -90,8 +90,8 @@ fn page_sublayers_stay_in_the_overlay_below_the_caret() {
 fn opacity_patches_redraw_only_their_region_like_a_full_frame() {
     use crate::{
         Clip,
+        gpu::scene::{EffectState, Scene, effect},
         gpu::{BOX, Instance, rect},
-        scene::{EffectState, Scene, effect},
     };
     use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandQueue};
     let (send, receive) = std::sync::mpsc::channel();
@@ -156,9 +156,9 @@ fn opacity_patches_redraw_only_their_region_like_a_full_frame() {
 fn rebuilt_scenes_redraw_only_what_changed_like_a_full_frame() {
     use crate::{
         Clip,
-        atlas::TileKey,
+        gpu::atlas::TileKey,
+        gpu::scene::{BackdropState, EffectState, Scene, effect},
         gpu::{BOX, IMAGE, Instance, rect},
-        scene::{BackdropState, EffectState, Scene, effect},
     };
     use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandQueue};
     #[derive(Clone, Copy)]
@@ -452,8 +452,8 @@ fn rebuilt_scenes_redraw_only_what_changed_like_a_full_frame() {
 fn returned_drawables_draw_what_changed_since_their_frame() {
     use crate::{
         Clip,
+        gpu::scene::Scene,
         gpu::{BOX, Instance, rect},
-        scene::Scene,
     };
     use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandQueue};
     let (send, receive) = std::sync::mpsc::channel();
@@ -521,9 +521,9 @@ fn returned_drawables_draw_what_changed_since_their_frame() {
 fn scrolled_content_copies_the_last_frame_moved() {
     use crate::{
         Clip,
+        gpu::scene::{EffectState, Scene, effect},
         gpu::{BOX, Instance, rect},
         point,
-        scene::{EffectState, Scene, effect},
     };
     use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandQueue};
     let (send, receive) = std::sync::mpsc::channel();

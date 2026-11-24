@@ -417,7 +417,7 @@ impl Scene {
 
     // Finds what changed since the drawn window, and the digest of each layer. `fresh` holds atlas tiles
     // that got new pixels in a place that another tile used before: (color page, page, texels).
-    pub(crate) fn diff(&mut self, fresh: Option<&[crate::atlas::Fresh]>) {
+    pub(crate) fn diff(&mut self, fresh: Option<&[crate::gpu::atlas::Fresh]>) {
         self.bake();
         let mut owners = mem::take(&mut self.owners);
         let window = &self.layers[0];

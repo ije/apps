@@ -3,10 +3,10 @@ mod textures;
 
 use crate::{
     Color, Rect, Size,
-    atlas::{self, PageKind, PageList, PageStore, Tile},
-    frame::{Command, Mask, Pool, RenderFrame, Target},
+    gpu::atlas::{self, PageKind, PageList, PageStore, Tile},
+    gpu::frame::{Command, Mask, Pool, RenderFrame, Target},
+    gpu::scene::Scene,
     gpu::{ATTRIBUTES, Globals, Instance, bytes},
-    scene::Scene,
 };
 use anyhow::{Context as _, Result, ensure};
 use block2::RcBlock;
@@ -867,7 +867,10 @@ impl Renderer {
         drawable: &ProtocolObject<dyn MTLTexture>,
         window: [u32; 2],
         damage: Vec<[i32; 4]>,
-        last: Option<(&ProtocolObject<dyn MTLTexture>, Option<crate::scene::Shift>)>,
+        last: Option<(
+            &ProtocolObject<dyn MTLTexture>,
+            Option<crate::gpu::scene::Shift>,
+        )>,
         srgb: Option<&ProtocolObject<dyn MTLTexture>>,
     ) -> Result<Rendered> {
         let mut frame = mem::take(&mut self.frame);

@@ -1,3 +1,7 @@
+pub(crate) mod atlas;
+pub(crate) mod frame;
+pub(crate) mod scene;
+
 use crate::{Clip, Rect, point, size};
 use std::{mem, slice};
 

@@ -423,7 +423,7 @@ impl Window {
                     color_matrix,
                 },
             ),
-            glass: effect.glass.map(|glass| crate::scene::GlassState {
+            glass: effect.glass.map(|glass| crate::gpu::scene::GlassState {
                 key: glass.key,
                 bounds: glass.bounds.scale(scale),
                 corner_radius: glass.corner_radius.0 * scale,
@@ -600,7 +600,7 @@ impl Window {
                 .atlas()
                 .get_or_insert_with(&TileKey::Glyph(params), &mut || {
                     Ok(text
-                        .raster(&params, crate::atlas::MAX_GLYPH_SIDE)?
+                        .raster(&params, crate::gpu::atlas::MAX_GLYPH_SIDE)?
                         .map(|(shown, size, bytes)| (shown, size, Cow::Owned(bytes))))
                 })
         else {
@@ -626,7 +626,7 @@ impl Window {
         kind: u32,
         rect: Rect<f32>,
         clip: Clip<f32>,
-        tile: crate::atlas::Tile,
+        tile: crate::gpu::atlas::Tile,
     ) -> Instance {
         let mut instance = Instance::new(kind, rect, clip);
         instance.aux = tile.rect.map(|value| value as f32).to_array();
@@ -635,7 +635,7 @@ impl Window {
         instance
     }
 
-    fn image_tile(&self, image: &RenderImage) -> Option<crate::atlas::Tile> {
+    fn image_tile(&self, image: &RenderImage) -> Option<crate::gpu::atlas::Tile> {
         self.platform
             .atlas()
             .get_or_insert_with(&TileKey::Image(image.id), &mut || {

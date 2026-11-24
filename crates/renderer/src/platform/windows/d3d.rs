@@ -1,9 +1,9 @@
 use crate::{
     Color, Rect, Size,
-    atlas::{self, PageKind, PageList, PageStore, Tile},
-    frame::{Command, Mask, Pool, RenderFrame, Target},
+    gpu::atlas::{self, PageKind, PageList, PageStore, Tile},
+    gpu::frame::{Command, Mask, Pool, RenderFrame, Target},
+    gpu::scene::Scene,
     gpu::{ATTRIBUTES, Blur, Composite, Globals, Instance, Plain, bytes},
-    scene::Scene,
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use std::{borrow::Cow, cell::RefCell, mem, rc::Rc, slice, time::Duration};

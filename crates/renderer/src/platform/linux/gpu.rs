@@ -1,7 +1,7 @@
-use crate::atlas::{self, PageKind, PageList, PageStore, Tile};
-use crate::frame::{Command, Mask, Pool, RenderFrame, Target};
+use crate::gpu::atlas::{self, PageKind, PageList, PageStore, Tile};
+use crate::gpu::frame::{Command, Mask, Pool, RenderFrame, Target};
+use crate::gpu::scene::Scene;
 use crate::gpu::{ATTRIBUTES, Blur, Composite, Globals, Instance, Plain, bytes};
-use crate::scene::Scene;
 use crate::{Rect, Size};
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use raw_window_handle::{DisplayHandle, HandleError, HasDisplayHandle};
@@ -243,7 +243,7 @@ impl Gpu {
             TextureFormat::Rgba8Unorm,
             TextureUsages::TEXTURE_BINDING,
         );
-        let source = wgpu::ShaderSource::Wgsl(include_str!("../../shaders.wgsl").into());
+        let source = wgpu::ShaderSource::Wgsl(include_str!("../../gpu/shaders.wgsl").into());
         let linear = wgpu::FilterMode::Linear;
         Self {
             module: device.create_shader_module(wgpu::ShaderModuleDescriptor {

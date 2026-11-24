@@ -3,8 +3,8 @@ mod span;
 
 use crate::{
     Clip, Color, Pixels, Point, Radii, Rect, Size,
-    atlas::Tile,
     geometry::{region, transform_bounds},
+    gpu::atlas::Tile,
     gpu::{Instance, SHADOW, bytes, rect},
     point,
 };

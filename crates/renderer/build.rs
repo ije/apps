@@ -57,7 +57,7 @@ fn hlsl() {
 
 #[cfg(target_os = "macos")]
 fn metal() {
-    let source = "src/shaders.wgsl";
+    let source = "src/gpu/shaders.wgsl";
     println!("cargo::rerun-if-changed={source}");
     let out = env::var("OUT_DIR").unwrap();
     let msl = format!("{out}/shaders.metal");

@@ -58,7 +58,7 @@ impl RenderFrame {
     ) -> (Target, f32) {
         let key = key.map(|(key, digest, keep)| {
             (
-                crate::scene::mix(key, u64::from(sigma.to_bits())),
+                crate::gpu::scene::mix(key, u64::from(sigma.to_bits())),
                 digest,
                 keep,
             )
@@ -318,7 +318,7 @@ impl RenderFrame {
         let digest = (scene.digests.get(nested.layer).copied())
             .filter(|digest| *digest != 0 && effect.text_mask.is_none());
         // The pixels are the same at another place, so the key holds the region relative to the layer.
-        let origin = crate::scene::origin(layer).map(|value| value as i32);
+        let origin = crate::gpu::scene::origin(layer).map(|value| value as i32);
         let border =
             |region: [i32; 4]| [region[0] - 1, region[1] - 1, region[2] + 2, region[3] + 2];
         let key = digest.map(|digest| {
@@ -329,7 +329,9 @@ impl RenderFrame {
                 whole_region[3],
             ]
             .iter()
-            .fold(digest, |key, value| crate::scene::mix(key, *value as u64))
+            .fold(digest, |key, value| {
+                crate::gpu::scene::mix(key, *value as u64)
+            })
         });
         let cached = key.and_then(|key| self.reuse(key, border(whole_region)));
         let count = self.count;
@@ -407,7 +409,7 @@ impl RenderFrame {
 
         let kept = |kind: u64| {
             key.zip(digest)
-                .map(|(key, digest)| (crate::scene::mix(key, kind), digest, keeps))
+                .map(|(key, digest)| (crate::gpu::scene::mix(key, kind), digest, keeps))
         };
         if let Some((offset, sigma, color)) = effect.shadow {
             let (src, left) = if sigma > 0.25 {

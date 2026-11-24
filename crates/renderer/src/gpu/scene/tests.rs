@@ -461,7 +461,7 @@ fn rebuilt_scenes_damage_what_changed() {
         scene.push(image);
         scene
     };
-    let damage = |from: &mut Scene, to: Scene, fresh: &[crate::atlas::Fresh]| {
+    let damage = |from: &mut Scene, to: Scene, fresh: &[crate::gpu::atlas::Fresh]| {
         from.diff(Some(&[]));
         from.drawn();
         let mut to = to;

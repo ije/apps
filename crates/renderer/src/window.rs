@@ -2,11 +2,10 @@ use crate::{
     App, Backdrop, BorderStyle, BoxShadow, Child, Clip, Color, Cursor, Edges, Event, Key,
     Modifiers, NodeKey, PaintEffect, Pixels, Point, Radii, Rect, RenderImage, ScrollRef, Size,
     Snapshot, Tree, Utf16Selection, WheelPhase, WindowChange, WindowControl, WindowId, WindowState,
-    atlas::TileKey,
     geometry::{Plane, compose, invert, plane_of, project, snap, snap_width},
-    platform, point, px,
-    scene::{self, BackdropState, EffectState, Scene},
-    size,
+    gpu::atlas::TileKey,
+    gpu::scene::{self, BackdropState, EffectState, Scene},
+    platform, point, px, size,
     text::{DecorationStyle, FontId, GlyphId, GlyphRaster, SUBPIXEL_STEPS, TextSystem},
 };
 use anyhow::Result;

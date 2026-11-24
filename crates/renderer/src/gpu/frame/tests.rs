@@ -1,8 +1,8 @@
 use super::{Command, RenderFrame};
 use crate::{
     Clip,
+    gpu::scene::{BackdropState, EffectState, Scene, effect},
     gpu::{BOX, GLYPH, IMAGE, Instance, bytes, rect as bounds},
-    scene::{BackdropState, EffectState, Scene, effect},
 };
 
 fn record(window: [u32; 2], quad: [f32; 4], scale: f32) -> RenderFrame {
@@ -175,7 +175,7 @@ fn glass_foregrounds_keep_the_border_box_and_draw_once() {
         scene.push(Instance::new(BOX, mask.bounds, mask));
         scene.push_effect(
             EffectState {
-                glass: Some(crate::scene::GlassState {
+                glass: Some(crate::gpu::scene::GlassState {
                     key: 5,
                     bounds: border,
                     corner_radius: 24.,
