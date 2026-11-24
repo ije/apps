@@ -885,7 +885,7 @@ impl SvgSource<'_> {
             let bounds = Rect::new(point(px(x), px(y)), size(px(w), px(h)));
             attrs.push((
                 "transform",
-                super::effects::transform(own, units, bounds, None).map_or(String::new(), |m| {
+                crate::css::transform(own, units, bounds, None).map_or(String::new(), |m| {
                     format!(
                         "matrix({} {} {} {} {} {})",
                         m[0], m[1], m[4], m[5], m[12], m[13]

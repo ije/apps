@@ -2676,9 +2676,7 @@ pub fn call(
                                 renderer::point(renderer::px(0.), renderer::px(0.)),
                                 renderer::size(renderer::px(size[0]), renderer::px(size[1])),
                             );
-                            let center = match crate::render::effects::transform(
-                                style, &units, bounds, None,
-                            ) {
+                            let center = match crate::css::transform(style, &units, bounds, None) {
                                 Some(m) if m[3] == 0. && m[7] == 0. && m[15] == 1. => {
                                     let [cx, cy] = [size[0] / 2., size[1] / 2.];
                                     [m[0] * cx + m[4] * cy + m[12], m[1] * cx + m[5] * cy + m[13]]
@@ -3294,7 +3292,7 @@ pub fn call(
                     let new = Drawn {
                         matrix: matrix
                             .or(old.as_ref().map(|old| old.matrix))
-                            .unwrap_or(crate::render::effects::IDENTITY),
+                            .unwrap_or(crate::css::IDENTITY),
                         clip: clip.or(old.as_ref().and_then(|old| old.clip)),
                         order: match &old {
                             Some(old) if args[4] == true => old.order,
@@ -3647,7 +3645,7 @@ pub fn call(
             );
             // The bounds are those of the last frame, so its animated transform moved them.
             let shift = match transformed
-                .then(|| crate::render::effects::transform(now, units, local, None))
+                .then(|| crate::css::transform(now, units, local, None))
                 .flatten()
             {
                 Some(m) if m[3] == 0. && m[7] == 0. && m[15] == 1. => {

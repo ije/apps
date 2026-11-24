@@ -704,7 +704,7 @@ pub(crate) fn resolved(
                 renderer::point(renderer::px(0.), renderer::px(0.)),
                 renderer::size(renderer::px(width), renderer::px(height)),
             );
-            match crate::render::effects::transform(&flat, units, bounds, None) {
+            match crate::css::transform(&flat, units, bounds, None) {
                 Some(m)
                     if [m[2], m[3], m[6], m[7], m[8], m[9], m[11], m[14]] == [0.; 8]
                         && m[10] == 1.

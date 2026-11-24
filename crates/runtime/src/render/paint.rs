@@ -8,7 +8,7 @@ pub(super) struct Turned {
     clockwise: bool,
     block: f32,
     inline: f32,
-    matrix: Cell<super::effects::Matrix>,
+    matrix: Cell<crate::css::Matrix>,
 }
 
 impl Turned {
@@ -23,15 +23,15 @@ impl Turned {
             clockwise,
             block,
             inline,
-            matrix: Cell::new(super::effects::IDENTITY),
+            matrix: Cell::new(crate::css::IDENTITY),
         });
         *node.style() = style;
         node
     }
 
-    fn matrix(&self, origin: Point<Pixels>) -> super::effects::Matrix {
+    fn matrix(&self, origin: Point<Pixels>) -> crate::css::Matrix {
         let [x, y] = [f32::from(origin.x), f32::from(origin.y)];
-        let mut m = super::effects::IDENTITY;
+        let mut m = crate::css::IDENTITY;
         if self.clockwise {
             [m[0], m[1], m[4], m[5]] = [0., 1., -1., 0.];
             [m[12], m[13]] = [x + self.block + y, y - x];
@@ -83,7 +83,7 @@ impl Hooks for Turned {
 pub(super) struct Transformed {
     pub(super) style: Rc<css::Style>,
     pub(super) units: css::Lengths,
-    pub(super) matrix: Cell<Option<super::effects::Matrix>>,
+    pub(super) matrix: Cell<Option<crate::css::Matrix>>,
     pub(super) local: super::effects::Local,
 }
 
@@ -696,7 +696,7 @@ pub(super) struct DomBox {
     pub(super) leading: Option<[f32; 3]>,
     pub(super) boxless: bool,
     pub(super) text: Option<([u32; 2], [f32; 2])>,
-    pub(super) placed: Cell<(Rect<Pixels>, Option<super::effects::Matrix>)>,
+    pub(super) placed: Cell<(Rect<Pixels>, Option<crate::css::Matrix>)>,
     // The window bounds and cull flags of the last prepaint, which a skip gives to `merge`.
     pub(super) reached_at: Cell<(Rect<Pixels>, u32)>,
     pub(super) offset: Cell<Point<Pixels>>,
@@ -1153,17 +1153,17 @@ impl Hooks for DomBox {
                 let view = &*self.view;
                 let host = view.host.borrow();
                 let [x, y, width, height] = *host.dom.get(&view.id)?.bounds.get(parent)?;
-                let [ox, oy, _] = super::effects::origin(origin, &self.units, [width, height]);
+                let [ox, oy, _] = crate::css::origin(origin, &self.units, [width, height]);
                 Some((*distance, [x + ox, y + oy]))
             });
         // A canvas draws a drawable element as it is before its transform.
         let mut matrix = match perspective {
-            Some(_) => super::effects::transform(&self.style, &self.units, bounds, perspective),
+            Some(_) => crate::css::transform(&self.style, &self.units, bounds, perspective),
             None => super::effects::transform_at(&self.local, &self.style, &self.units, bounds),
         }
         .filter(|_| !self.drawn);
         if self.transformed && !self.drawn {
-            matrix.get_or_insert(super::effects::IDENTITY);
+            matrix.get_or_insert(crate::css::IDENTITY);
             self.view
                 .composited_transforms
                 .borrow_mut()
@@ -1296,11 +1296,10 @@ impl Hooks for DomBox {
                 let drawn = view.host.borrow().dom.get(&view.id).and_then(|dom| {
                     let to_canvas = dom.drawn.get(&self.id)?.matrix;
                     let [x, y] = [bounds.origin.x, bounds.origin.y].map(f32::from);
-                    let from_box = super::effects::translate(-x, -y, 0.);
-                    let to_window =
-                        super::effects::translate(content.x.into(), content.y.into(), 0.);
-                    let placed = super::effects::multiply(&to_canvas, &from_box);
-                    Some(super::effects::multiply(&to_window, &placed))
+                    let from_box = crate::css::translate(-x, -y, 0.);
+                    let to_window = crate::css::translate(content.x.into(), content.y.into(), 0.);
+                    let placed = crate::css::multiply(&to_canvas, &from_box);
+                    Some(crate::css::multiply(&to_window, &placed))
                 });
                 window.with_hits_at(drawn, &mut prepaint)
             }
@@ -1534,7 +1533,7 @@ impl DomBox {
     fn effects(
         &self,
         bounds: Rect<Pixels>,
-        transform: Option<super::effects::Matrix>,
+        transform: Option<crate::css::Matrix>,
         window: &mut Window,
     ) -> (Option<renderer::Clip<Pixels>>, Vec<renderer::PaintEffect>) {
         use super::effects::{self, Clip};

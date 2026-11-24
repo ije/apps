@@ -14,6 +14,7 @@ mod sheet;
 mod shorthand;
 mod specified;
 mod tokens;
+mod transform;
 mod units;
 mod value;
 
@@ -38,6 +39,7 @@ pub(crate) use sheet::{
 pub(crate) use shorthand::{BORDER_IMAGE, BORDER_IMAGE_INITIAL, border_image, expand};
 pub(crate) use specified::specified;
 pub(crate) use tokens::{components, number, write_number, write_printed};
+pub(crate) use transform::{IDENTITY, Matrix, angle, multiply, origin, transform, translate};
 pub(crate) use units::{FontUnits, Kind, Lengths};
 pub use value::length;
 pub(crate) use value::{

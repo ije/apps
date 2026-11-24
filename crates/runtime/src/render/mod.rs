@@ -2694,7 +2694,7 @@ impl PageView {
 
 const BUTTONS: [u8; 5] = [1, 4, 2, 8, 16];
 const TRANSFORM_PROPS: [Prop; 4] = [Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE];
-// Must list every property that `effects::opacity` and `effects::transform` read.
+// Must list every property that `effects::opacity` and `crate::css::transform` read.
 const COMPOSITED_PROPS: [Prop; 6] = [
     Prop::OPACITY,
     Prop::TRANSFORM,
@@ -2907,8 +2907,8 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
                 .any(|&prop| old.get(prop) != style.get(prop));
             let matrix = match composited_transforms.get(id).filter(|_| turns) {
                 Some((bounds, perspective)) => Some(
-                    effects::transform(style, &styles.lengths[*id], *bounds, *perspective)
-                        .unwrap_or(effects::IDENTITY),
+                    crate::css::transform(style, &styles.lengths[*id], *bounds, *perspective)
+                        .unwrap_or(crate::css::IDENTITY),
                 ),
                 None if turns => return false,
                 None => None,
@@ -3006,13 +3006,13 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
                                     timeline
                                         .iter()
                                         .map(|style| {
-                                            effects::transform(
+                                            crate::css::transform(
                                                 style,
                                                 &styles.lengths[*id],
                                                 bounds,
                                                 *perspective,
                                             )
-                                            .unwrap_or(effects::IDENTITY)
+                                            .unwrap_or(crate::css::IDENTITY)
                                         })
                                         .collect()
                                 });
@@ -3033,12 +3033,17 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
                         };
                         if let Some(origin) = origin.filter(|_| local) {
                             let [x, y] = [f32::from(origin.x), f32::from(origin.y)];
-                            let (there, back) =
-                                (effects::translate(x, y, 0.), effects::translate(-x, -y, 0.));
-                            let moved = samples.1.as_ref().map(|list: &Vec<effects::Matrix>| {
+                            let (there, back) = (
+                                crate::css::translate(x, y, 0.),
+                                crate::css::translate(-x, -y, 0.),
+                            );
+                            let moved = samples.1.as_ref().map(|list: &Vec<crate::css::Matrix>| {
                                 list.iter()
                                     .map(|matrix| {
-                                        effects::multiply(&there, &effects::multiply(matrix, &back))
+                                        crate::css::multiply(
+                                            &there,
+                                            &crate::css::multiply(matrix, &back),
+                                        )
                                     })
                                     .collect()
                             });
