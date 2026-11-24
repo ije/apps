@@ -83,6 +83,7 @@ pub(crate) struct Main {
     wake: Cell<Option<Instant>>,
     driving: Cell<bool>,
     ended: Cell<bool>,
+    quiet: Cell<bool>,
 }
 
 impl Main {
@@ -107,6 +108,7 @@ impl Main {
             wake: Cell::new(None),
             driving: Cell::new(false),
             ended: Cell::new(false),
+            quiet: Cell::new(false),
         });
         MAIN.set(Rc::downgrade(&main));
         crate::host::link::set_receive_main(receive_main);
@@ -727,7 +729,7 @@ impl Main {
             crate::host::context::stop_pages();
             renderer::native::quit();
         }
-        if self.api.schedule_shrink() {
+        if self.api.shrink_pending() && !self.quiet.replace(true) {
             self.shrink_when_quiet();
         }
         crate::jsc::idle(true);
@@ -793,6 +795,7 @@ impl Main {
         renderer::native::after(Duration::from_secs(1), move || {
             if let Some(main) = main.upgrade() {
                 if main.api.shrink_due() {
+                    main.quiet.set(false);
                     main.api.shrink();
                     #[cfg(target_os = "macos")]
                     crate::malloc::flush();

@@ -98,6 +98,8 @@ impl crate::render::Pages for Pages {
 }
 
 thread_local! {
+    // The page side of this thread waits to shrink its engine. Main keeps its own flag.
+    static SHRINKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // Skip destruction: this needs HOSTS, which exits first.
     static PAGE_SIDE: std::mem::ManuallyDrop<RefCell<Option<Rc<RefCell<Desktop>>>>> = const { std::mem::ManuallyDrop::new(RefCell::new(None)) };
 }
@@ -892,7 +894,7 @@ impl Desktop {
             });
         }
         let api = runtime.borrow().api.clone();
-        if api.schedule_shrink() {
+        if api.shrink_pending() && !SHRINKING.replace(true) {
             shrink_when_quiet(runtime.clone(), cx);
         }
         match result {
@@ -1184,6 +1186,7 @@ fn shrink_when_quiet(runtime: Rc<RefCell<Desktop>>, cx: &mut App) {
         if drawing || !api.shrink_due() {
             return shrink_when_quiet(runtime, cx);
         }
+        SHRINKING.set(false);
         api.shrink();
         if let Ok(app) = runtime.try_borrow() {
             for view in app.views.values() {

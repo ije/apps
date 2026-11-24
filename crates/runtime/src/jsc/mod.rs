@@ -157,7 +157,6 @@ pub struct JavaScriptCore {
     burst: std::cell::Cell<bool>,
     quiet: std::cell::Cell<u32>,
     shrunk: std::cell::Cell<std::time::Instant>,
-    shrink_scheduled: std::cell::Cell<bool>,
     ticks: std::cell::Cell<(std::time::Duration, u32)>,
     pub(crate) inspectable: unsafe extern "C" fn(Ptr, bool),
     pub(crate) extra_memory: unsafe extern "C" fn(Ptr, usize),
@@ -436,7 +435,6 @@ impl JavaScriptCore {
                 burst: Default::default(),
                 quiet: Default::default(),
                 shrunk: std::cell::Cell::new(std::time::Instant::now()),
-                shrink_scheduled: Default::default(),
                 ticks: Default::default(),
                 create: *library.get(b"JSGlobalContextCreateInGroup\0")?,
                 release: *library.get(b"JSGlobalContextRelease\0")?,
@@ -610,11 +608,6 @@ impl JavaScriptCore {
         f64::from(ticks) * PAGE_TICK >= PAGE_LIMIT as f64
     }
 
-    // True once after scripts ran enough to collect later, until `shrink`.
-    pub(crate) fn schedule_shrink(&self) -> bool {
-        self.shrink_pending() && !self.shrink_scheduled.replace(true)
-    }
-
     pub(crate) fn terminator(&self) -> Option<Terminator> {
         self.terminate
             .map(|terminate| Terminator(self.group as usize, terminate))
@@ -648,7 +641,6 @@ impl JavaScriptCore {
     }
 
     pub(crate) fn shrink(&self) {
-        self.shrink_scheduled.set(false);
         self.busy.set(Default::default());
         self.burst.set(false);
         self.quiet.set(0);
