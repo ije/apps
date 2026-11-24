@@ -435,6 +435,10 @@ impl TextSystem {
         result
     }
 
+    pub(crate) fn has_floats(&self) -> bool {
+        self.floats.borrow().is_some()
+    }
+
     /// The floats of `beside`.
     pub fn floats(&self) -> Option<Rc<[[f32; 4]]>> {
         self.floats.borrow().clone()

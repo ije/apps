@@ -1499,7 +1499,7 @@ impl LayoutTree<'_> {
     pub(super) fn measure(&mut self, index: usize, inputs: LayoutInput) -> LayoutOutput {
         let scale = self.scale;
         let window = &mut *self.window;
-        let banded = window.text_system().floats().is_some();
+        let banded = window.text_system().has_floats();
         let Slot {
             stretched,
             measure,
