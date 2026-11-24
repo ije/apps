@@ -34,7 +34,7 @@ pub mod node;
 pub mod render;
 pub mod script;
 pub mod style;
-mod web;
+pub mod web;
 pub use web::download;
 pub use web::{gpu, media, terminal};
 

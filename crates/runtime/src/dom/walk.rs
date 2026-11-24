@@ -364,3 +364,106 @@ impl Walk {
         Some(true)
     }
 }
+
+#[cfg(test)]
+mod tests {
+
+    // `Walk::update` compares each patched walk with a fresh one in debug builds.
+    #[test]
+    fn patched_walks_match_fresh_walks() {
+        let mut doc = crate::dom::Document::parse(&format!(
+            "<body>{}</body>",
+            "<ul><li><b>a</b><i>b</i></li><li>c<span><em>d</em></span></li></ul>".repeat(40)
+        ));
+        let mut seed = 7u64;
+        let mut random = |below: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % below
+        };
+        let mut composed = rustc_hash::FxHashMap::default();
+        let mut walk = super::Walk::default();
+        walk.update(&doc, &composed, None);
+        let mut patches = 0;
+        for _ in 0..600 {
+            for _ in 0..1 + random(3) {
+                let (a, b) = (1 + random(doc.nodes.len() - 1), random(doc.nodes.len()));
+                match random(6) {
+                    0 => doc.nodes.push(crate::dom::Node {
+                        tag: "p".into(),
+                        ..Default::default()
+                    }),
+                    1 if doc.nodes[a].children.is_empty() => {
+                        if let Some(parent) = doc.nodes[a].parent.take() {
+                            doc.nodes[parent].children.retain(|&child| child != a);
+                        }
+                    }
+                    2 => doc.nodes[b].children.reverse(),
+                    3 => {
+                        composed.remove(&b);
+                        let mut children = doc.nodes[b].children.clone();
+                        let (turn, len) =
+                            (random(children.len().max(1)), random(children.len() + 1));
+                        children.rotate_left(turn);
+                        children.truncate(len);
+                        if random(2) == 0 {
+                            composed.insert(b, children);
+                        }
+                    }
+                    _ => {
+                        let mut above = Some(b);
+                        while above.is_some_and(|id| id != a) {
+                            above = above.and_then(|id| doc.nodes[id].parent);
+                        }
+                        let mut root = b;
+                        while let Some(parent) = doc.nodes[root].parent {
+                            root = parent;
+                        }
+                        if above.is_some()
+                            || doc.nodes[b].tag.starts_with('#')
+                            || root != 0 && random(8) != 0
+                        {
+                            continue;
+                        }
+                        if let Some(parent) = doc.nodes[a].parent.take() {
+                            doc.nodes[parent].children.retain(|&child| child != a);
+                            composed.remove(&parent);
+                        }
+                        composed.remove(&b);
+                        let at = random(doc.nodes[b].children.len() + 1);
+                        doc.nodes[b].children.insert(at, a);
+                        doc.nodes[a].parent = Some(b);
+                    }
+                }
+            }
+            // A composed list names only children of its node.
+            composed.retain(|&id, children: &mut Vec<usize>| {
+                children
+                    .iter()
+                    .all(|&child| doc.nodes[child].parent == Some(id))
+            });
+            let (old, serial) = (walk.snapshot(), walk.serial);
+            walk.update(&doc, &composed, None);
+            let Some(touched) = walk.since(serial) else {
+                continue;
+            };
+            patches += 1;
+            let untouched = |nodes: &[(u32, u32)]| {
+                let kept = |node: &&(u32, u32)| !touched.contains(&node.0);
+                nodes.iter().filter(kept).copied().collect::<Vec<_>>()
+            };
+            assert_eq!(untouched(&old), untouched(walk.order()));
+            assert!(
+                walk.order()
+                    .iter()
+                    .all(|&(id, _)| walk.contains(id as usize))
+            );
+        }
+        assert!(
+            patches > 300 && walk.order().len() > 300,
+            "{patches} {}",
+            walk.order().len()
+        );
+    }
+}

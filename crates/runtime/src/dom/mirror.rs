@@ -5,7 +5,7 @@ use std::sync::Arc;
 #[derive(Default)]
 pub struct LayoutMirror {
     memory: Option<Arc<MirrorMemory>>,
-    pub(super) capacity: usize,
+    capacity: usize,
 }
 
 // The float buffer that pages share, addressed by word.
@@ -121,6 +121,11 @@ impl LayoutMirror {
         }
         self.memory = Some(Arc::new(memory));
         self.capacity = capacity;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
     }
 
     pub(crate) fn get(&self, id: &usize) -> Option<&[f32; 4]> {

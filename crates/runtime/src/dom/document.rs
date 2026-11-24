@@ -3152,4 +3152,27 @@ mod tests {
             "\"a\\nb\\nc\""
         );
     }
+
+    #[test]
+    fn password_fields_show_a_bullet_per_code_point() {
+        let doc = Document::parse("<input type=password><input>");
+        let [password, text] = [1, 2].map(|nth| {
+            doc.nodes
+                .iter()
+                .filter(|node| node.tag == "input")
+                .nth(nth - 1)
+                .unwrap()
+        });
+        let value = "a\u{1F600}b";
+        assert_eq!(password.shown_text(value.into()), "\u{2022}".repeat(3));
+        assert_eq!(text.shown_text(value.into()), value);
+        assert_eq!(
+            [0, 1, 2, 3, 4].map(|offset| crate::dom::text::bullets(value, offset)),
+            [0, 1, 2, 2, 3]
+        );
+        assert_eq!(
+            [0, 1, 2, 3].map(|index| crate::dom::text::unbullet(value, index)),
+            [0, 1, 3, 4]
+        );
+    }
 }

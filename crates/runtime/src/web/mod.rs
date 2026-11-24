@@ -1,4 +1,5 @@
 pub(crate) mod crypto;
+pub mod dom;
 pub mod gpu;
 pub mod media;
 pub(crate) mod platform;

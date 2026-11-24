@@ -80,3 +80,37 @@ pub(crate) fn utf16_index(text: &str, index: usize) -> usize {
     }
     text.len()
 }
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn offsets_map_through_collapsed_white_space() {
+        let (source, shown) = ("  a  b\n c ", "a b c");
+        for (offset, byte) in [
+            (0, 0),
+            (2, 0),
+            (3, 1),
+            (5, 2),
+            (6, 3),
+            (8, 4),
+            (9, 5),
+            (10, 5),
+        ] {
+            assert_eq!(super::shown_index(source, shown, offset), byte, "{offset}");
+        }
+        assert_eq!(super::source_offset(source, shown, 0), 0);
+        assert_eq!(super::source_offset(source, shown, 1), 3);
+        assert_eq!(super::source_offset(source, shown, 2), 4);
+        assert_eq!(super::source_offset(source, shown, 3), 6);
+        assert_eq!(super::shown_index("héllo", "héllo", 2), 3);
+        assert_eq!(super::shown_index("", "abc", 2), 2);
+        // `text-transform: uppercase` makes one `ß` two letters.
+        let (source, shown) = ("groß ist", "GROSS IST");
+        assert_eq!(super::shown_index(source, shown, 4), 5);
+        assert_eq!(super::shown_index(source, shown, 5), 6);
+        assert_eq!(super::source_offset(source, shown, 5), 4);
+        assert_eq!(super::source_offset(source, shown, 4), 3);
+        assert_eq!(super::source_offset(source, shown, 7), 6);
+    }
+}

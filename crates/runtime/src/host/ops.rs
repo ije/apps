@@ -206,7 +206,7 @@ pub(super) unsafe extern "C" fn call(
             let state = &mut page.state;
             let viewport = *host.viewports.get(&id).unwrap_or(&[800., 600.]);
             if values.get(2).is_some_and(|&value| api.to_bool(ctx, value)) {
-                crate::dom::layout_flags(&mut page.doc, state, viewport);
+                crate::web::dom::geometry::layout_flags(&mut page.doc, state, viewport);
             }
             state.geometry.sync_scroll();
             if !values.get(1).is_some_and(|&value| api.to_bool(ctx, value)) {
@@ -964,7 +964,7 @@ impl Host {
             {
                 state.styles.invalidate();
             }
-            let result = crate::dom::call(
+            let result = crate::web::dom::call(
                 op,
                 args,
                 &mut page.doc,

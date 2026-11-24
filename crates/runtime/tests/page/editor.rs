@@ -287,7 +287,7 @@ fn native_ranges_respect_element_boundaries_and_utf16_offsets() {
             serde_json::json!([[text[1], 1, 2]]),
         ),
     ] {
-        let actual = apps_runtime::dom::call(
+        let actual = apps_runtime::web::dom::call(
             "dom.rangeNodes",
             &serde_json::json!(bounds),
             &mut doc,
@@ -329,7 +329,7 @@ fn caret_hit_testing_uses_the_nearest_visible_text() {
         ([90, 80], Some("second")),
         ([-1, 10], None),
     ] {
-        let actual = apps_runtime::dom::call(
+        let actual = apps_runtime::web::dom::call(
             "dom.hitTest",
             &serde_json::json!([point[0], point[1], true, true]),
             &mut doc,
