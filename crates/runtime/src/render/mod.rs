@@ -8,6 +8,7 @@ pub(crate) mod fonts;
 pub(crate) mod grid;
 mod hud;
 pub mod image;
+pub(crate) mod inline;
 mod input;
 mod inspect;
 pub(crate) mod native;
@@ -289,7 +290,7 @@ impl PageState {
         &self,
         doc: &crate::dom::Document,
         styles: &style::ComputedStyles,
-        texts: &mut rustc_hash::FxHashMap<usize, Option<Rc<style::InlineText>>>,
+        texts: &mut rustc_hash::FxHashMap<usize, Option<Rc<crate::render::inline::InlineText>>>,
         bounds: &crate::dom::LayoutMirror,
         tree: &renderer::Tree,
         near: Option<[f32; 2]>,
@@ -301,7 +302,8 @@ impl PageState {
             // An inline box that holds a block splits around it or not by its style, which its block decides. An
             // inline box that lost what gave it a box of its own goes back into the text of its block.
             if let Some(record) = kept.get(&node).filter(|_| {
-                !style::holds_block_box(doc, styles, node) && style::own_box(doc, styles, node)
+                !crate::render::inline::holds_block_box(doc, styles, node)
+                    && crate::render::inline::own_box(doc, styles, node)
             }) {
                 break record
                     .in_place()
@@ -949,7 +951,7 @@ impl PageView {
                         || doc.nodes[*id].tag == "canvas")
                     && composites(style, &styles.values[*id])
                     // A spliced box has no layer: its parts draw its opacity.
-                    && !style::spliced(&doc, &styles, *id)
+                    && !crate::render::inline::spliced(&doc, &styles, *id)
                     // A step that draws like the base style builds in place, like other paint changes.
                     && !style.iter().eq(styles.values[*id].iter())
                     && filter(style, 1).is_none_or(|value| {
@@ -1050,7 +1052,7 @@ impl PageView {
             dom.tracks.remove(&id);
             dom.areas.remove(&id);
             dom.anchors.remove(&id);
-            dom.anchors.remove(&style::atom_key(id, 2));
+            dom.anchors.remove(&crate::render::inline::atom_key(id, 2));
         }
         if flipped {
             self.svgs.borrow_mut().retain(|&id, _| shown(id));

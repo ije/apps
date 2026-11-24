@@ -1084,7 +1084,7 @@ impl State {
             if !self.pseudo_boxes.is_empty() {
                 for pseudo in 1..3 {
                     self.pseudo_boxes
-                        .remove(&crate::style::atom_key(id, pseudo));
+                        .remove(&crate::render::inline::atom_key(id, pseudo));
                 }
             }
             if let Some(node) = self.layout_nodes.get_mut(id) {
@@ -1889,7 +1889,9 @@ pub fn call(
                 }
                 state.selection.remove(&id);
                 for pseudo in 0..3 {
-                    state.atoms.remove(&crate::style::atom_key(id, pseudo));
+                    state
+                        .atoms
+                        .remove(&crate::render::inline::atom_key(id, pseudo));
                 }
                 if state.selection_caret == Some(id) {
                     state.selection_caret = None;
@@ -2534,7 +2536,8 @@ pub fn call(
                     .get(Prop::CONTENT)
                     .is_some_and(|content| !matches!(content, "none" | "normal")))
             .then(|| {
-                let key = crate::style::atom_key(id, if pseudo == "after" { 2 } else { 1 });
+                let key =
+                    crate::render::inline::atom_key(id, if pseudo == "after" { 2 } else { 1 });
                 state.pseudo_boxes.get(&key).copied()
             })
             .flatten();

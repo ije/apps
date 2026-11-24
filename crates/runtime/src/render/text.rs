@@ -564,7 +564,7 @@ pub(crate) fn text_index(
 }
 
 fn first_line(
-    data: &style::InlineText,
+    data: &crate::render::inline::InlineText,
     width: Option<Pixels>,
     font_size: Pixels,
     text_system: &renderer::TextSystem,
@@ -602,8 +602,8 @@ fn first_line(
 }
 
 pub(super) struct InlineText {
-    pub(super) data: Rc<style::InlineText>,
-    /// Rows can grow around runs or fallback glyphs, see `style::InlineText::mixed`.
+    pub(super) data: Rc<crate::render::inline::InlineText>,
+    /// Rows can grow around runs or fallback glyphs, see `crate::render::inline::InlineText::mixed`.
     pub(super) mixed: bool,
     pub(super) view: Rc<super::PageState>,
     pub(super) atoms: Rc<[AtomSlot]>,
@@ -695,7 +695,7 @@ impl renderer::Hooks for AtomBox {
 }
 
 fn with_atoms(
-    data: &style::InlineText,
+    data: &crate::render::inline::InlineText,
     sizes: impl Fn(usize) -> f32,
     runs: &mut [renderer::TextRun],
 ) {
@@ -712,7 +712,7 @@ fn with_atoms(
 type MeasuredSize = ((bool, Option<Pixels>), renderer::Size<Pixels>);
 
 struct Measured {
-    data: Rc<style::InlineText>,
+    data: Rc<crate::render::inline::InlineText>,
     atoms: Box<[([f32; 3], Option<AlignItems>)]>,
     styled: std::cell::RefCell<Option<renderer::TextStyle>>,
     measured: std::cell::Cell<[Pixels; 2]>,
@@ -885,7 +885,12 @@ impl From<InlineText> for renderer::Node {
 }
 
 // The mirror of a node of the text. A spliced inline box has a part in each line of text, which its block joins.
-fn place(dom: &mut crate::dom::State, data: &style::InlineText, id: usize, rect: [f32; 4]) {
+fn place(
+    dom: &mut crate::dom::State,
+    data: &crate::render::inline::InlineText,
+    id: usize,
+    rect: [f32; 4],
+) {
     if !data.cuts.contains(&id) {
         dom.bounds.insert(id, rect);
         return;
@@ -894,7 +899,7 @@ fn place(dom: &mut crate::dom::State, data: &style::InlineText, id: usize, rect:
 }
 
 // Drops the parts that the text gave its spliced boxes before it gives them again.
-fn unplace(dom: &mut crate::dom::State, data: &style::InlineText) {
+fn unplace(dom: &mut crate::dom::State, data: &crate::render::inline::InlineText) {
     for cut in &data.cuts {
         if let Some(pieces) = dom.pieces.get_mut(cut) {
             pieces.retain(|(key, _)| *key != data.key);
@@ -1543,7 +1548,7 @@ impl renderer::Hooks for InlineText {
                 );
                 // The border box of an inline box on each of its rows, with its left and right sides.
                 let fragments = |index: usize,
-                                 inline: Option<&style::InlineBox>,
+                                 inline: Option<&crate::render::inline::InlineBox>,
                                  window: &Window| {
                     let (id, range) = &self.data.ranges[index];
                     let (style, units) = (&styles.values[*id], styles.lengths[*id]);

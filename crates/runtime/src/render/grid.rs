@@ -21,7 +21,8 @@ pub(crate) struct Measurements {
     pub(crate) leads: rustc_hash::FxHashMap<(usize, Option<u32>, Option<u32>), f32>,
     pub(crate) pixel_ratio: f32,
     pub(crate) naturals: rustc_hash::FxHashMap<usize, [f32; 2]>,
-    pub(crate) texts: rustc_hash::FxHashMap<usize, Option<std::rc::Rc<style::InlineText>>>,
+    pub(crate) texts:
+        rustc_hash::FxHashMap<usize, Option<std::rc::Rc<crate::render::inline::InlineText>>>,
     // The text nodes in runs of more than one in flex and grid containers: `None` for a later node, which the
     // first builds, and for the first, whether the run has text other than white space.
     pub(crate) joined: rustc_hash::FxHashMap<usize, Option<bool>>,
@@ -90,7 +91,7 @@ impl Measurements {
                 self.joined.extend(rest.iter().map(|&node| (node, None)));
                 self.texts.insert(
                     *first,
-                    style::inline_text(doc, styles, *first, rest, &[], [true; 2])
+                    crate::render::inline::inline_text(doc, styles, *first, rest, &[], [true; 2])
                         .map(std::rc::Rc::new),
                 );
             } else {
@@ -950,7 +951,8 @@ pub(crate) fn intrinsic(
             .texts
             .entry(id)
             .or_insert_with(|| {
-                style::inline_text(doc, styles, id, &[], &[], [true; 2]).map(std::rc::Rc::new)
+                crate::render::inline::inline_text(doc, styles, id, &[], &[], [true; 2])
+                    .map(std::rc::Rc::new)
             })
             .clone()
             .map(|inline| {
@@ -1176,12 +1178,12 @@ pub(crate) fn intrinsic(
             && node
                 .children
                 .iter()
-                .any(|&child| style::spliced(doc, styles, child))
+                .any(|&child| crate::render::inline::spliced(doc, styles, child))
         {
             let (mut flat, mut pending) = (Vec::new(), node.children.clone());
             pending.reverse();
             while let Some(child) = pending.pop() {
-                match style::spliced(doc, styles, child) {
+                match crate::render::inline::spliced(doc, styles, child) {
                     true => pending.extend(doc.nodes[child].children.iter().rev()),
                     false => flat.push(child),
                 }

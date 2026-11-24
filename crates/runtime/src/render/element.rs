@@ -670,7 +670,9 @@ impl<'a> Build<'a> {
             }
             Query::Look(node) => hashed(doc.nodes[node as usize].state & LOOK),
             Query::Boxless(node) => hashed(boxless(doc, node as usize).map(|select| select.1)),
-            Query::Spliced(node) => hashed(style::spliced(doc, styles, node as usize)),
+            Query::Spliced(node) => {
+                hashed(crate::render::inline::spliced(doc, styles, node as usize))
+            }
             Query::RowFill => {
                 hashed(row_fill(doc, styles, id).map(|fill| fill.to_array().map(f32::to_bits)))
             }
@@ -1594,7 +1596,7 @@ fn create(
             || display == "inline-block" && styles.flags[id] & style::AGENT_DISPLAY != 0);
     let display = if sizeless {
         "inline-block"
-    } else if display == "inline" && style::holds_block_box(doc, styles, id) {
+    } else if display == "inline" && crate::render::inline::holds_block_box(doc, styles, id) {
         "block"
     } else {
         display
@@ -2045,7 +2047,7 @@ fn create(
     while let Some(child) = pending.pop() {
         if child > usize::MAX / 2 {
             let cut = cuts[!child].0;
-            if style::pseudo_blocks(styles, cut).is_some_and(|[_, after]| after) {
+            if crate::render::inline::pseudo_blocks(styles, cut).is_some_and(|[_, after]| after) {
                 cut_pseudos.push((flat.len(), 1));
                 flat.push(cut);
             }
@@ -2058,15 +2060,20 @@ fn create(
             .is_some_and(|value| value == "contents")
         {
             pending.extend(doc.nodes[child].children.iter().rev());
-        } else if flow && !drawable && style::holds_block_box(doc, styles, child) && {
-            let spliced = style::spliced(doc, styles, child);
-            reader.log(Query::Spliced(child as u32), depth, hashed(spliced));
-            spliced
-        } {
+        } else if flow
+            && !drawable
+            && crate::render::inline::holds_block_box(doc, styles, child)
+            && {
+                let spliced = crate::render::inline::spliced(doc, styles, child);
+                reader.log(Query::Spliced(child as u32), depth, hashed(spliced));
+                spliced
+            }
+        {
             pending.push(!cuts.len());
             cuts.push((child, flat.len(), flat.len()));
             pending.extend(doc.nodes[child].children.iter().rev());
-            if style::pseudo_blocks(styles, child).is_some_and(|[before, _]| before) {
+            if crate::render::inline::pseudo_blocks(styles, child).is_some_and(|[before, _]| before)
+            {
                 cut_pseudos.push((flat.len(), 0));
                 flat.push(child);
             }
@@ -2100,7 +2107,7 @@ fn create(
                 && styles.values[child]
                     .get(Prop::DISPLAY)
                     .is_none_or(|value| value.starts_with("inline"))
-                && !style::holds_block_box(doc, styles, child)
+                && !crate::render::inline::holds_block_box(doc, styles, child)
             || styles.values[child]
                 .get(Prop::POSITION)
                 .is_some_and(|value| matches!(value, "absolute" | "fixed"))
@@ -2111,7 +2118,8 @@ fn create(
             .texts
             .entry(id)
             .or_insert_with(|| {
-                style::inline_text(doc, styles, id, &[], &[], [true; 2]).map(Rc::new)
+                crate::render::inline::inline_text(doc, styles, id, &[], &[], [true; 2])
+                    .map(Rc::new)
             })
             .clone()
     };
@@ -2155,8 +2163,9 @@ fn create(
     };
     let first_content = flat.iter().position(|&child| content(child));
     let last_content = flat.iter().rposition(|&child| content(child));
-    let run_texts: RefCell<rustc_hash::FxHashMap<usize, Option<Rc<style::InlineText>>>> =
-        RefCell::default();
+    let run_texts: RefCell<
+        rustc_hash::FxHashMap<usize, Option<Rc<crate::render::inline::InlineText>>>,
+    > = RefCell::default();
     let run_text = |index: usize, end: usize| {
         let run = &flat[index..end];
         let parts = run_cuts(build, &cuts, &flat, [index, end], in_run);
@@ -2175,10 +2184,10 @@ fn create(
                     })
                     // The edges of a spliced box make a line also with only white space.
                     || parts.iter().any(|&(cut, flags)| {
-                        flags & style::CUT_FIRST != 0 && edge(build, cut, 3)
-                            || flags & style::CUT_LAST != 0 && edge(build, cut, 1)
+                        flags & crate::render::inline::CUT_FIRST != 0 && edge(build, cut, 3)
+                            || flags & crate::render::inline::CUT_LAST != 0 && edge(build, cut, 1)
                     }))
-                .then(|| style::inline_text(doc, styles, id, run, &parts, ends))
+                .then(|| crate::render::inline::inline_text(doc, styles, id, run, &parts, ends))
                 .flatten()
                 .map(|mut data| {
                     // Far above node ids, and unique per parent, so these lines keep their keys.
@@ -2210,7 +2219,8 @@ fn create(
     let empty_inline = || {
         display == "inline"
             && node.children.iter().all(|&child| {
-                doc.nodes[child].tag.starts_with('#') && style::makes_no_line(doc, styles, child)
+                doc.nodes[child].tag.starts_with('#')
+                    && crate::render::inline::makes_no_line(doc, styles, child)
             })
     };
     let rtl = style.get(Prop::DIRECTION) == Some("rtl");
@@ -2474,7 +2484,7 @@ fn create(
                     && doc.nodes[child].tag != "br"
                     && styles.values[child].get(Prop::DISPLAY) != Some("inline")
                     && in_flow(doc, info, child)
-                    && !style::makes_no_line(doc, styles, child)
+                    && !crate::render::inline::makes_no_line(doc, styles, child)
             })
         {
             (strut_due, struts) = (display != "inline", true);
@@ -3533,7 +3543,7 @@ fn create(
             // takes the line height and its baseline.
             if !styles.pseudos.contains_key(&id)
                 && empty_inline()
-                && !style::makes_no_line(doc, styles, id)
+                && !crate::render::inline::makes_no_line(doc, styles, id)
             {
                 let [ascent, descent, _] = text
                     .line_metrics(text.face(&parsed.face), px(units.font.em * pixel_ratio))
@@ -4836,7 +4846,7 @@ fn create(
                 _ if display == "inline" => below(style, units.font),
                 _ => padding[2] + borders[2] + below(style, units.font),
             };
-        if !style::makes_no_line(doc, styles, id)
+        if !crate::render::inline::makes_no_line(doc, styles, id)
             && (raise != 0. || reserve > margin[0] || margin[2] < floor)
         {
             el = el
@@ -6502,8 +6512,8 @@ fn create(
                 None => decoration,
             };
             // Like an out-of-flow child, an `::after` at its static place in the last line follows a placeholder there.
-            if index == 1 && style::static_after(styles, id) {
-                let key = style::atom_key(id, 2);
+            if index == 1 && crate::render::inline::static_after(styles, id) {
+                let key = crate::render::inline::atom_key(id, 2);
                 if flow
                     && !flexbox
                     && !matches!(display, "grid" | "inline-grid")
@@ -6567,7 +6577,7 @@ fn create(
                     origin: pseudo_origin.get_or_insert_default().clone(),
                     shift: contained.as_ref().map(|contained| contained.offset.clone()),
                     mirrored: lifted,
-                    key: style::atom_key(id, index as u8 + 1),
+                    key: crate::render::inline::atom_key(id, index as u8 + 1),
                 })
             };
             // Outside `PseudoBox`, which reads its move.
@@ -6584,7 +6594,7 @@ fn create(
                     .hooks(super::paint::PseudoPart {
                         view: view.clone(),
                         node: id,
-                        key: style::atom_key(id, index as u8 + 1),
+                        key: crate::render::inline::atom_key(id, index as u8 + 1),
                     })
                     .into();
             }
@@ -6697,44 +6707,46 @@ fn create(
     }
     let mut plans = 0;
     // The size of an inline box in a text as of the last frame, or a guess before it has one.
-    let atom_slot =
-        |atom: &style::Atom, child: &mut Child, containing: f32, pseudo: &dyn Fn() -> [f32; 3]| {
-            let last = view
-                .host
-                .borrow()
-                .dom
-                .get(&view.id)
-                .and_then(|dom| dom.atoms.get(&atom.key()).copied());
-            reader.log(
-                Query::Atom(atom.key() as u32),
-                0,
-                hashed(last.map(|size| size.map(f32::to_bits))),
-            );
-            let size = last.unwrap_or_else(|| {
-                if atom.pseudo != 0 {
-                    return pseudo();
-                }
-                let [_, max, _, height] = super::grid::intrinsic(
-                    doc,
-                    atom.node,
-                    styles,
-                    Some(containing),
-                    None,
-                    text,
-                    &mut measured.borrow_mut(),
-                );
-                let line = styles.lengths[atom.node].font.lh;
-                [max, height.max(line), line * 0.8]
-            });
-            super::text::AtomSlot {
-                size,
-                align: align_of(child),
-                at: std::cell::Cell::new(point(px(0.), px(0.))),
+    let atom_slot = |atom: &crate::render::inline::Atom,
+                     child: &mut Child,
+                     containing: f32,
+                     pseudo: &dyn Fn() -> [f32; 3]| {
+        let last = view
+            .host
+            .borrow()
+            .dom
+            .get(&view.id)
+            .and_then(|dom| dom.atoms.get(&atom.key()).copied());
+        reader.log(
+            Query::Atom(atom.key() as u32),
+            0,
+            hashed(last.map(|size| size.map(f32::to_bits))),
+        );
+        let size = last.unwrap_or_else(|| {
+            if atom.pseudo != 0 {
+                return pseudo();
             }
-        };
+            let [_, max, _, height] = super::grid::intrinsic(
+                doc,
+                atom.node,
+                styles,
+                Some(containing),
+                None,
+                text,
+                &mut measured.borrow_mut(),
+            );
+            let line = styles.lengths[atom.node].font.lh;
+            [max, height.max(line), line * 0.8]
+        });
+        super::text::AtomSlot {
+            size,
+            align: align_of(child),
+            at: std::cell::Cell::new(point(px(0.), px(0.))),
+        }
+    };
     // The box that places an inline box where its text puts it, from the padding box of the text's box.
     let atom_box = |index: usize,
-                    atom: &style::Atom,
+                    atom: &crate::render::inline::Atom,
                     child: Child,
                     slots: &Rc<[super::text::AtomSlot]>,
                     padding: [f32; 4]| {
@@ -6799,8 +6811,8 @@ fn create(
         reader.extra.set(hashed(&*data.text));
         let atom_containing = content_box();
         // An absolute box at its static place in a line has an empty atom there, which gives it its place.
-        let marker = |atom: &style::Atom| {
-            style::static_inline(match atom.pseudo {
+        let marker = |atom: &crate::render::inline::Atom| {
+            crate::render::inline::static_inline(match atom.pseudo {
                 0 => &styles.values[atom.node],
                 pseudo => &styles.pseudos[&id][usize::from(pseudo - 1)],
             })
@@ -6888,7 +6900,7 @@ fn create(
                 el = el.child(float);
             } else if doc.nodes[child].parent == Some(id)
                 && styles.values[child].get(Prop::DISPLAY) != Some("none")
-                && style::placed_out_of_flow(&styles.values[child])
+                && crate::render::inline::placed_out_of_flow(&styles.values[child])
                 && !top_layer.contains(&child)
             {
                 placed.push(child);
@@ -7872,7 +7884,10 @@ fn create(
                     }
                     let key = |at: usize| match cut_pseudos.binary_search_by_key(&at, |part| part.0)
                     {
-                        Ok(found) => style::atom_key(children[at], cut_pseudos[found].1 as u8 + 1),
+                        Ok(found) => crate::render::inline::atom_key(
+                            children[at],
+                            cut_pseudos[found].1 as u8 + 1,
+                        ),
                         Err(_) => children[at],
                     };
                     cut_parts.push((
@@ -8411,7 +8426,7 @@ fn create(
                     && grid.is_none()
                     && line.is_none()
                     && !out_of_flow
-                    && style::makes_no_line(doc, styles, child)
+                    && crate::render::inline::makes_no_line(doc, styles, child)
                 {
                     place!(
                         renderer::node().flex().flex_row().child(child_element),
@@ -9901,13 +9916,13 @@ fn run_cuts(
         };
         let content = |child: &usize| in_run(*child) || blocky(*child);
         let flags = if from < end && to > start && start < end {
-            (u8::from(!before.iter().any(content)) * style::CUT_FIRST)
-                | (u8::from(!after.iter().any(content)) * style::CUT_LAST)
+            (u8::from(!before.iter().any(content)) * crate::render::inline::CUT_FIRST)
+                | (u8::from(!after.iter().any(content)) * crate::render::inline::CUT_LAST)
         // Like Chrome, a box that starts or ends with a block has an empty part in the line next to it.
         } else if to == start && to > from && blocky(children[to - 1]) && edge(cut, 1) {
-            style::CUT_LAST | style::CUT_BEFORE
+            crate::render::inline::CUT_LAST | crate::render::inline::CUT_BEFORE
         } else if from == end && from < to && blocky(children[from]) && edge(cut, 3) {
-            style::CUT_FIRST | style::CUT_AFTER
+            crate::render::inline::CUT_FIRST | crate::render::inline::CUT_AFTER
         } else {
             continue;
         };
@@ -9935,11 +9950,11 @@ fn margins(
     let mut margin = units.edges(&build.styles.values[id], css::MARGIN, width);
     // The blocks of a spliced inline box are in the flow of its block.
     let parent = std::iter::successors(build.doc.nodes[id].parent, |&up| {
-        style::spliced(build.doc, build.styles, up)
+        crate::render::inline::spliced(build.doc, build.styles, up)
             .then(|| build.doc.nodes[up].parent)
             .flatten()
     })
-    .find(|&up| !style::spliced(build.doc, build.styles, up));
+    .find(|&up| !crate::render::inline::spliced(build.doc, build.styles, up));
     let Some(parent) = parent.filter(|_| !flex_parent && !slot) else {
         return margin;
     };
@@ -9973,7 +9988,7 @@ fn margins(
             for &child in &children {
                 if !block(build, child) {
                     // Like Chrome, margins collapse across inline content that makes no line.
-                    if !style::makes_no_line(build.doc, build.styles, child) {
+                    if !crate::render::inline::makes_no_line(build.doc, build.styles, child) {
                         (leading, pending, emitted) = (false, [0.; 2], 0.);
                     }
                     continue;
@@ -10005,7 +10020,8 @@ fn margins(
             if open[1] {
                 let mut trailing = Vec::new();
                 for child in children.into_iter().rev() {
-                    if !block(build, child) && style::makes_no_line(build.doc, build.styles, child)
+                    if !block(build, child)
+                        && crate::render::inline::makes_no_line(build.doc, build.styles, child)
                     {
                         continue;
                     }
@@ -10074,7 +10090,7 @@ fn flow(build: &Build<'_>, id: usize) -> Vec<usize> {
         // A plain block is an element in the flow that doesn't float.
         } else if build.info[child].flags & cull::PLAIN_BLOCK != 0 {
             flow.push(child);
-        } else if style::spliced(build.doc, build.styles, child) {
+        } else if crate::render::inline::spliced(build.doc, build.styles, child) {
             // The edges of the box make lines, which keep margins apart.
             let edges = [3, 1].map(|side| edge(build, child, side));
             if edges[1] {
@@ -10087,7 +10103,7 @@ fn flow(build: &Build<'_>, id: usize) -> Vec<usize> {
         // Preserved white space makes a line.
         } else if (in_flow(build.doc, build.info, child)
             || build.doc.nodes[child].tag == "#text"
-                && !style::makes_no_line(build.doc, build.styles, child))
+                && !crate::render::inline::makes_no_line(build.doc, build.styles, child))
             && float_side(&build.styles.values[child]).is_none()
         {
             flow.push(child);
@@ -10102,8 +10118,8 @@ fn block(build: &Build<'_>, id: usize) -> bool {
         && build.styles.values[id]
             .get(Prop::DISPLAY)
             .is_some_and(|value| !value.starts_with("inline") && value != "contents")
-        || style::holds_block_box(build.doc, build.styles, id)
-            && !style::spliced(build.doc, build.styles, id)
+        || crate::render::inline::holds_block_box(build.doc, build.styles, id)
+            && !crate::render::inline::spliced(build.doc, build.styles, id)
 }
 
 fn container(build: &Build<'_>, id: usize) -> bool {
@@ -10537,7 +10553,7 @@ fn adjoining(build: &Build<'_>, id: usize, width: f32, around: Option<[f32; 2]>)
                 index
             }];
             if !block(build, child) {
-                if style::makes_no_line(build.doc, build.styles, child) {
+                if crate::render::inline::makes_no_line(build.doc, build.styles, child) {
                     continue;
                 }
                 break;
@@ -10567,7 +10583,7 @@ fn adjoining(build: &Build<'_>, id: usize, width: f32, around: Option<[f32; 2]>)
             if block(build, child) {
                 adjoining(build, child, width, around).2
             } else {
-                style::makes_no_line(build.doc, build.styles, child)
+                crate::render::inline::makes_no_line(build.doc, build.styles, child)
             }
         });
     // An empty box keeps its own top set, which places it, and its bottom set holds all its margins.
