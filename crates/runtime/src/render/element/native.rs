@@ -1,10 +1,10 @@
 use super::Build;
-use super::cx::Cx;
+use super::cx::{Cx, Frame};
 use super::kept::{Query, hashed};
 use super::query::LOOK;
 use crate::css;
 use crate::css::properties::Prop;
-use renderer::{Color, px};
+use renderer::{Color, Rect, point, px, size};
 
 /// Reads the look of a native form control, and gives its box the padding and borders of that look.
 #[allow(clippy::too_many_arguments)]
@@ -295,4 +295,163 @@ pub(super) fn native_control(
             .pl(px(padding[3]));
     }
     (el, native)
+}
+
+/// Draws the native look of a control or the resizer of a textarea, above the box.
+#[inline(never)]
+pub(super) fn control_layer(
+    cx: &Cx<'_>,
+    fr: &Frame,
+    mut el: renderer::Node,
+    native: Option<super::super::paint::control::Look>,
+) -> renderer::Node {
+    let Cx {
+        reader,
+        id,
+        node,
+        style,
+        units,
+        ..
+    } = *cx;
+    let Build { styles, view, .. } = *reader;
+    let padding = fr.padding;
+    let resizer = (node.tag == "textarea"
+        && style.get(Prop::RESIZE).is_none_or(|value| value != "none"))
+    .then_some(super::super::paint::control::Look {
+        control: super::super::paint::control::Control::Resizer,
+        ..Default::default()
+    });
+    if let Some(look) = native
+        .filter(|look| {
+            !matches!(
+                look.control,
+                super::super::paint::control::Control::Button
+                    | super::super::paint::control::Control::Field
+            )
+        })
+        .or(resizer)
+    {
+        el = el.child(if look.plain {
+            let parts = styles.scrollbars.get(&id);
+            let range = look.control == super::super::paint::control::Control::Range;
+            let ink = css::value::color::rgba(
+                style
+                    .get(Prop::COLOR)
+                    .and_then(css::value::color::color)
+                    .unwrap_or((0, 255)),
+            );
+            // Size, margin-top, border width, radius, fill and border color of the track and thumb, or of the
+            // bar and value of a progress bar, with the defaults of Chrome. Both have `box-sizing: border-box`.
+            let [track, thumb] = [1, 2].map(|slot| {
+                let part = parts.and_then(|parts| parts[slot].as_ref());
+                let get = |prop| part.and_then(|part| part.get(prop));
+                let length = |prop| get(prop).and_then(|value| units.resolve(value, f32::NAN));
+                let color = |prop| get(prop).and_then(css::value::color::paint);
+                let native = range
+                    && slot == 2
+                    && [Prop::APPEARANCE, Prop::WEBKIT_APPEARANCE]
+                        .into_iter()
+                        .all(|prop| get(prop).is_none_or(|value| value != "none"));
+                let border = get(Prop::BORDER_TOP_STYLE)
+                    .is_some_and(|value| !matches!(value, "none" | "hidden"))
+                    .then(|| length(Prop::BORDER_TOP_WIDTH))
+                    .flatten()
+                    .unwrap_or(0.);
+                let fill = match (range, slot) {
+                    _ if native => Some(css::value::color::rgba((look.accent, 255))),
+                    (false, 1) => Some(renderer::Color::hex(0x808080ff)),
+                    (false, _) => Some(renderer::Color::hex(0x008000ff)),
+                    _ => None,
+                };
+                (
+                    [Prop::WIDTH, Prop::HEIGHT].map(|prop| length(prop).or(native.then_some(16.))),
+                    length(Prop::MARGIN_TOP).unwrap_or(0.),
+                    border,
+                    if native {
+                        8.
+                    } else {
+                        get(Prop::BORDER_TOP_LEFT_RADIUS).map_or(0., |value| {
+                            // Only round ends matter here, and the box clamps large radii.
+                            if value.contains('%') {
+                                1e4
+                            } else {
+                                units.resolve(value, f32::NAN).unwrap_or(0.)
+                            }
+                        })
+                    },
+                    color(Prop::BACKGROUND_COLOR).or(fill),
+                    color(Prop::BORDER_TOP_COLOR).unwrap_or(ink),
+                )
+            });
+            let (value, inset) = (look.value, padding);
+            renderer::canvas(
+                |_, _| (),
+                move |bounds, _, window| {
+                    let content = Rect::between(
+                        bounds.origin + point(px(inset[3]), px(inset[0])),
+                        bounds.bottom_right() - point(px(inset[1]), px(inset[2])),
+                    );
+                    let [width, height] = [content.size.width, content.size.height].map(f32::from);
+                    let thumb_size = thumb.0.map(|side| side.unwrap_or(0.));
+                    let track_height = match track.0[1] {
+                        Some(side) if range => side,
+                        _ if range => thumb_size[1] + 2. * track.2,
+                        _ => height,
+                    };
+                    let track_top = (height - track_height) / 2.;
+                    let inner = width - 2. * track.2;
+                    let rects = [
+                        (track, [0., track_top, width, track_height]),
+                        if range {
+                            (
+                                thumb,
+                                [
+                                    track.2 + (inner - thumb_size[0]) * value,
+                                    track_top + track.2 + thumb.1,
+                                    thumb_size[0],
+                                    thumb_size[1],
+                                ],
+                            )
+                        } else {
+                            (
+                                thumb,
+                                [
+                                    track.2,
+                                    track.2,
+                                    inner * value.max(0.),
+                                    height - 2. * track.2,
+                                ],
+                            )
+                        },
+                    ];
+                    for ((_, _, border, radius, fill, edge), [x, y, w, h]) in rects {
+                        if w <= 0. || h <= 0. {
+                            continue;
+                        }
+                        let rect =
+                            Rect::new(content.origin + point(px(x), px(y)), size(px(w), px(h)));
+                        window.draw_box(
+                            rect,
+                            renderer::Radii::from(px(radius)).fit(rect.size),
+                            fill.unwrap_or(renderer::Color::TRANSPARENT),
+                            renderer::Border {
+                                widths: px(border).into(),
+                                color: edge,
+                                style: renderer::BorderStyle::Solid,
+                                sides: 0,
+                            },
+                        );
+                    }
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .into()
+        } else {
+            super::super::paint::control::layer(id, look, view.clone())
+        });
+    }
+    el
 }
