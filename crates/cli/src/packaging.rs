@@ -28,15 +28,19 @@ pub fn package_app(
     bytecode: bool,
     aot: Option<&Path>,
 ) -> Result<usize> {
-    let package = files.get("package.json").map(String::as_str);
-    let (name, product_name, version, identifier) =
-        apps_runtime::bundle::package_metadata(package)?;
+    let apps_runtime::bundle::Package {
+        name,
+        product_name,
+        version,
+        identifier,
+        features,
+    } = apps_runtime::bundle::Package::parse(files.get("package.json").map(String::as_str))?;
     let library_name = apps_runtime::jsc::library_name(target.platform)?;
-    let disabled = apps_runtime::bundle::disabled_features(package)?;
-    let enabled = |feature| disabled & apps_runtime::bundle::feature_bit(feature) == 0;
-    let webgpu = apps_runtime::gpu::library_name(target.platform).filter(|_| enabled("webgpu"));
+    let enabled = |feature| features.has(feature);
+    let webgpu = apps_runtime::gpu::library_name(target.platform)
+        .filter(|_| enabled(apps_runtime::bundle::Feature::WebGpu));
     // FFmpeg is LGPL, so it ships as its own library with its license, which users can replace.
-    let media = if enabled("media") {
+    let media = if enabled(apps_runtime::bundle::Feature::Media) {
         let ffmpeg = apps_runtime::media::ffmpeg_name(target.platform);
         ensure!(
             runtime.canonicalize()?.with_file_name(ffmpeg).is_file(),
@@ -51,7 +55,7 @@ pub fn package_app(
         Vec::new()
     };
     // libghostty-vt is in the terminal library, so its license ships with it.
-    let terminal = enabled("terminal").then(|| {
+    let terminal = enabled(apps_runtime::bundle::Feature::Terminal).then(|| {
         [
             apps_runtime::terminal::library_name(target.platform),
             apps_runtime::terminal::LICENSE,
@@ -166,7 +170,7 @@ pub fn package_app(
             .map(|(name, source)| (name.as_str(), source.as_str()))
             .chain(main.as_deref().map(|main| ("app.js", main)))
             .collect();
-        apps_runtime::jsc::bytecode(disabled, &app)?
+        apps_runtime::jsc::bytecode(enabled(apps_runtime::bundle::Feature::WebGpu), &app)?
     } else {
         Vec::new()
     };
@@ -440,7 +444,8 @@ mod tests {
             assert_eq!(binary.unix_mode().unwrap() & 0o777, 0o755);
             let bundle = apps_runtime::bundle::read(&out).unwrap();
             assert_eq!(
-                apps_runtime::bundle::package_metadata(Some(&bundle.files["package.json"]))
+                apps_runtime::bundle::Package::parse(Some(&bundle.files["package.json"]))
+                    .map(|p| (p.name, p.product_name, p.version, p.identifier))
                     .unwrap(),
                 (
                     name.into(),

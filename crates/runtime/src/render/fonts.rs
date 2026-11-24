@@ -167,7 +167,7 @@ pub(crate) fn load(
                                 payload.trim(),
                             )
                             .map_err(anyhow::Error::from),
-                            None => crate::host::local_file(assets, state, value)
+                            None => crate::bundle::local_file(assets, state.base.as_ref(), value)
                                 .and_then(|path| {
                                     path.ok_or_else(|| {
                                         anyhow::anyhow!(

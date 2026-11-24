@@ -957,11 +957,12 @@ pub(super) fn border_image(
         Some(url) => {
             let host = view.host.borrow();
             let base = host.dom.get(&view.id).and_then(|state| state.base.clone());
-            let path = super::image::url_file(url, base.as_ref(), &host.assets).filter(|path| {
-                path.to_str()
-                    .is_some_and(|path| path.starts_with(super::image::DATA_PREFIX))
-                    || path.is_file()
-            })?;
+            let path =
+                super::image::url_file(url, base.as_ref(), &host.app.assets).filter(|path| {
+                    path.to_str()
+                        .is_some_and(|path| path.starts_with(super::image::DATA_PREFIX))
+                        || path.is_file()
+                })?;
             (path, None)
         }
         None => {

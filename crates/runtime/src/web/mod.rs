@@ -216,8 +216,6 @@ impl Drop for Listening {
     }
 }
 
-pub(crate) static ASSETS: OnceLock<HashMap<String, std::path::PathBuf>> = OnceLock::new();
-
 pub(crate) static LOCAL_NETWORK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -375,6 +373,7 @@ pub struct State {
     servers: crate::web::serve::State,
     sockets: crate::web::websocket::State,
     workers: crate::web::worker::State,
+    assets: std::sync::Arc<HashMap<String, std::path::PathBuf>>,
     tcp: crate::web::tcp::State,
     storage: crate::web::storage::State,
     next_id: u64,
@@ -416,15 +415,22 @@ pub(crate) fn url(input: &str, base: Option<&str>, set: Option<(&str, &str)>) ->
 }
 
 impl State {
-    pub fn configure_storage(&mut self, host: &crate::host::Host, window: Option<u64>) {
-        let namespace = host.app_name.as_deref().unwrap_or("apps");
+    pub(crate) fn new(
+        renderer: bool,
+        assets: std::sync::Arc<HashMap<String, std::path::PathBuf>>,
+    ) -> Self {
+        Self {
+            renderer,
+            workers: crate::web::worker::State::new(assets.clone()),
+            assets,
+            ..Self::default()
+        }
+    }
+
+    pub fn configure_storage(&mut self, app: &crate::bundle::AppInfo, window: Option<u64>) {
+        let namespace = app.name.as_deref().unwrap_or("apps");
         self.storage.configure(namespace, window);
-        self.workers.configure(
-            namespace,
-            host.packaged,
-            host.disabled,
-            host.scripts.clone(),
-        );
+        self.workers.configure(app);
     }
     pub fn call(&mut self, op: &str, args: &mut Value) -> Result<Value> {
         match op {
@@ -435,7 +441,7 @@ impl State {
             "asset" => {
                 let url = Url::parse(args[0].as_str().context("Expected URL")?)?;
                 let name = url.path().trim_start_matches('/');
-                let path = ASSETS.get().and_then(|assets| assets.get(name));
+                let path = self.assets.get(name);
                 Ok(match path.map(std::fs::read) {
                     Some(Ok(data)) => crate::jsc::payload::write(data),
                     _ => Value::Null,

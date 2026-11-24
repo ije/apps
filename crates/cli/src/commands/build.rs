@@ -59,11 +59,15 @@ pub fn run(
     if let Some(path) = &binary {
         target.validate_binary(path)?;
     }
-    let disabled =
-        apps_runtime::bundle::disabled_features(files.get("package.json").map(String::as_str))?;
-    let dynamic = ["jsExecute", "httpImport"]
-        .into_iter()
-        .find(|feature| disabled & apps_runtime::bundle::feature_bit(feature) == 0);
+    let features =
+        apps_runtime::bundle::Features::parse(files.get("package.json").map(String::as_str))?;
+    let dynamic = [
+        apps_runtime::bundle::Feature::JsExecute,
+        apps_runtime::bundle::Feature::HttpImport,
+    ]
+    .into_iter()
+    .find(|&feature| features.has(feature))
+    .map(apps_runtime::bundle::Feature::name);
     if aot && let Some(feature) = dynamic {
         eprintln!(
             "apps: warning: --aot is ignored, because the {feature} feature runs code that is not compiled"

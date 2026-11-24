@@ -113,10 +113,7 @@ impl Drop for Worker {
 #[derive(Default)]
 pub(crate) struct State {
     workers: HashMap<u64, Worker>,
-    namespace: String,
-    packaged: bool,
-    disabled: u32,
-    scripts: Arc<HashMap<String, bytes::Bytes>>,
+    app: crate::bundle::AppInfo,
     channels: Vec<u64>,
 }
 
@@ -133,18 +130,16 @@ impl Drop for State {
 }
 
 impl State {
-    pub(crate) fn configure(
-        &mut self,
-        namespace: &str,
-        packaged: bool,
-        disabled: u32,
-        scripts: Arc<HashMap<String, bytes::Bytes>>,
-    ) {
-        self.namespace = namespace.to_owned();
-        self.packaged = packaged;
-        self.disabled = disabled;
-        self.scripts = scripts;
+    pub(crate) fn new(assets: Arc<HashMap<String, std::path::PathBuf>>) -> Self {
+        let mut state = Self::default();
+        state.app.assets = assets;
+        state
     }
+
+    pub(crate) fn configure(&mut self, app: &crate::bundle::AppInfo) {
+        self.app = app.clone();
+    }
+
     pub(crate) fn call(&mut self, op: &str, args: &mut Value) -> Result<Value> {
         match op {
             "info" => Ok(PARENT.with(|parent| {
@@ -277,14 +272,15 @@ impl State {
                 ensure!(
                     args[1] == true
                         || args[2] == true
-                        || self.disabled & crate::bundle::feature_bit("jsExecute") == 0,
+                        || self.app.features.has(crate::bundle::Feature::JsExecute),
                     "Page workers from data: and blob: URLs need the jsExecute feature"
                 );
                 let source: bytes::Bytes = if args[2] == true {
                     let name = source
                         .strip_prefix("apps:///")
                         .context("Expected a bundled worker URL")?;
-                    self.scripts
+                    self.app
+                        .scripts
                         .get(name)
                         .cloned()
                         .with_context(|| format!("Missing bundled worker: {name}"))?
@@ -295,10 +291,15 @@ impl State {
                 // Web workers must not end when idle: they wait for messages.
                 let ends = native && args[3] == true;
                 let data = args[4].take();
-                let namespace = self.namespace.clone();
-                let packaged = self.packaged;
-                let disabled = self.disabled;
-                let scripts = self.scripts.clone();
+                // A worker gets the bundled scripts and assets of the app, not its native addons.
+                let app = crate::bundle::AppInfo {
+                    name: Some(self.app.name.clone().unwrap_or_default()),
+                    packaged: self.app.packaged,
+                    features: self.app.features,
+                    scripts: self.app.scripts.clone(),
+                    assets: self.app.assets.clone(),
+                    ..Default::default()
+                };
                 let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
                 let (input, inbox) = mpsc::channel::<Payload>();
                 let (output, events) = mpsc::channel::<Event>();
@@ -312,7 +313,7 @@ impl State {
                     crate::jsc::Waker::install(move || { let _ = own.send(Value::Null.into()); });
                     PARENT.with(|parent| *parent.borrow_mut() = Some(Parent { events: output.clone(), wake: wake.clone(), data, id, stop: cancelled.clone(), received, code: None }));
                     let result = (|| -> Result<()> {
-                        let host = Rc::new(RefCell::new(Host { app_name: Some(namespace), packaged, disabled, scripts, ..Host::default() }));
+                        let host = Rc::new(RefCell::new(Host { app, ..Host::default() }));
                         let role = if native { Role::Main } else {
                             host.borrow_mut().pages.insert(crate::host::WORKER_PAGE, Page { doc: Document::parse("<html><body></body></html>"), dirty: false });
                             Role::Renderer(crate::host::WORKER_PAGE)

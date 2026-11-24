@@ -72,7 +72,7 @@ fn runs_runtime_scripts_and_app_code_from_bundled_bytecode() {
         ("script-0.js", files["script-0.js"].as_str()),
         ("script-1.js", files["script-1.js"].as_str()),
     ];
-    let bytecode = apps_runtime::jsc::bytecode(0, &app).unwrap();
+    let bytecode = apps_runtime::jsc::bytecode(true, &app).unwrap();
     for name in [
         "apps:bootstrap",
         "apps:dom",

@@ -298,9 +298,9 @@ fn runtime_imports_follow_features() {
         }
     });
     let api = JavaScriptCore::load().unwrap();
-    let run = |disabled: u32, role: Role, code: &str| {
+    let run = |features: apps_runtime::bundle::Features, role: Role, code: &str| {
         let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().disabled = disabled;
+        host.borrow_mut().app.features = features;
         host.borrow_mut().pages.insert(
             1,
             Page {
@@ -326,15 +326,39 @@ fn runtime_imports_follow_features() {
             std::thread::sleep(Duration::from_millis(1));
         }
     };
-    let defaults = apps_runtime::bundle::disabled_features(None).unwrap();
+    let defaults = apps_runtime::bundle::Features::NONE;
     let data = "import('data:text/javascript,export default 6*7').then(m=>m.default)";
     let http = format!("import('http://127.0.0.1:{port}/a.js').then(m=>m.default)");
     let strings = "[eval('1'), new Function('return 2')()].join()";
-    assert_eq!(run(0, Role::Renderer(1), strings), "1,2");
+    assert_eq!(
+        run(
+            apps_runtime::bundle::Features::default(),
+            Role::Renderer(1),
+            strings
+        ),
+        "1,2"
+    );
     assert!(run(defaults, Role::Renderer(1), strings).contains("disabled in pages"));
-    assert_eq!(run(0, Role::Renderer(1), data), "42");
+    assert_eq!(
+        run(
+            apps_runtime::bundle::Features::default(),
+            Role::Renderer(1),
+            data
+        ),
+        "42"
+    );
     assert!(run(defaults, Role::Renderer(1), data).contains("jsExecute"));
-    assert_eq!(run(0, Role::Main, &http), "42");
+    assert_eq!(
+        run(apps_runtime::bundle::Features::default(), Role::Main, &http),
+        "42"
+    );
     assert!(run(defaults, Role::Main, &http).contains("httpImport"));
-    assert!(run(0, Role::Main, "import('file:///x.js')").contains("Cannot import"));
+    assert!(
+        run(
+            apps_runtime::bundle::Features::default(),
+            Role::Main,
+            "import('file:///x.js')"
+        )
+        .contains("Cannot import")
+    );
 }

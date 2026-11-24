@@ -724,12 +724,12 @@ fn build_bytecode() -> Result<()> {
 }
 
 pub fn bytecode<'a>(
-    disabled: u32,
+    webgpu: bool,
     app: &[(&'a str, &'a str)],
 ) -> Result<Vec<(&'a str, &'static [u8])>> {
     SCRIPTS.lock().unwrap().building = true;
     let api = JavaScriptCore::load()?;
-    api.prebuild(disabled & crate::bundle::feature_bit("webgpu") == 0, true);
+    api.prebuild(webgpu, true);
     build_bytecode()?;
     let mut bytecode: Vec<(&str, &[u8])> = SCRIPTS
         .lock()
@@ -971,7 +971,7 @@ unsafe extern "C" fn compile(
         && ARMED.get() != ctx as usize
         && !host
             .try_borrow()
-            .is_ok_and(|host| host.enabled("jsExecute"))
+            .is_ok_and(|host| host.app.features.has(crate::bundle::Feature::JsExecute))
     {
         throw(
             &api,
@@ -1039,7 +1039,7 @@ unsafe extern "C" fn chunk(
     let source = host
         .try_borrow()
         .ok()
-        .and_then(|host| host.scripts.get(&name).cloned());
+        .and_then(|host| host.app.scripts.get(&name).cloned());
     let Some(source) =
         source.filter(|source| source.is_ascii() || std::str::from_utf8(source).is_ok())
     else {
@@ -1256,7 +1256,7 @@ unsafe extern "C" fn call(
                 binding
                     .host
                     .try_borrow()
-                    .is_ok_and(|host| host.enabled("jsExecute")),
+                    .is_ok_and(|host| host.app.features.has(crate::bundle::Feature::JsExecute)),
                 "ShadowRealm needs the jsExecute feature"
             );
             let name = api.string("eval");
@@ -1436,7 +1436,7 @@ fn dispatch(
             "Browser views can only be managed by main"
         );
         let mut host = host.try_borrow_mut().context("Host is busy")?;
-        if host.packaged {
+        if host.app.packaged {
             if op == "command" && values[1] == "inspect" {
                 return Ok(serde_json::Value::Null);
             }
@@ -1447,14 +1447,14 @@ fn dispatch(
                 return host.browsers.call(
                     op,
                     &values,
-                    host.app_name.as_deref().unwrap_or_default(),
+                    host.app.name.as_deref().unwrap_or_default(),
                 );
             }
         }
         let host = &mut *host;
         return host
             .browsers
-            .call(op, values, host.app_name.as_deref().unwrap_or_default());
+            .call(op, values, host.app.name.as_deref().unwrap_or_default());
     }
     if let Some((service @ ("node" | "pty" | "child"), op)) = op.split_once('.') {
         anyhow::ensure!(
@@ -1555,7 +1555,7 @@ fn dispatch(
         let target = serde_json::from_value::<Role>(target.clone()).ok();
         let (link, rust) = {
             let host = host.try_borrow().context("Host is busy")?;
-            (host.link.clone(), host.rust_main)
+            (host.link.clone(), host.app.rust_main)
         };
         if let Some(link) = link {
             use crate::host::link::{ToMain, ToPage};
@@ -2195,7 +2195,7 @@ impl JsContext {
         role: Role,
         interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Self> {
-        let devtools = !host.borrow().packaged;
+        let devtools = !host.borrow().app.packaged;
         let ctx = unsafe { (api.create)(api.group, ptr::null_mut()) };
         anyhow::ensure!(!ctx.is_null(), "Cannot create a JavaScriptCore context");
         unsafe {
@@ -2209,12 +2209,14 @@ impl JsContext {
             host: host.clone(),
             role,
             sqlite: RefCell::default(),
-            web: RefCell::default(),
+            web: RefCell::new(crate::web::State::new(
+                matches!(role, Role::Renderer(_)),
+                host.borrow().app.assets.clone(),
+            )),
             ffi: Default::default(),
             node: RefCell::default(),
             inspector: std::cell::Cell::new(ptr::null_mut()),
         };
-        binding.web.borrow_mut().renderer = matches!(role, Role::Renderer(_));
         let callback_api = api.clone();
         binding
             .sqlite
@@ -2235,7 +2237,7 @@ impl JsContext {
                 .context("Authorizer must return a SQLite authorization code")
             }));
         binding.web.borrow_mut().configure_storage(
-            &host.borrow(),
+            &host.borrow().app,
             match role {
                 Role::Renderer(id) | Role::Preload(id) => Some(id),
                 Role::Main => None,
@@ -2354,10 +2356,11 @@ impl JsContext {
             (engine.api.string_release)(name);
         }
         // Bootstrap scripts call into the host, so the host is only borrowed per check.
-        let enabled = |feature| host.borrow().enabled(feature);
-        let disabled: Vec<_> = crate::bundle::FEATURES
+        let features = host.borrow().app.features;
+        let disabled: Vec<_> = crate::bundle::Feature::ALL
             .into_iter()
-            .filter(|name| !enabled(name))
+            .filter(|&feature| !features.has(feature))
+            .map(crate::bundle::Feature::name)
             .collect();
         engine.eval(
             &format!(
@@ -2398,11 +2401,11 @@ impl JsContext {
         )?;
         if matches!(role, Role::Renderer(_)) {
             for (url, source) in PAGE_SCRIPTS {
-                if url != "apps:gpu" || enabled("webgpu") {
+                if url != "apps:gpu" || features.has(crate::bundle::Feature::WebGpu) {
                     engine.run(source(), url)?;
                 }
             }
-            if !enabled("jsExecute") {
+            if !features.has(crate::bundle::Feature::JsExecute) {
                 let message = engine.api.string("Code generation is disabled in pages");
                 unsafe {
                     (engine.api.eval_enabled)(ctx, false, message);
@@ -2545,7 +2548,7 @@ impl JsContext {
         HOSTS.with(|hosts| {
             if let Some(binding) = hosts.borrow().get(&(self.ctx as usize))
                 && let Ok(mut host) = binding.host.try_borrow_mut()
-                && !host.packaged
+                && !host.app.packaged
             {
                 host.log(serde_json::json!({"type":"error","message":format!("{url}: {message}")}));
             }
@@ -2630,13 +2633,16 @@ impl JsContext {
         HOSTS.with(|hosts| {
             let binding = &hosts.borrow()[&(self.ctx as usize)];
             let mut host = binding.host.borrow_mut();
-            host.install(files)?;
-            if !host.scripts.is_empty() {
+            host.app.install(files)?;
+            if !host.app.scripts.is_empty() {
                 let window = match binding.role {
                     Role::Renderer(id) | Role::Preload(id) => Some(id),
                     Role::Main => None,
                 };
-                binding.web.borrow_mut().configure_storage(&host, window);
+                binding
+                    .web
+                    .borrow_mut()
+                    .configure_storage(&host.app, window);
             }
             Ok(())
         })
@@ -2767,7 +2773,7 @@ mod tests {
     #[test]
     fn bundled_chunks_keep_nul_bytes_and_non_ascii_text() {
         let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().scripts = std::sync::Arc::new(std::collections::HashMap::from([
+        host.borrow_mut().app.scripts = std::sync::Arc::new(std::collections::HashMap::from([
             (
                 "script-1.js".to_owned(),
                 bytes::Bytes::from_static(
@@ -2907,7 +2913,7 @@ mod tests {
     #[test]
     fn pages_cannot_turn_strings_into_code() {
         let host = page_host(1, "<body></body>");
-        host.borrow_mut().disabled = crate::bundle::disabled_features(None).unwrap();
+        host.borrow_mut().app.features = crate::bundle::Features::NONE;
         let page =
             JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
         for code in [

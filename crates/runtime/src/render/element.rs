@@ -2505,12 +2505,18 @@ fn create(
     if node.tag == "terminal" {
         let host = view.host.borrow();
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !host.enabled("terminal") && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if !host.app.features.has(crate::bundle::Feature::Terminal)
+            && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
             eprintln!(
                 "apps: The terminal feature is disabled. Add \"terminal\" to \"features\" in package.json"
             );
         }
-        if let Some(state) = host.dom.get(&view.id).filter(|_| host.enabled("terminal")) {
+        if let Some(state) = host
+            .dom
+            .get(&view.id)
+            .filter(|_| host.app.features.has(crate::bundle::Feature::Terminal))
+        {
             let look = super::terminal::look(style, styles.selections.get(&id), &units);
             // The bar of the scrollback.
             grid_bar = Some(scrollbar::Scrollbar {
@@ -4921,7 +4927,7 @@ fn create(
             [borders, padding, [0.; 4]],
             view.clone(),
             base.as_ref(),
-            &view.host.borrow().assets,
+            &view.host.borrow().app.assets,
             canvas.is_some(),
         ));
     }
@@ -6244,7 +6250,7 @@ fn create(
                     [[0.; 4], pseudo_padding, pseudo_borders],
                     view.clone(),
                     base.as_ref(),
-                    &view.host.borrow().assets,
+                    &view.host.borrow().app.assets,
                     false,
                 ));
             }

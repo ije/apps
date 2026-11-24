@@ -2296,9 +2296,9 @@ fn package_features_reach_the_runtime() {
             );
         }
     }
-    let gpu = |disabled| {
+    let gpu = |features| {
         let mut host = apps_runtime::host::Host::default();
-        host.disabled = disabled;
+        host.app.features = features;
         let host = Rc::new(RefCell::new(host));
         host.borrow_mut().pages.insert(
             1,
@@ -2317,10 +2317,10 @@ fn package_features_reach_the_runtime() {
     };
     let error = r#"The webgpu feature is disabled. Add "webgpu" to "features" in package.json"#;
     assert_eq!(
-        gpu(apps_runtime::bundle::disabled_features(None).unwrap()),
+        gpu(apps_runtime::bundle::Features::NONE),
         format!("undefined,undefined,{error},{error}")
     );
-    assert!(gpu(0).starts_with("undefined,function,,"));
+    assert!(gpu(apps_runtime::bundle::Features::default()).starts_with("undefined,function,,"));
     fs::write(dir.path().join("package.json"), r#"{"features":["webgl"]}"#).unwrap();
     let error = compile(&entry, Realm::Main, None, Rc::default(), true, None).unwrap_err();
     assert!(

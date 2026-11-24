@@ -644,7 +644,7 @@ impl PageView {
             let runtime = self.runtime.clone();
             cx.defer(move |cx| Desktop::drive(runtime, cx));
         }
-        let inspectable = !host.packaged;
+        let inspectable = !host.app.packaged;
         let Some(page) = host.pages.get_mut(&self.id) else {
             return renderer::node().size_full().into();
         };
@@ -698,7 +698,7 @@ impl PageView {
         let cached = dom.computed.clone();
         let mut styles = crate::dom::styles(&mut doc, dom, [width, height]);
         if cached.is_none_or(|cached| !std::rc::Rc::ptr_eq(&cached, &styles))
-            && fonts::load(&doc, dom, &state.assets).0
+            && fonts::load(&doc, dom, &state.app.assets).0
         {
             styles = crate::dom::styles(&mut doc, dom, [width, height]);
         }
@@ -2242,7 +2242,7 @@ impl PageView {
                             [[0.; 4]; 3],
                             self.0.clone(),
                             host.dom.get(&self.id).and_then(|state| state.base.as_ref()),
-                            &host.assets,
+                            &host.app.assets,
                             false,
                         ));
                     }

@@ -30,9 +30,11 @@ fn native_addons_values_callbacks_and_contexts() {
     std::fs::copy(&library, &second).unwrap();
     for role in [Role::Main, Role::Preload(1)] {
         let mut host = Host::default();
-        host.native_modules
+        host.app
+            .native_modules
             .insert("fixture/addon.node".into(), library.clone());
-        host.native_modules
+        host.app
+            .native_modules
             .insert("fixture/second.node".into(), second.clone());
         let engine = JsContext::new(
             JavaScriptCore::load().unwrap(),
@@ -144,7 +146,8 @@ fn native_addons_values_callbacks_and_contexts() {
     // has not started must never start.
     let load = || {
         let mut host = Host::default();
-        host.native_modules
+        host.app
+            .native_modules
             .insert("fixture/addon.node".into(), library.clone());
         JsContext::new(
             JavaScriptCore::load().unwrap(),

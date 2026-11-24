@@ -302,7 +302,7 @@ pub(crate) fn release(engine: &JsContext) -> Result<()> {
 
 fn dispatch(command: &Value, engine: &JsContext, host: &Rc<RefCell<Host>>) -> Result<Value> {
     ensure!(
-        !host.borrow().packaged,
+        !host.borrow().app.packaged,
         "Developer tools are unavailable in packaged apps"
     );
     let params = &command["params"];
@@ -336,10 +336,9 @@ mod tests {
 
     #[test]
     fn packaged_apps_disable_developer_tools() {
-        let host = Rc::new(RefCell::new(Host {
-            packaged: true,
-            ..Host::default()
-        }));
+        let mut host = Host::default();
+        host.app.packaged = true;
+        let host = Rc::new(RefCell::new(host));
         let engine =
             JsContext::new(JavaScriptCore::load().unwrap(), host.clone(), Role::Main).unwrap();
         engine.eval("globalThis.answer = 42", "app.js").unwrap();

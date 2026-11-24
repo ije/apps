@@ -206,7 +206,7 @@ pub(crate) fn url_file(
     let source = source.trim().trim_matches(['"', '\'']);
     data_file(source).or_else(|| {
         let base = base?;
-        crate::host::local_path(assets, base, &base.join(source).ok()?)
+        crate::bundle::local_path(assets, base, &base.join(source).ok()?)
     })
 }
 

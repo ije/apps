@@ -3,6 +3,7 @@ pub(crate) mod main;
 pub(crate) mod mcp;
 pub(crate) mod panel;
 
+use crate::bundle::Feature;
 use crate::host::link::{Link, PageQueue, ToMain, ToPage};
 use crate::{
     dom::Document,
@@ -77,15 +78,7 @@ thread_local! {
 }
 
 struct Template {
-    rust_main: bool,
-    version: Option<String>,
-    disabled: u32,
-    name: Option<String>,
-    path: std::path::PathBuf,
-    packaged: bool,
-    scripts: Arc<HashMap<String, bytes::Bytes>>,
-    assets: HashMap<String, std::path::PathBuf>,
-    native_modules: HashMap<String, std::path::PathBuf>,
+    app: crate::bundle::AppInfo,
     files: Arc<HashMap<String, String>>,
     packed: Arc<HashMap<String, bytes::Bytes>>,
 }
@@ -94,15 +87,7 @@ impl Template {
     fn host(&self, link: &Link) -> Host {
         Host {
             link: Some(link.clone()),
-            rust_main: self.rust_main,
-            app_version: self.version.clone(),
-            disabled: self.disabled,
-            app_name: self.name.clone(),
-            app_path: self.path.clone(),
-            packaged: self.packaged,
-            scripts: self.scripts.clone(),
-            assets: self.assets.clone(),
-            native_modules: self.native_modules.clone(),
+            app: self.app.clone(),
             ..Host::default()
         }
     }
@@ -205,14 +190,12 @@ impl Desktop {
         )
     }
 
-    pub(crate) fn create(bundle: crate::bundle::Bundle, rust: bool) -> Result<Self> {
+    pub(crate) fn create(mut bundle: crate::bundle::Bundle, rust: bool) -> Result<Self> {
+        let package =
+            crate::bundle::Package::parse(bundle.files.get("package.json").map(String::as_str))?;
+        let app = crate::bundle::AppInfo::new(&mut bundle, &package, rust)?;
         let crate::bundle::Bundle {
-            packaged,
-            root,
-            files,
-            pages,
-            scripts,
-            main,
+            files, pages, main, ..
         } = bundle;
         let files = &files;
         let windows = !pages.is_empty() || files.keys().any(|name| name.ends_with(".html"));
@@ -262,52 +245,12 @@ impl Desktop {
                 link.wake_pages();
             }
         });
-        let package = files.get("package.json").map(String::as_str);
-        let (_, name, version, _) = crate::bundle::package_metadata(package)?;
-        let disabled = crate::bundle::disabled_features(package)?;
         if windows {
-            api.prebuild(disabled & crate::bundle::feature_bit("webgpu") == 0, !rust);
+            api.prebuild(app.features.has(Feature::WebGpu), !rust);
         }
-        crate::web::LOCAL_NETWORK.store(
-            disabled & crate::bundle::feature_bit("localNetwork") == 0,
-            Ordering::Relaxed,
-        );
-        let path = if root.as_os_str().is_empty() {
-            std::env::current_dir().unwrap_or_default()
-        } else {
-            root
-        };
-        let scripts = Arc::new(scripts);
-        let assets: HashMap<String, std::path::PathBuf> = files
-            .get("assets.json")
-            .map(|source| serde_json::from_str(source))
-            .transpose()
-            .context("Invalid assets.json")?
-            .unwrap_or_default();
-        let _ = crate::web::ASSETS.set(assets.clone());
-        let mut host = Host {
-            link: Some(link.clone()),
-            rust_main: rust,
-            app_version: Some(version),
-            disabled,
-            app_name: Some(name),
-            app_path: path,
-            packaged,
-            scripts,
-            assets,
-            ..Host::default()
-        };
-        host.install(files)?;
+        crate::web::LOCAL_NETWORK.store(app.features.has(Feature::LocalNetwork), Ordering::Relaxed);
         let template = Arc::new(Template {
-            rust_main: host.rust_main,
-            version: host.app_version.clone(),
-            disabled: host.disabled,
-            name: host.app_name.clone(),
-            path: host.app_path.clone(),
-            packaged: host.packaged,
-            scripts: host.scripts.clone(),
-            assets: host.assets.clone(),
-            native_modules: host.native_modules.clone(),
+            app,
             files: Arc::new(
                 files
                     .iter()
@@ -317,6 +260,7 @@ impl Desktop {
             ),
             packed: Arc::new(pages),
         });
+        let host = template.host(&link);
         let host = Rc::new(RefCell::new(host));
         let main_host = Rc::new(RefCell::new(template.host(&link)));
         let engine = if rust {
@@ -572,12 +516,12 @@ impl Desktop {
                             .clone()
                         {
                             self.files = files;
-                            self.host.borrow_mut().scripts = scripts;
+                            self.host.borrow_mut().app.scripts = scripts;
                         }
                         let value = args[2].as_str().context("Expected HTML text or path")?;
                         let page = args[3] == "page";
                         let request = args[3].as_u64();
-                        let root = self.host.borrow().app_path.clone();
+                        let root = self.host.borrow().app.path.clone();
                         let mut file = None;
                         let location = if action == "load" {
                             Ok("apps://app/".to_owned())
@@ -639,7 +583,7 @@ impl Desktop {
                             Ok(loaded) => loaded,
                             Err((code, description)) => {
                                 let url = location.unwrap_or_else(|_| value.to_owned());
-                                if self.host.borrow().rust_main && !page {
+                                if self.host.borrow().app.rust_main && !page {
                                     bail!("Cannot load {value}: {description}");
                                 }
                                 if page {
@@ -663,7 +607,7 @@ impl Desktop {
                                             .is_ok_and(|root| path.starts_with(root))
                                     })
                                 });
-                        let bundled = self.host.borrow().scripts.clone();
+                        let bundled = self.host.borrow().app.scripts.clone();
                         let scripts = doc
                             .nodes
                             .iter()
@@ -874,7 +818,7 @@ impl Desktop {
                         page.dirty = true;
                     }
                     "devtools" => {
-                        if self.host.borrow().packaged {
+                        if self.host.borrow().app.packaged {
                             continue;
                         }
                         let cx = cx
@@ -934,7 +878,7 @@ impl Desktop {
                     }
                     // The FPS HUD of the window. Open developer tools show if it is on.
                     "hud" => {
-                        if self.host.borrow().packaged {
+                        if self.host.borrow().app.packaged {
                             continue;
                         }
                         let (Some(view), Some(cx)) = (self.views.get(&id), cx.as_deref_mut())
@@ -1162,7 +1106,7 @@ impl Desktop {
             }
             let text = title.as_deref().unwrap_or("");
             view.title = title.clone();
-            if !self.host.borrow().rust_main {
+            if !self.host.borrow().app.rust_main {
                 self.link
                     .event("title", id, Some(text.into()), "apps:title");
             } else if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
@@ -1538,7 +1482,7 @@ impl Desktop {
 
     pub fn run(self, devtools: bool, mcp: Option<u16>) -> Result<i32> {
         ensure!(
-            !(devtools || mcp.is_some()) || !self.host.borrow().packaged,
+            !(devtools || mcp.is_some()) || !self.host.borrow().app.packaged,
             "Developer tools are unavailable in packaged apps"
         );
         let Self {
@@ -1720,8 +1664,8 @@ impl Desktop {
             }
         };
         api.prebuild(
-            template.disabled & crate::bundle::feature_bit("webgpu") == 0,
-            !template.rust_main,
+            template.app.features.has(Feature::WebGpu),
+            !template.app.rust_main,
         );
         let waker = cx.waker();
         queue.set_wake(move || waker.wake());

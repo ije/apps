@@ -457,7 +457,7 @@ impl crate::host::Host {
     /// Runs an operation of a terminal session for the page, or for its preload script.
     pub fn terminal(&mut self, id: u64, preload: bool, op: &str, args: &Value) -> Result<Value> {
         ensure!(
-            self.enabled("terminal"),
+            self.app.features.has(crate::bundle::Feature::Terminal),
             "The terminal feature is disabled. Add \"terminal\" to \"features\" in package.json"
         );
         // Only a preload script starts programs, and only the page has elements.

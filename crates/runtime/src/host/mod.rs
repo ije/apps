@@ -43,18 +43,10 @@ pub struct Page {
 #[derive(Default)]
 pub struct Host {
     pub(crate) link: Option<link::Link>,
-    pub rust_main: bool,
-    pub app_name: Option<String>,
-    pub app_version: Option<String>,
-    pub app_path: PathBuf,
+    pub app: crate::bundle::AppInfo,
     pub paths: HashMap<String, PathBuf>,
     pub relaunch: Option<Vec<String>>,
     pub argv: Option<Vec<String>>,
-    pub packaged: bool,
-    pub disabled: u32,
-    pub native_modules: HashMap<String, PathBuf>,
-    pub assets: HashMap<String, PathBuf>,
-    pub scripts: std::sync::Arc<HashMap<String, bytes::Bytes>>,
     pub commands: Vec<Value>,
     pub pages: HashMap<u64, Page>,
     pub dom: rustc_hash::FxHashMap<u64, crate::dom::State>,
@@ -73,24 +65,6 @@ pub struct Host {
 }
 
 impl Host {
-    pub(crate) fn install(
-        &mut self,
-        files: &bbtree::unsync::BBTreeMap<String, String>,
-    ) -> Result<()> {
-        let paths: HashMap<String, PathBuf> =
-            serde_json::from_str(files.get("native.json").map_or("{}", String::as_str))?;
-        self.native_modules.extend(paths);
-        let mut scripts = files
-            .iter()
-            .filter(|(name, _)| name.starts_with("script-"))
-            .peekable();
-        if scripts.peek().is_some() {
-            std::sync::Arc::make_mut(&mut self.scripts)
-                .extend(scripts.map(|(name, source)| (name.clone(), source.clone().into())));
-        }
-        Ok(())
-    }
-
     pub(crate) fn command(&mut self, target: Target, command: Value) {
         use link::{ToMain, ToPage};
         let Some(link) = &self.link else {
@@ -109,10 +83,6 @@ impl Host {
             self.logs.pop_front();
         }
         self.logs.push_back(entry);
-    }
-
-    pub fn enabled(&self, feature: &str) -> bool {
-        self.disabled & crate::bundle::feature_bit(feature) == 0
     }
 
     fn app_dir(&self, name: &str) -> Result<PathBuf> {
@@ -140,11 +110,11 @@ impl Host {
                 .map_or_else(|| home.join(".config"), PathBuf::from),
             "userData" => self
                 .app_dir("appData")?
-                .join(self.app_name.as_deref().unwrap_or("apps")),
+                .join(self.app.name.as_deref().unwrap_or("apps")),
             "sessionData" => self.app_dir("userData")?,
             "logs" if cfg!(target_os = "macos") => home
                 .join("Library/Logs")
-                .join(self.app_name.as_deref().unwrap_or("apps")),
+                .join(self.app.name.as_deref().unwrap_or("apps")),
             "logs" => self.app_dir("userData")?.join("logs"),
             _ => bail!("Unsupported app path: {name}"),
         })
@@ -562,7 +532,10 @@ impl Host {
     }
 
     pub fn gpu(&mut self, id: u64, op: &str, args: &[u8]) -> Result<Value> {
-        ensure!(self.enabled("webgpu"), "The webgpu feature is disabled");
+        ensure!(
+            self.app.features.has(crate::bundle::Feature::WebGpu),
+            "The webgpu feature is disabled"
+        );
         let page = self.pages.get_mut(&id).context("Window is closed")?;
         let result = self.graphics.entry(id).or_default().call(op, args)?;
         if op == "resetCanvas"
@@ -578,7 +551,7 @@ impl Host {
     }
 
     pub fn media(&mut self, id: u64, op: &str, args: &Value) -> Result<Value> {
-        let disabled = self.disabled;
+        let features = self.app.features;
         let page = self.pages.get_mut(&id).context("Window is closed")?;
         let state = self.dom.entry(id).or_default();
         let media = self.media.entry(id).or_default();
@@ -606,15 +579,15 @@ impl Host {
         match op {
             "open" => {
                 let video = args[2].as_bool().unwrap_or(false);
-                let ffmpeg = disabled & crate::bundle::feature_bit("media") == 0;
+                let ffmpeg = features.has(crate::bundle::Feature::Media);
                 ensure!(
                     ffmpeg || !video,
                     "The media feature is disabled. Add \"media\" to \"features\" in package.json"
                 );
                 if args[1].is_string() {
-                    let path = local_file(
-                        &self.assets,
-                        state,
+                    let path = crate::bundle::local_file(
+                        &self.app.assets,
+                        state.base.as_ref(),
                         args[1].as_str().context("Expected a URL")?,
                     )?
                     .context("Media is not a bundled asset or local file")?;
@@ -648,7 +621,7 @@ impl Host {
             } else {
                 writeln!(std::io::stdout(), "{text}")
             };
-            if !self.packaged {
+            if !self.app.packaged {
                 let text: String = text.chars().take(16384).collect();
                 self.log(json!({"method":"Runtime.consoleAPICalled","params":{"type":args[1].as_str().unwrap_or("log"),"text":text,"context":role,"ref":args[2]}}));
             }
@@ -796,16 +769,16 @@ impl Host {
                     state,
                     *self.viewports.get(&id).unwrap_or(&[800., 600.]),
                 );
-                let loaded = crate::render::fonts::load(&page.doc, state, &self.assets);
+                let loaded = crate::render::fonts::load(&page.doc, state, &self.app.assets);
                 page.dirty |= std::mem::take(&mut state.dirty);
                 return Ok(json!(loaded));
             }
             if op == "dom.imageURL" {
                 let node = args[0].as_u64().context("Invalid node")? as usize;
                 ensure!(node < page.doc.nodes.len(), "Invalid node id");
-                let path = local_file(
-                    &self.assets,
-                    state,
+                let path = crate::bundle::local_file(
+                    &self.app.assets,
+                    state.base.as_ref(),
                     args[1].as_str().context("Expected a URL")?,
                 )?
                 .context("Image is not a bundled asset or local file")?;
@@ -928,7 +901,7 @@ impl Host {
                     .ok()
                     .filter(|command: &Vec<String>| !command.is_empty())
                     .context("Expected relaunch command")?;
-                if self.packaged {
+                if self.app.packaged {
                     self.relaunch = Some(command);
                 } else {
                     eprintln!("apps: app.relaunch() only works in built apps");
@@ -963,7 +936,7 @@ impl Host {
                     .argv
                     .clone()
                     .unwrap_or_else(|| std::env::args_os().map(lossy).collect());
-                if !self.packaged
+                if !self.app.packaged
                     && !node
                     && let Some(end) = argv.iter().position(|arg| arg == "--")
                 {
@@ -973,7 +946,7 @@ impl Host {
                     .map(|(name, value)| (lossy(name), lossy(value)))
                     .collect();
                 Ok(
-                    json!({"node":node,"rustMain":self.rust_main,"platform":if cfg!(target_os="macos"){"darwin"}else if cfg!(windows){"win32"}else{"linux"},"arch":if cfg!(target_arch="aarch64"){"arm64"}else if cfg!(target_arch="x86_64"){"x64"}else{std::env::consts::ARCH},"execPath":std::env::current_exe().ok(),"locale":locale,"appPath":self.app_path,"version":crate::VERSION,"javascriptcore":if std::env::var_os("APPS_JSC_LIBRARY").is_some(){"custom"}else{"bun"},"isPackaged":self.packaged,"appName":self.app_name.as_deref().unwrap_or("apps"),"appVersion":self.app_version.as_deref().unwrap_or("0.0.0"),"pid":std::process::id(),"argv":argv,"env":env,"homedir":std::env::var(if cfg!(windows){"USERPROFILE"}else{"HOME"}).unwrap_or_default(),"tmpdir":std::env::temp_dir(),"hostname":crate::node::hostname(),"parallelism":std::thread::available_parallelism().map_or(1,usize::from)}),
+                    json!({"node":node,"rustMain":self.app.rust_main,"platform":if cfg!(target_os="macos"){"darwin"}else if cfg!(windows){"win32"}else{"linux"},"arch":if cfg!(target_arch="aarch64"){"arm64"}else if cfg!(target_arch="x86_64"){"x64"}else{std::env::consts::ARCH},"execPath":std::env::current_exe().ok(),"locale":locale,"appPath":self.app.path,"version":crate::VERSION,"javascriptcore":if std::env::var_os("APPS_JSC_LIBRARY").is_some(){"custom"}else{"bun"},"isPackaged":self.app.packaged,"appName":self.app.name.as_deref().unwrap_or("apps"),"appVersion":self.app.version.as_deref().unwrap_or("0.0.0"),"pid":std::process::id(),"argv":argv,"env":env,"homedir":std::env::var(if cfg!(windows){"USERPROFILE"}else{"HOME"}).unwrap_or_default(),"tmpdir":std::env::temp_dir(),"hostname":crate::node::hostname(),"parallelism":std::thread::available_parallelism().map_or(1,usize::from)}),
                 )
             }
             // getcwd takes about 9 µs on macOS, so like Node the process keeps the path until `chdir`.
@@ -1000,7 +973,7 @@ impl Host {
                     matches!(role, Role::Main),
                     "Only the main context can control windows"
                 );
-                if self.packaged && op == "window" && args[0] == "devtools" {
+                if self.app.packaged && op == "window" && args[0] == "devtools" {
                     return Ok(Value::Null);
                 }
                 let target = match op {
@@ -1019,30 +992,5 @@ impl Host {
             }
             _ => bail!("Unsupported host operation: {op}"),
         }
-    }
-}
-
-pub(crate) fn local_file(
-    assets: &HashMap<String, PathBuf>,
-    state: &crate::dom::State,
-    url: &str,
-) -> Result<Option<PathBuf>> {
-    let base = state.base.as_ref().context("Missing page URL")?;
-    Ok(local_path(assets, base, &base.join(url)?))
-}
-
-// The files a page may name: its bundled assets, and local files only for a page that is a local file itself.
-// A file URL with a host is a network share, which is never read.
-pub(crate) fn local_path(
-    assets: &HashMap<String, PathBuf>,
-    base: &url::Url,
-    url: &url::Url,
-) -> Option<PathBuf> {
-    match url.scheme() {
-        "apps" => assets.get(url.path().trim_start_matches('/')).cloned(),
-        "file" if base.scheme() == "file" && url.host_str().is_none_or(str::is_empty) => {
-            url.to_file_path().ok()
-        }
-        _ => None,
     }
 }

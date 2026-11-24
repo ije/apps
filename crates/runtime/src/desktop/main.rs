@@ -312,7 +312,7 @@ impl Main {
         let Some(engine) = &self.engine else {
             return false;
         };
-        let Ok(packaged) = self.host.try_borrow().map(|host| host.packaged) else {
+        let Ok(packaged) = self.host.try_borrow().map(|host| host.app.packaged) else {
             return false;
         };
         if !self
@@ -892,7 +892,7 @@ mod tests {
             assert!(!main.before_input(5, &down(tool), &|| false));
         }
         assert_eq!(keys(), "");
-        host.borrow_mut().packaged = true;
+        host.borrow_mut().app.packaged = true;
         main.before_input(5, &down(key("f12", Modifiers::NONE)), &|| false);
         assert!(keys().contains(r#""code":"f12""#));
         main.driving.set(true);

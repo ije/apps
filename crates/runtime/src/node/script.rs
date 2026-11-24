@@ -25,32 +25,13 @@ pub fn run(mut bundle: Bundle, argv: Vec<String>) -> Result<i32> {
     crate::jsc::Waker::install(move || {
         let _ = wake.send(());
     });
-    let package = bundle.files.get("package.json").map(String::as_str);
-    let (_, name, version, _) = crate::bundle::package_metadata(package)?;
-    let assets: std::collections::HashMap<String, std::path::PathBuf> = bundle
-        .files
-        .get("assets.json")
-        .map(|source| serde_json::from_str(source))
-        .transpose()
-        .context("Invalid assets.json")?
-        .unwrap_or_default();
-    let _ = crate::web::ASSETS.set(assets.clone());
+    let package =
+        crate::bundle::Package::parse(bundle.files.get("package.json").map(String::as_str))?;
     let host = Rc::new(RefCell::new(Host {
-        app_version: Some(version),
-        disabled: crate::bundle::disabled_features(package)?,
-        app_name: Some(name),
-        app_path: if bundle.root.as_os_str().is_empty() {
-            std::env::current_dir().unwrap_or_default()
-        } else {
-            bundle.root
-        },
-        packaged: bundle.packaged,
-        scripts: bundle.scripts.into(),
-        assets,
+        app: crate::bundle::AppInfo::new(&mut bundle, &package, false)?,
         argv: Some(argv),
         ..Host::default()
     }));
-    host.borrow_mut().install(&bundle.files)?;
     let api = JavaScriptCore::load()?;
     let engine = JsContext::new(api.clone(), host, Role::Main)?;
     engine.eval(

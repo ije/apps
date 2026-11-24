@@ -224,7 +224,7 @@ impl Hooks for Masked {
             mask(
                 &self.view,
                 host.dom.entry(self.view.id).or_default(),
-                &host.assets,
+                &host.app.assets,
                 self.key,
                 &self.style,
                 self.units,
@@ -1575,7 +1575,7 @@ impl DomBox {
         let mask = mask(
             view,
             host.dom.entry(view.id).or_default(),
-            &host.assets,
+            &host.app.assets,
             (self.id, 0),
             style,
             units,

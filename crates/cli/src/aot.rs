@@ -113,9 +113,10 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
         .map(|(name, source)| (name.as_str(), source.as_str()))
         .collect();
     scripts.push(("app.js", &app));
-    let disabled =
-        apps_runtime::bundle::disabled_features(files.get("package.json").map(String::as_str))?;
-    let webgpu = disabled & apps_runtime::bundle::feature_bit("webgpu") == 0;
+    let webgpu =
+        apps_runtime::bundle::Package::parse(files.get("package.json").map(String::as_str))?
+            .features
+            .has(apps_runtime::bundle::Feature::WebGpu);
     for script in apps_runtime::jsc::runtime_scripts() {
         if webgpu || script.0 != "apps:gpu" {
             scripts.push(script);
