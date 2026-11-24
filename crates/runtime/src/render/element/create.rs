@@ -1,1559 +1,39 @@
-use super::layout::size::{
+use super::super::layout::size::{
     aspect_ratio, broken_image, dimension, field_line, field_size, file_size, layout_ceil, legend,
     natural_size, place, pseudo_lengths, text_field,
 };
-use super::{
-    ViewState,
+use super::super::{
     layout::cull,
     paint::{DomBox, Turned, background::css_background, scrollbar, text::InlineText},
 };
+use super::STACK_LIMIT;
+use super::border::{border_canvas, fieldset_border, inset_shadows, shade_border};
+use super::columns::{column_set, columns};
+use super::kept::{Query, Read, Replay, Shared, hashed};
+use super::margin::{
+    adjoining, block, body_overflow_moves, clear_bits, definite_line, edge, float_side, in_flow,
+    inline_fade, margins, overscroll, percent_bound, percent_calc, run_cuts, shrinks_around,
+};
+use super::query::{
+    LOOK, backdrop, baselines, box_parent, boxless, collapses, content_editable, href, inset_axes,
+    insets, only_auto_ratio, padding_start, parent_font, pictured, positioner, row_fill, scrolled,
+    scroller, shrinks, starts_line, static_mark, text_indent, uses,
+};
+use super::svg::{SVG_SOURCE, SvgSource, svg_layer};
+use super::{Build, element};
 use crate::css;
 use crate::css::properties::Prop;
-use crate::{
-    dom::Document,
-    style::{self, ComputedStyles},
-};
+use crate::style::{self};
 use renderer::{Child, Color, Rect, SharedString, point, px, relative, size};
-use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
-
-pub(super) struct Build<'a> {
-    pub(super) doc: &'a Document,
-    pub(super) styles: &'a ComputedStyles,
-    pub(super) text: &'a renderer::TextSystem,
-    pub(super) pixel_ratio: f32,
-    pub(super) view: &'a Rc<ViewState>,
-    pub(super) ancestors: Rc<[usize]>,
-    pub(super) flex_parent: bool,
-    pub(super) measured: &'a RefCell<super::layout::measure::Measurements>,
-    pub(super) perspective: Option<(f32, String)>,
-    pub(super) siblings: &'a RefCell<HashMap<usize, Rc<Siblings>>>,
-    // The index of each child of a parent with a `<br>`.
-    pub(super) breaks: &'a RefCell<rustc_hash::FxHashMap<usize, Siblings>>,
-    pub(super) walks: &'a RefCell<rustc_hash::FxHashMap<usize, Used>>,
-    pub(super) adjoins: &'a RefCell<rustc_hash::FxHashMap<usize, Sets>>,
-    pub(super) blocks: &'a RefCell<rustc_hash::FxHashMap<usize, [f32; 2]>>,
-    pub(super) ids: &'a Rc<super::effects::Ids>,
-    pub(super) info: &'a [cull::Info],
-    pub(super) zone: Option<Rc<cull::Zone>>,
-    // Inside a multi-column box, where boxes take break flags.
-    pub(super) columned: bool,
-    pub(super) top_layer: &'a [usize],
-    pub(super) tree: &'a renderer::Tree,
-    pub(super) culls: &'a std::cell::Cell<usize>,
-    pub(super) resized: bool,
-    pub(super) settled: bool,
-    pub(super) reads: &'a RefCell<Vec<Read>>,
-    pub(super) epoch: u64,
-    #[cfg(debug_assertions)]
-    pub(super) prints: &'a RefCell<Vec<u64>>,
-    #[cfg(debug_assertions)]
-    pub(super) checking: bool,
-    #[cfg(debug_assertions)]
-    pub(super) extra: std::cell::Cell<u64>,
-    #[cfg(debug_assertions)]
-    pub(super) plan: RefCell<Rc<[usize]>>,
-}
-
-// Log external reads through Build::log, or disable reuse of this box.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub(super) enum Query {
-    Margins,
-    Parent(Prop),
-    ParentFont,
-    FlatParent,
-    FlatParentPadding,
-    StickyParent,
-    Break,
-    UserSelect,
-    Positioner(bool),
-    Backdrop(u32),
-    // The state of the scroller walk when it reaches the box that holds the read.
-    Scroller(u8),
-    Editable,
-    Cell,
-    Shrunk,
-    Uses(u32),
-    Block(u32),
-    Scroll(u32),
-    Width(u32),
-    Track(u32, u8),
-    Baselines(u32),
-    Atom(u32),
-    Image(u32),
-    Look(u32),
-    Boxless(u32),
-    RowFill,
-    Collapse,
-    Value(u32),
-    Viewport,
-    Theme,
-    LineBase(u32),
-    Shrinks(u32),
-    Spliced(u32),
-}
-
-impl Query {
-    fn moved(self, from: u32, to: u32) -> Option<Self> {
-        let at = |node: u32| (node == from).then_some(to);
-        Some(match self {
-            Query::Uses(node) => Query::Uses(at(node)?),
-            Query::Block(node) => Query::Block(at(node)?),
-            Query::Scroll(node) => Query::Scroll(at(node)?),
-            Query::Width(node) => Query::Width(at(node)?),
-            Query::Backdrop(node) => Query::Backdrop(at(node)?),
-            Query::Track(node, axis) => Query::Track(at(node)?, axis),
-            Query::Baselines(node) => Query::Baselines(at(node)?),
-            Query::Atom(node) => Query::Atom(at(node)?),
-            Query::Image(node) => Query::Image(at(node)?),
-            Query::Look(node) => Query::Look(at(node)?),
-            Query::Boxless(node) => Query::Boxless(at(node)?),
-            Query::Value(node) => Query::Value(at(node)?),
-            Query::LineBase(node) => Query::LineBase(at(node)?),
-            Query::Shrinks(node) => Query::Shrinks(at(node)?),
-            Query::Spliced(node) => Query::Spliced(at(node)?),
-            query => query,
-        })
-    }
-
-    fn host(self) -> bool {
-        matches!(
-            self,
-            Query::Scroller(_)
-                | Query::Block(_)
-                | Query::Scroll(_)
-                | Query::Width(_)
-                | Query::Track(..)
-                | Query::Baselines(_)
-                | Query::Atom(_)
-                | Query::Image(_)
-                | Query::Viewport
-                | Query::Theme
-                | Query::Cell
-        )
-    }
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub(super) struct Read {
-    query: Query,
-    value: u64,
-    scope: u16,
-    reader: u16,
-}
-
-pub(super) struct Patch {
-    pub(super) ancestors: Rc<[usize]>,
-    pub(super) containing: [f32; 2],
-    pub(super) container: [f32; 2],
-    pub(super) slot: Option<([f32; 4], super::layout::grid::Grid)>,
-    pub(super) flex_parent: bool,
-    pub(super) columned: bool,
-    pub(super) perspective: Option<(f32, String)>,
-    pub(super) value: u64,
-}
-
-pub(super) struct Shared {
-    plan: Rc<super::plan::Plan>,
-    reads: Box<[Read]>,
-    style: Rc<renderer::Style>,
-}
-
-pub(super) struct Kept {
-    pub(super) call: Call,
-    pub(super) reads: Box<[Read]>,
-    ancestors: Rc<[usize]>,
-    epoch: std::cell::Cell<u64>,
-    // The call drops a height that the style doesn't read, but a build in place needs it: a stretched image
-    // takes its width from it.
-    containing: std::cell::Cell<[f32; 2]>,
-    pub(super) culled: bool,
-    // The cell of a grid item, so it can build in place.
-    slot: Option<([f32; 4], super::layout::grid::Grid)>,
-    #[cfg(debug_assertions)]
-    pub(super) print: u64,
-    // The print that the records around hold. It stays when the box builds in place.
-    #[cfg(debug_assertions)]
-    pub(super) seen: std::cell::Cell<u64>,
-    #[cfg(debug_assertions)]
-    plan: Rc<[usize]>,
-}
-
-impl Kept {
-    pub(super) fn in_place(&self) -> Option<&Rc<[usize]>> {
-        (!self.culled && (self.call.cell.is_none() || self.slot.is_some()))
-            .then_some(&self.ancestors)
-    }
-
-    // The revision of the boxes that the record was built from.
-    pub(super) fn subtree(&self) -> u64 {
-        self.call.subtree
-    }
-
-    pub(super) fn same_reads(&self, other: &Self) -> bool {
-        self.reads == other.reads
-    }
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub(super) struct Call {
-    subtree: u64,
-    containing: [f32; 2],
-    container: [f32; 2],
-    flex_parent: bool,
-    columned: bool,
-    cell: Option<(bool, bool, u64)>,
-}
-
-#[derive(PartialEq)]
-enum Replay {
-    Same,
-    Close,
-    Changed,
-}
-
-pub(super) fn hashed(value: impl std::hash::Hash) -> u64 {
-    use std::hash::BuildHasher;
-    rustc_hash::FxBuildHasher.hash_one(value)
-}
-
-fn parent_style<'b>(
-    doc: &Document,
-    styles: &'b ComputedStyles,
-    id: usize,
-    prop: Prop,
-) -> Option<&'b str> {
-    box_parent(doc, styles, id).and_then(|parent| styles.values[parent].get(prop))
-}
-
-fn row_fill(doc: &Document, styles: &ComputedStyles, id: usize) -> Option<Color> {
-    let fill = |node: usize| {
-        styles.values[node]
-            .get(Prop::BACKGROUND_COLOR)
-            .and_then(css::value::color::paint)
-            .filter(|color| color.a > 0.)
-    };
-    let mut table = None;
-    for row in std::iter::successors(doc.nodes[id].parent, |&parent| doc.nodes[parent].parent) {
-        if !(style::ROW..=style::FOOTER).contains(&style::role(styles, row)) {
-            table = Some(row);
-            break;
-        }
-        if let Some(fill) = fill(row) {
-            return Some(fill);
-        }
-    }
-    // Columns paint under the cells, after rows. Rows spanned from above are not counted.
-    let (table, row) = (table?, doc.nodes[id].parent?);
-    let span = |node: usize, name: &str| {
-        doc.nodes[node]
-            .attrs
-            .get(name)
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1)
-            .clamp(1, 1000)
-    };
-    let column: usize = doc.nodes[row]
-        .children
-        .iter()
-        .take_while(|&&cell| cell != id)
-        .filter(|&&cell| style::role(styles, cell) == style::CELL)
-        .map(|&cell| span(cell, "colspan"))
-        .sum();
-    let mut at = 0;
-    for &group in &doc.nodes[table].children {
-        if doc.nodes[group].tag != "colgroup" {
-            continue;
-        }
-        let start = at;
-        let mut found = None;
-        for &col in &doc.nodes[group].children {
-            if doc.nodes[col].tag == "col" {
-                if (at..at + span(col, "span")).contains(&column) {
-                    found = fill(col);
-                }
-                at += span(col, "span");
-            }
-        }
-        if at == start {
-            at += span(group, "span");
-        }
-        if (start..at).contains(&column) {
-            return found.or_else(|| fill(group));
-        }
-    }
-    None
-}
-
-fn collapses(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
-    std::iter::successors(doc.nodes[id].parent, |&parent| doc.nodes[parent].parent)
-        .find(|&parent| style::table_box(style::role(styles, parent)))
-        .is_some_and(|table| styles.values[table].get(Prop::BORDER_COLLAPSE) == Some("collapse"))
-}
-
-fn parent_font(
-    doc: &Document,
-    styles: &ComputedStyles,
-    id: usize,
-) -> Option<([u32; 6], renderer::Font)> {
-    doc.nodes[id].parent.map(|parent| {
-        let font = styles.lengths[parent].font;
-        (
-            [font.em, font.ch, font.ex, font.cap, font.ic, font.lh].map(f32::to_bits),
-            style::font(&styles.values[parent]),
-        )
-    })
-}
-
-fn box_parent(doc: &Document, styles: &ComputedStyles, id: usize) -> Option<usize> {
-    let mut parent = doc.nodes[id].parent;
-    while let Some(ancestor) = parent
-        && styles.values[ancestor]
-            .get(Prop::DISPLAY)
-            .is_some_and(|value| value == "contents")
-    {
-        parent = doc.nodes[ancestor].parent;
-    }
-    parent
-}
-
-/// The padding at the start side of a box, and whether that is the right side.
-fn padding_start(styles: &ComputedStyles, parent: usize, width: f32) -> (f32, bool) {
-    let style = &styles.values[parent];
-    let rtl = style.get(Prop::DIRECTION) == Some("rtl");
-    let padding = styles.lengths[parent].edges(style, css::properties::PADDING, width);
-    (padding[if rtl { 1 } else { 3 }].max(0.), rtl)
-}
-
-fn starts_line(build: &Build<'_>, id: usize) -> bool {
-    let doc = build.doc;
-    doc.nodes[id].parent.is_none_or(|parent| {
-        let siblings = &doc.nodes[parent].children;
-        let index = build
-            .breaks
-            .borrow_mut()
-            .entry(parent)
-            .or_insert_with(|| {
-                siblings
-                    .iter()
-                    .enumerate()
-                    .map(|(index, &child)| (child, index))
-                    .collect()
-            })
-            .get(&id)
-            .copied()
-            .unwrap_or(0);
-        siblings[..index]
-            .iter()
-            .rfind(|&&child| {
-                let node = &doc.nodes[child];
-                node.tag != "#comment"
-                    && !(node.tag == "#text" && node.text.trim_ascii().is_empty())
-            })
-            .is_none_or(|&child| doc.nodes[child].tag == "br")
-    })
-}
-
-fn insets(styles: &ComputedStyles, node: usize, padding: bool, width: f32) -> [f32; 4] {
-    let (style, units) = (&styles.values[node], &styles.lengths[node]);
-    let borders = units.borders(style, width);
-    if !padding {
-        return borders;
-    }
-    let padding = units.edges(style, css::properties::PADDING, width);
-    std::array::from_fn(|side| padding[side] + borders[side])
-}
-
-fn backdrop(doc: &Document, styles: &ComputedStyles, id: usize) -> Option<(usize, u32)> {
-    std::iter::successors(Some(id), |&node| doc.nodes[node].parent).find_map(|node| {
-        let (ink, alpha) =
-            css::value::color::color(styles.values[node].get(Prop::BACKGROUND_COLOR)?)?;
-        (alpha >= 128).then_some((node, ink))
-    })
-}
-
-const LOOK: u16 = crate::css::selector::HOVER | crate::css::selector::ACTIVE;
-
-fn boxless(doc: &Document, id: usize) -> Option<(usize, bool)> {
-    std::iter::successors(doc.nodes[id].parent, |&parent| doc.nodes[parent].parent)
-        .take(2)
-        .find(|&parent| doc.nodes[parent].tag == "select")
-        .map(|select| {
-            let attrs = &doc.nodes[select].attrs;
-            (
-                select,
-                !attrs.contains_key("multiple")
-                    && !attrs
-                        .get("size")
-                        .is_some_and(|size| size.trim().parse::<u32>().is_ok_and(|size| size > 1)),
-            )
-        })
-}
-
-fn content_editable(doc: &Document, id: usize) -> Option<usize> {
-    std::iter::successors(Some(id), |&node| doc.nodes[node].parent)
-        .find(|&node| doc.nodes[node].attrs.contains_key("contenteditable"))
-}
-
-fn shrinks(doc: &Document, styles: &ComputedStyles, id: usize, first: bool) -> (bool, usize) {
-    let mut child = id;
-    loop {
-        let own = &styles.values[child];
-        let inset = |prop| own.get(prop).is_some_and(|v| v != "auto");
-        if float_side(own).is_some()
-            || own
-                .get(Prop::POSITION)
-                .is_some_and(|v| matches!(v, "absolute" | "fixed"))
-                && !(inset(Prop::LEFT) && inset(Prop::RIGHT))
-        {
-            break (true, child);
-        }
-        let Some(parent) = box_parent(doc, styles, child) else {
-            break (false, child);
-        };
-        let style = &styles.values[parent];
-        let display = style.get(Prop::DISPLAY).unwrap_or("block");
-        if display.ends_with("flex")
-            && style
-                .get(Prop::FLEX_DIRECTION)
-                .is_none_or(|v| v.starts_with("row"))
-        {
-            break (
-                first && child == id
-                    || own
-                        .get(Prop::FLEX_GROW)
-                        .is_none_or(|v| v.parse::<f32>().is_ok_and(|grow| grow == 0.)),
-                parent,
-            );
-        }
-        if !matches!(
-            display,
-            "block" | "list-item" | "flow-root" | "inline-block" | "flex" | "inline-flex"
-        ) || style.get(Prop::WIDTH).is_some_and(|v| v != "auto")
-        {
-            break (false, parent);
-        }
-        if display == "inline-block" {
-            break (true, parent);
-        }
-        child = parent;
-    }
-}
-
-fn uses(
-    doc: &Document,
-    styles: &ComputedStyles,
-    ids: &super::effects::Ids,
-    svg: usize,
-) -> Option<u64> {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = rustc_hash::FxHasher::default();
-    let mut found = false;
-    let mut pending = vec![(svg, false)];
-    let mut visited = rustc_hash::FxHashSet::default();
-    while let Some((node, outside)) = pending.pop() {
-        if !visited.insert(node) {
-            continue;
-        }
-        if outside {
-            (
-                node,
-                doc.nodes.revision(node),
-                Rc::as_ptr(&styles.values[node]),
-            )
-                .hash(&mut hasher);
-        }
-        let current = &doc.nodes[node];
-        pending.extend(current.children.iter().map(|&child| (child, outside)));
-        if current.tag == "use"
-            && let Some(name) = href(current)
-        {
-            found = true;
-            name.hash(&mut hasher);
-            pending.extend(
-                super::effects::index(ids, doc)
-                    .get(name)
-                    .into_iter()
-                    .flatten()
-                    .map(|&target| (target, true)),
-            );
-        }
-    }
-    found.then(|| hasher.finish())
-}
-
-fn href(node: &crate::dom::Node) -> Option<&str> {
-    node.attrs
-        .get("href")
-        .or_else(|| node.attrs.get("xlink:href"))
-        .and_then(|value| value.strip_prefix('#'))
-}
-
-fn scrolled(handle: Option<&renderer::ScrollRef>) -> Option<[bool; 2]> {
-    handle.map(|handle| {
-        let max = handle.extent();
-        [max.x > px(0.5), max.y > px(0.5)]
-    })
-}
-
-fn pictured(
-    image: Option<&Arc<renderer::RenderImage>>,
-    vector: Option<&(Rc<str>, [f32; 2])>,
-) -> u64 {
-    hashed((
-        image.map(|image| {
-            let size = image.size();
-            [size.width, size.height]
-        }),
-        vector.map(|(_, natural)| natural.map(f32::to_bits)),
-    ))
-}
-
-fn baselines(doc: &Document, dom: Option<&crate::render::PageState>, grid: usize) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = rustc_hash::FxHasher::default();
-    for child in &doc.nodes[grid].children {
-        dom.and_then(|dom| dom.layout.baselines.get(child))
-            .map(|baselines| baselines.map(|value| value.map(f32::to_bits)))
-            .hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
-impl<'a> Build<'a> {
-    #[inline(never)]
-    fn log(&self, query: Query, scope: usize, value: u64) {
-        self.reads.borrow_mut().push(Read {
-            query,
-            value,
-            scope: scope as u16,
-            reader: self.ancestors.len() as u16,
-        });
-    }
-
-    fn parent(&self, id: usize, prop: Prop) -> Option<&'a str> {
-        let value = parent_style(self.doc, self.styles, id, prop);
-        self.log(Query::Parent(prop), self.ancestors.len(), hashed(value));
-        value
-    }
-
-    fn scope_of(&self, id: usize, node: usize) -> usize {
-        std::iter::successors(Some(node), |&node| self.doc.nodes[node].parent)
-            .find_map(|node| {
-                if node == id {
-                    Some(self.ancestors.len() + 1)
-                } else {
-                    self.ancestors
-                        .iter()
-                        .rposition(|&ancestor| ancestor == node)
-                        .map(|index| index + 1)
-                }
-            })
-            .unwrap_or(0)
-    }
-
-    fn block_size(&self, dom: Option<&crate::render::PageState>, block: usize) -> Option<[f32; 2]> {
-        dom.and_then(|dom| dom.layout.blocks.get(&block))
-            .map(|bounds| [f32::from(bounds.size.width), f32::from(bounds.size.height)])
-            .or_else(|| self.blocks.borrow().get(&block).copied())
-    }
-
-    fn replay(
-        &self,
-        id: usize,
-        [width, _]: [f32; 2],
-        container: [f32; 2],
-        cell: Option<[f32; 2]>,
-        dom: Option<&crate::render::PageState>,
-        read: &Read,
-    ) -> Replay {
-        let (doc, styles) = (self.doc, self.styles);
-        let below = read.reader != 0;
-        let now = match read.query {
-            Query::Margins => {
-                let mut units = styles.lengths[id];
-                units.container = Some(container);
-                hashed(
-                    margins(self, id, &units, width, self.flex_parent, cell.is_some())
-                        .map(f32::to_bits),
-                )
-            }
-            Query::Parent(prop) => hashed(parent_style(doc, styles, id, prop)),
-            Query::ParentFont => hashed(parent_font(doc, styles, id)),
-            Query::FlatParent => {
-                let parent = box_parent(doc, styles, id);
-                hashed((
-                    parent,
-                    parent.and_then(|parent| styles.values[parent].get(Prop::DISPLAY)),
-                ))
-            }
-            Query::FlatParentPadding => hashed(box_parent(doc, styles, id).map(|parent| {
-                let (padding, rtl) = padding_start(styles, parent, width);
-                (padding.to_bits(), rtl)
-            })),
-            Query::StickyParent => hashed(self.ancestors.last().map(|&parent| {
-                (
-                    parent,
-                    insets(styles, parent, true, width).map(f32::to_bits),
-                )
-            })),
-            Query::Break => hashed(starts_line(self, id)),
-            Query::UserSelect => hashed(styles.user_select[id].0 as u8),
-            Query::Positioner(fixed) => hashed(positioner(
-                if fixed { "fixed" } else { "absolute" },
-                self.ancestors.iter().rev().copied(),
-                |ancestor| super::effects::establishes(&styles.values[ancestor]),
-            )),
-            Query::Backdrop(node) => hashed(backdrop(doc, styles, node as usize)),
-            Query::Scroller(escape) => {
-                let Some(handles) = dom.map(|dom| &dom.geometry.scroll) else {
-                    return Replay::Changed;
-                };
-                let ancestors = self.ancestors.iter().rev().copied();
-                let scroller = if below {
-                    scroller(
-                        doc,
-                        styles,
-                        std::iter::once(id).chain(ancestors),
-                        handles,
-                        escape,
-                    )
-                } else {
-                    scroller(doc, styles, ancestors, handles, escape)
-                };
-                hashed((
-                    scroller,
-                    insets(styles, scroller, false, width).map(f32::to_bits),
-                    handles.contains_key(&scroller),
-                ))
-            }
-            Query::Editable => hashed(content_editable(doc, id).is_some()),
-            Query::Cell => hashed(cell.map(|size| size.map(f32::to_bits))),
-            Query::Shrunk => hashed(shrinks(doc, styles, id, !below).0),
-            Query::Uses(svg) => hashed(uses(doc, styles, self.ids, svg as usize)),
-            Query::Block(block) => hashed(
-                self.block_size(dom, block as usize)
-                    .map(|size| size.map(f32::to_bits)),
-            ),
-            Query::Scroll(node) => hashed(scrolled(
-                dom.and_then(|dom| dom.geometry.scroll.get(&(node as usize))),
-            )),
-            Query::Width(node) => hashed(
-                dom.and_then(|dom| dom.layout.cull.widths.get(&(node as usize)))
-                    .map(|size| size.map(f32::to_bits)),
-            ),
-            Query::Track(node, axis) => {
-                // The 0.5 px must match prepaint, which draws again only for a size more than half a pixel
-                // off.
-                let used = f32::from_bits(read.value as u32);
-                return match dom
-                    .and_then(|dom| dom.layout.cull.widths.get(&(node as usize)))
-                    .map(|size| size[usize::from(axis)])
-                {
-                    // A node keeps its size, so a read that finds none was made without one too.
-                    None => Replay::Same,
-                    Some(size) if size.to_bits() == used.to_bits() => Replay::Same,
-                    Some(size) if (size - used).abs() <= 0.5 => Replay::Close,
-                    Some(_) => Replay::Changed,
-                };
-            }
-            Query::Baselines(grid) => baselines(doc, dom, grid as usize),
-            Query::Atom(node) => hashed(
-                dom.and_then(|dom| dom.layout.atoms.get(&(node as usize)))
-                    .map(|size| size.map(f32::to_bits)),
-            ),
-            Query::Image(node) => {
-                let node = node as usize;
-                let dom = dom.filter(|_| !broken_image(&doc.nodes[node]));
-                pictured(
-                    dom.and_then(|dom| dom.media.images.get(&node)),
-                    dom.and_then(|dom| dom.media.svg_images.get(&node)),
-                )
-            }
-            Query::Look(node) => hashed(doc.nodes[node as usize].state & LOOK),
-            Query::Boxless(node) => hashed(boxless(doc, node as usize).map(|select| select.1)),
-            Query::Spliced(node) => {
-                hashed(crate::render::inline::spliced(doc, styles, node as usize))
-            }
-            Query::RowFill => {
-                hashed(row_fill(doc, styles, id).map(|fill| fill.to_array().map(f32::to_bits)))
-            }
-            Query::Collapse => hashed(collapses(doc, styles, id)),
-            Query::Value(node) => hashed(&doc.nodes[node as usize].value),
-            Query::Viewport => hashed(styles.lengths[id].viewport.map(f32::to_bits)),
-            Query::Theme => hashed(crate::native::theme_state() & 1),
-            Query::LineBase(node) => hashed(definite_line(doc, styles, node as usize)),
-            Query::Shrinks(node) => hashed(shrinks_around(doc, styles, node as usize)),
-        };
-        if now == read.value {
-            Replay::Same
-        } else {
-            Replay::Changed
-        }
-    }
-}
-
-// The axes, 1 for x and 2 for y, that the insets of an out-of-flow box set.
-fn inset_axes(style: &css::properties::Style) -> u8 {
-    [[Prop::LEFT, Prop::RIGHT], [Prop::TOP, Prop::BOTTOM]]
-        .iter()
-        .enumerate()
-        .filter(|(_, axis)| {
-            axis.iter()
-                .any(|&prop| style.get(prop).is_some_and(|value| value != "auto"))
-        })
-        .fold(0, |axes, (axis, _)| axes | 1 << axis)
-}
-
-// An empty box at the static place of an absolute box, which puts its place in `anchors` for the box to follow.
-fn static_mark(view: &Rc<super::ViewState>, key: usize) -> renderer::Node {
-    let view = view.clone();
-    renderer::canvas_watching(
-        move |bounds, _| {
-            let mut host = view.host.borrow_mut();
-            host.state(view.id).layout.anchors.insert(key, bounds);
-        },
-        |_, _, _| {},
-    )
-    .w(px(0.))
-    .h(px(0.))
-}
-
-fn positioner(
-    position: &str,
-    mut ancestors: impl Iterator<Item = usize>,
-    mut made: impl FnMut(usize) -> super::effects::Establishes,
-) -> Option<usize> {
-    let fixed = match position {
-        "absolute" => false,
-        "fixed" => true,
-        _ => return None,
-    };
-    ancestors
-        .find(|&ancestor| {
-            let made = made(ancestor);
-            if fixed { made.fixed } else { made.absolute }
-        })
-        .or((!fixed).then_some(0))
-}
-
-// Find the scroll container by style, not by handle, since scripts make handles for any box. `escape` is the state
-// of the walk when it reaches the first ancestor, as `escape_step` gives it.
-fn scroller(
-    doc: &Document,
-    styles: &ComputedStyles,
-    mut ancestors: impl Iterator<Item = usize>,
-    handles: &rustc_hash::FxHashMap<usize, renderer::ScrollRef>,
-    mut escape: u8,
-) -> usize {
-    ancestors
-        .find(|&ancestor| {
-            let Some(next) = escape_step(styles, ancestor, escape) else {
-                return false;
-            };
-            escape = next;
-            ancestor != 0
-                && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
-                    .into_iter()
-                    .any(|prop| {
-                        styles.values[ancestor]
-                            .get(prop)
-                            .is_some_and(|value| matches!(value, "auto" | "scroll" | "hidden"))
-                    })
-                && (!matches!(doc.nodes[ancestor].tag.as_str(), "html" | "body")
-                    || handles.contains_key(&ancestor))
-        })
-        .unwrap_or(0)
-}
-
-// Past an absolute (1) or fixed (2) box, only its containing block chain scrolls it. Returns `None` when the walk
-// skips `node`, else the state after it.
-fn escape_step(styles: &ComputedStyles, node: usize, escape: u8) -> Option<u8> {
-    let style = &styles.values[node];
-    if escape != 0 {
-        let made = super::effects::establishes(style);
-        if !(if escape == 2 {
-            made.fixed
-        } else {
-            made.absolute
-        }) {
-            return None;
-        }
-    }
-    Some(match style.get(Prop::POSITION) {
-        Some("absolute") => 1,
-        Some("fixed") => 2,
-        _ => 0,
-    })
-}
-
-// A read as the parent of `id` holds it: the scroller walk of a box inside `id` goes through `id`.
-fn passed(styles: &ComputedStyles, id: usize, query: Query, below: bool) -> Query {
-    match query {
-        Query::Scroller(escape) if below => {
-            Query::Scroller(escape_step(styles, id, escape).unwrap_or(escape))
-        }
-        query => query,
-    }
-}
-
-// The place of each list item among the list items of its parent.
-type Siblings = rustc_hash::FxHashMap<usize, usize>;
-
-const SVG_SOURCE: [Prop; 13] = [
-    Prop::TRANSLATE,
-    Prop::ROTATE,
-    Prop::SCALE,
-    Prop::TRANSFORM_BOX,
-    Prop::CX,
-    Prop::CY,
-    Prop::R,
-    Prop::RX,
-    Prop::RY,
-    Prop::X,
-    Prop::Y,
-    Prop::WIDTH,
-    Prop::HEIGHT,
-];
-
-// `text-indent` as pixels and a fraction of the width of the paragraph, which the renderer resolves at layout.
-fn text_indent(style: &css::properties::Style, units: &css::value::units::Lengths) -> (f32, f32) {
-    let Some(value) = style.get(Prop::TEXT_INDENT) else {
-        return (0., 0.);
-    };
-    let pixels = units.resolve(value, 0.).unwrap_or(0.);
-    match value.contains('%') {
-        true => (
-            pixels,
-            (units.resolve(value, 100.).unwrap_or(pixels) - pixels) / 100.,
-        ),
-        false => (pixels, 0.),
-    }
-}
-
-struct SvgSource<'a> {
-    doc: &'a Document,
-    styles: &'a ComputedStyles,
-    root: usize,
-    scale: f32,
-    view: [f32; 2],
-    header: String,
-    ids: &'a super::effects::Ids,
-}
-
-impl SvgSource<'_> {
-    fn attrs(&self, element: usize, paint: bool, transform: bool) -> Vec<(&'static str, String)> {
-        let (doc, root) = (self.doc, self.root);
-        let own = &self.styles.values[element];
-        let units = &self.styles.lengths[element];
-        let tag = doc.nodes[element].tag.as_str();
-        let mut attrs = Vec::new();
-        if element != root {
-            for prop in &SVG_SOURCE[4..] {
-                let applies = match *prop {
-                    Prop::CX | Prop::CY => matches!(tag, "circle" | "ellipse"),
-                    Prop::R => tag == "circle",
-                    Prop::RX | Prop::RY => matches!(tag, "ellipse" | "rect"),
-                    _ => matches!(tag, "rect" | "image" | "foreignObject"),
-                };
-                if let Some(value) = own.get(*prop).filter(|value| applies && *value != "auto") {
-                    let value = if value.ends_with('%') || value.parse::<f32>().is_ok() {
-                        value.to_owned()
-                    } else {
-                        units
-                            .resolve(value, f32::NAN)
-                            .map_or_else(|| value.to_owned(), |length| length.to_string())
-                    };
-                    attrs.push((prop.name(), value));
-                }
-            }
-        }
-        // resvg doesn't take CSS transforms, `transform-box` or `transform-origin`, so they become a matrix.
-        if transform
-            && element != root
-            && super::TRANSFORM_PROPS
-                .iter()
-                .any(|&prop| own.get(prop).is_some())
-        {
-            let fill = own
-                .get(Prop::TRANSFORM_BOX)
-                .is_some_and(|value| value != "view-box");
-            let [x, y, w, h] = fill
-                .then(|| self.shape(element))
-                .flatten()
-                .map_or([0., 0., self.view[0], self.view[1]], |(rect, _)| rect);
-            let bounds = Rect::new(point(px(x), px(y)), size(px(w), px(h)));
-            attrs.push((
-                "transform",
-                crate::css::value::transform::transform(own, units, bounds, None).map_or(
-                    String::new(),
-                    |m| {
-                        format!(
-                            "matrix({} {} {} {} {} {})",
-                            m[0], m[1], m[4], m[5], m[12], m[13]
-                        )
-                    },
-                ),
-            ));
-        }
-        if !paint {
-            return attrs;
-        }
-        let parent = doc.nodes[element]
-            .parent
-            .map(|parent| &self.styles.values[parent]);
-        // resvg ignores `vector-effect: non-scaling-stroke` and `pathLength`, so stroke widths and dashes are
-        // scaled here.
-        let width = if element != root
-            && self.scale != 1.
-            && own.get(Prop::VECTOR_EFFECT) == Some("non-scaling-stroke")
-        {
-            1. / self.scale
-        } else {
-            1.
-        };
-        let dashed = own
-            .get(Prop::STROKE_DASHARRAY)
-            .is_some_and(|value| value != "none")
-            || own
-                .get(Prop::STROKE_DASHOFFSET)
-                .is_some_and(|value| value.trim_end_matches("px").parse::<f32>() != Ok(0.));
-        let dashes = width
-            * doc.nodes[element]
-                .attrs
-                .get("pathLength")
-                .and_then(|value| value.trim().parse::<f32>().ok())
-                .filter(|length| *length > 0. && dashed && element != root)
-                .and_then(|length| Some(self.shape(element)?.1 / length))
-                .filter(|ratio| *ratio > 0.)
-                .unwrap_or(1.);
-        let mut result = String::new();
-        for prop in style::SVG {
-            // A style holds the lines of a text decoration, and SVG reads the short form. The lines include the
-            // ones of ancestors, which don't reach into an image, so only a change from the parent counts.
-            let value = own.get(prop).or_else(|| {
-                let outer = parent.and_then(|parent| parent.get(Prop::TEXT_DECORATION_LINE));
-                own.get(Prop::TEXT_DECORATION_LINE)
-                    .filter(|line| prop == Prop::TEXT_DECORATION && outer != Some(*line))
-            });
-            let Some(value) = value else { continue };
-            let factor = match prop {
-                Prop::TRANSFORM | Prop::TRANSFORM_ORIGIN => continue,
-                Prop::STROKE_WIDTH => width,
-                Prop::STROKE_DASHARRAY | Prop::STROKE_DASHOFFSET => dashes,
-                _ => 1.,
-            };
-            if if element == root {
-                !prop.inherited()
-            } else {
-                prop.inherited()
-                    && factor == 1.
-                    && !doc.nodes[element].attrs.contains_key(prop.name())
-                    && parent.and_then(|parent| parent.get(prop)) == Some(value)
-            } {
-                continue;
-            }
-            let value = match prop {
-                Prop::DISPLAY if value != "none" => continue,
-                Prop::CLIP_PATH | Prop::MASK | Prop::FILTER if !value.starts_with("url(") => {
-                    continue;
-                }
-                Prop::VECTOR_EFFECT => continue,
-                Prop::FONT_SIZE => format!("{}px", units.font.em),
-                // Resolve currentColor from the <use> element's inherited color, not the referenced
-                // definition.
-                Prop::FILL
-                | Prop::STROKE
-                | Prop::STOP_COLOR
-                | Prop::FLOOD_COLOR
-                | Prop::LIGHTING_COLOR
-                    if value.eq_ignore_ascii_case("currentcolor") =>
-                {
-                    "currentColor".to_owned()
-                }
-                Prop::FILL
-                | Prop::STROKE
-                | Prop::COLOR
-                | Prop::STOP_COLOR
-                | Prop::FLOOD_COLOR
-                | Prop::LIGHTING_COLOR => css::value::color::color(value)
-                    .map_or(value.to_owned(), |(rgb, alpha)| {
-                        format!("#{rgb:06x}{alpha:02x}")
-                    }),
-                _ if factor != 1. => value
-                    .split(|c: char| c == ',' || c.is_ascii_whitespace())
-                    .filter(|part| !part.is_empty())
-                    .map(|part| {
-                        part.strip_suffix("px")
-                            .unwrap_or(part)
-                            .parse::<f32>()
-                            .map_or(part.to_owned(), |length| (length * factor).to_string())
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                _ => value.to_owned(),
-            };
-            result.push_str(prop.name());
-            result.push(':');
-            result.push_str(&value);
-            result.push(';');
-        }
-        if !result.is_empty() {
-            attrs.push(("style", result));
-        }
-        attrs
-    }
-
-    fn shape(&self, element: usize) -> Option<([f32; 4], f32)> {
-        let attrs = |node| {
-            let mut attrs = self.attrs(node, false, node != element);
-            // resvg drops shapes without paint.
-            attrs.push(("fill", "#000".into()));
-            if node == element {
-                attrs.extend([("id", "apps-shape".into()), ("transform", String::new())]);
-                if self.doc.nodes[node].tag == "use" {
-                    attrs.extend([("x", String::new()), ("y", String::new())]);
-                }
-            }
-            attrs
-        };
-        let (mut targets, mut pending) = (Vec::new(), vec![element]);
-        while let Some(node) = pending.pop() {
-            let node = &self.doc.nodes[node];
-            if node.tag == "use"
-                && let Some(target) = href(node).and_then(|name| {
-                    super::effects::index(self.ids, self.doc)
-                        .get(name)?
-                        .first()
-                        .copied()
-                })
-                && !targets.contains(&target)
-            {
-                targets.push(target);
-                pending.push(target);
-            }
-            pending.extend(&node.children);
-        }
-        let mut source = format!("{}><defs>", self.header);
-        for target in targets {
-            source.push_str(&self.doc.serialize_svg(target, false, &attrs));
-        }
-        source.push_str("</defs>");
-        source.push_str(&self.doc.serialize_svg(element, false, &attrs));
-        source.push_str("</svg>");
-        super::raster::svg::svg_shape(&source)
-    }
-}
-pub(super) type Svg = (Vec<Rc<css::properties::Style>>, ([f32; 2], u64));
-
-type Used = Rc<rustc_hash::FxHashMap<usize, [f32; 2]>>;
-type Sets = ([f32; 2], [f32; 2], bool);
-pub(super) type Adjoined = ((u64, u32, Option<[u32; 2]>), Sets);
-pub(super) type Walked = ((u64, u32, [bool; 2], Option<[u32; 2]>), Used);
-
-thread_local! {
-    // Reserve a quarter of the stack for layout and paint, which recurse as deeply as build.
-    static STACK_LIMIT: usize = {
-        let marker = 0u8;
-        let here = &raw const marker as usize;
-        #[cfg(target_os = "macos")]
-        let (low, size) = unsafe {
-            let size = libc::pthread_get_stacksize_np(libc::pthread_self());
-            (libc::pthread_get_stackaddr_np(libc::pthread_self()) as usize - size, size)
-        };
-        #[cfg(target_os = "linux")]
-        let (low, size) = unsafe {
-            let mut attr = std::mem::zeroed();
-            let (mut low, mut size) = (std::ptr::null_mut(), 0);
-            if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) == 0 {
-                libc::pthread_attr_getstack(&attr, &mut low, &mut size);
-                libc::pthread_attr_destroy(&mut attr);
-            }
-            (low as usize, size)
-        };
-        // Assumes the 64 MB main stack that build.rs links on Windows.
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let (low, size) = (here.saturating_sub(60 << 20), 64 << 20);
-        (low + size / 4).min(here)
-    };
-}
-
-pub(super) fn element(
-    build: &Build<'_>,
-    id: usize,
-    containing: [f32; 2],
-    container: [f32; 2],
-    slot: Option<([f32; 4], super::layout::grid::Grid)>,
-) -> Child {
-    let info = build.info[id];
-    let depth = build.ancestors.len();
-    let mark = build.reads.borrow().len();
-    #[cfg(debug_assertions)]
-    let printed = build.prints.borrow().len();
-    let text = build.doc.nodes[id].tag.starts_with('#');
-    let storable = !text
-        && build.perspective.is_none()
-        && depth < 256
-        && info.flags
-            & (cull::ANIMATED
-                | cull::HIDDEN
-                | cull::MOVES_CONTENT
-                | cull::COMPOSITED
-                | cull::TRANSFORMED)
-            == 0;
-    let call = Call {
-        subtree: info.subtree,
-        containing: if info.flags & cull::READS_HEIGHT != 0 {
-            containing
-        } else {
-            [containing[0], 0.]
-        },
-        container,
-        flex_parent: build.flex_parent,
-        columned: build.columned,
-        cell: slot.as_ref().map(|(_, grid)| {
-            use std::hash::{Hash, Hasher};
-            let mut tracks = rustc_hash::FxHasher::default();
-            for value in grid.columns.iter().chain(&grid.rows).chain(&grid.gap) {
-                value.to_bits().hash(&mut tracks);
-            }
-            (grid.baseline, grid.first_item.is_some(), tracks.finish())
-        }),
-    };
-    // Debug checks must not remove repaint entries, or the real build can skip the box.
-    #[cfg(debug_assertions)]
-    let repainted = if build.checking {
-        build.view.repaint.borrow().contains(&id)
-    } else {
-        build.view.repaint.borrow_mut().remove(&id)
-    };
-    #[cfg(not(debug_assertions))]
-    let repainted = build.view.repaint.borrow_mut().remove(&id);
-    let keep = 'keep: {
-        if !storable
-            || repainted
-            || build.resized && info.flags & cull::READS_VIEWPORT != 0
-            || !build.settled && info.flags & cull::READS_LAST_FRAME != 0
-            || !build.tree.contains(id)
-        {
-            break 'keep None;
-        }
-        let kept = build.view.kept.borrow();
-        let Some(record) = kept.get(&id) else {
-            break 'keep None;
-        };
-        let cell = slot.as_ref().map(|(bounds, _)| [bounds[2], bounds[3]]);
-        // A float is never culled, so it stays kept far from the view.
-        if !record.culled
-            && float_side(&build.styles.values[id]).is_none()
-            && let Some(zone) = &build.zone
-        {
-            let margin = build.styles.lengths[id].viewport[1];
-            let reach = build.view.reach.borrow().get(id).copied();
-            if !reach.is_some_and(|[bottom, top]| {
-                bottom >= zone.top - margin && top <= zone.bottom + margin
-            }) {
-                break 'keep None;
-            }
-        }
-        let mut close = false;
-        // A debug check of a kept box keeps the positioned boxes in it that build in place after the build.
-        #[cfg(debug_assertions)]
-        let inside = build.checking
-            && info.flags & cull::OUT_OF_FLOW != 0
-            && build.view.outs.borrow().contains_key(&id)
-            && Call {
-                subtree: record.call.subtree,
-                cell: call.cell,
-                ..call
-            } == record.call;
-        #[cfg(not(debug_assertions))]
-        let inside = false;
-        let held = (record.call == call || inside) && {
-            let fresh = record.epoch.get() == build.epoch;
-            let host = build.view.host.borrow();
-            let dom = host.page_state(build.view.id);
-            record.reads.iter().all(|read| {
-                fresh && !read.query.host()
-                    || match build.replay(id, containing, container, cell, dom, read) {
-                        Replay::Same => true,
-                        Replay::Close => {
-                            close = true;
-                            true
-                        }
-                        Replay::Changed => false,
-                    }
-            })
-        };
-        #[cfg(debug_assertions)]
-        assert!(
-            held || !build.checking,
-            "box {id} <{}> builds again inside a kept box: {}",
-            build.doc.nodes[id].tag,
-            if record.call == call {
-                let host = build.view.host.borrow();
-                let dom = host.page_state(build.view.id);
-                format!(
-                    "{:?} changed",
-                    record
-                        .reads
-                        .iter()
-                        .filter(
-                            |read| build.replay(id, containing, container, cell, dom, read)
-                                == Replay::Changed
-                        )
-                        .map(|read| read.query)
-                        .collect::<Vec<_>>()
-                )
-            } else {
-                "its call changed".into()
-            }
-        );
-        if !held {
-            break 'keep None;
-        }
-        record.epoch.set(build.epoch);
-        record.containing.set(containing);
-        if record.culled {
-            build.culls.set(build.culls.get() + 1);
-        }
-        build
-            .reads
-            .borrow_mut()
-            .extend(record.reads.iter().map(|read| Read {
-                scope: if read.scope == 0 {
-                    0
-                } else {
-                    (depth + 1).saturating_sub(usize::from(read.scope)).max(1) as u16
-                },
-                reader: depth as u16 + read.reader,
-                query: passed(build.styles, id, read.query, read.reader != 0),
-                ..*read
-            }));
-        #[cfg(debug_assertions)]
-        build.prints.borrow_mut().push(match inside {
-            true => record.seen.get(),
-            false => {
-                if !build.checking {
-                    record.seen.set(record.print);
-                }
-                record.print
-            }
-        });
-        // A record with culled boxes can come from a debug build in a zone, which a check without a zone can't
-        // repeat. The zone checks of `plan` cover such boxes.
-        Some(close || inside || record.culled)
-    };
-    if let Some(_close) = keep {
-        #[cfg(debug_assertions)]
-        if !_close && !build.view.around.borrow().contains(&id) {
-            check(build, id, containing, container, slot, mark, printed);
-        }
-        return Child::Kept(id.into());
-    }
-    let culls = build.culls.get();
-    #[cfg(debug_assertions)]
-    let checking = build.checking;
-    #[cfg(not(debug_assertions))]
-    let checking = false;
-    if !checking && !build.view.repaint.borrow().is_empty() {
-        build.view.built.borrow_mut().insert(id);
-    }
-    let field = text_field(&build.doc.nodes[id], &build.styles.values[id]);
-    let positioned = storable && info.flags & cull::OUT_OF_FLOW != 0;
-    let patch = (field || positioned).then(|| Patch {
-        ancestors: build.ancestors.clone(),
-        containing,
-        container,
-        slot: slot.clone(),
-        flex_parent: build.flex_parent,
-        columned: build.columned,
-        perspective: build.perspective.clone(),
-        value: hashed(&build.doc.nodes[id].value),
-    });
-    let cell = slot.clone().filter(|_| storable);
-    let child = create(build, id, containing, container, slot, None);
-    #[cfg(debug_assertions)]
-    let plan = build.plan.take();
-    #[cfg(debug_assertions)]
-    if !build.checking
-        && *TRACE
-        && let Some(name) = build.doc.nodes[id].attrs.get("id")
-    {
-        eprintln!("BUILT {name}");
-    }
-    let reads = {
-        let below = |read: &Read| usize::from(read.reader) > depth;
-        let mut log = build.reads.borrow_mut();
-        let mut end = mark;
-        for at in mark..log.len() {
-            let read = log[at];
-            if usize::from(read.scope) <= depth
-                && !log[end.saturating_sub(16).max(mark)..end]
-                    .iter()
-                    .any(|old| old.query == read.query && below(old) == below(&read))
-            {
-                log[end] = read;
-                end += 1;
-            }
-        }
-        log.truncate(end);
-        let reads = storable.then(|| {
-            log[mark..]
-                .iter()
-                .map(|read| Read {
-                    scope: if read.scope == 0 {
-                        0
-                    } else {
-                        (depth + 1 - usize::from(read.scope)) as u16
-                    },
-                    reader: u16::from(below(read)),
-                    ..*read
-                })
-                .collect()
-        });
-        for read in &mut log[mark..] {
-            read.query = passed(build.styles, id, read.query, below(read));
-        }
-        reads
-    };
-    #[cfg(debug_assertions)]
-    let print = print(build, printed, &child);
-    if let Some(patch) = patch.filter(|_| !checking) {
-        match field {
-            true => build.view.patches.borrow_mut().insert(id, patch),
-            false => build.view.outs.borrow_mut().insert(id, patch),
-        };
-    }
-    if !text {
-        let mut kept = build.view.kept.borrow_mut();
-        match reads {
-            Some(reads) => {
-                kept.insert(
-                    id,
-                    Kept {
-                        call,
-                        reads,
-                        ancestors: build.ancestors.clone(),
-                        epoch: build.epoch.into(),
-                        containing: containing.into(),
-                        culled: build.culls.get() != culls,
-                        slot: cell,
-                        #[cfg(debug_assertions)]
-                        print,
-                        #[cfg(debug_assertions)]
-                        seen: print.into(),
-                        #[cfg(debug_assertions)]
-                        plan,
-                    },
-                );
-            }
-            None => {
-                kept.remove(&id);
-            }
-        }
-    }
-    child
-}
-
-pub(super) fn repaint(build: &Build<'_>, id: usize) -> Option<renderer::Node> {
-    let old = build.view.kept.borrow_mut().remove(&id)?;
-    let (ancestors, containing, container, flex_parent) = (
-        old.ancestors.clone(),
-        old.containing.get(),
-        old.call.container,
-        old.call.flex_parent,
-    );
-    let mark = build.reads.borrow().len();
-    let place = Build {
-        ancestors: ancestors.clone(),
-        flex_parent,
-        columned: old.call.columned,
-        perspective: None,
-        zone: None,
-        #[cfg(debug_assertions)]
-        extra: Default::default(),
-        #[cfg(debug_assertions)]
-        plan: Default::default(),
-        ..*build
-    };
-    #[cfg(debug_assertions)]
-    let printed = place.prints.borrow().len();
-    let bounds = old.slot.as_ref().map(|(bounds, _)| *bounds);
-    let child = element(&place, id, containing, container, old.slot.clone());
-    // A grid item takes its place in its cell, as its parent would give it.
-    let child = match bounds {
-        Some(bounds) => {
-            let mut units = build.styles.lengths[id];
-            units.container = Some(container);
-            let margin = units.edges(
-                &build.styles.values[id],
-                css::properties::MARGIN,
-                containing[0],
-            );
-            self::place(child, margin, build.pixel_ratio, bounds)
-        }
-        None => child,
-    };
-    #[cfg(debug_assertions)]
-    place.prints.borrow_mut().truncate(printed);
-    build.reads.borrow_mut().truncate(mark);
-    let mut kept = build.view.kept.borrow_mut();
-    if kept.get(&id).is_none_or(|record| record.reads != old.reads) {
-        for ancestor in ancestors.iter() {
-            kept.remove(ancestor);
-        }
-    }
-    match child {
-        Child::Node(node) => Some(*node),
-        Child::Kept(_) | Child::Placed(..) => None,
-    }
-}
-
-#[cfg(debug_assertions)]
-pub(super) fn same_in_place(fresh: &Child, placed: &[renderer::Node], tree: &renderer::Tree) {
-    fn find(child: &Child, id: renderer::NodeKey) -> Option<&renderer::Node> {
-        let Child::Node(node) = child else {
-            return None;
-        };
-        if node.element_id() == Some(id) {
-            return Some(node);
-        }
-        node.kids().iter().find_map(|kid| find(kid, id))
-    }
-    fn same(fresh: &renderer::Node, placed: &renderer::Node, tree: &renderer::Tree) {
-        let id = fresh.element_id();
-        assert!(
-            fresh.style_ref() == placed.style_ref(),
-            "box {id:?} built in place has another style than a full build gives"
-        );
-        assert!(
-            fresh.text_content() == placed.text_content(),
-            "box {id:?} built in place has other text than a full build gives"
-        );
-        assert_eq!(
-            fresh.kids().len(),
-            placed.kids().len(),
-            "box {id:?} built in place has other children than a full build gives"
-        );
-        for (fresh, placed) in fresh.kids().iter().zip(placed.kids()) {
-            match (fresh, placed) {
-                (Child::Node(fresh), Child::Node(placed)) => same(fresh, placed, tree),
-                (Child::Node(fresh), Child::Kept(kept) | Child::Placed(kept, _)) => assert!(
-                    tree.style_of(*kept) == Some(fresh.style_ref()),
-                    "box {kept:?} kept in a box built in place has another style than a full build gives"
-                ),
-                _ => {}
-            }
-        }
-    }
-    for node in placed {
-        if let Some(id) = node.element_id()
-            && let Some(fresh) = find(fresh, id)
-        {
-            same(fresh, node, tree);
-        }
-    }
-}
-
-#[cfg(debug_assertions)]
-static TRACE: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var_os("APPS_TRACE_BUILDS").is_some());
-
-#[cfg(debug_assertions)]
-fn check(
-    build: &Build<'_>,
-    id: usize,
-    containing: [f32; 2],
-    container: [f32; 2],
-    slot: Option<([f32; 4], super::layout::grid::Grid)>,
-    mark: usize,
-    printed: usize,
-) {
-    let culls = std::cell::Cell::new(0);
-    let shadow = Build {
-        ancestors: build.ancestors.clone(),
-        perspective: build.perspective.clone(),
-        zone: None,
-        culls: &culls,
-        checking: true,
-        extra: Default::default(),
-        plan: Default::default(),
-        ..*build
-    };
-    let start = build.reads.borrow().len();
-    let fresh = create(&shadow, id, containing, container, slot, None);
-    let depth = build.ancestors.len();
-    let set = |reads: &[Read]| {
-        let mut set: Vec<_> = reads
-            .iter()
-            .filter(|read| usize::from(read.scope) <= depth)
-            .map(|read| (read.query, usize::from(read.reader) > depth, read.value))
-            .collect();
-        set.sort_unstable_by_key(|&(query, below, _)| (query, below));
-        set.dedup_by_key(|&mut (query, below, _)| (query, below));
-        set
-    };
-    let mut log = build.reads.borrow_mut();
-    // A kept box passes its reads on as its parent holds them.
-    for read in &mut log[start..] {
-        read.query = passed(
-            build.styles,
-            id,
-            read.query,
-            usize::from(read.reader) > depth,
-        );
-    }
-    let (kept, now) = (set(&log[mark..start]), set(&log[start..]));
-    log.truncate(start);
-    drop(log);
-    let tag = &build.doc.nodes[id].tag;
-    assert!(
-        kept == now,
-        "kept box {id} <{tag}> reads otherwise when built again: {:?} instead of {:?}",
-        now.iter().map(|read| read.0).collect::<Vec<_>>(),
-        kept.iter().map(|read| read.0).collect::<Vec<_>>()
-    );
-    let print = print(&shadow, printed + 1, &fresh);
-    let mut prints = build.prints.borrow_mut();
-    assert_eq!(
-        prints[printed], print,
-        "kept box {id} <{tag}> builds otherwise when built again"
-    );
-    prints.truncate(printed + 1);
-}
-
-#[cfg(debug_assertions)]
-fn print(build: &Build<'_>, from: usize, child: &Child) -> u64 {
-    use std::hash::Hasher;
-    struct Hashed(rustc_hash::FxHasher);
-    impl std::fmt::Write for Hashed {
-        fn write_str(&mut self, text: &str) -> std::fmt::Result {
-            self.0.write(text.as_bytes());
-            Ok(())
-        }
-    }
-    let mut hasher = Hashed(Default::default());
-    if let Child::Node(node) = child {
-        let _ = std::fmt::Write::write_fmt(&mut hasher, format_args!("{:?}", node.style_ref()));
-    }
-    hasher.0.write_u64(build.extra.take());
-    let mut prints = build.prints.borrow_mut();
-    for print in prints.drain(from..) {
-        hasher.0.write_u64(print);
-    }
-    let print = hasher.0.finish();
-    prints.push(print);
-    print
-}
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 /// Builds the box of `id`, or with `pseudo` only that block pseudo-element of a spliced inline box.
-fn create(
+pub(super) fn create(
     build: &Build<'_>,
     id: usize,
     containing: [f32; 2],
     container: [f32; 2],
-    slot: Option<([f32; 4], super::layout::grid::Grid)>,
+    slot: Option<([f32; 4], super::super::layout::grid::Grid)>,
     pseudo: Option<usize>,
 ) -> Child {
     let reader = build;
@@ -1689,7 +169,7 @@ fn create(
     let position = style.get(Prop::POSITION).unwrap_or("static");
     let parent = box_parent(doc, styles, id);
     let positioner = positioner(position, ancestors.iter().rev().copied(), |ancestor| {
-        super::effects::establishes(&styles.values[ancestor])
+        super::super::effects::establishes(&styles.values[ancestor])
     });
     if matches!(position, "absolute" | "fixed") {
         let scope = positioner
@@ -1978,7 +458,7 @@ fn create(
                 });
                 if caret {
                     window.paint_volatile();
-                    super::paint::text::paint_caret(
+                    super::super::paint::text::paint_caret(
                         &painter,
                         [id, 0, 0],
                         Rect::new(bounds.origin, size(px(1.), px(line_height))),
@@ -2018,7 +498,7 @@ fn create(
         (
             skips && !forced,
             forced,
-            skips.then(|| super::layout::grid::intrinsic_size(style, &units, remembered)),
+            skips.then(|| super::super::layout::grid::intrinsic_size(style, &units, remembered)),
             // The last size is the size without the contents only if the last build skipped them.
             last.filter(|_| was),
         )
@@ -2043,7 +523,7 @@ fn create(
     // Spliced inline boxes, with the range of their content in `flat`. The end of a box is `!index` in `pending`.
     let mut cuts: Vec<(usize, usize, usize)> = Vec::new();
     // The parts of the spliced boxes: their place in `flat`, and the key of their text or their first and last block.
-    let mut cut_parts: Vec<(usize, usize, super::paint::Piece)> = Vec::new();
+    let mut cut_parts: Vec<(usize, usize, super::super::paint::Piece)> = Vec::new();
     // The block `::before` and `::after` of spliced boxes: their place in `flat` and their index.
     let mut cut_pseudos: Vec<(usize, usize)> = Vec::new();
     while let Some(child) = pending.pop() {
@@ -2496,21 +976,23 @@ fn create(
     let mut content_layers: Vec<Child> = Vec::new();
     if node.tag == "canvas" {
         let picture = |source| {
-            renderer::node().size_full().hooks(super::paint::Picture {
-                id,
-                view: view.clone(),
-                source,
-                fit: renderer::ObjectFit::Fill,
-                cropped: None,
-                position: None,
-                pixelated: matches!(
-                    style.get(Prop::IMAGE_RENDERING),
-                    Some("pixelated" | "crisp-edges")
-                ),
-            })
+            renderer::node()
+                .size_full()
+                .hooks(super::super::paint::Picture {
+                    id,
+                    view: view.clone(),
+                    source,
+                    fit: renderer::ObjectFit::Fill,
+                    cropped: None,
+                    position: None,
+                    pixelated: matches!(
+                        style.get(Prop::IMAGE_RENDERING),
+                        Some("pixelated" | "crisp-edges")
+                    ),
+                })
         };
-        let mut presented = picture(super::paint::Source::Presented)
-            .child(picture(super::paint::Source::Drawn).absolute());
+        let mut presented = picture(super::super::paint::Source::Presented)
+            .child(picture(super::super::paint::Source::Drawn).absolute());
         presented.style().aspect_ratio = natural_ratio;
         content_layers.push(presented.into());
     }
@@ -2529,7 +1011,8 @@ fn create(
             .page_state(view.id)
             .filter(|_| host.app.features.has(crate::bundle::Feature::Terminal))
         {
-            let look = super::paint::terminal::look(style, styles.selections.get(&id), &units);
+            let look =
+                super::super::paint::terminal::look(style, styles.selections.get(&id), &units);
             // The bar of the scrollback.
             grid_bar = Some(scrollbar::Scrollbar {
                 id,
@@ -2552,7 +1035,7 @@ fn create(
             content_layers.push(
                 renderer::node()
                     .size_full()
-                    .hooks(super::paint::terminal::Grid {
+                    .hooks(super::super::paint::terminal::Grid {
                         id,
                         view: view.clone(),
                         terminals: state.media.terminals.clone(),
@@ -2807,21 +1290,20 @@ fn create(
             linked |= child.tag == "use";
             if child.tag == "use"
                 && let Some(reference) = href(child)
-                && let Some(target) =
-                    super::effects::index(ids, doc)
-                        .get(reference)
-                        .and_then(|targets| {
-                            targets.iter().copied().find(|&target| {
-                                let mut root = target;
-                                while let Some(parent) = doc.nodes[root].parent {
-                                    if parent == id {
-                                        return false;
-                                    }
-                                    root = parent;
+                && let Some(target) = super::super::effects::index(ids, doc)
+                    .get(reference)
+                    .and_then(|targets| {
+                        targets.iter().copied().find(|&target| {
+                            let mut root = target;
+                            while let Some(parent) = doc.nodes[root].parent {
+                                if parent == id {
+                                    return false;
                                 }
-                                root == scope
-                            })
+                                root = parent;
+                            }
+                            root == scope
                         })
+                    })
                 && !visited.contains(&target)
             {
                 targets.push(target);
@@ -3003,7 +1485,7 @@ fn create(
     let input = (node.tag == "input").then(|| node.input_type());
     let appkit = node.native_control(style);
     if appkit.is_some() {
-        super::paint::native::register(&view.controls, id);
+        super::super::paint::native::register(&view.controls, id);
     }
     let check = input.is_some_and(|kind| {
         kind.eq_ignore_ascii_case("checkbox") || kind.eq_ignore_ascii_case("radio")
@@ -3085,7 +1567,8 @@ fn create(
         }
     }
     if appkit == Some(renderer::ControlKind::Button) {
-        let [padding, height] = super::layout::size::native_size(renderer::ControlKind::Button);
+        let [padding, height] =
+            super::super::layout::size::native_size(renderer::ControlKind::Button);
         if style.get(Prop::WIDTH).is_none_or(|value| value == "auto") {
             let label = node.button_label();
             let run = style::text_run(style, &units, label.len());
@@ -3218,7 +1701,7 @@ fn create(
             .entry(id)
             .or_default()
             .clone();
-        let field = super::paint::field::FieldText {
+        let field = super::super::paint::field::FieldText {
             selected: Default::default(),
             id,
             view: view.clone(),
@@ -3316,7 +1799,7 @@ fn create(
     let mut text_fill = None;
     // The root element paints the background of the canvas, also when it comes from the body.
     let source = matches!(node.tag.as_str(), "html" | "body")
-        .then(|| super::paint::background::canvas_source(doc, styles))
+        .then(|| super::super::paint::background::canvas_source(doc, styles))
         .flatten();
     let propagated = node.tag == "body" && source == Some(id);
     let canvas = source.filter(|_| node.tag == "html" && node.parent == Some(0));
@@ -3584,7 +2067,7 @@ fn create(
             let metrics = text.metrics(font);
             let height = metrics.ascent * size_px.0 - metrics.descent * size_px.0;
             let line_height = units.font.lh;
-            let radii = super::effects::clip::radii(style, &units, || containing);
+            let radii = super::super::effects::clip::radii(style, &units, || containing);
             let (sides, pad_y, fill) = (borders, padding[0] + padding[2], inline_fill);
             let dashed = matches!(border_kinds[0], "dashed");
             el = el.child(
@@ -3655,7 +2138,7 @@ fn create(
             }
         })
         .flatten();
-    let native = super::paint::control::kind(&node.tag, input, list.is_some(), style).map(
+    let native = super::super::paint::control::kind(&node.tag, input, list.is_some(), style).map(
         |(control, boxed, plain)| {
             let number = |name: &str| {
                 node.attrs
@@ -3664,17 +2147,17 @@ fn create(
                     .filter(|value| value.is_finite())
             };
             let [min, max] = match control {
-                super::paint::control::Control::Range => {
+                super::super::paint::control::Control::Range => {
                     [number("min").unwrap_or(0.), number("max").unwrap_or(100.)]
                 }
-                super::paint::control::Control::Meter => {
+                super::super::paint::control::Control::Meter => {
                     [number("min").unwrap_or(0.), number("max").unwrap_or(1.)]
                 }
                 _ => [0., number("max").filter(|&max| max > 0.).unwrap_or(1.)],
             };
             let max = max.max(min);
             let value = match control {
-                super::paint::control::Control::Range => {
+                super::super::paint::control::Control::Range => {
                     let value = node
                         .current_value()
                         .and_then(|value| value.trim().parse::<f32>().ok())
@@ -3697,7 +2180,7 @@ fn create(
                     }
                 }
                 _ => number("value").unwrap_or(
-                    if control == super::paint::control::Control::Progress {
+                    if control == super::super::paint::control::Control::Progress {
                         -1.
                     } else {
                         0.
@@ -3706,7 +2189,7 @@ fn create(
             };
             let mut dark = dark();
             let accent = match control {
-                super::paint::control::Control::Meter => {
+                super::super::paint::control::Control::Meter => {
                     let low = number("low").unwrap_or(min).clamp(min, max);
                     let high = number("high").unwrap_or(max).clamp(low, max);
                     let region = |value: f32| u8::from(value >= low) + u8::from(value > high);
@@ -3729,7 +2212,7 @@ fn create(
                         colors[2]
                     }
                 }
-                super::paint::control::Control::Color => node
+                super::super::paint::control::Control::Color => node
                     .current_value()
                     .and_then(css::value::color::color)
                     .map_or(0, |(color, _)| color),
@@ -3739,7 +2222,7 @@ fn create(
                     .and_then(css::value::color::color)
                 {
                     Some((color, _)) => {
-                        dark = super::paint::control::accent_dark(
+                        dark = super::super::paint::control::accent_dark(
                             control,
                             node.checked(),
                             color,
@@ -3751,7 +2234,7 @@ fn create(
                     None => 0x0075ff,
                 },
             };
-            super::paint::control::Look {
+            super::super::paint::control::Look {
                 control,
                 boxed,
                 plain,
@@ -3766,9 +2249,9 @@ fn create(
                     .and_then(css::value::color::color)
                     .map_or(0, |(color, _)| color),
                 value: if value < min
-                    || max <= min && control != super::paint::control::Control::Progress
+                    || max <= min && control != super::super::paint::control::Control::Progress
                 {
-                    if control == super::paint::control::Control::Progress {
+                    if control == super::super::paint::control::Control::Progress {
                         -1.
                     } else {
                         0.
@@ -3799,7 +2282,7 @@ fn create(
     }
     if let Some(look) = &native {
         if look.boxed {
-            let (edge, fill) = super::paint::control::box_colors(look);
+            let (edge, fill) = super::super::paint::control::box_colors(look);
             for side in 0..4 {
                 padding[side] += (borders[side] - 1.).max(0.);
                 borders[side] = borders[side].min(1.);
@@ -3829,7 +2312,7 @@ fn create(
                 + borders[0]
                 + borders[2]));
         }
-        if look.control == super::paint::control::Control::Menu {
+        if look.control == super::super::paint::control::Control::Menu {
             padding[1] += 16.;
             padding[3] += 4.;
             if style.get(Prop::WIDTH).is_none_or(|value| value == "auto") {
@@ -3924,7 +2407,7 @@ fn create(
     }
     let border_image = hit
         .is_none()
-        .then(|| super::paint::background::border_image(style, units, id, 0, borders, view))
+        .then(|| super::super::paint::background::border_image(style, units, id, 0, borders, view))
         .flatten();
     if border_image.is_some() {
         border_colors = [renderer::Color::TRANSPARENT; 4];
@@ -3965,7 +2448,7 @@ fn create(
                 .all(|side| border_colors[side] == border_colors[first])
         {
             el = el.border_color(border_colors[first]);
-            el.style().border_style = super::effects::border_style(border_kinds[first]);
+            el.style().border_style = super::super::effects::border_style(border_kinds[first]);
         } else {
             el = el.border_color(renderer::Color::TRANSPARENT);
         }
@@ -4034,7 +2517,7 @@ fn create(
                 el = el.min_w(px(min));
             }
         } else if percent {
-            el = el.child(super::paint::field::natural_width(px(width)));
+            el = el.child(super::super::paint::field::natural_width(px(width)));
         }
         if auto[1] && (node.tag != "textarea" || style.get(Prop::FIELD_SIZING) != Some("content")) {
             el = el.min_h(px(height + chrome[1]));
@@ -4052,7 +2535,7 @@ fn create(
     };
     let radius = parsed
         .radii
-        .unwrap_or_else(|| super::effects::clip::radii(style, &units, basis));
+        .unwrap_or_else(|| super::super::effects::clip::radii(style, &units, basis));
     if hit.is_none() {
         el.style().corner_radii = radius;
     }
@@ -4193,7 +2676,7 @@ fn create(
                     && value == "fit-content"
                 {
                     // The grid's measure child gives the content sizes, and these bounds clamp a stretched width.
-                    let [min, max, ..] = super::layout::grid::intrinsic(
+                    let [min, max, ..] = super::super::layout::grid::intrinsic(
                         doc,
                         id,
                         styles,
@@ -4218,7 +2701,7 @@ fn create(
                 } else if matches!(value, "fit-content" | "max-content" | "min-content")
                     && axis == 0
                 {
-                    let [min, max, ..] = super::layout::grid::intrinsic(
+                    let [min, max, ..] = super::super::layout::grid::intrinsic(
                         doc,
                         id,
                         styles,
@@ -4770,7 +3253,7 @@ fn create(
         let field = editable && node.tag == "input";
         let swatch = native
             .as_ref()
-            .is_some_and(|look| look.control == super::paint::control::Control::Color);
+            .is_some_and(|look| look.control == super::super::paint::control::Control::Color);
         let parent_style = &styles.values[parent];
         let parent = below(parent_style, line);
         let edge = el.style().align_self.is_none()
@@ -4816,7 +3299,7 @@ fn create(
         } else if native.as_ref().is_some_and(|look| {
             // Like Chrome, a range sits on the bottom of its border box, a progress bar without its native look
             // on the bottom of its margin box.
-            !look.plain || look.control == super::paint::control::Control::Range
+            !look.plain || look.control == super::super::paint::control::Control::Range
         }) {
             0.
         } else {
@@ -4986,7 +3469,7 @@ fn create(
                 .left_0()
                 .size_full()
                 .children(background)
-                .hooks(super::paint::Effected {
+                .hooks(super::super::paint::Effected {
                     effect: renderer::PaintEffect {
                         text_mask: true,
                         ..Default::default()
@@ -5009,21 +3492,23 @@ fn create(
             .to_pixels(size(px(basis()[0]), px(basis()[1])))
             .inset(inset(0), inset(1), inset(2), inset(3));
         let cropped = matches!(fit, renderer::ObjectFit::Cover | renderer::ObjectFit::None);
-        let mut image = renderer::node().size_full().hooks(super::paint::Picture {
-            id,
-            view: view.clone(),
-            source: super::paint::Source::Element,
-            fit,
-            cropped: cropped.then_some(corners),
-            position: style
-                .get(Prop::OBJECT_POSITION)
-                .filter(|value| !matches!(*value, "50% 50%" | "center" | "center center"))
-                .map(|value| (value.into(), units)),
-            pixelated: matches!(
-                style.get(Prop::IMAGE_RENDERING),
-                Some("pixelated" | "crisp-edges")
-            ),
-        });
+        let mut image = renderer::node()
+            .size_full()
+            .hooks(super::super::paint::Picture {
+                id,
+                view: view.clone(),
+                source: super::super::paint::Source::Element,
+                fit,
+                cropped: cropped.then_some(corners),
+                position: style
+                    .get(Prop::OBJECT_POSITION)
+                    .filter(|value| !matches!(*value, "50% 50%" | "center" | "center center"))
+                    .map(|value| (value.into(), units)),
+                pixelated: matches!(
+                    style.get(Prop::IMAGE_RENDERING),
+                    Some("pixelated" | "crisp-edges")
+                ),
+            });
         image.style().aspect_ratio = natural_ratio;
         if !cropped {
             image.style().corner_radii = renderer::Radii {
@@ -5163,7 +3648,7 @@ fn create(
             .and_then(css::value::color::paint)
             .unwrap_or(ink);
         let name = style.get(Prop::OUTLINE_STYLE).unwrap_or("solid");
-        let kind = super::effects::border_style(name);
+        let kind = super::super::effects::border_style(name);
         // The top and left sides, then the right and bottom ones, of each band from the outer edge in.
         let bands: Vec<[renderer::Color; 2]> = match name {
             "inset" => vec![[true, false].map(|dark| shade_border(color, dark))],
@@ -5289,28 +3774,29 @@ fn create(
             bands,
             borders,
             radius,
-            border_kinds.map(super::effects::border_style),
+            border_kinds.map(super::super::effects::border_style),
             false,
         ));
     }
     let resizer = (node.tag == "textarea"
         && style.get(Prop::RESIZE).is_none_or(|value| value != "none"))
-    .then_some(super::paint::control::Look {
-        control: super::paint::control::Control::Resizer,
+    .then_some(super::super::paint::control::Look {
+        control: super::super::paint::control::Control::Resizer,
         ..Default::default()
     });
     if let Some(look) = native
         .filter(|look| {
             !matches!(
                 look.control,
-                super::paint::control::Control::Button | super::paint::control::Control::Field
+                super::super::paint::control::Control::Button
+                    | super::super::paint::control::Control::Field
             )
         })
         .or(resizer)
     {
         el = el.child(if look.plain {
             let parts = styles.scrollbars.get(&id);
-            let range = look.control == super::paint::control::Control::Range;
+            let range = look.control == super::super::paint::control::Control::Range;
             let ink = css::value::color::rgba(
                 style
                     .get(Prop::COLOR)
@@ -5427,7 +3913,7 @@ fn create(
             .size_full()
             .into()
         } else {
-            super::paint::control::layer(id, look, view.clone())
+            super::super::paint::control::layer(id, look, view.clone())
         });
     }
     let overscroll = overscroll(style);
@@ -5592,8 +4078,8 @@ fn create(
             let space = text
                 .advance(face, px(size), ' ')
                 .map_or(size / 4., f32::from);
-            let look = super::paint::control::Look {
-                control: super::paint::control::Control::Disclosure,
+            let look = super::super::paint::control::Look {
+                control: super::super::paint::control::Control::Disclosure,
                 checked: kind == "disclosure-open",
                 ink: marker_style
                     .unwrap_or(style)
@@ -5607,7 +4093,7 @@ fn create(
                 .left_0()
                 .top(px((leading + ascent - side) / pixel_ratio))
                 .size(px(side / pixel_ratio))
-                .child(super::paint::control::layer(id, look, view.clone()));
+                .child(super::super::paint::control::layer(id, look, view.clone()));
             let above = (leading + ascent) / pixel_ratio;
             let marker = renderer::node()
                 .flex_shrink_0()
@@ -6014,7 +4500,8 @@ fn create(
                     pseudo_padding[0] + pseudo_padding[2] + pseudo_borders[0] + pseudo_borders[2],
                 ]
             };
-            let pseudo_radius = super::effects::clip::radii(pseudo, &pseudo_units, || containing);
+            let pseudo_radius =
+                super::super::effects::clip::radii(pseudo, &pseudo_units, || containing);
             decoration.style().corner_radii = pseudo_radius;
             let colors = sides.map(|(_, _, color)| {
                 pseudo
@@ -6022,7 +4509,7 @@ fn create(
                     .and_then(css::value::color::paint)
                     .unwrap_or(ink)
             });
-            let border_image = super::paint::background::border_image(
+            let border_image = super::super::paint::background::border_image(
                 pseudo,
                 pseudo_units,
                 id,
@@ -6039,7 +4526,7 @@ fn create(
                 } else {
                     decoration = decoration.border_color(renderer::Color::TRANSPARENT);
                     let kinds = sides.map(|(_, kind, _)| {
-                        super::effects::border_style(pseudo.get(kind).unwrap_or("solid"))
+                        super::super::effects::border_style(pseudo.get(kind).unwrap_or("solid"))
                     });
                     decoration = decoration.child(border_canvas(
                         vec![([0.; 4], pseudo_borders, colors)],
@@ -6065,7 +4552,7 @@ fn create(
                     false => self::positioner(
                         if fixed { "fixed" } else { "absolute" },
                         ancestors.iter().rev().copied(),
-                        |ancestor| super::effects::establishes(&styles.values[ancestor]),
+                        |ancestor| super::super::effects::establishes(&styles.values[ancestor]),
                     ),
                 };
                 let scope = block
@@ -6253,7 +4740,7 @@ fn create(
                         }
                     }
                     Prop::OPACITY if !keyed => {
-                        decoration = decoration.opacity(super::effects::opacity(pseudo));
+                        decoration = decoration.opacity(super::super::effects::opacity(pseudo));
                     }
                     Prop::BOX_SHADOW => {
                         decoration.style().box_shadow =
@@ -6397,8 +4884,9 @@ fn create(
                 .find_map(|prop| pseudo.get(prop))
                 .filter(|value| *value != "none")
             {
-                for effect in super::effects::filter::filters(value, &pseudo_units, doc, ids) {
-                    decoration = decoration.hooks(super::paint::Effected {
+                for effect in super::super::effects::filter::filters(value, &pseudo_units, doc, ids)
+                {
+                    decoration = decoration.hooks(super::super::paint::Effected {
                         effect,
                         backdrop: None,
                     });
@@ -6409,7 +4897,7 @@ fn create(
                 .find_map(|prop| pseudo.get(prop))
                 .is_some_and(|value| value != "none")
             {
-                decoration = decoration.hooks(super::paint::Masked {
+                decoration = decoration.hooks(super::super::paint::Masked {
                     view: view.clone(),
                     key: (id, index as u8 + 1),
                     style: Rc::new(pseudo.clone()),
@@ -6420,9 +4908,9 @@ fn create(
                 .get(Prop::MIX_BLEND_MODE)
                 .filter(|value| *value != "normal")
             {
-                decoration = decoration.hooks(super::paint::Effected {
+                decoration = decoration.hooks(super::super::paint::Effected {
                     effect: renderer::PaintEffect {
-                        blend_mode: super::effects::filter::blend_mode(value),
+                        blend_mode: super::super::effects::filter::blend_mode(value),
                         ..Default::default()
                     },
                     backdrop: None,
@@ -6430,10 +4918,10 @@ fn create(
             }
             // An opacity animation keeps one keyed layer, so its frames only patch the layer's opacity.
             if keyed {
-                decoration = decoration.hooks(super::paint::Effected {
+                decoration = decoration.hooks(super::super::paint::Effected {
                     effect: renderer::PaintEffect {
-                        opacity: super::effects::opacity(pseudo),
-                        key: Some(super::pseudo_key(id, index as u8 + 1)),
+                        opacity: super::super::effects::opacity(pseudo),
+                        key: Some(super::super::pseudo_key(id, index as u8 + 1)),
                         ..Default::default()
                     },
                     backdrop: None,
@@ -6447,9 +4935,9 @@ fn create(
                         .get(Prop::VISIBILITY)
                         .is_none_or(|value| value == "visible")
                 })
-                .and_then(|value| super::effects::filter::backdrop(value, &pseudo_units))
+                .and_then(|value| super::super::effects::filter::backdrop(value, &pseudo_units))
             {
-                Some((blur, color_matrix)) => decoration.hooks(super::paint::Effected {
+                Some((blur, color_matrix)) => decoration.hooks(super::super::paint::Effected {
                     effect: renderer::PaintEffect {
                         backdrop: Some(renderer::Backdrop {
                             bounds: Rect::default(),
@@ -6463,11 +4951,11 @@ fn create(
                 }),
                 None => decoration,
             };
-            let decoration = if super::TRANSFORM_PROPS
+            let decoration = if super::super::TRANSFORM_PROPS
                 .iter()
                 .any(|&prop| pseudo.get(prop).is_some_and(|value| value != "none"))
             {
-                decoration.hooks(super::paint::Transformed {
+                decoration.hooks(super::super::paint::Transformed {
                     style: Rc::new(pseudo.clone()),
                     units: pseudo_units,
                     matrix: Default::default(),
@@ -6511,11 +4999,11 @@ fn create(
                         renderer::Escape::ABSOLUTE
                     };
                     decoration.style().placed = inset_axes(pseudo);
-                    contained = Some(super::paint::PseudoBlock {
+                    contained = Some(super::super::paint::PseudoBlock {
                         view: view.clone(),
                         anchor: None,
-                        place: Some(super::paint::Contained {
-                            key: super::pseudo_key(id, index as u8 + 1) as usize,
+                        place: Some(super::super::paint::Contained {
+                            key: super::super::pseudo_key(id, index as u8 + 1) as usize,
                             container,
                             viewport: units.viewport,
                             sized: sized.then_some(size),
@@ -6567,7 +5055,7 @@ fn create(
                 match &mut contained {
                     Some(contained) => contained.anchor = anchor,
                     None => {
-                        contained = Some(super::paint::PseudoBlock {
+                        contained = Some(super::super::paint::PseudoBlock {
                             view: view.clone(),
                             place: None,
                             anchor,
@@ -6595,7 +5083,7 @@ fn create(
             let decoration = if matches!(own, "inline" | "none" | "contents") {
                 decoration
             } else {
-                decoration.hooks(super::paint::PseudoBox {
+                decoration.hooks(super::super::paint::PseudoBox {
                     view: view.clone(),
                     element: id,
                     origin: pseudo_origin.get_or_insert_default().clone(),
@@ -6615,7 +5103,7 @@ fn create(
             // The part of a spliced box gives the box its bounds.
             if pseudo_only {
                 return decoration
-                    .hooks(super::paint::PseudoPart {
+                    .hooks(super::super::paint::PseudoPart {
                         view: view.clone(),
                         node: id,
                         key: crate::render::inline::atom_key(id, index as u8 + 1),
@@ -6749,7 +5237,7 @@ fn create(
             if atom.pseudo != 0 {
                 return pseudo();
             }
-            let [_, max, _, height] = super::layout::grid::intrinsic(
+            let [_, max, _, height] = super::super::layout::grid::intrinsic(
                 doc,
                 atom.node,
                 styles,
@@ -6761,7 +5249,7 @@ fn create(
             let line = styles.lengths[atom.node].font.lh;
             [max, height.max(line), line * 0.8]
         });
-        super::paint::text::AtomSlot {
+        super::super::paint::text::AtomSlot {
             size,
             align: align_of(child),
             at: std::cell::Cell::new(point(px(0.), px(0.))),
@@ -6771,7 +5259,7 @@ fn create(
     let atom_box = |index: usize,
                     atom: &crate::render::inline::Atom,
                     child: Child,
-                    slots: &Rc<[super::paint::text::AtomSlot]>,
+                    slots: &Rc<[super::super::paint::text::AtomSlot]>,
                     padding: [f32; 4]| {
         let mut wrapper = renderer::node()
             .absolute()
@@ -6798,7 +5286,7 @@ fn create(
             None => wrapper.max_w(renderer::Length::Calc(1., px(-padding[1] - padding[3]))),
         };
         wrapper = wrapper
-            .hooks(super::paint::text::AtomBox {
+            .hooks(super::super::paint::text::AtomBox {
                 slots: slots.clone(),
                 index,
                 node: atom.key(),
@@ -6811,7 +5299,7 @@ fn create(
                 renderer::node()
                     .flex_1()
                     .min_w(px(0.))
-                    .hooks(super::paint::text::AtomRest(rest)),
+                    .hooks(super::super::paint::text::AtomRest(rest)),
             );
         }
         wrapper
@@ -6852,21 +5340,21 @@ fn create(
                     .into(),
             })
             .collect();
-        let atom_slots: Rc<[super::paint::text::AtomSlot]> = data
+        let atom_slots: Rc<[super::super::paint::text::AtomSlot]> = data
             .atoms
             .iter()
             .zip(&mut atom_elements)
             .map(|(atom, child)| {
                 if marker(atom) {
                     // At the top of its line, as Chrome places the box.
-                    return super::paint::text::AtomSlot {
+                    return super::super::paint::text::AtomSlot {
                         size: [0.; 3],
                         align: Some(renderer::AlignItems::FlexStart),
                         at: Default::default(),
                     };
                 }
                 atom_slot(atom, child, containing[0], &|| {
-                    super::layout::grid::pseudo_atom(
+                    super::super::layout::grid::pseudo_atom(
                         doc,
                         id,
                         usize::from(atom.pseudo - 1),
@@ -6965,7 +5453,7 @@ fn create(
             && matches!(position, "static" | "relative")
             && el.style_ref().overflow.x == renderer::Overflow::Visible
             && el.style_ref().overflow.y == renderer::Overflow::Visible
-            && super::TRANSFORM_PROPS
+            && super::super::TRANSFORM_PROPS
                 .iter()
                 .all(|&prop| style.get(prop).is_none_or(|value| value == "none"))
             && style
@@ -7010,7 +5498,7 @@ fn create(
         for (index, (atom, child)) in data.atoms.iter().zip(atom_elements).enumerate() {
             let atom_box = atom_box(index, atom, child, &atom_slots, padding);
             el = el.child(match inline_fade(doc, styles, atom.node, id) {
-                fade if fade < 1. => atom_box.hooks(super::paint::Effected {
+                fade if fade < 1. => atom_box.hooks(super::super::paint::Effected {
                     effect: renderer::PaintEffect {
                         opacity: fade,
                         ..Default::default()
@@ -7101,7 +5589,7 @@ fn create(
             .right(px(padding[1]))
             .left(px(padding[3]))
             .children(boxes);
-        el = el.child(holder.hooks(super::paint::Undrawn(view.clone())));
+        el = el.child(holder.hooks(super::super::paint::Undrawn(view.clone())));
     } else if (!node.children.is_empty() || items.iter().any(Option::is_some))
         && !skipped
         && node.tag != "canvas"
@@ -7196,7 +5684,7 @@ fn create(
             {
                 let extent =
                     padding[1] + padding[3] + borders[1] + borders[3] + margin[1] + margin[3];
-                let [min, max, ..] = super::layout::grid::intrinsic(
+                let [min, max, ..] = super::super::layout::grid::intrinsic(
                     doc,
                     id,
                     styles,
@@ -7211,7 +5699,7 @@ fn create(
             let vertical = padding[0] + padding[2] + borders[0] + borders[2];
             let mut tracked = [None; 2];
             if shrunk {
-                let [min, max, ..] = super::layout::grid::intrinsic(
+                let [min, max, ..] = super::super::layout::grid::intrinsic(
                     doc,
                     id,
                     styles,
@@ -7255,7 +5743,7 @@ fn create(
                 if matches!(style::role(styles, id), 1 | 2 | 10..=12)
                     && style.get(Prop::MIN_WIDTH).is_none()
                 {
-                    let [min, ..] = super::layout::grid::intrinsic(
+                    let [min, ..] = super::super::layout::grid::intrinsic(
                         doc,
                         id,
                         styles,
@@ -7356,7 +5844,7 @@ fn create(
                 })
                 .map(|(_, _, _, grid)| grid.clone());
             Some(cached.unwrap_or_else(|| {
-                let grid = super::layout::grid::layout(
+                let grid = super::super::layout::grid::layout(
                     doc,
                     id,
                     styles,
@@ -7502,7 +5990,7 @@ fn create(
             // Absolute grid items need an in-flow content-height box for flex basis and min-height: auto.
             // Previously stretched rows cannot provide it.
             if flexed {
-                let [.., height] = super::layout::grid::intrinsic(
+                let [.., height] = super::super::layout::grid::intrinsic(
                     doc,
                     id,
                     styles,
@@ -7798,7 +6286,7 @@ fn create(
         if let (Some(grid), Some(zone)) = (&grid, &build.zone) {
             if let Some(dom) = view.host.borrow().page_state(view.id) {
                 for &(child, _, [x, y, width, height], _) in &grid.cells {
-                    if super::layout::grid::pseudo_item(child).is_some() {
+                    if super::super::layout::grid::pseudo_item(child).is_some() {
                         continue;
                     }
                     let placed = dom
@@ -7840,7 +6328,7 @@ fn create(
                 culls.set(culls.get() + 1);
                 #[cfg(debug_assertions)]
                 culled_ids.extend(culled.iter().map(|&(child, _)| child));
-                el = el.child(super::paint::spacer::anchor(
+                el = el.child(super::super::paint::spacer::anchor(
                     culled.clone(),
                     build.ancestors.clone(),
                     zone.clone(),
@@ -7927,7 +6415,7 @@ fn create(
                     cut_parts.push((
                         cut,
                         2 * at + 1,
-                        super::paint::Piece::Blocks(key(at), key(last), {
+                        super::super::paint::Piece::Blocks(key(at), key(last), {
                             let last = children[last];
                             styles.lengths[last].edges(
                                 &styles.values[last],
@@ -7950,7 +6438,7 @@ fn create(
                     .flex()
                     .flex_col()
                     .child(element)
-                    .hooks(super::paint::Effected {
+                    .hooks(super::super::paint::Effected {
                         effect: renderer::PaintEffect {
                             opacity: fade,
                             ..Default::default()
@@ -7996,10 +6484,9 @@ fn create(
                 if let Some(data) = found {
                     #[cfg(debug_assertions)]
                     reader.extra.set(hashed((reader.extra.get(), &*data.text)));
-                    cut_parts
-                        .extend((parts.iter()).map(|&(cut, _)| {
-                            (cut, 2 * index, super::paint::Piece::Text(data.key))
-                        }));
+                    cut_parts.extend((parts.iter()).map(|&(cut, _)| {
+                        (cut, 2 * index, super::super::paint::Piece::Text(data.key))
+                    }));
 
                     let content = content_box();
                     let mut atom_elements: Vec<Child> = data
@@ -8013,7 +6500,7 @@ fn create(
                                 .into(),
                         })
                         .collect();
-                    let atom_slots: Rc<[super::paint::text::AtomSlot]> = data
+                    let atom_slots: Rc<[super::super::paint::text::AtomSlot]> = data
                         .atoms
                         .iter()
                         .zip(&mut atom_elements)
@@ -8051,7 +6538,7 @@ fn create(
                     for (at, (atom, child)) in data.atoms.iter().zip(atom_elements).enumerate() {
                         let atom_box = atom_box(at, atom, child, &atom_slots, [0.; 4]);
                         block = block.child(match fade(atom.node) {
-                            fade if fade < 1. => atom_box.hooks(super::paint::Effected {
+                            fade if fade < 1. => atom_box.hooks(super::super::paint::Effected {
                                 effect: renderer::PaintEffect {
                                     opacity: fade,
                                     ..Default::default()
@@ -8085,7 +6572,11 @@ fn create(
                             .map(|at| children[at])
                             .collect();
                         if !nodes.is_empty() {
-                            cut_parts.push((cut, 2 * index, super::paint::Piece::Nodes(nodes)));
+                            cut_parts.push((
+                                cut,
+                                2 * index,
+                                super::super::paint::Piece::Nodes(nodes),
+                            ));
                         }
                     }
                 }
@@ -8100,13 +6591,13 @@ fn create(
                 let part = cut_pseudos[found].1;
                 let decoration = create(build, child, content_box(), container, None, Some(part));
                 // The pseudo-element is in its box, which `faded` leaves out.
-                let fade = super::effects::opacity(&styles.values[child]);
+                let fade = super::super::effects::opacity(&styles.values[child]);
                 let decoration = match fade < 1. {
                     true => renderer::node()
                         .flex()
                         .flex_col()
                         .child(decoration)
-                        .hooks(super::paint::Effected {
+                        .hooks(super::super::paint::Effected {
                             effect: renderer::PaintEffect {
                                 opacity: fade,
                                 ..Default::default()
@@ -8154,7 +6645,7 @@ fn create(
                             place!(open, None);
                         }
                         place!(
-                            super::paint::spacer::spacer(
+                            super::super::paint::spacer::spacer(
                                 run,
                                 build.ancestors.clone(),
                                 *then,
@@ -8206,7 +6697,7 @@ fn create(
                     });
                     Some((
                         bounds,
-                        super::layout::grid::Grid {
+                        super::super::layout::grid::Grid {
                             columns: columns?,
                             rows: rows?,
                             gap: grid.gap,
@@ -8597,14 +7088,18 @@ fn create(
                                         + gap * line as f32
                                 };
                                 // Lines past the explicit grid are `auto`.
-                                let (line, span) =
-                                    super::layout::grid::placement(start, end, &[], tracks.len());
+                                let (line, span) = super::super::layout::grid::placement(
+                                    start,
+                                    end,
+                                    &[],
+                                    tracks.len(),
+                                );
                                 let line = line.filter(|line| line + span <= tracks.len());
                                 let first = line.filter(|_| start != "auto").map(edge);
                                 let last = match (line, end) {
                                     (_, "auto") => None,
                                     (Some(line), _) => Some(edge(line + span) - gap),
-                                    (None, _) => super::layout::grid::placement(
+                                    (None, _) => super::super::layout::grid::placement(
                                         end,
                                         "auto",
                                         &[],
@@ -9032,7 +7527,7 @@ fn create(
                 depth,
                 hashed(block.map(|(parent, insets)| (parent, insets.map(f32::to_bits)))),
             );
-            Some(Box::new(super::paint::Sticky {
+            Some(Box::new(super::super::paint::Sticky {
                 scroll: scrolls.get(&parent)?.clone(),
                 border,
                 block,
@@ -9106,7 +7601,7 @@ fn create(
         .filter(|_| id != 0 && !node.tag.starts_with('#') && slot.is_none());
     let mut el = match vertical {
         Some(mode) => {
-            let [_, widest, ..] = super::layout::grid::intrinsic(
+            let [_, widest, ..] = super::super::layout::grid::intrinsic(
                 doc,
                 id,
                 styles,
@@ -9121,7 +7616,7 @@ fn create(
                 .map(|height| height + extra[1])
                 .unwrap_or_else(|| widest.min(units.viewport[1]))
                 .max(1.);
-            let block = super::layout::grid::intrinsic(
+            let block = super::super::layout::grid::intrinsic(
                 doc,
                 id,
                 styles,
@@ -9251,7 +7746,7 @@ fn create(
             }
             let rows = rows.into_iter().map(|(row, cells)| (row, true, cells));
             let rows = rows.chain(groups.into_iter().map(|(group, rows)| (group, false, rows)));
-            Some(Rc::new(super::paint::Parts::Rows(rows.collect())))
+            Some(Rc::new(super::super::paint::Parts::Rows(rows.collect())))
         } else {
             (!cuts.is_empty()).then(|| {
                 cut_parts.sort_by_key(|&(_, at, _)| at);
@@ -9264,7 +7759,7 @@ fn create(
                 for (cut, _, piece) in cut_parts {
                     boxes[at[&cut]].1.push(piece);
                 }
-                Rc::new(super::paint::Parts::Cuts {
+                Rc::new(super::super::paint::Parts::Cuts {
                     sides: (!multicol)
                         .then_some([padding[3] + borders[3], padding[1] + borders[1]]),
                     boxes,
@@ -9363,7 +7858,7 @@ fn create(
     }
     let mut element = el.hooks(hooks);
     if let Some(origin) = pseudo_origin {
-        element = element.hooks(super::paint::ElementOrigin(origin));
+        element = element.hooks(super::super::paint::ElementOrigin(origin));
     }
     // Like Chrome, positioned boxes and stacking contexts with `z-index: auto` or 0 paint after the in-flow
     // boxes of their stacking context, in tree order.
@@ -9469,31 +7964,10 @@ fn create(
     element.into()
 }
 
-// Taffy applies min/max constraints through aspect ratio even with an explicit opposite size. Prevent
-// max-width from changing explicit image heights.
-fn only_auto_ratio(mut el: renderer::Node, style: &css::properties::Style) -> renderer::Node {
-    let set = |prop| style.get(prop).is_some_and(|value| value != "auto");
-    let limited = |prop| style.get(prop).is_some_and(|value| value != "none");
-    if set(Prop::HEIGHT) {
-        if !limited(Prop::MAX_HEIGHT) {
-            el = el.max_h(px(1e7));
-        }
-        if !set(Prop::MIN_HEIGHT) {
-            el = el.min_h(px(0.));
-        }
-    }
-    if set(Prop::WIDTH) {
-        if !limited(Prop::MAX_WIDTH) {
-            el = el.max_w(px(1e7));
-        }
-        if !set(Prop::MIN_WIDTH) {
-            el = el.min_w(px(0.));
-        }
-    }
-    el
-}
-
-fn paint_broken_icon(origin: renderer::Point<renderer::Pixels>, window: &mut renderer::Window) {
+pub(super) fn paint_broken_icon(
+    origin: renderer::Point<renderer::Pixels>,
+    window: &mut renderer::Window,
+) {
     thread_local! {
         static ICON: RefCell<Option<(u32, Arc<renderer::RenderImage>)>> = const { RefCell::new(None) };
     }
@@ -9501,7 +7975,7 @@ fn paint_broken_icon(origin: renderer::Point<renderer::Pixels>, window: &mut ren
     let raster = (16. * window.scale_factor()).ceil() as u32;
     let Some(image) = ICON.with_borrow_mut(|icon| {
         if icon.as_ref().is_none_or(|(size, _)| *size != raster) {
-            *icon = super::raster::svg::svg(SVG, raster, raster)
+            *icon = super::super::raster::svg::svg(SVG, raster, raster)
                 .ok()
                 .map(|image| (raster, image));
         }
@@ -9511,1424 +7985,4 @@ fn paint_broken_icon(origin: renderer::Point<renderer::Pixels>, window: &mut ren
     };
     let bounds = Rect::new(origin, size(px(16.), px(16.)));
     window.draw_image(bounds, bounds, px(0.), image, false, false);
-}
-
-/// Whether an inline box has padding, a border or a margin on a side.
-fn edge(build: &Build<'_>, id: usize, side: usize) -> bool {
-    let (style, units) = (&build.styles.values[id], &build.styles.lengths[id]);
-    units.edges(style, css::properties::PADDING, 0.)[side]
-        + units.edges(style, css::properties::MARGIN, 0.)[side]
-        + units.borders(style, 0.)[side]
-        != 0.
-}
-
-/// The spliced inline boxes with a part in the run `[start, end)` of `children`, with their `CUT_*` flags.
-fn run_cuts(
-    build: &Build<'_>,
-    cuts: &[(usize, usize, usize)],
-    children: &[usize],
-    [start, end]: [usize; 2],
-    in_run: impl Fn(usize) -> bool,
-) -> Vec<(usize, u8)> {
-    let blocky = |child: usize| {
-        !in_run(child)
-            && float_side(&build.styles.values[child]).is_none()
-            && build.styles.values[child]
-                .get(Prop::POSITION)
-                .is_none_or(|value| !matches!(value, "absolute" | "fixed"))
-    };
-    // An empty run is a line of its own, only for the edges of the boxes next to it.
-    let edge = |cut: usize, side: usize| start < end || edge(build, cut, side);
-    let mut parts = Vec::new();
-    let near = cuts.partition_point(|&(_, from, _)| from <= end);
-    for &(cut, from, to) in cuts[..near].iter().filter(|&&(_, _, to)| to >= start) {
-        let (Some(before), Some(after)) = (
-            children.get(from..start.max(from)),
-            children.get(end.min(to)..to),
-        ) else {
-            continue;
-        };
-        let content = |child: &usize| in_run(*child) || blocky(*child);
-        let flags = if from < end && to > start && start < end {
-            (u8::from(!before.iter().any(content)) * crate::render::inline::CUT_FIRST)
-                | (u8::from(!after.iter().any(content)) * crate::render::inline::CUT_LAST)
-        // Like Chrome, a box that starts or ends with a block has an empty part in the line next to it.
-        } else if to == start && to > from && blocky(children[to - 1]) && edge(cut, 1) {
-            crate::render::inline::CUT_LAST | crate::render::inline::CUT_BEFORE
-        } else if from == end && from < to && blocky(children[from]) && edge(cut, 3) {
-            crate::render::inline::CUT_FIRST | crate::render::inline::CUT_AFTER
-        } else {
-            continue;
-        };
-        parts.push((cut, flags));
-    }
-    parts
-}
-
-fn in_flow(doc: &Document, info: &[cull::Info], id: usize) -> bool {
-    let node = &doc.nodes[id];
-    !matches!(node.tag.as_str(), "#comment" | "#doctype")
-        && !(node.tag == "#text" && node.text.trim_ascii().is_empty())
-        && info[id].flags & cull::OUT_OF_FLOW == 0
-}
-
-// Keep these margins equal to layout margins: culled spacers use them.
-fn margins(
-    build: &Build<'_>,
-    id: usize,
-    units: &css::value::units::Lengths,
-    width: f32,
-    flex_parent: bool,
-    slot: bool,
-) -> [f32; 4] {
-    let mut margin = units.edges(&build.styles.values[id], css::properties::MARGIN, width);
-    // The blocks of a spliced inline box are in the flow of its block.
-    let parent = std::iter::successors(build.doc.nodes[id].parent, |&up| {
-        crate::render::inline::spliced(build.doc, build.styles, up)
-            .then(|| build.doc.nodes[up].parent)
-            .flatten()
-    })
-    .find(|&up| !crate::render::inline::spliced(build.doc, build.styles, up));
-    let Some(parent) = parent.filter(|_| !flex_parent && !slot) else {
-        return margin;
-    };
-    let walked = build.walks.borrow().get(&parent).cloned();
-    let walked = walked.unwrap_or_else(|| {
-        let collapses = container(build, parent);
-        let open =
-            [0, 2].map(|side| collapses && margin_collapses_through(build, parent, side, width));
-        // Skip animated boxes. Clear walks when fonts or the viewport change: the key excludes them.
-        let key = (
-            build.info[parent].revision,
-            width.to_bits(),
-            open,
-            units.container.map(|size| size.map(f32::to_bits)),
-        );
-        let animated = build.info[parent].flags & cull::ANIMATED != 0;
-        if let Some((old, used)) = build.view.walked.borrow().get(&parent)
-            && *old == key
-            && !animated
-        {
-            build.walks.borrow_mut().insert(parent, used.clone());
-            return used.clone();
-        }
-        let mut used = rustc_hash::FxHashMap::default();
-        if collapses {
-            let children = flow(build, parent);
-            let value = |set: [f32; 2]| set[0] + set[1];
-            let mut pending = [0f32; 2];
-            let mut emitted = 0.;
-            let mut leading = open[0];
-            for &child in &children {
-                if !block(build, child) {
-                    // Like Chrome, margins collapse across inline content that makes no line.
-                    if !crate::render::inline::makes_no_line(build.doc, build.styles, child) {
-                        (leading, pending, emitted) = (false, [0.; 2], 0.);
-                    }
-                    continue;
-                }
-                let (top, bottom, empty) = adjoining(build, child, width, units.container);
-                let mut sides = [0f32; 2];
-                if leading {
-                    if empty {
-                        used.insert(child, sides);
-                        continue;
-                    }
-                    leading = false;
-                } else {
-                    pending = [pending[0].max(top[0]), pending[1].min(top[1])];
-                    sides[0] = value(pending) - emitted;
-                    emitted += sides[0];
-                }
-                if empty {
-                    pending = [pending[0].max(bottom[0]), pending[1].min(bottom[1])];
-                    sides[1] = value(pending) - emitted;
-                    emitted += sides[1];
-                } else {
-                    pending = bottom;
-                    sides[1] = value(bottom);
-                    emitted = sides[1];
-                }
-                used.insert(child, sides);
-            }
-            if open[1] {
-                let mut trailing = Vec::new();
-                for child in children.into_iter().rev() {
-                    if !block(build, child)
-                        && crate::render::inline::makes_no_line(build.doc, build.styles, child)
-                    {
-                        continue;
-                    }
-                    let sets = adjoining(build, child, width, units.container);
-                    let empty = block(build, child) && sets.2;
-                    let Some(sides) = used.get_mut(&child) else {
-                        break;
-                    };
-                    if empty {
-                        *sides = [0.; 2];
-                        trailing.push((child, sets));
-                        continue;
-                    }
-                    sides[1] = 0.;
-                    // Like Chrome, the empty boxes after the last box sit below the margins before them, and
-                    // their margins pass to the parent.
-                    let mut pending = sets.1;
-                    for (child, (top, bottom, _)) in trailing.into_iter().rev() {
-                        pending = [pending[0].max(top[0]), pending[1].min(top[1])];
-                        let at = value(pending);
-                        used.insert(child, [at, -at]);
-                        pending = [pending[0].max(bottom[0]), pending[1].min(bottom[1])];
-                    }
-                    break;
-                }
-            }
-        }
-        let used = Rc::new(used);
-        build.walks.borrow_mut().insert(parent, used.clone());
-        if !animated {
-            build
-                .view
-                .walked
-                .borrow_mut()
-                .insert(parent, (key, used.clone()));
-        }
-        used
-    });
-    if let Some(&[top, bottom]) = walked.get(&id) {
-        margin[0] = top;
-        margin[2] = bottom;
-    }
-    margin
-}
-
-/// The opacity of the inline boxes between `child` and its block `id`, which are parts of the text of the block.
-fn inline_fade(doc: &Document, styles: &style::ComputedStyles, child: usize, id: usize) -> f32 {
-    std::iter::successors(doc.nodes.get(child).and_then(|node| node.parent), |&up| {
-        doc.nodes[up].parent
-    })
-    .take_while(|&up| up != id)
-    .filter(|&up| {
-        !doc.nodes[up].tag.starts_with('#')
-            && styles.values[up].get(Prop::DISPLAY) != Some("contents")
-    })
-    .map(|up| super::effects::opacity(&styles.values[up]))
-    .product()
-}
-
-fn flow(build: &Build<'_>, id: usize) -> Vec<usize> {
-    let mut flow = Vec::new();
-    let mut pending: Vec<usize> = build.doc.nodes[id].children.iter().rev().copied().collect();
-    while let Some(child) = pending.pop() {
-        if child > usize::MAX / 2 {
-            flow.push(!child);
-        // A plain block is an element in the flow that doesn't float.
-        } else if build.info[child].flags & cull::PLAIN_BLOCK != 0 {
-            flow.push(child);
-        } else if crate::render::inline::spliced(build.doc, build.styles, child) {
-            // The edges of the box make lines, which keep margins apart.
-            let edges = [3, 1].map(|side| edge(build, child, side));
-            if edges[1] {
-                pending.push(!child);
-            }
-            pending.extend(build.doc.nodes[child].children.iter().rev());
-            if edges[0] {
-                flow.push(child);
-            }
-        // Preserved white space makes a line.
-        } else if (in_flow(build.doc, build.info, child)
-            || build.doc.nodes[child].tag == "#text"
-                && !crate::render::inline::makes_no_line(build.doc, build.styles, child))
-            && float_side(&build.styles.values[child]).is_none()
-        {
-            flow.push(child);
-        }
-    }
-    flow
-}
-
-fn block(build: &Build<'_>, id: usize) -> bool {
-    !build.doc.nodes[id].tag.starts_with('#')
-        && build.doc.nodes[id].tag != "br"
-        && build.styles.values[id]
-            .get(Prop::DISPLAY)
-            .is_some_and(|value| !value.starts_with("inline") && value != "contents")
-        || crate::render::inline::holds_block_box(build.doc, build.styles, id)
-            && !crate::render::inline::spliced(build.doc, build.styles, id)
-}
-
-fn container(build: &Build<'_>, id: usize) -> bool {
-    build.styles.values[id]
-        .get(Prop::DISPLAY)
-        .is_none_or(|value| {
-            !value.contains("flex") && !value.contains("grid") && value != "contents"
-        })
-}
-
-// The overflow of the body goes to the viewport when the html box has none, so the body itself doesn't clip.
-fn body_overflow_moves(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
-    doc.nodes[id].tag == "body"
-        && doc.nodes[id].parent.is_some_and(|parent| {
-            doc.nodes[parent].tag == "html"
-                && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
-                    .into_iter()
-                    .all(|prop| {
-                        styles.values[parent]
-                            .get(prop)
-                            .is_none_or(|value| value == "visible")
-                    })
-        })
-}
-
-// `side` 3 is the bottom edge of a box that margins collapse through, which can also have a zero height.
-fn margin_collapses_through(build: &Build<'_>, id: usize, side: usize, width: f32) -> bool {
-    let (doc, styles) = (build.doc, build.styles);
-    let style = &styles.values[id];
-    let edge = |prop: Prop| {
-        style
-            .get(prop)
-            .and_then(|value| styles.lengths[id].resolve(value, width))
-            .unwrap_or(0.)
-    };
-    let [padding, border, kind] = if side == 0 {
-        [
-            Prop::PADDING_TOP,
-            Prop::BORDER_TOP_WIDTH,
-            Prop::BORDER_TOP_STYLE,
-        ]
-    } else {
-        [
-            Prop::PADDING_BOTTOM,
-            Prop::BORDER_BOTTOM_WIDTH,
-            Prop::BORDER_BOTTOM_STYLE,
-        ]
-    };
-    id != 0
-        && !matches!(
-            doc.nodes[id].tag.as_str(),
-            "html"
-                | "img"
-                | "svg"
-                | "canvas"
-                | "video"
-                | "audio"
-                | "iframe"
-                | "embed"
-                | "input"
-                | "button"
-                | "select"
-                | "textarea"
-                | "progress"
-                | "meter"
-                | "fieldset"
-        )
-        && doc.nodes[id]
-            .parent
-            .is_none_or(|parent| container(build, parent))
-        && style
-            .get(Prop::DISPLAY)
-            .is_some_and(|value| matches!(value, "block" | "list-item"))
-        && float_side(style).is_none()
-        // A pseudo-element in the flow, like a clearfix, holds the margin of its side.
-        && styles.pseudos.get(&id).is_none_or(|pseudos| {
-            let pseudo = &pseudos[side / 2];
-            pseudo
-                .get(Prop::CONTENT)
-                .is_none_or(|value| matches!(value, "none" | "normal"))
-                || pseudo.get(Prop::DISPLAY) == Some("none")
-                || pseudo
-                    .get(Prop::POSITION)
-                    .is_some_and(|value| matches!(value, "absolute" | "fixed"))
-        })
-        && (body_overflow_moves(doc, styles, id)
-            || [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
-                .into_iter()
-                .all(|key| style.get(key).is_none_or(|value| value == "visible")))
-        // A multi-column box and a `content-visibility` box hold the margins of their content.
-        && style
-            .get(Prop::CONTENT_VISIBILITY)
-            .is_none_or(|value| value == "visible")
-        && [Prop::COLUMN_COUNT, Prop::COLUMN_WIDTH]
-            .into_iter()
-            .all(|key| style.get(key).is_none_or(|value| value == "auto"))
-        // So does a box with `align-content` or a size container, which make a formatting context of their own.
-        && style
-            .get(Prop::ALIGN_CONTENT)
-            .is_none_or(|value| value == "normal")
-        && style
-            .get(Prop::CONTAINER_TYPE)
-            .is_none_or(|value| value == "normal")
-        && style
-            .get(Prop::POSITION)
-            .is_none_or(|value| !matches!(value, "absolute" | "fixed"))
-        && edge(padding) == 0.
-        && (edge(border) == 0.
-            || style
-                .get(kind)
-                .is_none_or(|value| matches!(value, "none" | "hidden")))
-        && (side == 0
-            || (side == 3 || style.get(Prop::HEIGHT).is_none_or(|value| value == "auto"))
-                && style
-                    .get(Prop::MIN_HEIGHT)
-                    .is_none_or(|value| value == "auto" || edge(Prop::MIN_HEIGHT) == 0.))
-}
-
-// Whether the block around the line of a box has a definite height, which its percent heights resolve against.
-fn definite_line(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
-    let block =
-        std::iter::successors(doc.nodes[id].parent, |&node| doc.nodes[node].parent).find(|&node| {
-            styles.values[node]
-                .get(Prop::DISPLAY)
-                .is_some_and(|value| !matches!(value, "inline" | "contents"))
-        });
-    definite_height(doc, styles, block)
-}
-
-fn definite_height(doc: &Document, styles: &ComputedStyles, id: Option<usize>) -> bool {
-    let Some(id) = id else { return true };
-    let (style, parent) = (&styles.values[id], doc.nodes[id].parent);
-    let parent_style = |prop| parent.and_then(|parent| styles.values[parent].get(prop));
-    let set = |prop| style.get(prop).is_some_and(|value| value != "auto");
-    let stretched = || {
-        style
-            .get(Prop::ALIGN_SELF)
-            .filter(|value| *value != "auto")
-            .or_else(|| parent_style(Prop::ALIGN_ITEMS))
-            .is_none_or(|value| matches!(value, "normal" | "stretch"))
-    };
-    match style.get(Prop::HEIGHT) {
-        // The root element takes percentages from the viewport.
-        Some(height) if height.contains('%') => {
-            parent.is_none_or(|parent| parent == 0) || definite_height(doc, styles, parent)
-        }
-        Some(height) if height != "auto" => styles.lengths[id].resolve(height, 0.).is_some(),
-        _ if style
-            .get(Prop::POSITION)
-            .is_some_and(|value| matches!(value, "absolute" | "fixed")) =>
-        {
-            set(Prop::TOP) && set(Prop::BOTTOM)
-        }
-        // A cell takes the height of its table.
-        _ if style.get(Prop::DISPLAY) == Some("table-cell") => definite_height(
-            doc,
-            styles,
-            std::iter::successors(parent, |&node| doc.nodes[node].parent)
-                .find(|&node| styles.values[node].get(Prop::DISPLAY) == Some("table")),
-        ),
-        // Stretched grid items, and stretched items of a flex row or growing items of a flex column of a definite
-        // height.
-        _ => match parent_style(Prop::DISPLAY) {
-            Some("grid" | "inline-grid") => stretched(),
-            Some("flex" | "inline-flex")
-                if parent_style(Prop::FLEX_DIRECTION)
-                    .is_none_or(|value| value.starts_with("row")) =>
-            {
-                stretched() && definite_height(doc, styles, parent)
-            }
-            Some("flex" | "inline-flex") => {
-                style
-                    .get(Prop::FLEX_GROW)
-                    .and_then(|value| value.parse::<f32>().ok())
-                    .is_some_and(|grow| grow > 0.)
-                    && definite_height(doc, styles, parent)
-            }
-            _ => false,
-        },
-    }
-}
-
-// Whether a box around this one shrinks to its content before a box of a fixed width does.
-fn shrinks_around(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
-    std::iter::successors(doc.nodes[id].parent, |&node| doc.nodes[node].parent)
-        .take_while(|&node| node != 0)
-        .find_map(|node| {
-            let style = &styles.values[node];
-            let width = style.get(Prop::WIDTH).unwrap_or("auto");
-            if styles.lengths[node].resolve(width, 0.).is_some() {
-                return Some(false);
-            }
-            (float_side(style).is_some()
-                || style
-                    .get(Prop::DISPLAY)
-                    .is_some_and(|value| value.starts_with("inline-"))
-                || style
-                    .get(Prop::POSITION)
-                    .is_some_and(|value| matches!(value, "absolute" | "fixed"))
-                || matches!(width, "max-content" | "min-content" | "fit-content"))
-            .then_some(true)
-        })
-        .unwrap_or(false)
-}
-
-fn percent_calc(units: &css::value::units::Lengths, value: &str) -> Option<(f32, f32)> {
-    // Bounds can look linear at the samples, so `percent_bound` takes them.
-    if !value.starts_with("calc(")
-        || !value.contains('%')
-        || ["min(", "max(", "clamp("]
-            .iter()
-            .any(|name| value.contains(name))
-    {
-        return None;
-    }
-    let low = units.resolve(value, 1000.)?;
-    let high = units.resolve(value, 2000.)?;
-    let check = units.resolve(value, 3000.)?;
-    ((check - high - (high - low)).abs() < 0.01).then(|| {
-        let fraction = (high - low) / 1000.;
-        (fraction, low - fraction * 1000.)
-    })
-}
-
-// `min()`, `max()` and `clamp()` with percentages resolve at layout, against the real basis. The bound goes into
-// `style`, which can hold 256.
-fn percent_bound(
-    units: &css::value::units::Lengths,
-    value: &str,
-    extra: f32,
-    style: &mut renderer::Style,
-) -> Option<renderer::Length> {
-    use renderer::Bound;
-    enum Value {
-        Number(f32),
-        Length(Bound),
-    }
-    // Sums and products spread over the terms of a bound: min(a, b) + c is min(a + c, b + c).
-    fn add(a: Bound, b: Bound) -> Bound {
-        match (a, b) {
-            (Bound::Term(s1, o1), Bound::Term(s2, o2)) => Bound::Term(s1 + s2, o1 + o2),
-            (Bound::Min(all), other) | (other, Bound::Min(all)) => {
-                Bound::Min(all.into_iter().map(|a| add(a, other.clone())).collect())
-            }
-            (Bound::Max(all), other) | (other, Bound::Max(all)) => {
-                Bound::Max(all.into_iter().map(|a| add(a, other.clone())).collect())
-            }
-        }
-    }
-    fn scale(bound: Bound, by: f32) -> Bound {
-        let all = |all: Vec<Bound>| all.into_iter().map(|a| scale(a, by)).collect();
-        match bound {
-            Bound::Term(share, offset) => Bound::Term(share * by, offset * by),
-            Bound::Min(list) if by >= 0. => Bound::Min(all(list)),
-            Bound::Min(list) => Bound::Max(all(list)),
-            Bound::Max(list) if by >= 0. => Bound::Max(all(list)),
-            Bound::Max(list) => Bound::Min(all(list)),
-        }
-    }
-    struct Parser<'a> {
-        text: &'a str,
-        at: usize,
-        units: &'a css::value::units::Lengths,
-    }
-    impl Parser<'_> {
-        fn peek(&mut self) -> Option<u8> {
-            let rest = &self.text[self.at..];
-            self.at += rest.len() - rest.trim_start().len();
-            self.text.as_bytes().get(self.at).copied()
-        }
-        fn eat(&mut self, byte: u8) -> Option<()> {
-            (self.peek()? == byte).then(|| self.at += 1)
-        }
-        fn sum(&mut self) -> Option<Value> {
-            let mut value = self.product()?;
-            loop {
-                // A sign between terms has spaces around it.
-                let sign = match self.peek() {
-                    Some(b'+') => 1.,
-                    Some(b'-') => -1.,
-                    _ => return Some(value),
-                };
-                if !self.text.as_bytes()[self.at - 1].is_ascii_whitespace() {
-                    return Some(value);
-                }
-                self.at += 1;
-                value = match (value, self.product()?) {
-                    (Value::Number(a), Value::Number(b)) => Value::Number(a + sign * b),
-                    (Value::Length(a), Value::Length(b)) => Value::Length(add(a, scale(b, sign))),
-                    _ => return None,
-                };
-            }
-        }
-        fn product(&mut self) -> Option<Value> {
-            let mut value = self.factor()?;
-            loop {
-                let divide = match self.peek() {
-                    Some(b'*') => false,
-                    Some(b'/') => true,
-                    _ => return Some(value),
-                };
-                self.at += 1;
-                value = match (value, self.factor()?, divide) {
-                    (Value::Number(a), Value::Number(b), false) => Value::Number(a * b),
-                    (Value::Number(a), Value::Number(b), true) => Value::Number(a / b),
-                    (Value::Length(a), Value::Number(b), false)
-                    | (Value::Number(b), Value::Length(a), false) => Value::Length(scale(a, b)),
-                    (Value::Length(a), Value::Number(b), true) if b != 0. => {
-                        Value::Length(scale(a, 1. / b))
-                    }
-                    _ => return None,
-                };
-            }
-        }
-        fn factor(&mut self) -> Option<Value> {
-            if self.eat(b'(').is_some() {
-                let value = self.sum()?;
-                return self.eat(b')').map(|_| value);
-            }
-            let rest = &self.text[self.at..];
-            let end = rest
-                .find(|c: char| c.is_ascii_whitespace() || matches!(c, ',' | '(' | ')' | '*' | '/'))
-                .unwrap_or(rest.len());
-            let token = &rest[..end];
-            self.at += end;
-            if self.text.as_bytes().get(self.at) != Some(&b'(') {
-                if let Ok(number) = token.parse::<f32>() {
-                    return Some(Value::Number(number));
-                }
-                // A plain length or percentage, which is linear in its basis.
-                let [low, high] = [1000., 2000.].map(|basis| self.units.resolve(token, basis));
-                let (low, high) = (low?, high?);
-                let share = (high - low) / 1000.;
-                return Some(Value::Length(Bound::Term(share, low - share * 1000.)));
-            }
-            self.at += 1;
-            let mut args = vec![self.sum()?];
-            while self.eat(b',').is_some() {
-                args.push(self.sum()?);
-            }
-            self.eat(b')')?;
-            if token == "calc" && args.len() == 1 {
-                return args.pop();
-            }
-            let mut args = args
-                .into_iter()
-                .map(|arg| match arg {
-                    Value::Length(bound) => Some(bound),
-                    Value::Number(_) => None,
-                })
-                .collect::<Option<Vec<_>>>()?;
-            Some(Value::Length(match token {
-                "min" => Bound::Min(args),
-                "max" => Bound::Max(args),
-                "clamp" if args.len() == 3 => {
-                    let high = args.pop()?;
-                    let value = args.pop()?;
-                    args.push(Bound::Min(vec![value, high]));
-                    Bound::Max(args)
-                }
-                _ => return None,
-            }))
-        }
-    }
-    if !value.contains('%') || !value.starts_with(['m', 'c']) {
-        return None;
-    }
-    let index = u8::try_from(style.bounds.len()).ok()?;
-    let mut parser = Parser {
-        text: value,
-        at: 0,
-        units,
-    };
-    let Value::Length(bound) = parser.sum()? else {
-        return None;
-    };
-    if parser.peek().is_some() {
-        return None;
-    }
-    style.bounds.push(add(bound, Bound::Term(0., extra)));
-    Some(renderer::Length::Bound(index))
-}
-
-// `around` is the size of the container around the box, for container units.
-fn adjoining(build: &Build<'_>, id: usize, width: f32, around: Option<[f32; 2]>) -> Sets {
-    if let Some(&sets) = build.adjoins.borrow().get(&id) {
-        return sets;
-    }
-    let key = (
-        build.info[id].revision,
-        width.to_bits(),
-        around.map(|size| size.map(f32::to_bits)),
-    );
-    let animated = build.info[id].flags & cull::ANIMATED != 0;
-    if !animated
-        && let Some(&(old, sets)) = build.view.adjoined.borrow().get(&id)
-        && old == key
-    {
-        build.adjoins.borrow_mut().insert(id, sets);
-        return sets;
-    }
-    let (style, mut units) = (&build.styles.values[id], build.styles.lengths[id]);
-    units.container = around.or(units.container);
-    let own = |prop: Prop| {
-        let value = style
-            .get(prop)
-            .and_then(|value| units.resolve(value, width))
-            .unwrap_or(0.);
-        [value.max(0.), value.min(0.)]
-    };
-    let (mut top, mut bottom) = (own(Prop::MARGIN_TOP), own(Prop::MARGIN_BOTTOM));
-    // This recurses into first and last children, so margins stop collapsing past the stack budget.
-    let marker = 0u8;
-    let deep = (&raw const marker as usize) < STACK_LIMIT.with(|limit| *limit);
-    let blocks = container(build, id) && !deep;
-    let [first, last] =
-        [0, 2].map(|side| margin_collapses_through(build, id, side, width) && blocks);
-    let children = if first || last {
-        flow(build, id)
-    } else {
-        Vec::new()
-    };
-    for (open, set, order) in [(first, &mut top, false), (last, &mut bottom, true)] {
-        if !open {
-            continue;
-        }
-        for index in 0..children.len() {
-            let child = children[if order {
-                children.len() - 1 - index
-            } else {
-                index
-            }];
-            if !block(build, child) {
-                if crate::render::inline::makes_no_line(build.doc, build.styles, child) {
-                    continue;
-                }
-                break;
-            }
-            let (child_top, child_bottom, empty) = adjoining(build, child, width, around);
-            for adjoining in if order {
-                [child_bottom, child_top]
-            } else {
-                [child_top, child_bottom]
-            }
-            .into_iter()
-            .take(if empty { 2 } else { 1 })
-            {
-                *set = [set[0].max(adjoining[0]), set[1].min(adjoining[1])];
-            }
-            if !empty {
-                break;
-            }
-        }
-    }
-    let empty = first
-        && (last || blocks && margin_collapses_through(build, id, 3, width))
-        && style
-            .get(Prop::HEIGHT)
-            .is_none_or(|value| value == "auto" || units.resolve(value, width) == Some(0.))
-        && children.iter().all(|&child| {
-            if block(build, child) {
-                adjoining(build, child, width, around).2
-            } else {
-                crate::render::inline::makes_no_line(build.doc, build.styles, child)
-            }
-        });
-    // An empty box keeps its own top set, which places it, and its bottom set holds all its margins.
-    if empty {
-        bottom = [top[0].max(bottom[0]), top[1].min(bottom[1])];
-    }
-    build.adjoins.borrow_mut().insert(id, (top, bottom, empty));
-    if !animated && !deep {
-        build
-            .view
-            .adjoined
-            .borrow_mut()
-            .insert(id, (key, (top, bottom, empty)));
-    }
-    (top, bottom, empty)
-}
-
-pub(super) fn overscroll(style: &css::properties::Style) -> renderer::Point<renderer::Overscroll> {
-    let axis = |prop| match style.get(prop) {
-        Some("contain") => renderer::Overscroll::Contain,
-        Some("none") => renderer::Overscroll::None,
-        _ => renderer::Overscroll::Auto,
-    };
-    point(
-        axis(Prop::OVERSCROLL_BEHAVIOR_X),
-        axis(Prop::OVERSCROLL_BEHAVIOR_Y),
-    )
-}
-
-fn clear_bits(style: &css::properties::Style) -> u8 {
-    let rtl = style.get(Prop::DIRECTION) == Some("rtl");
-    match style.get(Prop::CLEAR) {
-        Some("left") => renderer::Flow::CLEAR_LEFT,
-        Some("right") => renderer::Flow::CLEAR_RIGHT,
-        Some("both") => renderer::Flow::CLEAR_LEFT | renderer::Flow::CLEAR_RIGHT,
-        Some("inline-start") if rtl => renderer::Flow::CLEAR_RIGHT,
-        Some("inline-start") => renderer::Flow::CLEAR_LEFT,
-        Some("inline-end") if rtl => renderer::Flow::CLEAR_LEFT,
-        Some("inline-end") => renderer::Flow::CLEAR_RIGHT,
-        _ => 0,
-    }
-}
-
-fn float_side(style: &css::properties::Style) -> Option<bool> {
-    let rtl = style.get(Prop::DIRECTION) == Some("rtl");
-    match style.get(Prop::FLOAT) {
-        Some("left") => Some(false),
-        Some("right") => Some(true),
-        Some("inline-start") => Some(rtl),
-        Some("inline-end") => Some(!rtl),
-        _ => None,
-    }
-}
-
-type ColumnRule = (f32, renderer::Color, renderer::BorderStyle);
-
-fn columns(
-    style: &css::properties::Style,
-    units: &css::value::units::Lengths,
-    width: f32,
-) -> Option<(usize, f32, Option<ColumnRule>)> {
-    let count = style
-        .get(Prop::COLUMN_COUNT)
-        .and_then(|value| value.parse::<usize>().ok());
-    let column_width = style
-        .get(Prop::COLUMN_WIDTH)
-        .and_then(|value| units.resolve(value, width));
-    if count.is_none() && column_width.is_none() {
-        return None;
-    }
-    let gap = style
-        .get(Prop::COLUMN_GAP)
-        .filter(|value| *value != "normal")
-        .and_then(|value| units.resolve(value, width))
-        .unwrap_or(units.font.em)
-        .max(0.);
-    let fit = column_width
-        .filter(|value| *value > 0.)
-        .map(|value| (((width + gap) / (value + gap)).floor() as usize).max(1));
-    let count = match (count, fit) {
-        (Some(count), Some(fit)) => count.min(fit),
-        (count, fit) => count.or(fit)?,
-    }
-    .clamp(1, 64);
-    if count < 2 {
-        return None;
-    }
-    let (rule_width, rule_style, rule_color) = (
-        style.get(Prop::COLUMN_RULE_WIDTH),
-        style.get(Prop::COLUMN_RULE_STYLE),
-        style.get(Prop::COLUMN_RULE_COLOR),
-    );
-    let rule = rule_style
-        .filter(|kind| !matches!(*kind, "none" | "hidden"))
-        .map(|kind| {
-            let width = rule_width
-                .map_or(Some(3.), |value| units.resolve(value, width))
-                .unwrap_or(0.);
-            let color = rule_color
-                .or_else(|| style.get(Prop::COLOR))
-                .and_then(css::value::color::paint)
-                .unwrap_or(renderer::Color::BLACK);
-            (width, color, super::effects::border_style(kind))
-        })
-        .filter(|(width, ..)| *width > 0.);
-    Some((count, gap, rule))
-}
-
-// A set of columns: its first child holds the flow of content, as wide as one column, which the renderer breaks.
-fn column_set(
-    style: &css::properties::Style,
-    content: [f32; 2],
-    count: usize,
-    gap: f32,
-    rule: Option<ColumnRule>,
-    alone: bool,
-    items: impl IntoIterator<Item = impl Into<Child>>,
-) -> renderer::Node {
-    // A height or max-height limits the columns, which then overflow to the right.
-    let fixed = style.get(Prop::HEIGHT).is_some_and(|value| value != "auto");
-    let limited = fixed
-        || style
-            .get(Prop::MAX_HEIGHT)
-            .is_some_and(|value| value != "none");
-    let mut set = renderer::node().flex().flex_col().w_full().flex_shrink_0();
-    set.style().columns = Some(Box::new(renderer::Columns {
-        count: count as u16,
-        gap: px(gap),
-        height: (limited && alone).then_some(px(content[1])),
-        fill: fixed && style.get(Prop::COLUMN_FILL) == Some("auto"),
-    }));
-    let share = renderer::Length::Calc(
-        1. / count as f32,
-        px(-gap * (count - 1) as f32 / count as f32),
-    );
-    set = set.child(renderer::node().flex().flex_col().w(share).children(items));
-    match rule {
-        Some((width, color, kind)) => set.child(column_rules(count, gap, width, color, kind)),
-        None => set,
-    }
-}
-
-fn column_rules(
-    count: usize,
-    gap: f32,
-    width: f32,
-    color: renderer::Color,
-    kind: renderer::BorderStyle,
-) -> Child {
-    renderer::canvas(
-        |_, _| (),
-        move |bounds, _, window| {
-            let column = (f32::from(bounds.size.width) - gap * (count - 1) as f32) / count as f32;
-            for index in 1..count {
-                let x = bounds.left() + px(index as f32 * (column + gap) - gap / 2. - width / 2.);
-                window.draw_box(
-                    Rect::new(point(x, bounds.top()), size(px(width), bounds.size.height)),
-                    renderer::Corners::default(),
-                    renderer::Color::TRANSPARENT,
-                    renderer::Border {
-                        widths: renderer::Edges {
-                            left: px(width),
-                            ..Default::default()
-                        },
-                        color,
-                        style: kind,
-                        sides: 0,
-                    },
-                );
-            }
-        },
-    )
-    .absolute()
-    .top_0()
-    .left_0()
-    .size_full()
-    .into()
-}
-
-fn fieldset_border(
-    legend: usize,
-    height: f32,
-    middle: f32,
-    widths: [f32; 4],
-    colors: [renderer::Color; 4],
-    kinds: [&str; 4],
-    view: Rc<super::ViewState>,
-) -> Child {
-    let kinds = kinds.map(str::to_owned);
-    renderer::canvas(
-        |_, _| (),
-        move |bounds, _, window| {
-            // The legend can move without a new box here.
-            window.paint_volatile();
-            let gap = view
-                .host
-                .borrow()
-                .page_state(view.id)
-                .and_then(|dom| dom.geometry.mirror.get(&legend).copied())
-                .map(|[x, _, width, _]| [px(x), px(x + width)]);
-            let top = bounds.top() + px(middle - widths[0] / 2.);
-            let [left, right, bottom] = [bounds.left(), bounds.right(), bounds.bottom()];
-            let sides = [
-                Rect::between(point(left, top), point(right, top + px(widths[0]))),
-                Rect::between(point(right - px(widths[1]), top), point(right, bottom)),
-                Rect::between(point(left, bottom - px(widths[2])), point(right, bottom)),
-                Rect::between(point(left, top), point(left + px(widths[3]), bottom)),
-            ];
-            for (side, rect) in sides.into_iter().enumerate() {
-                if widths[side] <= 0. {
-                    continue;
-                }
-                let raised = side == 0 || side == 3;
-                let (outer, inner) = match kinds[side].as_str() {
-                    "groove" => (
-                        shade_border(colors[side], raised),
-                        shade_border(colors[side], !raised),
-                    ),
-                    "ridge" => (
-                        shade_border(colors[side], !raised),
-                        shade_border(colors[side], raised),
-                    ),
-                    "inset" => (
-                        shade_border(colors[side], raised),
-                        shade_border(colors[side], raised),
-                    ),
-                    "outset" => (
-                        shade_border(colors[side], !raised),
-                        shade_border(colors[side], !raised),
-                    ),
-                    _ => (colors[side], colors[side]),
-                };
-                let half = px(widths[side] / 2.);
-                let halves = match side {
-                    0 => [
-                        (rect.top(), rect.top() + half),
-                        (rect.top() + half, rect.bottom()),
-                    ],
-                    2 => [
-                        (rect.bottom() - half, rect.bottom()),
-                        (rect.top(), rect.bottom() - half),
-                    ],
-                    1 => [
-                        (rect.right() - half, rect.right()),
-                        (rect.left(), rect.right() - half),
-                    ],
-                    _ => [
-                        (rect.left(), rect.left() + half),
-                        (rect.left() + half, rect.right()),
-                    ],
-                };
-                for ((start, end), color) in halves.into_iter().zip([outer, inner]) {
-                    let part = if side % 2 == 0 {
-                        Rect::between(point(rect.left(), start), point(rect.right(), end))
-                    } else {
-                        Rect::between(point(start, rect.top()), point(end, rect.bottom()))
-                    };
-                    let pieces = match gap.filter(|_| side == 0) {
-                        Some([from, to]) => vec![
-                            Rect::between(part.origin, point(from.max(part.left()), part.bottom())),
-                            Rect::between(
-                                point(to.min(part.right()), part.top()),
-                                part.bottom_right(),
-                            ),
-                        ],
-                        None => vec![part],
-                    };
-                    for piece in pieces.into_iter().filter(|piece| piece.size.width > px(0.)) {
-                        window.draw_rect(piece, color);
-                    }
-                }
-            }
-        },
-    )
-    .absolute()
-    .top(px(-height))
-    .left(px(-widths[3]))
-    .right(px(-widths[1]))
-    .bottom(px(-widths[2]))
-    .into()
-}
-
-fn shade_border(color: renderer::Color, dark: bool) -> renderer::Color {
-    let value = color.r.max(color.g).max(color.b);
-    if value <= 0. {
-        let gray = if dark { 0.33 } else { 0.66 };
-        return renderer::Color {
-            r: gray,
-            g: gray,
-            b: gray,
-            a: color.a,
-        };
-    }
-    let end = if dark { 0. } else { 1. };
-    let distance = (color.r - end).powi(2) + (color.g - end).powi(2) + (color.b - end).powi(2);
-    if distance <= 3. * (if dark { 32. } else { 20. } / 255.0f32).powi(2) {
-        return color;
-    }
-    let factor = if dark {
-        ((value - 0.33) / value).max(0.)
-    } else {
-        (value + 0.33).min(1.) / value
-    };
-    renderer::Color {
-        r: (color.r * factor).min(1.),
-        g: (color.g * factor).min(1.),
-        b: (color.b * factor).min(1.),
-        a: color.a,
-    }
-}
-
-fn border_canvas(
-    bands: Vec<([f32; 4], [f32; 4], [renderer::Color; 4])>,
-    borders: [f32; 4],
-    radius: renderer::Radii<renderer::Length>,
-    kinds: [renderer::BorderStyle; 4],
-    pseudo: bool,
-) -> renderer::Node {
-    renderer::canvas(
-        |_, _| (),
-        move |bounds, _, window| {
-            let outer = Rect::new(
-                point(
-                    bounds.left() - px(borders[3]),
-                    bounds.top() - px(borders[0]),
-                ),
-                size(
-                    bounds.size.width + px(borders[1] + borders[3]),
-                    bounds.size.height + px(borders[0] + borders[2]),
-                ),
-            );
-            for (inset, widths, colors) in &bands {
-                // Pseudo-element borders paint on `outer`, box borders on the rect between the insets: the two
-                // differ by an ulp at fractional positions.
-                let bounds = if pseudo {
-                    outer
-                } else {
-                    Rect::between(
-                        outer.origin + point(px(inset[3]), px(inset[0])),
-                        outer.bottom_right() - point(px(inset[1]), px(inset[2])),
-                    )
-                };
-                let corners = radius
-                    .resolve(outer.size)
-                    .inset(px(inset[0]), px(inset[1]), px(inset[2]), px(inset[3]))
-                    .fit(bounds.size);
-                // Sides that look the same draw at once, so their joins have no seams.
-                let same = |a: usize, b: usize| {
-                    (colors[a], kinds[a]) == (colors[b], kinds[b]) && widths[b] > 0.
-                };
-                for side in 0..4 {
-                    if widths[side] <= 0. || (0..side).any(|before| same(side, before)) {
-                        continue;
-                    }
-                    let sides = (side..4)
-                        .filter(|&other| same(side, other))
-                        .fold(0, |sides, other| sides | 1 << other);
-                    window.draw_box(
-                        bounds,
-                        corners,
-                        renderer::Color::TRANSPARENT,
-                        renderer::Border {
-                            widths: renderer::Edges {
-                                top: px(widths[0]),
-                                right: px(widths[1]),
-                                bottom: px(widths[2]),
-                                left: px(widths[3]),
-                            },
-                            color: colors[side],
-                            style: kinds[side],
-                            sides: if sides == 15 { 0 } else { sides },
-                        },
-                    );
-                }
-            }
-        },
-    )
-    .absolute()
-    .top_0()
-    .left_0()
-    .size_full()
-}
-
-fn inset_shadows(
-    shadows: Vec<renderer::BoxShadow>,
-    radius: renderer::Radii<renderer::Length>,
-    borders: [f32; 4],
-) -> Child {
-    let mut node = renderer::canvas_within(
-        |_, _| (),
-        move |bounds, _, window| {
-            let outer = size(
-                bounds.size.width + px(borders[1] + borders[3]),
-                bounds.size.height + px(borders[0] + borders[2]),
-            );
-            let radii = radius.resolve(outer).inset(
-                px(borders[0]),
-                px(borders[1]),
-                px(borders[2]),
-                px(borders[3]),
-            );
-            window.draw_shadows(bounds, radii, &shadows, true)
-        },
-    )
-    .absolute()
-    .top_0()
-    .left_0()
-    .size_full();
-    // Like the background, the shadow doesn't scroll with the content or add to its scroll range.
-    node.style().escape = renderer::Escape::OUTLINE;
-    node.into()
-}
-
-/// `padding` places the drawing in the content box, as the layer is absolute in the padding box.
-fn svg_layer(
-    id: usize,
-    inline: bool,
-    spill: bool,
-    view: Rc<super::ViewState>,
-    padding: [f32; 4],
-) -> Child {
-    let geometry = view.clone();
-    renderer::canvas(
-        move |bounds, window| {
-            let [width, height] = [f32::from(bounds.size.width), f32::from(bounds.size.height)];
-            if !inline || width <= 0. || height <= 0. {
-                return;
-            }
-            let mut host = geometry.host.borrow_mut();
-            let state = host.state(geometry.id);
-            if let Some(source) = state.media.svg_sources.get(&id)
-                && let Some(entry) = state.rasters.svg_boxes.get_mut(&id)
-            {
-                if entry.0 != *source {
-                    // Drop stale svg_trees entries here: repeated draws can skip paint and leave old sources
-                    // cached.
-                    state.rasters.svg_trees.remove(&id);
-                    let (size, content, boxes, painted) = match state.rasters.svg_cache.get(source)
-                    {
-                        Some((geometry, _)) => geometry.clone(),
-                        None => {
-                            let tree = super::raster::svg::svg_tree(source, false).ok();
-                            let geometry = tree
-                                .as_ref()
-                                .map(super::raster::svg::svg_boxes)
-                                .unwrap_or_default();
-                            if let Some(tree) = tree {
-                                state.rasters.svg_trees.insert(id, tree);
-                                // Bound the cache here: this is the only place that adds sources.
-                                if state.rasters.svg_cache.len() >= 256 {
-                                    for image in state
-                                        .rasters
-                                        .svg_cache
-                                        .drain()
-                                        .flat_map(|(_, entry)| entry.1)
-                                    {
-                                        if Arc::strong_count(&image) == 1 {
-                                            window.release_image(image);
-                                        }
-                                    }
-                                }
-                                state
-                                    .rasters
-                                    .svg_cache
-                                    .insert(source.clone(), (geometry.clone(), Vec::new()));
-                            }
-                            geometry
-                        }
-                    };
-                    let names = &entry.1;
-                    entry.2 = size;
-                    entry.4 = content;
-                    entry.5 = painted;
-                    entry.3 = boxes
-                        .into_iter()
-                        .filter_map(|(name, canvas, object)| {
-                            let node = match name.strip_prefix("apps-") {
-                                Some(mark) => names.get(mark.parse::<usize>().ok()?)?.1,
-                                None => names.iter().find(|(other, _)| *other == name)?.1,
-                            };
-                            Some((node, canvas, object))
-                        })
-                        .collect();
-                    entry.0 = source.clone();
-                }
-                let [scale_x, scale_y] =
-                    [0, 1].map(|axis| [width, height][axis] / entry.2[axis].max(f32::EPSILON));
-                let [x, y, w, h] = entry.5;
-                let reach = (-x * scale_x)
-                    .max(-y * scale_y)
-                    .max((x + w) * scale_x - width)
-                    .max((y + h) * scale_y - height);
-                // Like the cull margin of a box shadow.
-                let far = spill && reach >= f32::from(window.viewport_size().height);
-                if far != state.layout.cull.spills.contains(&id) {
-                    match far {
-                        true => state.layout.cull.spills.insert(id),
-                        false => state.layout.cull.spills.remove(&id),
-                    };
-                    state.layout.cull.swapped.push(id);
-                    state.layout.cull.respilled.push(id);
-                    window.redraw();
-                }
-                for &(node, [x, y, w, h], _) in &entry.3 {
-                    let rect = window.transformed_bounds(Rect::new(
-                        point(
-                            bounds.left() + px(x * scale_x),
-                            bounds.top() + px(y * scale_y),
-                        ),
-                        size(px(w * scale_x), px(h * scale_y)),
-                    ));
-                    state.geometry.mirror.insert(
-                        node,
-                        [
-                            rect.origin.x.into(),
-                            rect.origin.y.into(),
-                            rect.size.width.into(),
-                            rect.size.height.into(),
-                        ],
-                    );
-                }
-            }
-        },
-        move |bounds, _, window| {
-            let [width, height] = [f32::from(bounds.size.width), f32::from(bounds.size.height)];
-            if width <= 0. || height <= 0. {
-                return;
-            }
-            let scale = window.scale_factor();
-            let view = &*view;
-            let mut host = view.host.borrow_mut();
-            let state = host.state(view.id);
-            // The painted area in the box, in CSS pixels on device pixel edges. A long spill paints only near
-            // the content mask, in steps, so it keeps the device scale.
-            let mask = window.content_mask().bounds;
-            let mut cut = false;
-            let area = match state.rasters.svg_boxes.get(&id).filter(|_| spill) {
-                Some((_, _, [sw, sh], _, _, [x, y, w, h], _)) => {
-                    let [kx, ky] = [width / sw.max(f32::EPSILON), height / sh.max(f32::EPSILON)];
-                    let mut edges = [
-                        (x * kx).min(0.),
-                        (y * ky).min(0.),
-                        ((x + w) * kx).max(width),
-                        ((y + h) * ky).max(height),
-                    ];
-                    if mask.size.width < px(1e5) {
-                        const STEP: f32 = 256.;
-                        let [left, top] = [mask.left() - bounds.left(), mask.top() - bounds.top()]
-                            .map(|at| ((f32::from(at) - STEP) / STEP).floor() * STEP);
-                        let [right, bottom] =
-                            [mask.right() - bounds.left(), mask.bottom() - bounds.top()]
-                                .map(|at| ((f32::from(at) + STEP) / STEP).ceil() * STEP);
-                        let near = [
-                            edges[0].max(left),
-                            edges[1].max(top),
-                            edges[2].min(right),
-                            edges[3].min(bottom),
-                        ];
-                        cut = near != edges;
-                        edges = near;
-                    }
-                    let [left, top] = [edges[0], edges[1]].map(|at| (at * scale).floor() / scale);
-                    let [right, bottom] =
-                        [edges[2], edges[3]].map(|at| (at * scale).ceil() / scale);
-                    [left, top, right - left, bottom - top]
-                }
-                _ => [0., 0., width, height],
-            };
-            if cut {
-                window.paint_volatile();
-            }
-            if area[2] <= 0. || area[3] <= 0. {
-                return;
-            }
-            let moved = area != [0., 0., width, height];
-            let raster =
-                [area[2], area[3]].map(|extent| (extent * scale).ceil().clamp(1., 4096.) as u32);
-            let source = if inline {
-                state.media.svg_sources.get(&id).cloned()
-            } else {
-                state
-                    .media
-                    .svg_images
-                    .get(&id)
-                    .map(|(source, _)| source.clone())
-            };
-            let Some(source) = source else { return };
-            if state.rasters.svgs.get(&id).is_none_or(|(old, image)| {
-                !inline && *old != source
-                    || (image.size().width as u32) != raster[0]
-                    || (image.size().height as u32) != raster[1]
-            }) || moved
-                && state
-                    .rasters
-                    .svg_boxes
-                    .get(&id)
-                    .is_some_and(|entry| entry.6 != area)
-            {
-                if let Some(entry) = state.rasters.svg_boxes.get_mut(&id) {
-                    entry.6 = area;
-                }
-                let shared = state
-                    .rasters
-                    .svg_cache
-                    .get(&source)
-                    .filter(|_| inline && !moved)
-                    .and_then(|(_, images)| {
-                        images.iter().find(|image| {
-                            [image.size().width as u32, image.size().height as u32] == raster
-                        })
-                    })
-                    .cloned();
-                let image = match (
-                    &shared,
-                    state.rasters.svg_trees.remove(&id).filter(|_| inline),
-                ) {
-                    (Some(image), _) => Ok(image.clone()),
-                    (_, Some(tree)) if !moved => {
-                        super::raster::svg::render_svg(&tree, raster[0], raster[1], None)
-                    }
-                    (_, tree) if moved => tree
-                        .map_or_else(|| super::raster::svg::svg_tree(&source, false), Ok)
-                        .and_then(|tree| {
-                            let [kx, ky] = [raster[0] as f32 / area[2], raster[1] as f32 / area[3]];
-                            super::raster::svg::render_svg(
-                                &tree,
-                                raster[0],
-                                raster[1],
-                                Some((
-                                    [width * kx, height * ky],
-                                    [1., 0., 0., 1., -area[0] * kx, -area[1] * ky],
-                                )),
-                            )
-                        }),
-                    _ => super::raster::svg::svg(&source, raster[0], raster[1]),
-                };
-                match image {
-                    Ok(image) => {
-                        if inline
-                            && shared.is_none()
-                            && raster[0] <= 96
-                            && raster[1] <= 96
-                            && !moved
-                            && let Some((_, images)) = state.rasters.svg_cache.get_mut(&source)
-                        {
-                            // Keep the rasters of the last few sizes, so a resized icon doesn't grow the list.
-                            if images.len() >= 4 {
-                                let old = images.remove(0);
-                                if Arc::strong_count(&old) == 1 {
-                                    window.release_image(old);
-                                }
-                            }
-                            images.push(image.clone());
-                        }
-                        if let Some((_, old)) = state.rasters.svgs.insert(id, (source, image))
-                            && Arc::strong_count(&old) == 1
-                        {
-                            window.release_image(old);
-                        }
-                    }
-                    Err(error) => eprintln!("apps: SVG: {error}"),
-                }
-            }
-            let image = state.rasters.svgs.get(&id).map(|(_, image)| image.clone());
-            drop(host);
-            if let Some(image) = image {
-                let target = Rect::new(
-                    point(bounds.left() + px(area[0]), bounds.top() + px(area[1])),
-                    size(px(area[2]), px(area[3])),
-                );
-                window.draw_image(
-                    target,
-                    target,
-                    renderer::Corners::default(),
-                    image,
-                    false,
-                    false,
-                );
-            }
-        },
-    )
-    .absolute()
-    .top(px(padding[0]))
-    .right(px(padding[1]))
-    .bottom(px(padding[2]))
-    .left(px(padding[3]))
-    .into()
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn dimension_attributes_parse_like_html() {
-        for (value, integer, expected) in [
-            ("300", true, Some(300.)),
-            (" 100px", true, Some(100.)),
-            ("1e9", true, Some(1.)),
-            ("2.5", true, Some(2.)),
-            ("2.5", false, Some(2.5)),
-            ("NaN", true, None),
-            ("inf", false, None),
-            ("-50", true, None),
-            ("50%", false, None),
-            ("50%", true, Some(50.)),
-            ("+7", true, Some(7.)),
-            ("+7", false, None),
-            ("2147483648", true, None),
-            ("", true, None),
-            ("99999999999", true, None),
-        ] {
-            assert_eq!(super::dimension(value, integer), expected, "{value}");
-        }
-    }
 }

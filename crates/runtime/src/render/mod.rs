@@ -9,7 +9,6 @@ pub mod layout;
 pub mod media;
 mod page;
 pub(crate) mod paint;
-mod plan;
 pub mod raster;
 mod view;
 
@@ -61,7 +60,7 @@ pub(crate) struct ViewState {
     pub(crate) frames: RefCell<HashMap<usize, Frame>>,
     controls: RefCell<native::Controls>,
     ids: RefCell<(u64, Rc<effects::Ids>)>,
-    svgs: RefCell<HashMap<usize, element::Svg>>,
+    svgs: RefCell<HashMap<usize, element::svg::Svg>>,
     fields: RefCell<HashMap<usize, field::Caret>>,
     decoding: RefCell<HashMap<String, (usize, background::Decoding)>>,
     // The decoded files of each mask, so a new mask size doesn't decode them again.
@@ -83,21 +82,21 @@ pub(crate) struct ViewState {
     terminals: RefCell<rustc_hash::FxHashMap<u32, terminal::Drawn>>,
     pub(crate) hud: RefCell<Option<hud::Hud>>,
     pub(crate) inspect: Cell<inspect::Inspect>,
-    kept: RefCell<rustc_hash::FxHashMap<usize, element::Kept>>,
-    plans: RefCell<plan::Plans>,
+    kept: RefCell<rustc_hash::FxHashMap<usize, element::kept::Kept>>,
+    plans: RefCell<element::plan::Plans>,
     repaint: RefCell<rustc_hash::FxHashSet<usize>>,
     built: RefCell<rustc_hash::FxHashSet<usize>>,
     animated: RefCell<Vec<usize>>,
     #[cfg(debug_assertions)]
     around: RefCell<rustc_hash::FxHashSet<usize>>,
     // Retain plans used as pointer keys to prevent address reuse.
-    shared: RefCell<rustc_hash::FxHashMap<u64, Vec<element::Shared>>>,
+    shared: RefCell<rustc_hash::FxHashMap<u64, Vec<element::kept::Shared>>>,
     focused: Cell<Option<usize>>,
-    patches: RefCell<rustc_hash::FxHashMap<usize, element::Patch>>,
+    patches: RefCell<rustc_hash::FxHashMap<usize, element::kept::Patch>>,
     // How each absolutely positioned box was last built, to build it again in place.
-    outs: RefCell<rustc_hash::FxHashMap<usize, element::Patch>>,
+    outs: RefCell<rustc_hash::FxHashMap<usize, element::kept::Patch>>,
     epoch: Cell<(u64, bool)>,
-    reads: RefCell<Vec<element::Read>>,
+    reads: RefCell<Vec<element::kept::Read>>,
     walked: RefCell<rustc_hash::FxHashMap<usize, element::Walked>>,
     adjoined: RefCell<rustc_hash::FxHashMap<usize, element::Adjoined>>,
     kept_frame: RefCell<([f32; 4], Vec<usize>)>,
@@ -1242,7 +1241,7 @@ impl PageView {
         // The html and body boxes read each other's background, which their kept builds don't track.
         let layers = source.map(|id| {
             let style = &styles.values[id];
-            element::hashed((
+            element::kept::hashed((
                 id,
                 [
                     Prop::BACKGROUND_IMAGE,
@@ -2085,7 +2084,7 @@ impl PageView {
         let page_rtl =
             html.is_some_and(|html| styles.values[html].get(Prop::DIRECTION) == Some("rtl"));
         let page_overscroll = html.map_or_else(Default::default, |html| {
-            element::overscroll(&styles.values[html])
+            element::margin::overscroll(&styles.values[html])
         });
         let page_bar = html
             .filter(|_| page_scrolls || page_scrolls_x)
@@ -2342,7 +2341,7 @@ impl PageView {
                 .borrow()
                 .iter()
                 .filter(|&(&id, patch)| {
-                    patch.value != element::hashed(&doc.nodes[id].value) && tree.contains(id)
+                    patch.value != element::kept::hashed(&doc.nodes[id].value) && tree.contains(id)
                 })
                 .map(|(&id, _)| id)
                 .collect();
@@ -2541,7 +2540,7 @@ impl PageView {
             );
             build.prints.borrow_mut().truncate(printed);
             reads.borrow_mut().truncate(mark);
-            element::same_in_place(&fresh, &placed, tree);
+            element::oracle::same_in_place(&fresh, &placed, tree);
             drop(records);
         }
         #[cfg(debug_assertions)]

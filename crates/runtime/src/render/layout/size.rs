@@ -481,3 +481,29 @@ pub(crate) fn native_size(kind: ControlKind) -> [f32; 2] {
         _ => [width, height],
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn dimension_attributes_parse_like_html() {
+        for (value, integer, expected) in [
+            ("300", true, Some(300.)),
+            (" 100px", true, Some(100.)),
+            ("1e9", true, Some(1.)),
+            ("2.5", true, Some(2.)),
+            ("2.5", false, Some(2.5)),
+            ("NaN", true, None),
+            ("inf", false, None),
+            ("-50", true, None),
+            ("50%", false, None),
+            ("50%", true, Some(50.)),
+            ("+7", true, Some(7.)),
+            ("+7", false, None),
+            ("2147483648", true, None),
+            ("", true, None),
+            ("99999999999", true, None),
+        ] {
+            assert_eq!(super::dimension(value, integer), expected, "{value}");
+        }
+    }
+}

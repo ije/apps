@@ -300,7 +300,7 @@ pub(crate) fn content(
     let mut shape = rustc_hash::FxHasher::default();
     node.tag.hash(&mut shape);
     node.text.hash(&mut shape);
-    // Exclude field values from revisions: element::Patch rebuilds changed fields in place.
+    // Exclude field values from revisions: element::kept::Patch rebuilds changed fields in place.
     if !super::size::text_field(node, style) {
         node.value.hash(&mut shape);
     }

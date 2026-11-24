@@ -1,4 +1,4 @@
-use super::effects::{self, Establishes};
+use super::super::effects::{self, Establishes};
 use crate::css;
 use crate::css::{properties::Prop, properties::Style, value::units::Lengths};
 use crate::style;
@@ -8,22 +8,22 @@ use std::rc::Rc;
 
 // Plans can depend only on computed style, units and pixel ratio. Box reads escape cache dependency tracking.
 #[derive(PartialEq)]
-pub(super) struct Plan {
-    pub(super) made: Establishes,
-    pub(super) order: Option<i32>,
-    pub(super) opacity: f32,
-    pub(super) face: renderer::Font,
-    pub(super) line_height: f32,
-    pub(super) spacing: [Pixels; 2],
-    pub(super) smoothing: bool,
-    pub(super) ink: Option<Color>,
-    pub(super) background: Option<Color>,
-    pub(super) selection: (Option<u32>, u32),
-    pub(super) padding: Option<[f32; 4]>,
-    pub(super) borders: Option<[f32; 4]>,
-    pub(super) border_colors: [Color; 4],
-    pub(super) radii: Option<Radii<renderer::Length>>,
-    pub(super) shareable: bool,
+pub(crate) struct Plan {
+    pub(crate) made: Establishes,
+    pub(crate) order: Option<i32>,
+    pub(crate) opacity: f32,
+    pub(crate) face: renderer::Font,
+    pub(crate) line_height: f32,
+    pub(crate) spacing: [Pixels; 2],
+    pub(crate) smoothing: bool,
+    pub(crate) ink: Option<Color>,
+    pub(crate) background: Option<Color>,
+    pub(crate) selection: (Option<u32>, u32),
+    pub(crate) padding: Option<[f32; 4]>,
+    pub(crate) borders: Option<[f32; 4]>,
+    pub(crate) border_colors: [Color; 4],
+    pub(crate) radii: Option<Radii<renderer::Length>>,
+    pub(crate) shareable: bool,
 }
 
 impl Plan {
@@ -118,13 +118,13 @@ type Stored = (Rc<Style>, Lengths, u32, Rc<Plan>);
 
 // Retain styles used as pointer keys to prevent address reuse.
 #[derive(Default)]
-pub(super) struct Plans {
+pub(crate) struct Plans {
     map: FxHashMap<*const Style, Vec<Stored>>,
     limit: usize,
 }
 
 impl Plans {
-    pub(super) fn get(&mut self, style: &Rc<Style>, units: &Lengths, pixel_ratio: f32) -> Rc<Plan> {
+    pub(crate) fn get(&mut self, style: &Rc<Style>, units: &Lengths, pixel_ratio: f32) -> Rc<Plan> {
         let list = self.map.entry(Rc::as_ptr(style)).or_default();
         if let Some((.., plan)) = list
             .iter()
@@ -151,7 +151,7 @@ impl Plans {
         plan
     }
 
-    pub(super) fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.map.clear();
     }
 }
