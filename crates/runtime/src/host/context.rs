@@ -16,6 +16,7 @@ pub(super) struct Binding {
     pub(super) role: Role,
     pub(super) sqlite: RefCell<crate::node::sqlite::State>,
     pub(super) web: RefCell<crate::web::State>,
+    pub(super) workers: RefCell<super::worker::State>,
     pub(super) ffi: crate::node::ffi::State,
     pub(super) node: RefCell<crate::node::State>,
     pub(super) inspector: std::cell::Cell<Ptr>,
@@ -377,6 +378,7 @@ impl JsContext {
                 matches!(role, Role::Renderer(_)),
                 host.borrow().app.assets.clone(),
             )),
+            workers: RefCell::new(super::worker::State::new(&host.borrow().app)),
             ffi: Default::default(),
             node: RefCell::default(),
             inspector: std::cell::Cell::new(ptr::null_mut()),
@@ -455,7 +457,14 @@ impl JsContext {
                 )
             };
         }
-        encoding::install(&engine.api, ctx);
+        encoding::install(
+            &engine.api,
+            ctx,
+            &[
+                ("digest", crate::node::system::digest),
+                ("url", crate::web::url_parts),
+            ],
+        );
         let natives = [
             ("__appsNative", super::ops::call as Callback),
             ("__appsNow", now),
@@ -779,6 +788,7 @@ impl JsContext {
                     .web
                     .borrow_mut()
                     .configure_storage(&host.app, window);
+                binding.workers.borrow_mut().configure(&host.app);
             }
             Ok(())
         })

@@ -1180,3 +1180,27 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
         _ => bail!("Unsupported Node operation: {op}"),
     }
 }
+
+pub(crate) unsafe extern "C" fn digest(
+    ctx: crate::jsc::Ptr,
+    _: crate::jsc::Ptr,
+    _: crate::jsc::Ptr,
+    count: usize,
+    args: *const crate::jsc::Ptr,
+    exception: *mut crate::jsc::Ptr,
+) -> crate::jsc::Ptr {
+    crate::jsc::encoding::native(ctx, count, args, exception, |api, arg| {
+        let name = match api.chars(ctx, arg(0)) {
+            Some(crate::jsc::encoding::Chars::Latin1(name)) => std::str::from_utf8(name).ok(),
+            _ => None,
+        }
+        .context("Expected a digest name")?;
+        let key = api.view(ctx, arg(2));
+        let mut hasher = Hasher::new(name, key)?;
+        hasher.update(api.view(ctx, arg(1)).context("Expected bytes")?);
+        let digest = hasher.digest();
+        let (array, out) = api.uint8_array(ctx, digest.len())?;
+        out.copy_from_slice(&digest);
+        Ok(array)
+    })
+}

@@ -131,9 +131,9 @@ impl Drop for State {
 }
 
 impl State {
-    pub(crate) fn new(assets: Arc<HashMap<String, std::path::PathBuf>>) -> Self {
+    pub(crate) fn new(app: &crate::bundle::AppInfo) -> Self {
         let mut state = Self::default();
-        state.app.assets = assets;
+        state.configure(app);
         state
     }
 

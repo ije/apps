@@ -33,6 +33,7 @@ pub mod library;
 pub(crate) mod native;
 pub mod node;
 pub mod render;
+pub mod script;
 pub mod style;
 mod web;
 pub use web::download;

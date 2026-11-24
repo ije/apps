@@ -7,7 +7,6 @@ pub(crate) mod storage;
 pub(crate) mod tcp;
 pub mod terminal;
 pub(crate) mod websocket;
-pub(crate) mod worker;
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -372,7 +371,6 @@ pub struct State {
     platform: crate::web::platform::State,
     servers: crate::web::serve::State,
     sockets: crate::web::websocket::State,
-    workers: crate::web::worker::State,
     assets: std::sync::Arc<HashMap<String, std::path::PathBuf>>,
     tcp: crate::web::tcp::State,
     storage: crate::web::storage::State,
@@ -421,7 +419,6 @@ impl State {
     ) -> Self {
         Self {
             renderer,
-            workers: crate::web::worker::State::new(assets.clone()),
             assets,
             ..Self::default()
         }
@@ -430,7 +427,6 @@ impl State {
     pub fn configure_storage(&mut self, app: &crate::bundle::AppInfo, window: Option<u64>) {
         let namespace = app.name.as_deref().unwrap_or("apps");
         self.storage.configure(namespace, window);
-        self.workers.configure(app);
     }
     pub fn call(&mut self, op: &str, args: &mut Value) -> Result<Value> {
         match op {
@@ -655,11 +651,63 @@ impl State {
                 Some(("serve", op)) => self.servers.call(op, args, &mut self.sockets),
                 Some(("socket", op)) => self.sockets.call(op, args, self.renderer),
                 Some(("crypto", op)) => crate::web::crypto::call(op, args),
-                Some(("worker", op)) => self.workers.call(op, args),
                 Some(("tcp", op)) => self.tcp.call(op, args),
                 Some(("storage", op)) => self.storage.call(op, args),
                 _ => bail!("Unknown web operation: {op}"),
             },
         }
     }
+}
+
+pub(crate) unsafe extern "C" fn url_parts(
+    ctx: crate::jsc::Ptr,
+    _: crate::jsc::Ptr,
+    _: crate::jsc::Ptr,
+    count: usize,
+    args: *const crate::jsc::Ptr,
+    exception: *mut crate::jsc::Ptr,
+) -> crate::jsc::Ptr {
+    crate::jsc::encoding::native(ctx, count, args, exception, |api, arg| {
+        use ::url::Position::*;
+        let text = |index| {
+            api.chars(ctx, arg(index))
+                .map(|chars| api.utf8_string(chars))
+        };
+        let (input, base) = (text(0).context("Expected URL")?, text(1));
+        let (key, value) = (text(2), text(3));
+        let url = url(
+            &input,
+            base.as_deref(),
+            key.as_deref().zip(value.as_deref()),
+        )?;
+        let href = url.as_str();
+        let mut items = [std::ptr::null_mut(); 11];
+        items[0] = api.utf8(ctx, href.as_bytes())?;
+        for (item, position) in items[1..].iter_mut().zip([
+            AfterScheme,
+            BeforeUsername,
+            AfterUsername,
+            BeforePassword,
+            AfterPassword,
+            BeforeHost,
+            AfterHost,
+            AfterPort,
+            AfterPath,
+            AfterQuery,
+        ]) {
+            // Without a password, the url crate puts the end of the password after the `@`.
+            let position = match position {
+                BeforePassword | AfterPassword if url.password().is_none() => AfterUsername,
+                position => position,
+            };
+            let end = url[..position].len();
+            let end = if href.is_ascii() {
+                end
+            } else {
+                href[..end].encode_utf16().count()
+            };
+            *item = unsafe { (api.number)(ctx, end as f64) };
+        }
+        Ok(unsafe { (api.make_array)(ctx, items.len(), items.as_ptr(), std::ptr::null_mut()) })
+    })
 }

@@ -35,7 +35,7 @@ fn main() {
                 .context("Cannot read the app bundle")?,
                 None => apps_runtime::bundle::read(&home)?,
             };
-            return apps_runtime::node::script::run(bundle, argv);
+            return apps_runtime::script::run(bundle, argv);
         }
         for os in std::env::args_os().skip(1).filter(|_| !packaged) {
             let arg = os.to_string_lossy();

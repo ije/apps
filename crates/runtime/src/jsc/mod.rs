@@ -213,7 +213,7 @@ pub struct JavaScriptCore {
     pub(crate) get_index: unsafe extern "C" fn(Ptr, Ptr, u32, *mut Ptr) -> Ptr,
     pub(crate) set_index: unsafe extern "C" fn(Ptr, Ptr, u32, Ptr, *mut Ptr),
     pub(crate) make_error: unsafe extern "C" fn(Ptr, usize, *const Ptr, *mut Ptr) -> Ptr,
-    make_array: unsafe extern "C" fn(Ptr, usize, *const Ptr, *mut Ptr) -> Ptr,
+    pub(crate) make_array: unsafe extern "C" fn(Ptr, usize, *const Ptr, *mut Ptr) -> Ptr,
     typed_from_buffer: unsafe extern "C" fn(Ptr, u32, Ptr, *mut Ptr) -> Ptr,
     pub(crate) memory: unsafe extern "C" fn(Ptr) -> Ptr,
     pub(crate) proxy_target: unsafe extern "C" fn(Ptr) -> Ptr,

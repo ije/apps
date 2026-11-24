@@ -2,6 +2,7 @@ mod context;
 pub(crate) mod link;
 mod ops;
 pub(crate) mod window;
+pub(crate) mod worker;
 
 use crate::dom::{Document, Node};
 use anyhow::{Context, Result, bail, ensure};
