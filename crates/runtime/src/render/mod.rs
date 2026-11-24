@@ -28,8 +28,6 @@ use renderer::{App, Color, Event, Window, WindowId};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
-    hash::Hash,
-    mem,
     path::PathBuf,
     rc::Rc,
     sync::Arc,
@@ -466,44 +464,7 @@ impl PageView {
             state.geometry.unshift();
             state.geometry.sync_scroll();
             state.geometry.mirror.touch();
-            let hash = |value: &dyn Fn(&mut rustc_hash::FxHasher)| {
-                let mut hasher = rustc_hash::FxHasher::default();
-                value(&mut hasher);
-                std::hash::Hasher::finish(&hasher)
-            };
-            // Images that load or decode later change paint without a new box.
-            let images = (state.media.images.iter())
-                .map(|(id, image)| hash(&|h| (id, Arc::as_ptr(image)).hash(h)))
-                .chain(
-                    state
-                        .rasters
-                        .bitmaps
-                        .values()
-                        .map(|image| Arc::as_ptr(image) as u64),
-                )
-                .chain(
-                    (state.rasters.backgrounds.values())
-                        .map(|(_, image)| Arc::as_ptr(image) as u64),
-                )
-                .chain(
-                    state
-                        .rasters
-                        .layer_sources
-                        .values()
-                        .map(|image| Arc::as_ptr(image) as u64),
-                )
-                .chain(
-                    (state.media.svg_images.iter())
-                        .map(|(id, (source, _))| hash(&|h| (id, Rc::as_ptr(source)).hash(h))),
-                )
-                .fold(0u64, u64::wrapping_add);
-            let selection = (state.interaction.selection.iter())
-                .map(|entry| hash(&|h| entry.hash(h)))
-                .fold(0u64, u64::wrapping_add);
-            let inputs = hash(&|h| (images, selection, state.interaction.selection_caret).hash(h));
-            if mem::replace(&mut state.layout.paint_inputs, inputs) != inputs {
-                window.repaint();
-            }
+            frame::changes::repaint(state, window);
         }
         let pointer_events = frame::pointer::events(self.0.clone());
         let mut host = self.host.borrow_mut();

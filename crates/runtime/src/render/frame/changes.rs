@@ -6,7 +6,9 @@ use crate::css::properties::Prop;
 use crate::render::layout::cull;
 use crate::style;
 use crate::style::ComputedStyles;
+use std::hash::Hash;
 use std::rc::Rc;
+use std::sync::Arc;
 
 // The boxes whose style, children or content changed since the last frame. It gives the flags of each visited
 // node, the nodes with a new layout, the nodes that changed when the tree and the focus didn't, and whether a box
@@ -609,4 +611,42 @@ pub(crate) fn remeasure(
         });
     }
     dom.layout.text_layouts.clear();
+}
+
+// Images that load or decode later, and the selection, change paint without a new box.
+pub(crate) fn repaint(state: &mut PageState, window: &mut renderer::Window) {
+    let hash = |value: &dyn Fn(&mut rustc_hash::FxHasher)| {
+        let mut hasher = rustc_hash::FxHasher::default();
+        value(&mut hasher);
+        std::hash::Hasher::finish(&hasher)
+    };
+    let images = (state.media.images.iter())
+        .map(|(id, image)| hash(&|h| (id, Arc::as_ptr(image)).hash(h)))
+        .chain(
+            state
+                .rasters
+                .bitmaps
+                .values()
+                .map(|image| Arc::as_ptr(image) as u64),
+        )
+        .chain((state.rasters.backgrounds.values()).map(|(_, image)| Arc::as_ptr(image) as u64))
+        .chain(
+            state
+                .rasters
+                .layer_sources
+                .values()
+                .map(|image| Arc::as_ptr(image) as u64),
+        )
+        .chain(
+            (state.media.svg_images.iter())
+                .map(|(id, (source, _))| hash(&|h| (id, Rc::as_ptr(source)).hash(h))),
+        )
+        .fold(0u64, u64::wrapping_add);
+    let selection = (state.interaction.selection.iter())
+        .map(|entry| hash(&|h| entry.hash(h)))
+        .fold(0u64, u64::wrapping_add);
+    let inputs = hash(&|h| (images, selection, state.interaction.selection_caret).hash(h));
+    if std::mem::replace(&mut state.layout.paint_inputs, inputs) != inputs {
+        window.repaint();
+    }
 }
