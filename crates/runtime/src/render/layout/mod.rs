@@ -47,7 +47,7 @@ pub(crate) struct LayoutNode {
 
 #[derive(Default)]
 pub struct Layout {
-    pub(in crate::render) text_layouts: rustc_hash::FxHashMap<usize, TextLayout>,
+    pub(crate) text_layouts: rustc_hash::FxHashMap<usize, TextLayout>,
     pub(in crate::render) grids: rustc_hash::FxHashMap<
         usize,
         (
@@ -78,7 +78,7 @@ pub struct Layout {
     pub(in crate::render) container_pass: bool,
     pub(in crate::render) anchors: rustc_hash::FxHashMap<usize, renderer::Rect<renderer::Pixels>>,
     pub(in crate::render) blocks: rustc_hash::FxHashMap<usize, renderer::Rect<renderer::Pixels>>,
-    pub(in crate::render) cull: cull::Cull,
+    pub(crate) cull: cull::Cull,
     // The `content-visibility: auto` boxes, each with the boxes on its path, the boxes that clip it, and the view
     // and its top and bottom at its last change.
     #[allow(clippy::type_complexity)]

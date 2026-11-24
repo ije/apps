@@ -1,6 +1,6 @@
-use super::{Desktop, Pages, RELOADED, View, scripted};
+use super::{Desktop, RELOADED, View, scripted, view::PageView};
 use crate::host::link::ToMain;
-use crate::{dom::Document, host::context::JsContext, jsc::Role, render::PageView};
+use crate::{dom::Document, host::context::JsContext, jsc::Role};
 use anyhow::{Context as _, Result, bail, ensure};
 use renderer::{App, Rect, WindowChange, WindowOptions, point, px, size};
 use std::{
@@ -49,7 +49,7 @@ impl Desktop {
                 (0xffffff, 255)
             });
         self.host.borrow_mut().set_background(id, background);
-        let mut data = Weak::new();
+        let (mut data, mut input) = (Weak::new(), Weak::new());
         let handle = if let Some(cx) = cx {
             let runtime = runtime.unwrap().clone();
             let host = self.host.clone();
@@ -84,8 +84,8 @@ impl Desktop {
                 movable: options["movable"] != false,
             };
             let handle = cx.open_window(window_options, |window, _| {
-                let view = PageView::new(id, Rc::new(Pages(runtime)), host, window.id());
-                data = Rc::downgrade(&view.0);
+                let view = PageView::new(runtime, host, id, window.id());
+                (data, input) = (Rc::downgrade(&view.page), Rc::downgrade(&view.input));
                 Box::new(view)
             })?;
             cx.update_window(handle, |window, _| {
@@ -151,6 +151,7 @@ impl Desktop {
             View {
                 handle,
                 data,
+                input,
                 title: None,
                 preload: None,
                 renderer: None,

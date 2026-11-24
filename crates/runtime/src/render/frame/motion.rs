@@ -89,32 +89,6 @@ pub(super) fn animate(
     }
 }
 
-// Animation handlers can hide or remove a popup, so run them before its final frame is painted.
-pub(super) fn animation_events(
-    view: &Rc<ViewState>,
-    events: Vec<(usize, &'static str, String, f64)>,
-    cx: &mut App,
-) {
-    let renderer = view.runtime.renderer(view.id);
-    for (node, kind, name, elapsed) in events {
-        let (pseudo, name) = name.split_once('\0').unwrap_or(("", &name));
-        let data = if kind.starts_with("animation") {
-            serde_json::json!({"animationName": name, "elapsedTime": elapsed, "pseudoElement": pseudo})
-        } else {
-            serde_json::json!({"propertyName": name, "elapsedTime": elapsed, "pseudoElement": pseudo})
-        };
-        if let Some(renderer) = &renderer
-            && let Err(error) = renderer.eval(
-                &format!("__appsDispatch('{kind}',[{node}],{data})"),
-                "apps:animation",
-            )
-        {
-            eprintln!("apps: {error}");
-        }
-    }
-    view.runtime.drive(cx);
-}
-
 fn composite(view: Rc<ViewState>, window: &mut Window, cx: &mut App) {
     if window.will_draw() {
         return;
@@ -449,7 +423,7 @@ fn composite(view: Rc<ViewState>, window: &mut Window, cx: &mut App) {
     }
     // Handlers can change the page, and `Desktop::drive` can't refresh the window it runs in, so refresh here.
     if !events.is_empty() {
-        animation_events(&view, events, cx);
+        view.runtime.animation_events(events, cx);
         if view
             .store
             .try_borrow()

@@ -344,7 +344,7 @@ impl super::Desktop {
                 let mut inspect = data.inspect.get();
                 if args[2].is_number() {
                     let at = serde_json::json!({"x":args[2],"y":args[3]});
-                    let node = crate::render::scripted(cx, None, || agent(engine, "pick", &at))?
+                    let node = super::view::scripted(cx, None, || agent(engine, "pick", &at))?
                         .as_u64()
                         .map(|node| node as usize);
                     if args[4] == true {

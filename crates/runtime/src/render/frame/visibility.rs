@@ -524,6 +524,30 @@ pub(super) fn forget(
     }
 }
 
+impl ViewState {
+    // Parked animations come back when their boxes come into view.
+    pub(crate) fn wake_parked(&self, window: &mut renderer::Window) {
+        let parked = self.parked.take();
+        let size = window.viewport_size();
+        if !parked.is_empty()
+            && self.store.try_borrow().is_ok_and(|store| {
+                store.page_state(self.id).is_some_and(|dom| {
+                    parked.iter().any(|(id, clips)| {
+                        in_view(
+                            &dom.geometry.mirror,
+                            [f32::from(size.width), f32::from(size.height)],
+                            *id,
+                            clips.iter().copied(),
+                        )
+                    })
+                })
+            })
+        {
+            window.request_animation_frame();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::raster;

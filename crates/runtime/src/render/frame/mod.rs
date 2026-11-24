@@ -4,18 +4,17 @@ mod lint;
 mod motion;
 mod page;
 mod patch;
-mod pointer;
 mod visibility;
 
 use super::element::{Build, element};
 use super::layout::cull;
 use super::paint::native;
-use super::{PageView, ViewState, effects, queue_layout};
+use super::{ViewState, effects};
 use crate::css::properties::{Prop, Style};
 use crate::dom::{Document, LayoutMirror};
 use crate::render::inline::InlineText;
 use crate::style::ComputedStyles;
-use motion::{animate, animation_events};
+use motion::animate;
 use renderer::{App, Window};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -65,12 +64,14 @@ impl Cx<'_> {
     }
 }
 
-impl PageView {
-    pub(super) fn render_page(
-        &mut self,
+impl ViewState {
+    // `pointer_events` is the box of the window glue that takes the pointer for the page.
+    pub(crate) fn render_page(
+        self: &Rc<Self>,
         tree: &renderer::Tree,
         window: &mut Window,
         cx: &mut App,
+        pointer_events: renderer::Node,
     ) -> renderer::Child {
         let started = std::time::Instant::now();
         {
@@ -82,7 +83,6 @@ impl PageView {
             state.geometry.mirror.touch();
             changes::repaint(state, window);
         }
-        let pointer_events = pointer::events(self.0.clone());
         let mut store = self.store.borrow_mut();
         let size = window.viewport_size();
         let width = f32::from(size.width);
@@ -161,7 +161,7 @@ impl PageView {
         {
             styles = dom.restyle(&mut doc, [width, height]);
         }
-        visibility::wake(&self.0, &doc, dom, &styles);
+        visibility::wake(self, &doc, dom, &styles);
         let mut children: Vec<_> = styles
             .children
             .iter()
@@ -260,13 +260,12 @@ impl PageView {
             custom,
             &mut animated,
         );
-        let (composited, pseudo_layers) =
-            motion::layers(&self.0, &doc, &styles, &animated, &pseudos);
+        let (composited, pseudo_layers) = motion::layers(self, &doc, &styles, &animated, &pseudos);
         let compositing = !animated.is_empty()
             && composited.len() == animated.len()
             && pseudo_layers.len() == pseudos.len()
             && backdrops.is_empty();
-        animate(&self.0, dom, next, now, compositing, window, cx);
+        animate(self, dom, next, now, compositing, window, cx);
         // Paint and the next frame read the cascade values, so they go back to `computed` after the frame.
         let taken = !pseudos.is_empty() || !animated.is_empty() || !lengths.is_empty();
         let (mut restore, restore_pseudos, paint) =
@@ -278,7 +277,7 @@ impl PageView {
             [moved - height, moved + 2. * height]
         });
         let fcx = Cx {
-            view: &self.0,
+            view: self,
             doc: &doc,
             tree,
             frame,
@@ -475,10 +474,7 @@ impl PageView {
         let walk = dom.styles.walk.snapshot();
         drop(store);
         if !warnings.is_empty() {
-            let mut host = self.host.borrow_mut();
-            for text in warnings {
-                host.log(serde_json::json!({"method":"Runtime.consoleAPICalled","params":{"type":"error","text":text,"context":crate::jsc::Role::Renderer(self.id)}}));
-            }
+            self.runtime.lint(warnings);
         }
         let text_system = window.text_system().clone();
         let ids = {
@@ -494,7 +490,7 @@ impl PageView {
             styles: &styles,
             text: &text_system,
             pixel_ratio: window.scale_factor(),
-            view: &self.0,
+            view: self,
             ancestors: Rc::default(),
             flex_parent: false,
             measured: &measured,
@@ -633,18 +629,18 @@ impl PageView {
         }
         if !events.is_empty() {
             if self.reflowing.get() {
-                let view = self.0.clone();
-                cx.defer(move |cx| animation_events(&view, events, cx));
+                let runtime = self.runtime.clone();
+                cx.defer(move |cx| runtime.animation_events(events, cx));
             } else {
-                animation_events(&self.0, events, cx);
+                self.runtime.animation_events(events, cx);
                 window.restart();
             }
         }
         if !window.redrawing() && !self.reflowing.get() && !repass {
-            queue_layout(self.0.clone(), window);
+            self.runtime.clone().queue_layout(window);
         }
         page::node(
-            &self.0,
+            self,
             viewport,
             pointer_events,
             root,

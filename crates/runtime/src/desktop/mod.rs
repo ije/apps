@@ -5,6 +5,7 @@ mod page;
 pub(crate) mod panel;
 #[cfg(test)]
 mod tests;
+mod view;
 
 use crate::bundle::Feature;
 use crate::host::link::{Link, PageQueue, ToMain, ToPage};
@@ -27,6 +28,7 @@ use std::{
 pub(crate) struct View {
     handle: Option<WindowId>,
     data: Weak<crate::render::ViewState>,
+    input: Weak<view::Input>,
     title: Option<String>,
     preload: Option<Rc<JsContext>>,
     renderer: Option<Rc<JsContext>>,
@@ -68,35 +70,6 @@ pub struct Desktop {
     scheduled: bool,
     // A shrink of the engine waits for a quiet second.
     shrinking: Rc<std::cell::Cell<bool>>,
-}
-
-// The page views reach their desktop through this.
-struct Pages(Rc<RefCell<Desktop>>);
-
-impl crate::render::Pages for Pages {
-    fn renderer(&self, id: u64) -> Option<Rc<JsContext>> {
-        self.0.borrow().views.get(&id)?.renderer.clone()
-    }
-
-    fn try_renderer(&self, id: u64) -> Option<Rc<JsContext>> {
-        self.0.try_borrow().ok()?.views.get(&id)?.renderer.clone()
-    }
-
-    fn dispatch(
-        &self,
-        id: u64,
-        name: &str,
-        path: &[usize],
-        data: serde_json::Value,
-        window: Option<&mut renderer::Window>,
-        cx: &mut App,
-    ) -> bool {
-        Desktop::dispatch(self.0.clone(), id, name, path, data, window, cx)
-    }
-
-    fn drive(&self, cx: &mut App) {
-        Desktop::drive(self.0.clone(), cx);
-    }
 }
 
 thread_local! {
@@ -177,7 +150,7 @@ impl Desktop {
         let Some(renderer) = renderer else {
             return false;
         };
-        let result = crate::render::scripted(cx, window, || {
+        let result = view::scripted(cx, window, || {
             renderer.call(
                 "__appsDispatch",
                 &[
@@ -416,7 +389,7 @@ impl Desktop {
                             let command = args[2].as_str().unwrap_or_default();
                             let text = args[3].as_str().unwrap_or_default();
                             let app = cx.as_deref_mut().map(|cx| (cx, None));
-                            crate::render::edit(&renderer, app, command, text);
+                            view::edit(&renderer, app, command, text);
                         }
                     }
                     "insertCSS" | "removeInsertedCSS" => {
@@ -640,7 +613,7 @@ impl Desktop {
                 let size = serde_json::json!({"width": (width * zoom).round(), "height": (height * zoom).round()});
                 app.link.event("resize", id, Some(size), "apps:resize");
                 if let Some(renderer) = app.views.get(&id).and_then(|v| v.renderer.as_ref())
-                    && let Err(error) = crate::render::scripted(cx, None, || {
+                    && let Err(error) = view::scripted(cx, None, || {
                         renderer.eval("__appsDispatch('window:resize',[0])", "apps:resize")
                     })
                 {
@@ -675,7 +648,7 @@ impl Desktop {
                         "__appsDispatch('window:blur',[])"
                     };
                     if let Err(error) =
-                        crate::render::scripted(cx, None, || renderer.eval(script, "apps:focus"))
+                        view::scripted(cx, None, || renderer.eval(script, "apps:focus"))
                     {
                         eprintln!("apps: {error}");
                     }
@@ -685,7 +658,7 @@ impl Desktop {
                     Some([_, true]) => {
                         view.fullscreen = None;
                         if let Some(renderer) = &view.renderer
-                            && let Err(error) = crate::render::scripted(cx, None, || {
+                            && let Err(error) = view::scripted(cx, None, || {
                                 renderer
                                     .eval("__appsDispatch('fullscreen:exit',[])", "apps:fullscreen")
                             })
@@ -704,7 +677,7 @@ impl Desktop {
             }
             let mut delay = i64::MAX;
             for engine in app.views.values().flat_map(View::engines) {
-                let next = match crate::render::scripted(cx, None, || engine.tick()) {
+                let next = match view::scripted(cx, None, || engine.tick()) {
                     Ok(next) => next,
                     Err(error) => {
                         eprintln!("apps: page script: {error:#}");
@@ -729,7 +702,7 @@ impl Desktop {
                 delay = delay.min(0);
                 for view in app.views.values() {
                     if let Some(renderer) = &view.renderer
-                        && let Err(error) = crate::render::scripted(cx, None, || {
+                        && let Err(error) = view::scripted(cx, None, || {
                             renderer.eval("__appsMediaChanged()", "apps:theme")
                         })
                     {
@@ -745,7 +718,7 @@ impl Desktop {
                     continue;
                 };
                 let (commands, data) = (tools.commands(), view.data.upgrade());
-                crate::render::scripted(cx, None, || -> Result<()> {
+                view::scripted(cx, None, || -> Result<()> {
                     for command in &commands {
                         tools.answer(command, engine, &app.host, data.as_deref())?;
                     }
@@ -777,7 +750,7 @@ impl Desktop {
             let raw: *mut App = cx;
             // SAFETY: a forced layout uses `cx` only inside a script call, while `poll` waits for it.
             if mcp
-                && crate::render::scripted(unsafe { &mut *raw }, None, || {
+                && view::scripted(unsafe { &mut *raw }, None, || {
                     mcp::poll(&app, unsafe { &mut *raw })
                 })
             {
@@ -807,7 +780,7 @@ impl Desktop {
                     }
                     for (node, event) in events {
                         if let Some(renderer) = &view.renderer
-                            && let Err(error) = crate::render::scripted(cx, None, || {
+                            && let Err(error) = view::scripted(cx, None, || {
                                 renderer.eval(
                                     &format!("__appsFrameEvent({node},{event})"),
                                     "apps:iframe",
@@ -823,7 +796,7 @@ impl Desktop {
                     for (node, event) in &controls {
                         let value = serde_json::to_string(&event.value).unwrap_or_default();
                         if let Some(renderer) = &view.renderer
-                            && let Err(error) = crate::render::scripted(cx, None, || {
+                            && let Err(error) = view::scripted(cx, None, || {
                                 renderer.eval(
                                     &format!("__appsNativeControl({node},{value},{})", event.done),
                                     "apps:control",
@@ -869,10 +842,10 @@ impl Desktop {
                     )
                 };
                 if frame
-                    && let (Some(handle), Some(data)) = (view.handle, view.data.upgrade())
+                    && let (Some(handle), Some(input)) = (view.handle, view.input.upgrade())
                     && cx
                         .update_window(handle, |window, _| {
-                            crate::render::queue_animation_frame(data, window)
+                            view::queue_animation_frame(input, window)
                         })
                         .is_some()
                     && let Some(dom) = store.borrow_mut().page_state_mut(id)
@@ -1167,7 +1140,7 @@ impl Desktop {
 
 fn scripted<R>(cx: Option<&mut App>, f: impl FnOnce() -> R) -> R {
     match cx {
-        Some(cx) => crate::render::scripted(cx, None, f),
+        Some(cx) => view::scripted(cx, None, f),
         None => f(),
     }
 }
