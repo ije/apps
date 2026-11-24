@@ -1,7 +1,6 @@
 use crate::css::SelectorList;
 use crate::css::{
-    Declaration, Declarations, FontUnits, Lengths, Prop, Rule, Style, Stylesheet, Vars, color,
-    components,
+    Declaration, Declarations, Lengths, Prop, Rule, Style, Stylesheet, color, components,
 };
 use crate::dom::Document;
 use bbtree::unsync::BBTreeMap;
