@@ -1,6 +1,7 @@
 use crate::css::properties::Prop;
 use crate::dom::{ABSENT, Document, Node};
 use crate::style;
+use anyhow::{Context, Result, bail, ensure};
 use std::sync::Arc;
 
 // What a page keeps besides its document: its nodes, geometry, focus and selection, styles, layout, media and
@@ -243,5 +244,399 @@ impl PageState {
             }
             old => old,
         }
+    }
+
+    // A change to node `id` restyles the page when the node is in the tree.
+    pub(crate) fn mutated(&mut self, doc: &Document, id: usize) {
+        if self.styles.computed.is_some() && self.tree.reaches(doc, id, 0) {
+            self.styles.invalidate();
+        }
+    }
+
+    // Applies a batch of tree changes from dom.js. Returns whether the page changed, and the errors.
+    pub(crate) fn batch(
+        &mut self,
+        doc: &mut Document,
+        codes: &[u8],
+        mut text: &str,
+    ) -> (bool, Vec<String>) {
+        let node = |doc: &Document, value: i32| {
+            usize::try_from(value)
+                .ok()
+                .filter(|&id| doc.nodes.get(id).is_some_and(|node| !node.tag.is_empty()))
+                .context("Invalid node")
+        };
+        fn prune(doc: &mut Document, parent: usize) {
+            let mut children = std::mem::take(&mut doc.nodes[parent].children);
+            children.retain(|&child| doc.nodes[child].parent == Some(parent));
+            doc.nodes[parent].children = children;
+        }
+        fn insert(
+            doc: &mut Document,
+            (parent, before): (usize, Option<usize>),
+            run: &mut Vec<usize>,
+        ) {
+            let children = &mut doc.nodes[parent].children;
+            let index = before
+                .and_then(|before| children.iter().position(|&id| id == before))
+                .unwrap_or(children.len());
+            children.splice(index..index, run.drain(..));
+        }
+        let (mut dirty, mut errors) = (false, Vec::new());
+        // Parent links are current during a batch. `stale` has obsolete child entries. `run` has children
+        // awaiting insertion.
+        let (mut stale, mut run, mut runs) = (None, None, Vec::new());
+        'ops: for op in codes.as_chunks::<16>().0 {
+            let [code, a, b, c] =
+                [0, 4, 8, 12].map(|i| i32::from_ne_bytes([op[i], op[i + 1], op[i + 2], op[i + 3]]));
+            let mut parts = ["", ""];
+            for (part, units) in parts.iter_mut().zip([b, c]).take(match code {
+                0 | 4 => 2,
+                1 | 5 | 7 => 1,
+                _ => 0,
+            }) {
+                let units = usize::try_from(units).unwrap_or(usize::MAX);
+                let end = if text.as_bytes().get(..units).is_some_and(<[u8]>::is_ascii) {
+                    units
+                } else {
+                    let (mut end, mut count) = (0, 0);
+                    for character in text.chars() {
+                        if count >= units {
+                            break;
+                        }
+                        count += character.len_utf16();
+                        end += character.len_utf8();
+                    }
+                    if count != units {
+                        errors.push("Invalid DOM batch".into());
+                        break 'ops;
+                    }
+                    end
+                };
+                (*part, text) = text.split_at(end);
+            }
+            let result = (|| -> Result<bool> {
+                Ok(match code {
+                    0 => {
+                        let (id, tag) = (usize::try_from(a).context("Invalid node")?, parts[0]);
+                        ensure!(
+                            matches!(
+                                tag,
+                                "#text" | "#comment" | "#fragment" | "#document" | "#doctype"
+                            ) || !tag.is_empty()
+                                && tag.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'),
+                            "Invalid tag"
+                        );
+                        ensure!(self.tree.reserved.remove(&id), "Invalid node");
+                        self.place(
+                            doc,
+                            id,
+                            // Pages lower-case HTML names themselves; SVG and other namespaces keep their case.
+                            Node {
+                                tag: tag.into(),
+                                text: parts[1].into(),
+                                ..Node::default()
+                            },
+                        );
+                        false
+                    }
+                    1 => {
+                        let (id, value) = (node(doc, a)?, parts[0]);
+                        if let Some(pending) = run.take_if(|&mut (parent, _)| parent == id) {
+                            insert(doc, pending, &mut runs);
+                        }
+                        if stale.take_if(|&mut parent| parent == id).is_some() {
+                            prune(doc, id);
+                        }
+                        let current = &doc.nodes[id];
+                        if current.children.is_empty() && current.text == value {
+                            return Ok(false);
+                        }
+                        if !(current.tag == "#text"
+                            && current.text.is_empty() == value.is_empty()
+                            && current
+                                .parent
+                                .is_none_or(|parent| doc.nodes[parent].tag != "style"))
+                            && self.styles.computed.is_some()
+                            && self.tree.reaches(doc, id, 0)
+                        {
+                            self.styles.invalidate();
+                        }
+                        if doc.nodes[id].children.is_empty()
+                            && let Some(current) = doc.nodes.edit(id)
+                        {
+                            current.text = value.into();
+                            current.stylesheet = None;
+                            return Ok(true);
+                        }
+                        doc.nodes[id].text = value.into();
+                        doc.nodes[id].stylesheet = None;
+                        for child in std::mem::take(&mut doc.nodes[id].children) {
+                            doc.nodes[child].parent = None;
+                            self.tree.detached.push(child);
+                            self.tree.removed.push(child);
+                        }
+                        true
+                    }
+                    2 => {
+                        let (parent, child) = (node(doc, a)?, node(doc, b)?);
+                        ensure!(child > 0, "Invalid child");
+                        let tag = &doc.nodes[parent].tag;
+                        ensure!(
+                            !tag.starts_with('#') || tag == "#document" || tag == "#fragment",
+                            "Invalid parent"
+                        );
+                        let before = usize::try_from(c).ok();
+                        ensure!(
+                            before.is_none_or(|before| doc
+                                .nodes
+                                .get(before)
+                                .is_some_and(|node| node.parent == Some(parent))),
+                            "Reference is not a child"
+                        );
+                        ensure!(
+                            !self.tree.reaches(doc, parent, child),
+                            "Cannot create a DOM cycle"
+                        );
+                        if self.styles.computed.is_some()
+                            && (self.tree.reaches(doc, parent, 0)
+                                || self.tree.reaches(doc, child, 0))
+                        {
+                            self.styles.invalidate();
+                        }
+                        if before == Some(child) {
+                            return Ok(false);
+                        }
+                        if let Some(pending) = run.take_if(|&mut key| key != (parent, before)) {
+                            insert(doc, pending, &mut runs);
+                        }
+                        if stale.take_if(|&mut stale| stale == parent).is_some() {
+                            prune(doc, parent);
+                        }
+                        match doc.nodes[child].parent {
+                            Some(old) if old == parent => {
+                                if let Some(pending) = run.take() {
+                                    insert(doc, pending, &mut runs);
+                                }
+                                let children = &mut doc.nodes[parent].children;
+                                if let Some(index) = children.iter().position(|&id| id == child) {
+                                    children.remove(index);
+                                }
+                                let index = before
+                                    .and_then(|before| children.iter().position(|&id| id == before))
+                                    .unwrap_or(children.len());
+                                children.insert(index, child);
+                                return Ok(true);
+                            }
+                            Some(old) => {
+                                if let Some(previous) = stale.replace(old)
+                                    && previous != old
+                                {
+                                    prune(doc, previous);
+                                }
+                            }
+                            None => {}
+                        }
+                        doc.nodes[child].parent = Some(parent);
+                        run = Some((parent, before));
+                        runs.push(child);
+                        true
+                    }
+                    3 => {
+                        let parent = node(doc, a)?;
+                        let child = usize::try_from(b)
+                            .ok()
+                            .filter(|&child| {
+                                doc.nodes
+                                    .get(child)
+                                    .is_some_and(|node| node.parent == Some(parent))
+                            })
+                            .context("Node is not a child")?;
+                        if let Some(pending) = run.take() {
+                            insert(doc, pending, &mut runs);
+                        }
+                        if let Some(previous) = stale.replace(parent)
+                            && previous != parent
+                        {
+                            prune(doc, previous);
+                        }
+                        self.mutated(doc, parent);
+                        doc.nodes[child].parent = None;
+                        self.tree.detached.push(child);
+                        self.tree.removed.push(child);
+                        true
+                    }
+                    4 | 5 => {
+                        let (id, key) = (node(doc, a)?, parts[0]);
+                        let value = (code == 4).then_some(parts[1]);
+                        if doc.nodes[id].attrs.get(key).map(String::as_str) == value {
+                            return Ok(false);
+                        }
+                        self.mutated(doc, id);
+                        // Kept walks of the tree read these attributes, so their edits must use `get_mut` and
+                        // count as tree changes.
+                        let current =
+                            if matches!(key, "slot" | "name" | "contenteditable" | "inert") {
+                                doc.nodes.get_mut(id)
+                            } else {
+                                doc.nodes.edit(id)
+                            };
+                        if let Some(current) = current {
+                            match value {
+                                Some(value) => current.attrs.set(key, value),
+                                None => drop(current.attrs.remove(key)),
+                            }
+                            if key == "style" {
+                                current.inline = None;
+                            }
+                        }
+                        true
+                    }
+                    6 => {
+                        let (host, root) = (node(doc, a)?, node(doc, b)?);
+                        ensure!(
+                            !doc.nodes[host].tag.starts_with('#')
+                                && doc.nodes[root].tag == "#fragment"
+                                && doc.nodes[root].parent.is_none(),
+                            "Invalid shadow root"
+                        );
+                        ensure!(
+                            !self.tree.shadows.contains_key(&host)
+                                && !self.tree.hosts.contains_key(&root),
+                            "Shadow root already exists"
+                        );
+                        ensure!(
+                            !self.tree.reaches(doc, host, root),
+                            "Cannot create a DOM cycle"
+                        );
+                        self.mutated(doc, host);
+                        self.tree.shadows.insert(host, root);
+                        self.tree.hosts.insert(root, host);
+                        true
+                    }
+                    7 => {
+                        let id = node(doc, a)?;
+                        let value = (c == 0).then(|| parts[0].to_owned());
+                        let current = &doc.nodes[id];
+                        if current.value == value {
+                            return Ok(false);
+                        }
+                        let fallback = current.attrs.get("value").map(String::as_str);
+                        let empty = |value: Option<&String>| {
+                            value
+                                .map(String::as_str)
+                                .or(fallback)
+                                .is_none_or(str::is_empty)
+                        };
+                        if self.styles.computed.is_some()
+                            && empty(current.value.as_ref()) != empty(value.as_ref())
+                            && self.tree.reaches(doc, id, 0)
+                        {
+                            self.styles.invalidate();
+                        }
+                        if let Some(current) = doc.nodes.edit(id) {
+                            current.value = value;
+                        }
+                        true
+                    }
+                    8 => {
+                        use crate::dom::{
+                            BROKEN, CHECKED, DIRTY, FULLSCREEN, INDETERMINATE, INVALID, LEAVING,
+                            MODAL, POPOVER, TOP_LAYER,
+                        };
+                        let id = node(doc, a)?;
+                        let bits = [
+                            CHECKED,
+                            DIRTY,
+                            MODAL,
+                            POPOVER,
+                            FULLSCREEN,
+                            BROKEN,
+                            INDETERMINATE,
+                            INVALID,
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        .fold(0, |bits, (index, bit)| {
+                            bits | if b & 1 << index != 0 { bit } else { 0 }
+                        });
+                        let mask = CHECKED
+                            | DIRTY
+                            | MODAL
+                            | POPOVER
+                            | FULLSCREEN
+                            | BROKEN
+                            | INDETERMINATE
+                            | INVALID;
+                        let old = doc.nodes[id].state;
+                        if old & mask == bits {
+                            return Ok(false);
+                        }
+                        let leaving = if bits & TOP_LAYER == 0
+                            && self.fonts.system.is_some()
+                            && self.interaction.top_layer.contains(&id)
+                        {
+                            old & LEAVING | (old & TOP_LAYER) << 5
+                        } else {
+                            0
+                        };
+                        self.mutated(doc, id);
+                        if let Some(node) = doc.nodes.edit(id) {
+                            node.state = node.state & !(mask | LEAVING) | bits | leaving;
+                        }
+                        true
+                    }
+                    9 => {
+                        let id = node(doc, a)?;
+                        if b != 0 || doc.nodes[id].state & crate::dom::LEAVING == 0 {
+                            self.interaction.top_layer.retain(|&other| other != id);
+                        }
+                        if b != 0 {
+                            self.interaction.top_layer.push(id);
+                        }
+                        true
+                    }
+                    // A copy of a node for `cloneNode`: tag, attributes, and the text of text and comments.
+                    10 => {
+                        let (id, from) =
+                            (usize::try_from(a).context("Invalid node")?, node(doc, b)?);
+                        ensure!(self.tree.reserved.remove(&id), "Invalid node");
+                        let from = &doc.nodes[from];
+                        let text = match &from.stylesheet {
+                            Some(sheet) if from.tag == "#text" => sheet.source(),
+                            _ if from.tag.starts_with('#') => from.text.clone(),
+                            _ => Default::default(),
+                        };
+                        let copy = Node {
+                            tag: from.tag.clone(),
+                            text,
+                            attrs: from.attrs.clone(),
+                            ..Node::default()
+                        };
+                        self.place(doc, id, copy);
+                        false
+                    }
+                    _ => bail!("Unknown DOM operation"),
+                })
+            })();
+            match result {
+                // Offscreen canvas changes must not dirty the page or schedule frames.
+                Ok(changed) => {
+                    dirty |= changed
+                        && usize::try_from(a)
+                            .ok()
+                            .and_then(|id| doc.nodes.get(id))
+                            .is_none_or(|node| node.tag != "apps-canvas");
+                }
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        if let Some(pending) = run {
+            insert(doc, pending, &mut runs);
+        }
+        if let Some(parent) = stale {
+            prune(doc, parent);
+        }
+        (dirty, errors)
     }
 }
