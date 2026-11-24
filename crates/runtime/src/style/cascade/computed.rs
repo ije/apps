@@ -62,6 +62,28 @@ pub(crate) fn table_part(doc: &crate::dom::Document, styles: &ComputedStyles, id
 }
 
 impl ComputedStyles {
+    // Gives a node that left the walk the styles of an unstyled node, and drops what was kept for it.
+    pub(crate) fn leave(&mut self, id: usize, unstyled: &Rc<Style>, empty: &Vars) {
+        self.values[id] = unstyled.clone();
+        self.vars[id] = empty.clone();
+        self.flags[id] = 0;
+        self.lengths.unset(id);
+        self.containers[id] = None;
+        self.pseudos.remove(&id);
+        self.text_pseudos.remove(&id);
+        self.backdrops.remove(&id);
+        self.backdrop_starts.remove(&id);
+        self.counting.remove(&id);
+        self.scrollbars.remove(&id);
+        self.selections.remove(&id);
+        self.animations.remove(&id);
+        self.important.remove(&id);
+        self.starting.remove(&id);
+        self.slotted.remove(&id);
+        self.parts.remove(&id);
+        self.exported.remove(&id);
+    }
+
     // Gives a new detached node the styles of an unstyled node, as a full pass does, and grows every list.
     pub(crate) fn place(&mut self, id: usize, len: usize) {
         let (style, vars) = empty();

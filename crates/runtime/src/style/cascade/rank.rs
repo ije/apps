@@ -1,5 +1,6 @@
 // Origin values are in precedence order and important ones rank `IMPORTANT - origin`, so don't reorder them.
 use crate::css::{properties::LOGICAL, properties::Prop, properties::Style};
+use crate::style::cascade::shadow::ShadowRule;
 use bbtree::unsync::BBTreeMap;
 pub(crate) const AGENT: u8 = 0;
 pub(crate) const USER: u8 = 1;
@@ -21,6 +22,24 @@ pub(crate) struct CascadeRank {
 }
 
 impl CascadeRank {
+    // The rank of a declaration of a rule from another tree: important ones turn the order of the trees around.
+    pub(crate) fn shadowed(rule: &ShadowRule, important: bool, position: u16) -> Self {
+        Self {
+            context: if important {
+                -rule.context
+            } else {
+                rule.context
+            },
+            ..Self::rule(
+                rule.layer,
+                important,
+                rule.specificity,
+                rule.order,
+                position,
+            )
+        }
+    }
+
     pub(crate) fn new(
         origin: u8,
         important: bool,
