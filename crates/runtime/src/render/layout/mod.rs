@@ -160,6 +160,7 @@ impl Layout {
         self.cull.spills.remove(&id);
         self.measurements.naturals.remove(&id);
         self.anchors.remove(&id);
+        self.anchors.remove(&crate::render::inline::atom_key(id, 2));
         self.blocks.remove(&id);
         self.containers.remove(&id);
         self.flexed_grids.remove(&id);

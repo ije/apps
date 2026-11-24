@@ -149,7 +149,7 @@ pub(crate) fn load(
         statuses[index] = 'status: {
             for (kind, value) in sources {
                 if *kind == "local" {
-                    if crate::render::fonts::local_font(state, family, value) {
+                    if local_font(state, family, value) {
                         break 'status "loaded";
                     }
                     continue;
@@ -157,7 +157,7 @@ pub(crate) fn load(
                 let name = match state.fonts.files.get(value).cloned() {
                     Some(name) => {
                         if let Some(name) = &name {
-                            crate::render::fonts::use_font(state, family, name, false);
+                            use_font(state, family, name, false);
                         }
                         name
                     }
@@ -181,7 +181,7 @@ pub(crate) fn load(
                                 })
                                 .and_then(|path| Ok(std::fs::read(path)?)),
                         }
-                        .and_then(|bytes| crate::render::fonts::add_font(state, family, bytes));
+                        .and_then(|bytes| add_font(state, family, bytes));
                         if let Err(error) = &result {
                             eprintln!("apps: @font-face {family}: {error}");
                         }
@@ -203,6 +203,117 @@ pub(crate) fn load(
         .map(|((family, _, src, range), status)| (family, src, range, status))
         .collect();
     (state.fonts.loads != loads, faces)
+}
+
+pub(crate) fn add_font(state: &mut PageState, family: &str, bytes: Vec<u8>) -> Result<String> {
+    const LIMIT: usize = 32 * 1024 * 1024;
+    let system = state
+        .fonts
+        .system
+        .as_ref()
+        .context("Font loading requires a displayed window")?;
+    ensure!(bytes.len() <= LIMIT, "Font exceeds 32 MB limit");
+    let bytes = match bytes.get(..4) {
+        Some(b"\0\x01\0\0" | b"true" | b"OTTO" | b"ttcf") => bytes,
+        #[cfg(target_os = "macos")]
+        Some(b"wOFF" | b"wOF2") => {
+            #[allow(improper_ctypes)]
+            unsafe extern "C" {
+                fn apps_font_sfnt(
+                    bytes: *const u8,
+                    length: usize,
+                    allocate: extern "C" fn(&mut Vec<u8>, usize) -> *mut u8,
+                    font: &mut Vec<u8>,
+                ) -> bool;
+            }
+            extern "C" fn allocate(font: &mut Vec<u8>, length: usize) -> *mut u8 {
+                if length > LIMIT {
+                    return std::ptr::null_mut();
+                }
+                *font = vec![0; length];
+                font.as_mut_ptr()
+            }
+            let mut font = Vec::new();
+            ensure!(
+                unsafe { apps_font_sfnt(bytes.as_ptr(), bytes.len(), allocate, &mut font) },
+                "Invalid or too large WOFF font"
+            );
+            font
+        }
+        #[cfg(not(target_os = "macos"))]
+        Some(magic @ (b"wOFF" | b"wOF2")) => {
+            let font = if magic == b"wOFF" {
+                wuff::decompress_woff1(&bytes)
+            } else {
+                wuff::decompress_woff2(&bytes)
+            }
+            .map_err(|_| anyhow::anyhow!("Invalid WOFF font"))?;
+            ensure!(font.len() <= LIMIT, "Font exceeds 32 MB limit");
+            font
+        }
+        _ => anyhow::bail!("Unsupported font format"),
+    };
+    let mut fonts = crate::render::raster::svg::fonts(false);
+    let database = std::sync::Arc::make_mut(&mut fonts.0);
+    let ids = database.load_font_source(usvg::fontdb::Source::Binary(std::sync::Arc::new(
+        bytes.clone(),
+    )));
+    let mut info = ids
+        .first()
+        .and_then(|id| database.face(*id))
+        .context("Unsupported or invalid font data")?
+        .clone();
+    let name = system.add_font(bytes, family)?;
+    // Faces are found by the family of their `@font-face`, as in CSS.
+    for &id in &ids {
+        database.remove_face(id);
+    }
+    info.families = vec![(name.clone(), usvg::fontdb::Language::English_UnitedStates)];
+    database.push_face_info(info);
+    use_font(state, family, &name, true);
+    Ok(name)
+}
+
+pub(crate) fn local_font(state: &mut PageState, family: &str, name: &str) -> bool {
+    let Some(system) = state.fonts.system.clone() else {
+        return false;
+    };
+    style::font_names(&system, &state.fonts.aliases);
+    let Some(found) =
+        style::FONT_NAMES.with(|names| names.borrow().0.get(&name.to_ascii_lowercase()).cloned())
+    else {
+        return false;
+    };
+    use_font(state, family, &found, false);
+    true
+}
+
+pub(crate) fn use_font(state: &mut PageState, family: &str, name: &str, added: bool) {
+    let same = name.eq_ignore_ascii_case(family);
+    if !added && (same || state.fonts.aliases.contains_key(family)) {
+        return;
+    }
+    state.fonts.loads += 1;
+    style::FONT_NAMES.with(|names| *names.borrow_mut() = Default::default());
+    // Invalidate only font-dependent values. A new style cache loses constructed and CSSOM-edited sheets.
+    state.styles.cache.environment.metrics = None;
+    state.styles.invalidate();
+    if !same {
+        state
+            .fonts
+            .aliases
+            .insert(family.to_owned(), name.to_owned());
+    }
+    state.dirty = true;
+}
+
+#[derive(Default)]
+pub struct Fonts {
+    pub(crate) aliases: HashMap<String, String>,
+    pub(crate) files: HashMap<String, Option<String>>,
+    pub(crate) loads: u32,
+    pub(crate) text: (u64, Vec<u64>),
+    pub(crate) system: Option<std::rc::Rc<renderer::TextSystem>>,
 }
 
 #[cfg(test)]
@@ -363,115 +474,4 @@ mod tests {
             );
         }
     }
-}
-
-pub(crate) fn add_font(state: &mut PageState, family: &str, bytes: Vec<u8>) -> Result<String> {
-    const LIMIT: usize = 32 * 1024 * 1024;
-    let system = state
-        .fonts
-        .system
-        .as_ref()
-        .context("Font loading requires a displayed window")?;
-    ensure!(bytes.len() <= LIMIT, "Font exceeds 32 MB limit");
-    let bytes = match bytes.get(..4) {
-        Some(b"\0\x01\0\0" | b"true" | b"OTTO" | b"ttcf") => bytes,
-        #[cfg(target_os = "macos")]
-        Some(b"wOFF" | b"wOF2") => {
-            #[allow(improper_ctypes)]
-            unsafe extern "C" {
-                fn apps_font_sfnt(
-                    bytes: *const u8,
-                    length: usize,
-                    allocate: extern "C" fn(&mut Vec<u8>, usize) -> *mut u8,
-                    font: &mut Vec<u8>,
-                ) -> bool;
-            }
-            extern "C" fn allocate(font: &mut Vec<u8>, length: usize) -> *mut u8 {
-                if length > LIMIT {
-                    return std::ptr::null_mut();
-                }
-                *font = vec![0; length];
-                font.as_mut_ptr()
-            }
-            let mut font = Vec::new();
-            ensure!(
-                unsafe { apps_font_sfnt(bytes.as_ptr(), bytes.len(), allocate, &mut font) },
-                "Invalid or too large WOFF font"
-            );
-            font
-        }
-        #[cfg(not(target_os = "macos"))]
-        Some(magic @ (b"wOFF" | b"wOF2")) => {
-            let font = if magic == b"wOFF" {
-                wuff::decompress_woff1(&bytes)
-            } else {
-                wuff::decompress_woff2(&bytes)
-            }
-            .map_err(|_| anyhow::anyhow!("Invalid WOFF font"))?;
-            ensure!(font.len() <= LIMIT, "Font exceeds 32 MB limit");
-            font
-        }
-        _ => anyhow::bail!("Unsupported font format"),
-    };
-    let mut fonts = crate::render::raster::svg::fonts(false);
-    let database = std::sync::Arc::make_mut(&mut fonts.0);
-    let ids = database.load_font_source(usvg::fontdb::Source::Binary(std::sync::Arc::new(
-        bytes.clone(),
-    )));
-    let mut info = ids
-        .first()
-        .and_then(|id| database.face(*id))
-        .context("Unsupported or invalid font data")?
-        .clone();
-    let name = system.add_font(bytes, family)?;
-    // Faces are found by the family of their `@font-face`, as in CSS.
-    for &id in &ids {
-        database.remove_face(id);
-    }
-    info.families = vec![(name.clone(), usvg::fontdb::Language::English_UnitedStates)];
-    database.push_face_info(info);
-    use_font(state, family, &name, true);
-    Ok(name)
-}
-
-pub(crate) fn local_font(state: &mut PageState, family: &str, name: &str) -> bool {
-    let Some(system) = state.fonts.system.clone() else {
-        return false;
-    };
-    style::font_names(&system, &state.fonts.aliases);
-    let Some(found) =
-        style::FONT_NAMES.with(|names| names.borrow().0.get(&name.to_ascii_lowercase()).cloned())
-    else {
-        return false;
-    };
-    use_font(state, family, &found, false);
-    true
-}
-
-pub(crate) fn use_font(state: &mut PageState, family: &str, name: &str, added: bool) {
-    let same = name.eq_ignore_ascii_case(family);
-    if !added && (same || state.fonts.aliases.contains_key(family)) {
-        return;
-    }
-    state.fonts.loads += 1;
-    style::FONT_NAMES.with(|names| *names.borrow_mut() = Default::default());
-    // Invalidate only font-dependent values. A new style cache loses constructed and CSSOM-edited sheets.
-    state.styles.cache.environment.metrics = None;
-    state.styles.invalidate();
-    if !same {
-        state
-            .fonts
-            .aliases
-            .insert(family.to_owned(), name.to_owned());
-    }
-    state.dirty = true;
-}
-
-#[derive(Default)]
-pub struct Fonts {
-    pub(crate) aliases: HashMap<String, String>,
-    pub(crate) files: HashMap<String, Option<String>>,
-    pub(crate) loads: u32,
-    pub(crate) text: (u64, Vec<u64>),
-    pub(crate) system: Option<std::rc::Rc<renderer::TextSystem>>,
 }

@@ -36,49 +36,94 @@ pub fn call(
         state.dirty = true;
         return Ok(Value::Null);
     }
+    let id = || -> Result<usize> {
+        let id = args[0].as_u64().context("Expected node id")? as usize;
+        ensure!(id < doc.nodes.len(), "Invalid node id");
+        Ok(id)
+    };
     match op {
-        "dom.cssControl"
-        | "dom.easing"
-        | "dom.animation"
-        | "dom.mediaMatches"
-        | "dom.properties"
-        | "dom.aliases"
-        | "dom.path"
-        | "dom.specified"
-        | "dom.declare"
-        | "dom.constructed"
-        | "dom.adopt"
-        | "dom.supports"
-        | "dom.registerProperty" => return css::page(op, args, doc, state, viewport),
-        "dom.decoded" | "dom.frames" => return media::page(op, state),
-        "dom.rangeNodes" => return text::page(op, args, doc),
-        "dom.scrollEvents" | "dom.hitTest" => {
-            return geometry::page(op, args, doc, state, viewport);
+        "dom.cssControl" => css::css_control(args, doc, state, viewport),
+        "dom.easing" => css::easing(args),
+        "dom.animation" => css::animation(args, doc, state),
+        "dom.mediaMatches" => css::media_matches(args, state, viewport),
+        "dom.properties" => css::properties(),
+        "dom.aliases" => css::aliases(),
+        "dom.path" => css::css_path(args),
+        "dom.specified" => css::specified(args),
+        "dom.declare" => css::declare(args),
+        "dom.constructed" | "dom.adopt" | "dom.supports" | "dom.registerProperty" => {
+            css::constructed(op, args, state)
         }
-        "dom.release" | "dom.focus" | "dom.hover" | "dom.active" | "dom.target" | "dom.reserve" => {
-            return nodes::page(op, args, doc, state);
+        "dom.cssAnimations" => css::css_animations(id()?, args, doc, state, viewport),
+        "dom.animated" => css::animated(id()?, args, doc, state, viewport),
+        "dom.computed" => css::computed(id()?, args, doc, state, viewport),
+        "dom.css" => css::css(id()?, doc, state),
+        "dom.sheet" => css::sheet(id()?, args, doc, state),
+        "dom.font" => {
+            id()?;
+            css::font(args, state)
         }
-        _ => {}
-    }
-    let id = args[0].as_u64().context("Expected node id")? as usize;
-    ensure!(id < doc.nodes.len(), "Invalid node id");
-    match op {
-        "dom.cssAnimations" | "dom.animated" | "dom.computed" | "dom.css" | "dom.sheet"
-        | "dom.font" | "dom.fontSources" | "dom.fontCheck" => {
-            css::node(op, id, args, doc, state, viewport)
+        "dom.fontSources" => {
+            id()?;
+            css::font_sources(args)
         }
-        "dom.canvas" | "dom.canvasURL" | "dom.canvasPixels" | "dom.canvasTake"
-        | "dom.canvasAdopt" | "dom.snapshot" | "dom.drawn" | "dom.canvasLink"
-        | "dom.canvasBind" | "dom.image" | "dom.canvasFont" | "dom.canvasColor" | "dom.svgBox"
-        | "dom.measureText" | "dom.canvasQuery" => media::node(op, id, args, doc, state),
-        "dom.selection" | "dom.userSelect" | "dom.selectionText" | "dom.textOffset"
-        | "dom.textPoint" | "dom.textRect" | "dom.textIndex" | "dom.innerText"
-        | "dom.caretText" => text::node(op, id, args, doc, state, viewport),
-        "dom.scrolled" | "dom.scroll" | "dom.fragments" | "dom.client" | "dom.skipped" => {
-            geometry::node(op, id, args, doc, state, viewport)
+        "dom.fontCheck" => {
+            id()?;
+            css::font_check(args, state)
         }
-        "dom.assignedNodes" | "dom.tree" | "dom.source" | "dom.matches" | "dom.closest"
-        | "dom.queryWithin" | "dom.html" => nodes::node(op, id, args, doc, state),
+        "dom.scrollEvents" => geometry::scroll_events(state),
+        "dom.hitTest" => geometry::hit_test(args, doc, state, viewport),
+        "dom.scrolled" => geometry::scrolled(id()?, state),
+        "dom.scroll" => geometry::scroll(id()?, args, doc, state, viewport),
+        "dom.fragments" => geometry::fragments(id()?, state),
+        "dom.client" => geometry::client(id()?, args, doc, state, viewport),
+        "dom.skipped" => geometry::skipped(id()?, args, doc, state, viewport),
+        "dom.decoded" => media::decoded(state),
+        "dom.frames" => media::frames(state),
+        "dom.canvas" => media::canvas(id()?, args, doc, state),
+        "dom.canvasURL" => media::canvas_url(id()?, args, doc, state),
+        "dom.canvasPixels" => media::canvas_pixels(id()?, args, doc, state),
+        "dom.canvasTake" => media::canvas_take(id()?, args, doc, state),
+        "dom.canvasAdopt" => media::canvas_adopt(id()?, args, doc, state),
+        "dom.snapshot" => media::snapshot(id()?, args, state),
+        "dom.drawn" => media::drawn(id()?, args, state),
+        "dom.canvasLink" => media::canvas_link(id()?, state),
+        "dom.canvasBind" => media::canvas_bind(id()?, args, state),
+        "dom.image" => media::image(id()?, args, state),
+        "dom.canvasFont" => {
+            id()?;
+            media::canvas_font(args)
+        }
+        "dom.canvasColor" => {
+            id()?;
+            media::canvas_color(args)
+        }
+        "dom.svgBox" => media::svg_box(id()?, doc, state),
+        "dom.measureText" => {
+            id()?;
+            media::measure_text(args, state)
+        }
+        "dom.canvasQuery" => media::canvas_query(id()?, args, state),
+        "dom.release" => nodes::release(args, doc, state),
+        "dom.focus" | "dom.hover" | "dom.active" => nodes::focus(op, args, doc, state),
+        "dom.target" => nodes::target(args, doc, state),
+        "dom.reserve" => nodes::reserve(args, doc, state),
+        "dom.assignedNodes" => nodes::assigned_nodes(id()?, args, doc, state),
+        "dom.tree" => nodes::subtree(id()?, doc),
+        "dom.source" => nodes::source(id()?, doc),
+        "dom.matches" => nodes::matches(id()?, args, doc, state),
+        "dom.closest" => nodes::closest(id()?, args, doc, state),
+        "dom.queryWithin" => nodes::query_within(id()?, args, doc, state),
+        "dom.html" => nodes::html(id()?, args, doc, state),
+        "dom.rangeNodes" => text::range_nodes(args, doc),
+        "dom.selection" => text::selection(id()?, args, doc, state),
+        "dom.userSelect" | "dom.selectionText" => {
+            text::user_select(op, id()?, args, doc, state, viewport)
+        }
+        "dom.textOffset" | "dom.textPoint" => text::text_offset(op, id()?, args, doc),
+        "dom.textRect" | "dom.textIndex" => text::text_rect(op, id()?, args, doc, state),
+        "dom.innerText" => text::inner_text(id()?, doc, state, viewport),
+        "dom.caretText" => text::caret(id()?, args, doc, state, viewport),
         _ => anyhow::bail!("Unknown DOM operation: {op}"),
     }
 }

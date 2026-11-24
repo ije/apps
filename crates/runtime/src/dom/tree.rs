@@ -9,7 +9,7 @@ pub struct Tree {
     pub(crate) live: rustc_hash::FxHashSet<usize>,
     pub shadows: rustc_hash::FxHashMap<usize, usize>,
     pub(crate) hosts: rustc_hash::FxHashMap<usize, usize>,
-    pub(crate) reserved: rustc_hash::FxHashSet<usize>,
+    reserved: rustc_hash::FxHashSet<usize>,
 }
 
 impl Tree {
@@ -27,11 +27,6 @@ impl Tree {
     pub(crate) fn place(&mut self, doc: &mut Document, id: usize, node: Node) {
         doc.nodes[id] = node;
         self.detached.push(id);
-    }
-
-    // A node whose parent is already set joins the arena without the detached list.
-    pub(crate) fn place_attached(&mut self, doc: &mut Document, id: usize, node: Node) {
-        doc.nodes[id] = node;
     }
 
     // Takes `child` out of its parent. The parent keeps it in its list of children until the caller prunes it.

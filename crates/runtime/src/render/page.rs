@@ -177,7 +177,7 @@ impl PageState {
 
     // Places a node whose parent is already in the arena.
     pub(crate) fn place_attached(&mut self, doc: &mut Document, id: usize, node: Node) {
-        self.tree.place_attached(doc, id, node);
+        doc.nodes[id] = node;
         self.styles.place(id, doc.nodes.len());
     }
 
@@ -253,7 +253,7 @@ impl PageState {
     }
 
     // A change to node `id` restyles the page when the node is in the tree.
-    pub(crate) fn mutated(&mut self, doc: &Document, id: usize) {
+    fn mutated(&mut self, doc: &Document, id: usize) {
         if self.styles.computed.is_some() && self.tree.reaches(doc, id, 0) {
             self.styles.invalidate();
         }

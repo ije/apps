@@ -87,6 +87,9 @@ pub(crate) struct SelectorCache {
     positions: rustc_hash::FxHashMap<usize, (u32, Positions)>,
     nth: rustc_hash::FxHashMap<(usize, usize, Option<usize>), NthPositions>,
     dependencies: Vec<Dependency>,
+    // The last record that held each dependency key, by record generation, for `finish_repeated`.
+    unique: Vec<(u32, u32)>,
+    generation: u32,
     revision: u32,
     pub(crate) epoch: u64,
     changes: std::collections::VecDeque<(u64, Vec<u32>)>,
@@ -194,7 +197,6 @@ impl SelectorCache {
         }
     }
 
-    // `dependencies` must be sorted, as `chunk_by` groups them by node.
     // Starts the record of what the matches of a node read.
     pub(crate) fn begin(&mut self) {
         self.dependencies.clear();
@@ -204,8 +206,24 @@ impl SelectorCache {
         &self.dependencies
     }
 
-    pub(crate) fn retain_recorded(&mut self, keep: impl FnMut(&Dependency) -> bool) {
-        self.dependencies.retain(keep);
+    // Ends the record of node `id` like `finish`, for a record where most entries repeat: each candidate
+    // selector reads the node again. It drops them in one pass before sorting.
+    pub(crate) fn finish_repeated(&mut self, id: usize) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.unique.fill((0, 0));
+            self.generation = 1;
+        }
+        let (unique, generation) = (&mut self.unique, self.generation);
+        self.dependencies.retain(|&(key, revision)| {
+            let key = key as usize;
+            if key >= unique.len() {
+                unique.resize(key + 1, (0, 0));
+            }
+            std::mem::replace(&mut unique[key], (generation, revision)) != (generation, revision)
+        });
+        self.dependencies.sort_unstable();
+        self.register(id);
     }
 
     // Ends the record of node `id`: its dependencies, once each, mark it when they change.
@@ -246,6 +264,7 @@ impl SelectorCache {
             })
     }
 
+    // `dependencies` must be sorted, as `chunk_by` groups them by node.
     pub(crate) fn register(&mut self, id: usize) {
         for group in self
             .dependencies

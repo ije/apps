@@ -133,6 +133,7 @@ impl Host {
     pub(crate) fn close_page(&mut self, id: u64) {
         self.forget_page(id);
         self.pages.remove(&id);
+        self.closed = Default::default();
         self.viewports.remove(&id);
         self.backgrounds.remove(&id);
     }

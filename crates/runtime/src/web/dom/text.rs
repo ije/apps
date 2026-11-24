@@ -7,297 +7,6 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
-pub(super) fn page(op: &str, args: &Value, doc: &mut Document) -> Result<Value> {
-    if op == "dom.rangeNodes" {
-        let start = args[0].as_u64().context("Expected start node")? as usize;
-        let end = args[2].as_u64().context("Expected end node")? as usize;
-        ensure!(
-            start < doc.nodes.len() && end < doc.nodes.len(),
-            "Invalid range node"
-        );
-        let from = args[1].as_u64().context("Expected start offset")? as usize;
-        let to = args[3].as_u64().context("Expected end offset")? as usize;
-        let mut positions = HashMap::new();
-        let mut following = |mut id: usize| {
-            loop {
-                let parent = doc.nodes[id].parent?;
-                let children = &doc.nodes[parent].children;
-                if !positions.contains_key(&id) {
-                    positions.extend(
-                        children
-                            .iter()
-                            .enumerate()
-                            .map(|(index, &child)| (child, index)),
-                    );
-                }
-                if let Some(&next) = children.get(*positions.get(&id)? + 1) {
-                    return Some(next);
-                }
-                id = parent;
-            }
-        };
-        let mut current = if doc.nodes[start].tag == "#text" {
-            Some(start)
-        } else {
-            doc.nodes[start]
-                .children
-                .get(from)
-                .copied()
-                .or_else(|| following(start))
-        };
-        let stop = if doc.nodes[end].tag == "#text" {
-            following(end)
-        } else {
-            doc.nodes[end]
-                .children
-                .get(to)
-                .copied()
-                .or_else(|| following(end))
-        };
-        // With `elements`, elements that the range holds whole come too, for their boxes.
-        let elements = args.get(4).and_then(Value::as_bool) == Some(true);
-        let mut ranges = Vec::new();
-        // Like CSSOM, an element whose parent is selected too gives no box of its own.
-        let mut whole = None;
-        while let Some(id) = current.filter(|id| Some(*id) != stop) {
-            let node = &doc.nodes[id];
-            if elements
-                && !node.tag.starts_with('#')
-                && std::iter::successors(Some(end), |&at| doc.nodes[at].parent).all(|at| at != id)
-            {
-                if whole.is_none_or(|whole| {
-                    std::iter::successors(node.parent, |&at| doc.nodes[at].parent)
-                        .all(|at| at != whole)
-                }) {
-                    ranges.push([id, 0, 0]);
-                    whole = Some(id);
-                }
-            } else if node.tag == "#text" {
-                ranges.push([
-                    id,
-                    if id == start { from } else { 0 },
-                    if id == end {
-                        to
-                    } else {
-                        node.text.encode_utf16().count()
-                    },
-                ]);
-            }
-            current = node.children.first().copied().or_else(|| following(id));
-        }
-        return Ok(json!(ranges));
-    }
-    anyhow::bail!("Unknown DOM operation: {op}")
-}
-
-pub(super) fn node(
-    op: &str,
-    id: usize,
-    args: &Value,
-    doc: &mut Document,
-    state: &mut PageState,
-    viewport: [f32; 2],
-) -> Result<Value> {
-    match op {
-        "dom.selection" => {
-            state.interaction.selection.clear();
-            state.interaction.selection_caret = None;
-            if let Some(ranges) = args[1].as_array() {
-                for range in ranges {
-                    let node = range[0].as_u64().context("Expected selection node")? as usize;
-                    ensure!(node < doc.nodes.len(), "Invalid selection node");
-                    state.interaction.selection.insert(
-                        node,
-                        [
-                            range[1].as_u64().unwrap_or(0) as usize,
-                            range[2].as_u64().unwrap_or(0) as usize,
-                        ],
-                    );
-                    if args[2].as_bool() == Some(true) {
-                        state.interaction.selection_caret = Some(node);
-                    }
-                }
-            } else if id != 0 {
-                state.interaction.selection.insert(
-                    id,
-                    [
-                        args[1].as_u64().unwrap_or(0) as usize,
-                        args[2].as_u64().unwrap_or(0) as usize,
-                    ],
-                );
-                if args[1] == args[2] {
-                    state.interaction.selection_caret = Some(id);
-                }
-            }
-            state.dirty = true;
-            Ok(Value::Null)
-        }
-        "dom.userSelect" | "dom.selectionText" => {
-            let computed = state.restyle(doc, viewport);
-            if op == "dom.userSelect" {
-                return Ok(if state.styles.inert(id) {
-                    json!((style::UserSelect::None, id))
-                } else {
-                    json!(computed.user_select[id])
-                });
-            }
-            let mut range = rustc_hash::FxHashMap::default();
-            let (mut first, mut last) = (None, 0);
-            for item in args[1].as_array().into_iter().flatten() {
-                let node = item[0].as_u64().context("Expected selection node")? as usize;
-                ensure!(node < doc.nodes.len(), "Invalid selection node");
-                let [start, end] = [1, 2].map(|index| item[index].as_u64().unwrap_or(0) as usize);
-                range.insert(node, [start, end]);
-                first.get_or_insert(node);
-                last = node;
-            }
-            let Some(mut root) = first else {
-                return Ok(json!(""));
-            };
-            while !std::iter::successors(Some(last), |&id| doc.nodes[id].parent)
-                .any(|id| id == root)
-                && let Some(parent) = doc.nodes[root].parent
-            {
-                root = parent;
-            }
-            Ok(json!(rendered_text(
-                doc,
-                state,
-                &computed,
-                root,
-                Some(&range)
-            )))
-        }
-        "dom.textOffset" | "dom.textPoint" => {
-            let target = args[1].as_u64().unwrap_or(0) as usize;
-            let mut offset = 0;
-            let mut pending = vec![id];
-            while let Some(node) = pending.pop() {
-                let current = &doc.nodes[node];
-                if op == "dom.textOffset" && node == target {
-                    let index = args[2].as_u64().unwrap_or(0) as usize;
-                    if current.tag == "#text" {
-                        return Ok(json!(offset + index));
-                    }
-                    pending.clear();
-                    pending.extend(current.children.iter().take(index));
-                    while let Some(node) = pending.pop() {
-                        let current = &doc.nodes[node];
-                        if current.tag == "#text" {
-                            offset += current.text.encode_utf16().count();
-                        } else {
-                            pending.extend(&current.children);
-                        }
-                    }
-                    return Ok(json!(offset));
-                }
-                if current.tag == "#text" {
-                    let length = current.text.encode_utf16().count();
-                    if op == "dom.textPoint" && target <= offset + length {
-                        return Ok(json!([node, target.saturating_sub(offset)]));
-                    }
-                    offset += length;
-                } else {
-                    pending.extend(current.children.iter().rev());
-                }
-            }
-            Ok(if op == "dom.textOffset" {
-                json!(offset)
-            } else {
-                let mut node = id;
-                while let Some(&child) = doc.nodes[node].children.first()
-                    && !doc.nodes[child].children.is_empty()
-                {
-                    node = child;
-                }
-                json!([node, 0])
-            })
-        }
-        "dom.textRect" | "dom.textIndex" => {
-            let password = doc.nodes[id]
-                .password()
-                .then(|| doc.nodes[id].current_value().unwrap_or("").to_owned());
-            let shown = |offset| {
-                password
-                    .as_deref()
-                    .map_or(offset, |value| crate::dom::text::bullets(value, offset))
-            };
-            let real = |index| {
-                password
-                    .as_deref()
-                    .map_or(index, |value| crate::dom::text::unbullet(value, index))
-            };
-            let start = shown(args[1].as_u64().unwrap_or(0) as usize);
-            let end = args[2].as_u64().map_or(start, |end| shown(end as usize));
-            if let Some((layout, text, range, rows, font)) = state.layout.text_layouts.get(&id) {
-                let content = &text[range.clone()];
-                let source = doc.nodes[id].text.as_str();
-                let [dx, dy] = state.geometry.scroll_shift(&state.styles.walk, id);
-                if op == "dom.textIndex" {
-                    let position = renderer::point(
-                        renderer::px(args[1].as_f64().unwrap_or(0.) as f32 - dx),
-                        renderer::px(args[2].as_f64().unwrap_or(0.) as f32 - dy),
-                    );
-                    let index = crate::render::text::text_index(layout, text, rows, position, true)
-                        .unwrap_or_else(|index| index)
-                        .clamp(range.start, range.end);
-                    let offset =
-                        crate::dom::text::source_offset(source, content, index - range.start);
-                    return Ok(json!(real(offset)));
-                }
-                let mut rects = crate::render::text::text_rects(
-                    layout,
-                    text,
-                    rows,
-                    [start, end].map(|index| {
-                        range.start + crate::dom::text::shown_index(source, content, index)
-                    }),
-                    *font,
-                );
-                rects
-                    .iter_mut()
-                    .for_each(|rect| (rect[0], rect[1]) = (rect[0] + dx, rect[1] + dy));
-                return Ok(json!(rects));
-            }
-            // Text that this frame did not lay out, like the text of a block far from the view, lays out with its
-            // block on the next reflow: `null` asks the script for one, as `dom.skipped` does.
-            let forced = &mut state.layout.measurements.forced;
-            if doc.nodes[id].parent.is_some() && forced.insert(id) {
-                state.layout.measurements.waking.push(id);
-                state.layout.cull.reskipped = true;
-                return Ok(Value::Null);
-            }
-            Ok(if op == "dom.textRect" {
-                json!([])
-            } else {
-                json!(0)
-            })
-        }
-        "dom.innerText" => {
-            let computed = state.restyle(doc, viewport);
-            Ok(json!(rendered_text(doc, state, &computed, id, None)))
-        }
-        "dom.caretText" => {
-            let computed = state.restyle(doc, viewport);
-            let point = args[2]
-                .as_u64()
-                .map(|node| (node as usize, args[3].as_u64().unwrap_or(0) as usize));
-            let window = args[4]
-                .as_u64()
-                .map_or(usize::MAX, |window| window as usize);
-            Ok(caret_text(
-                doc,
-                &computed,
-                id,
-                args[1].as_bool().unwrap_or(false),
-                point,
-                window,
-            ))
-        }
-        _ => anyhow::bail!("Unknown DOM operation: {op}"),
-    }
-}
-
 #[derive(Default)]
 struct Caret {
     text: Vec<u16>,
@@ -765,4 +474,310 @@ fn rendered_text(
         );
     }
     text
+}
+
+pub(super) fn range_nodes(args: &Value, doc: &mut Document) -> Result<Value> {
+    let start = args[0].as_u64().context("Expected start node")? as usize;
+    let end = args[2].as_u64().context("Expected end node")? as usize;
+    ensure!(
+        start < doc.nodes.len() && end < doc.nodes.len(),
+        "Invalid range node"
+    );
+    let from = args[1].as_u64().context("Expected start offset")? as usize;
+    let to = args[3].as_u64().context("Expected end offset")? as usize;
+    let mut positions = HashMap::new();
+    let mut following = |mut id: usize| {
+        loop {
+            let parent = doc.nodes[id].parent?;
+            let children = &doc.nodes[parent].children;
+            if !positions.contains_key(&id) {
+                positions.extend(
+                    children
+                        .iter()
+                        .enumerate()
+                        .map(|(index, &child)| (child, index)),
+                );
+            }
+            if let Some(&next) = children.get(*positions.get(&id)? + 1) {
+                return Some(next);
+            }
+            id = parent;
+        }
+    };
+    let mut current = if doc.nodes[start].tag == "#text" {
+        Some(start)
+    } else {
+        doc.nodes[start]
+            .children
+            .get(from)
+            .copied()
+            .or_else(|| following(start))
+    };
+    let stop = if doc.nodes[end].tag == "#text" {
+        following(end)
+    } else {
+        doc.nodes[end]
+            .children
+            .get(to)
+            .copied()
+            .or_else(|| following(end))
+    };
+    // With `elements`, elements that the range holds whole come too, for their boxes.
+    let elements = args.get(4).and_then(Value::as_bool) == Some(true);
+    let mut ranges = Vec::new();
+    // Like CSSOM, an element whose parent is selected too gives no box of its own.
+    let mut whole = None;
+    while let Some(id) = current.filter(|id| Some(*id) != stop) {
+        let node = &doc.nodes[id];
+        if elements
+            && !node.tag.starts_with('#')
+            && std::iter::successors(Some(end), |&at| doc.nodes[at].parent).all(|at| at != id)
+        {
+            if whole.is_none_or(|whole| {
+                std::iter::successors(node.parent, |&at| doc.nodes[at].parent).all(|at| at != whole)
+            }) {
+                ranges.push([id, 0, 0]);
+                whole = Some(id);
+            }
+        } else if node.tag == "#text" {
+            ranges.push([
+                id,
+                if id == start { from } else { 0 },
+                if id == end {
+                    to
+                } else {
+                    node.text.encode_utf16().count()
+                },
+            ]);
+        }
+        current = node.children.first().copied().or_else(|| following(id));
+    }
+    Ok(json!(ranges))
+}
+
+pub(super) fn selection(
+    id: usize,
+    args: &Value,
+    doc: &mut Document,
+    state: &mut PageState,
+) -> Result<Value> {
+    state.interaction.selection.clear();
+    state.interaction.selection_caret = None;
+    if let Some(ranges) = args[1].as_array() {
+        for range in ranges {
+            let node = range[0].as_u64().context("Expected selection node")? as usize;
+            ensure!(node < doc.nodes.len(), "Invalid selection node");
+            state.interaction.selection.insert(
+                node,
+                [
+                    range[1].as_u64().unwrap_or(0) as usize,
+                    range[2].as_u64().unwrap_or(0) as usize,
+                ],
+            );
+            if args[2].as_bool() == Some(true) {
+                state.interaction.selection_caret = Some(node);
+            }
+        }
+    } else if id != 0 {
+        state.interaction.selection.insert(
+            id,
+            [
+                args[1].as_u64().unwrap_or(0) as usize,
+                args[2].as_u64().unwrap_or(0) as usize,
+            ],
+        );
+        if args[1] == args[2] {
+            state.interaction.selection_caret = Some(id);
+        }
+    }
+    state.dirty = true;
+    Ok(Value::Null)
+}
+
+pub(super) fn user_select(
+    op: &str,
+    id: usize,
+    args: &Value,
+    doc: &mut Document,
+    state: &mut PageState,
+    viewport: [f32; 2],
+) -> Result<Value> {
+    let computed = state.restyle(doc, viewport);
+    if op == "dom.userSelect" {
+        return Ok(if state.styles.inert(id) {
+            json!((style::UserSelect::None, id))
+        } else {
+            json!(computed.user_select[id])
+        });
+    }
+    let mut range = rustc_hash::FxHashMap::default();
+    let (mut first, mut last) = (None, 0);
+    for item in args[1].as_array().into_iter().flatten() {
+        let node = item[0].as_u64().context("Expected selection node")? as usize;
+        ensure!(node < doc.nodes.len(), "Invalid selection node");
+        let [start, end] = [1, 2].map(|index| item[index].as_u64().unwrap_or(0) as usize);
+        range.insert(node, [start, end]);
+        first.get_or_insert(node);
+        last = node;
+    }
+    let Some(mut root) = first else {
+        return Ok(json!(""));
+    };
+    while !std::iter::successors(Some(last), |&id| doc.nodes[id].parent).any(|id| id == root)
+        && let Some(parent) = doc.nodes[root].parent
+    {
+        root = parent;
+    }
+    Ok(json!(rendered_text(
+        doc,
+        state,
+        &computed,
+        root,
+        Some(&range)
+    )))
+}
+
+pub(super) fn text_offset(op: &str, id: usize, args: &Value, doc: &mut Document) -> Result<Value> {
+    let target = args[1].as_u64().unwrap_or(0) as usize;
+    let mut offset = 0;
+    let mut pending = vec![id];
+    while let Some(node) = pending.pop() {
+        let current = &doc.nodes[node];
+        if op == "dom.textOffset" && node == target {
+            let index = args[2].as_u64().unwrap_or(0) as usize;
+            if current.tag == "#text" {
+                return Ok(json!(offset + index));
+            }
+            pending.clear();
+            pending.extend(current.children.iter().take(index));
+            while let Some(node) = pending.pop() {
+                let current = &doc.nodes[node];
+                if current.tag == "#text" {
+                    offset += current.text.encode_utf16().count();
+                } else {
+                    pending.extend(&current.children);
+                }
+            }
+            return Ok(json!(offset));
+        }
+        if current.tag == "#text" {
+            let length = current.text.encode_utf16().count();
+            if op == "dom.textPoint" && target <= offset + length {
+                return Ok(json!([node, target.saturating_sub(offset)]));
+            }
+            offset += length;
+        } else {
+            pending.extend(current.children.iter().rev());
+        }
+    }
+    Ok(if op == "dom.textOffset" {
+        json!(offset)
+    } else {
+        let mut node = id;
+        while let Some(&child) = doc.nodes[node].children.first()
+            && !doc.nodes[child].children.is_empty()
+        {
+            node = child;
+        }
+        json!([node, 0])
+    })
+}
+
+pub(super) fn text_rect(
+    op: &str,
+    id: usize,
+    args: &Value,
+    doc: &mut Document,
+    state: &mut PageState,
+) -> Result<Value> {
+    let password = doc.nodes[id]
+        .password()
+        .then(|| doc.nodes[id].current_value().unwrap_or("").to_owned());
+    let shown = |offset| {
+        password
+            .as_deref()
+            .map_or(offset, |value| crate::dom::text::bullets(value, offset))
+    };
+    let real = |index| {
+        password
+            .as_deref()
+            .map_or(index, |value| crate::dom::text::unbullet(value, index))
+    };
+    let start = shown(args[1].as_u64().unwrap_or(0) as usize);
+    let end = args[2].as_u64().map_or(start, |end| shown(end as usize));
+    if let Some((layout, text, range, rows, font)) = state.layout.text_layouts.get(&id) {
+        let content = &text[range.clone()];
+        let source = doc.nodes[id].text.as_str();
+        let [dx, dy] = state.geometry.scroll_shift(&state.styles.walk, id);
+        if op == "dom.textIndex" {
+            let position = renderer::point(
+                renderer::px(args[1].as_f64().unwrap_or(0.) as f32 - dx),
+                renderer::px(args[2].as_f64().unwrap_or(0.) as f32 - dy),
+            );
+            let index = crate::render::text::text_index(layout, text, rows, position, true)
+                .unwrap_or_else(|index| index)
+                .clamp(range.start, range.end);
+            let offset = crate::dom::text::source_offset(source, content, index - range.start);
+            return Ok(json!(real(offset)));
+        }
+        let mut rects = crate::render::text::text_rects(
+            layout,
+            text,
+            rows,
+            [start, end]
+                .map(|index| range.start + crate::dom::text::shown_index(source, content, index)),
+            *font,
+        );
+        rects
+            .iter_mut()
+            .for_each(|rect| (rect[0], rect[1]) = (rect[0] + dx, rect[1] + dy));
+        return Ok(json!(rects));
+    }
+    // Text that this frame did not lay out, like the text of a block far from the view, lays out with its
+    // block on the next reflow: `null` asks the script for one, as `dom.skipped` does.
+    let forced = &mut state.layout.measurements.forced;
+    if doc.nodes[id].parent.is_some() && forced.insert(id) {
+        state.layout.measurements.waking.push(id);
+        state.layout.cull.reskipped = true;
+        return Ok(Value::Null);
+    }
+    Ok(if op == "dom.textRect" {
+        json!([])
+    } else {
+        json!(0)
+    })
+}
+
+pub(super) fn inner_text(
+    id: usize,
+    doc: &mut Document,
+    state: &mut PageState,
+    viewport: [f32; 2],
+) -> Result<Value> {
+    let computed = state.restyle(doc, viewport);
+    Ok(json!(rendered_text(doc, state, &computed, id, None)))
+}
+
+pub(super) fn caret(
+    id: usize,
+    args: &Value,
+    doc: &mut Document,
+    state: &mut PageState,
+    viewport: [f32; 2],
+) -> Result<Value> {
+    let computed = state.restyle(doc, viewport);
+    let point = args[2]
+        .as_u64()
+        .map(|node| (node as usize, args[3].as_u64().unwrap_or(0) as usize));
+    let window = args[4]
+        .as_u64()
+        .map_or(usize::MAX, |window| window as usize);
+    Ok(caret_text(
+        doc,
+        &computed,
+        id,
+        args[1].as_bool().unwrap_or(false),
+        point,
+        window,
+    ))
 }
