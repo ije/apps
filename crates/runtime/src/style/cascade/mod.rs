@@ -21,13 +21,16 @@ use table::anonymous_tables;
 pub(crate) mod computed;
 mod container;
 mod counters;
+mod declared;
 mod memo;
+mod moves;
 mod node;
 pub(super) mod rank;
 pub(super) mod scope;
 mod shadow;
 mod sheets;
 mod table;
+mod used_values;
 
 pub(crate) use container::Container;
 pub(crate) use shadow::Passed;
