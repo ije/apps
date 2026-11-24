@@ -108,13 +108,14 @@ impl ComputedStyles {
             std::mem::swap(&mut self.values[*id], style);
         }
         generated.retain_mut(|(id, pair)| {
-            let Some(extras) = self.extras.get_mut(id) else {
+            let Some(extras) = self
+                .extras
+                .get_mut(id)
+                .filter(|kept| kept.generated.is_some())
+            else {
                 return false;
             };
-            match &mut Rc::make_mut(extras).generated {
-                Some(old) => std::mem::swap(old, pair),
-                None => return false,
-            }
+            std::mem::swap(Rc::make_mut(extras).generated.as_mut().unwrap(), pair);
             true
         });
         for (id, new) in lengths {
