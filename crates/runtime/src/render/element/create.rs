@@ -1,10 +1,9 @@
-use super::super::layout::size::{
-    broken_image, dimension, field_size, legend, natural_size, text_field,
-};
+use super::super::layout::size::{broken_image, field_size, legend, natural_size, text_field};
 use super::super::{
     layout::cull,
     paint::{DomBox, Turned, background::css_background, scrollbar},
 };
+use super::align::vertical_align;
 use super::border::{border_canvas, fieldset_border, inset_shadows, shade_border};
 use super::children::children;
 use super::columns::columns;
@@ -13,16 +12,15 @@ use super::cx::{Carry, Cx, Frame, above, viewport};
 use super::kept::{Query, Read, Replay, Shared, hashed};
 use super::margin::{
     body_overflow_moves, clear_bits, definite_line, float_side, in_flow, margins, overscroll,
-    shrinks_around,
 };
 use super::native::native_control;
+use super::natural::natural_box;
 use super::paragraph::paragraph;
 use super::props::props;
 use super::pseudos::pseudo_elements;
 use super::query::{
-    backdrop, box_parent, boxless, collapses, content_editable, inset_axes, insets,
-    only_auto_ratio, padding_start, parent_font, positioner, row_fill, scrolled, scroller,
-    starts_line, text_indent,
+    backdrop, box_parent, boxless, collapses, content_editable, inset_axes, insets, padding_start,
+    positioner, row_fill, scrolled, scroller, starts_line, text_indent,
 };
 use super::replaced::replaced;
 use super::svg::svg_box;
@@ -1341,157 +1339,7 @@ pub(super) fn create(
         && parent.is_some_and(|parent| doc.nodes[parent].tag == "details");
     el = props(&cx, &mut fr, el, &mut inner_shadows, line_base, in_details);
     if let Some(natural) = natural {
-        let chrome = [
-            padding[1] + padding[3] + borders[1] + borders[3],
-            padding[0] + padding[2] + borders[0] + borders[2],
-        ];
-        let props = [Prop::WIDTH, Prop::HEIGHT];
-        let hint = [0, 1].map(|axis| {
-            node.attrs
-                .get(["width", "height"][axis])
-                .filter(|_| {
-                    style.get(props[axis]).is_none()
-                        && matches!(node.tag.as_str(), "img" | "video")
-                        && !(broken && natural == [16., 16.])
-                })
-                .and_then(|value| dimension(value, false))
-                .map(|length| length + extra[axis])
-        });
-        if let Some(width) = hint[0] {
-            el = el.w(px(width));
-        }
-        if let Some(height) = hint[1] {
-            el = el.h(px(height));
-        }
-        let set = [0, 1].map(|axis| {
-            hint[axis].is_some()
-                || style.get(props[axis]).is_some_and(|value| {
-                    value != "auto"
-                        && !(axis == 1 && line_base == Some(false) && value.contains('%'))
-                })
-        });
-        let [content_width, content_height] = [0, 1].map(|axis| {
-            hint[axis]
-                .or_else(|| {
-                    style
-                        .get(props[axis])
-                        .filter(|value| !value.contains('%'))
-                        .and_then(|value| units.resolve(value, containing[axis]))
-                        .map(|length| length + extra[axis])
-                })
-                .map(|length| (length - chrome[axis]).max(0.))
-        });
-        // A flex item's automatic minimum is the smaller of its specified and natural widths.
-        if flex_parent
-            && style
-                .get(Prop::MIN_WIDTH)
-                .is_none_or(|value| value == "auto")
-            && reader
-                .parent(id, Prop::FLEX_DIRECTION)
-                .is_none_or(|value| !value.starts_with("column"))
-            && let Some(percent) = style
-                .get(Prop::WIDTH)
-                .and_then(|value| value.strip_suffix('%'))
-                .and_then(|value| value.parse::<f32>().ok())
-        {
-            el = el.min_w(px(
-                (percent.max(0.) / 100. * containing[0] + extra[0]).min(natural[0] + chrome[0])
-            ));
-        }
-        let stretch = [cx.stretched(0), cx.stretched(1)];
-        let css = el.style().aspect_ratio.is_some();
-        let line = (stretch[1]
-            && reader
-                .parent(id, Prop::FLEX_WRAP)
-                .is_none_or(|value| value == "nowrap")
-            && reader
-                .parent(id, Prop::HEIGHT)
-                .is_some_and(|value| value != "auto" && !value.contains('%')))
-        .then(|| (containing[1] - margin[0] - margin[2] - chrome[1]).max(0.));
-        let sized = !set[0] && !stretch[0] && !(css && set[1]);
-        let width = if set[0] {
-            content_width
-        } else if !sized {
-            None
-        } else {
-            match natural_ratio.filter(|_| !css) {
-                Some(ratio) if set[1] => content_height.map(|height| height * ratio),
-                Some(ratio) => Some(line.map_or(natural[0], |line| line * ratio)),
-                None => Some(natural[0]),
-            }
-        };
-        // Like Chrome, a video without a frame has no natural size when CSS gives it a ratio, so it fills the line.
-        if sized
-            && css
-            && natural_ratio.is_none()
-            && node.tag == "video"
-            && !matches!(position, "absolute" | "fixed")
-        {
-            match el.style().aspect_ratio {
-                Some(ratio) => {
-                    // A box around it that shrinks to its content makes it as narrow as its frame.
-                    let shrinks = shrinks_around(doc, styles, id);
-                    reader.log(Query::Shrinks(id as u32), 0, hashed(shrinks));
-                    let limit = |prop| {
-                        style
-                            .get(prop)
-                            .and_then(|value| units.resolve(value, containing[0]))
-                            .map(|value| value + extra[0])
-                    };
-                    let width = if shrinks {
-                        chrome[0]
-                    } else {
-                        containing[0] - margin[1] - margin[3]
-                    }
-                    .min(limit(Prop::MAX_WIDTH).unwrap_or(f32::INFINITY))
-                    .max(limit(Prop::MIN_WIDTH).unwrap_or(0.));
-                    // The ratio of the width and height attributes is for the content box.
-                    let height = if style.get(Prop::BOX_SIZING) == Some("border-box")
-                        && style
-                            .get(Prop::ASPECT_RATIO)
-                            .is_some_and(|v| !v.contains("auto"))
-                    {
-                        width / ratio
-                    } else {
-                        (width - chrome[0]).max(0.) / ratio + chrome[1]
-                    };
-                    el = el.w(px(width)).h(px(height));
-                }
-                None => el = el.w(renderer::Length::Calc(1., px(-margin[1] - margin[3]))),
-            }
-        } else if sized {
-            if let Some(width) = width {
-                el = el.w(px(width + chrome[0]));
-                if let Some(min) = fr.floor(&cx, 0, width + chrome[0]) {
-                    el = el.min_w(px(min));
-                }
-            } else {
-                el.style().aspect_ratio = natural_ratio;
-                el = only_auto_ratio(el, style);
-            }
-        }
-        if let Some(height) = match natural_ratio {
-            _ if set[1] || line.is_some() || css => None,
-            None => Some(natural[1]),
-            Some(ratio) if matches!(position, "absolute" | "fixed") => {
-                width.map(|width| width / ratio)
-            }
-            Some(_) => None,
-        } {
-            let height = height + chrome[1];
-            if stretch[1]
-                && style
-                    .get(Prop::MIN_HEIGHT)
-                    .is_none_or(|value| value == "auto")
-            {
-                el = el.min_h(px(height));
-            } else {
-                el = el.h(px(height));
-                if let Some(min) = fr.floor(&cx, 1, height) {
-                    el = el.min_h(px(min));
-                }
-            }
-        }
+        el = natural_box(&cx, &fr, el, natural, line_base);
     }
     if block_size.is_some() && natural.is_none() {
         for (axis, size, sides) in [(0, Prop::WIDTH, [3, 1]), (1, Prop::HEIGHT, [0, 2])] {
@@ -1571,178 +1419,7 @@ pub(super) fn create(
         && display.starts_with("inline")
         && let Some(parent) = node.parent
     {
-        if display != "inline"
-            && el.style().size.width == renderer::Length::Auto
-            && (!replaced || node.tag == "button")
-            && float_side(style).is_none()
-        {
-            el.style().flex_shrink = 1.;
-        }
-        reader.log(
-            Query::ParentFont,
-            depth,
-            hashed(parent_font(doc, styles, id)),
-        );
-        let align = style.get(Prop::VERTICAL_ALIGN).unwrap_or("baseline");
-        let middle = match el.style().size.height {
-            _ if align != "middle" => None,
-            _ if display == "inline" => Some(units.font.lh),
-            renderer::Length::Px(height) => Some(f32::from(height) + margin[0] - margin[2]),
-            _ => None,
-        };
-        let sized = matches!(el.style().size.height, renderer::Length::Px(_));
-        // Like Chrome, a middle box puts the middle of its margin box half an x-height above the baseline.
-        let centered = align == "middle" && middle.is_none();
-        el.style().align_self = match align {
-            "top" => Some(renderer::AlignItems::FlexStart),
-            "text-top" if !sized && display != "inline" => Some(renderer::AlignItems::FlexStart),
-            "bottom" => Some(renderer::AlignItems::FlexEnd),
-            _ => None,
-        };
-        let below = |style: &css::properties::Style, font: css::value::units::FontUnits| {
-            let face = text.face(&style::font(style));
-            font.lh - f32::from(text.baseline(face, px(font.em), px(font.lh), pixel_ratio))
-        };
-        let line = styles.lengths[parent].font;
-        let replaced = matches!(
-            node.tag.as_str(),
-            "img"
-                | "svg"
-                | "canvas"
-                | "video"
-                | "audio"
-                | "iframe"
-                | "embed"
-                | "object"
-                | "progress"
-                | "meter"
-                | "textarea"
-        ) || check
-            || display == "inline-block"
-                && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
-                    .into_iter()
-                    .any(|prop| style.get(prop).is_some_and(|value| value != "visible"))
-            || display != "inline"
-                && !node.tag.starts_with('#')
-                && !input.is_some_and(|kind| {
-                    ["button", "submit", "reset", "file"]
-                        .iter()
-                        .any(|other| kind.eq_ignore_ascii_case(other))
-                })
-                && cx.blank();
-        let replaced = replaced && alt.is_none();
-        let field = editable && node.tag == "input";
-        let swatch = native
-            .as_ref()
-            .is_some_and(|look| look.control == super::super::paint::control::Control::Color);
-        let parent_style = &styles.values[parent];
-        let parent = below(parent_style, line);
-        let edge = el.style().align_self.is_none()
-            && !centered
-            && (matches!(align, "text-top" | "text-bottom")
-                || middle.is_some()
-                || swatch
-                || replaced && !field
-                || display == "inline-grid"
-                    && !node.children.iter().any(|&child| in_flow(doc, info, child)));
-        if centered {
-            el.style().baseline = renderer::Baseline::Middle;
-        } else if edge {
-            el.style().baseline = renderer::Baseline::None;
-        }
-        let lift = if centered {
-            line.ex / 2. + (margin[2] - margin[0]) / 2.
-        } else if !edge {
-            0.
-        } else if matches!(align, "text-top" | "text-bottom") {
-            let face = text.face(&style::font(parent_style));
-            let [ascent, descent, _] = text
-                .line_metrics(face, px(line.em * pixel_ratio))
-                .map(|value| f32::from(value) / pixel_ratio);
-            // The inline box of a span is as tall as its line height.
-            match el.style().size.height {
-                renderer::Length::Px(height) if align == "text-top" => {
-                    ascent - margin[0] - f32::from(height)
-                }
-                _ if align == "text-top" => ascent - units.font.lh,
-                _ => margin[2] - descent,
-            }
-        } else if let Some(height) = middle {
-            line.ex / 2. - height / 2.
-        } else if swatch {
-            -padding[2] - borders[2] - 4.
-        } else if node.tag == "button"
-            && node.children.iter().all(|&child| {
-                doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim_ascii().is_empty()
-            })
-        {
-            -padding[2] - borders[2]
-        } else if native.as_ref().is_some_and(|look| {
-            // Like Chrome, a range sits on the bottom of its border box, a progress bar without its native look
-            // on the bottom of its margin box.
-            !look.plain || look.control == super::super::paint::control::Control::Range
-        }) {
-            0.
-        } else {
-            margin[2]
-        };
-        let inset = |prop| style.get(prop).filter(|value| *value != "auto");
-        let offset = match (inset(Prop::TOP), inset(Prop::BOTTOM)) {
-            _ if position != "relative" => Some(0.),
-            (Some(top), _) => units.resolve(top, f32::NAN),
-            (None, Some(bottom)) => units.resolve(bottom, f32::NAN).map(|bottom| -bottom),
-            (None, None) => Some(0.),
-        };
-        let raise = match align {
-            _ if offset.is_none() => 0.,
-            "super" => line.em / 3. + 1. / pixel_ratio + lift,
-            "sub" => -line.em / 5. - 1. / pixel_ratio + lift,
-            "baseline" => lift,
-            value => units.resolve(value, units.font.lh).unwrap_or(0.) + lift,
-        };
-        // A box with a line of text has its baseline there, also when the text overflows its height.
-        let reserve = match (el.style().size.height, el.style().align_self) {
-            (renderer::Length::Px(height), None) if display != "inline" && replaced => {
-                line.lh - parent - f32::from(height)
-            }
-            (renderer::Length::Auto, None) if field => {
-                line.lh - parent - units.font.lh - padding[0] - borders[0]
-                    + below(style, units.font)
-            }
-            _ => f32::NEG_INFINITY,
-        };
-        let floor = margin[2].min(0.) + parent
-            - match () {
-                _ if centered
-                    || matches!(display, "inline-block" | "inline-flex" | "inline-grid")
-                        && !replaced =>
-                {
-                    f32::INFINITY
-                }
-                // A top or bottom box sits on a line edge, so the strut below the baseline does not reach it.
-                _ if matches!(
-                    el.style().align_self,
-                    Some(renderer::AlignItems::FlexStart | renderer::AlignItems::FlexEnd)
-                ) =>
-                {
-                    f32::INFINITY
-                }
-                _ if edge => 0.,
-                _ if display == "inline" => below(style, units.font),
-                _ => padding[2] + borders[2] + below(style, units.font),
-            };
-        if !crate::render::inline::makes_no_line(doc, styles, id)
-            && (raise != 0. || reserve > margin[0] || margin[2] < floor)
-        {
-            el = el
-                .mt(px((margin[0] + raise).max(reserve)))
-                .mb(px((margin[2] - raise).max(floor)));
-        }
-        if let Some(offset) = offset
-            && (raise != 0. || offset != 0.)
-        {
-            el = el.top(px(offset - raise));
-        }
+        el = vertical_align(&cx, &fr, el, parent, replaced, check, input, &native);
     }
     if let Some((color, content)) = clipped_fill {
         let inset = std::array::from_fn::<_, 4, _>(|side| {
