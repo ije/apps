@@ -151,6 +151,7 @@ fn engine_launch() {
             apps_runtime::host::Page {
                 doc: apps_runtime::dom::Document::parse("<body></body>"),
                 dirty: false,
+                ..Default::default()
             },
         );
         let start = std::time::Instant::now();

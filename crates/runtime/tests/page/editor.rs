@@ -21,6 +21,7 @@ fn editor_selection_keyboard_and_input_events() {
                 "<html><body><test-editor></test-editor><textarea></textarea></body></html>",
             ),
             dirty: false,
+            ..Default::default()
         },
     );
     let engine = JsContext::new(
@@ -61,7 +62,7 @@ fn page_text_selection_respects_user_select() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><body><p id='first'>alpha beta</p><p id='blocked' style='user-select:none'>hidden<span id='override' style='user-select:text'>visible</span></p><p id='last'>gamma delta</p><p id='all' style='user-select:all'>whole <span>group</span></p><p id='alias' style='-webkit-user-select:none'>alias</p><button>button</button></body></html>"),
-        dirty: false,
+        dirty: false, ..Default::default()
     });
     let engine = JsContext::new(
         JavaScriptCore::load().unwrap(),
@@ -124,7 +125,10 @@ fn page_text_selection_respects_user_select() {
         editor.focus();selected.selectAllChildren(editor);
         assert(selected.toString()==='editable','Editable content remains selectable under none');
     "#, "page-selection").unwrap();
-    assert_eq!(host.borrow().dom[&1].interaction.selection_caret, None);
+    assert_eq!(
+        host.borrow().pages[&1].state.interaction.selection_caret,
+        None
+    );
 }
 
 #[test]
@@ -135,6 +139,7 @@ fn selection_paint_ranges_and_native_text_offsets() {
         Page {
             doc: Document::parse("<div contenteditable><span>A😀</span><b>BC</b><i>文D</i></div>"),
             dirty: false,
+            ..Default::default()
         },
     );
     let engine = JsContext::new(
@@ -144,7 +149,7 @@ fn selection_paint_ranges_and_native_text_offsets() {
     )
     .unwrap();
     engine.eval("const editor=document.querySelector('div');editor.focus();const a=editor.firstChild.firstChild,b=editor.children[1].firstChild,c=editor.lastChild.firstChild;getSelection().setBaseAndExtent(c,1,a,1)", "test").unwrap();
-    let ranges = host.borrow().dom[&1].interaction.selection.clone();
+    let ranges = host.borrow().pages[&1].state.interaction.selection.clone();
     for (name, expected) in [("a", [1, 3]), ("b", [0, 2]), ("c", [0, 1])] {
         let id: usize = engine
             .eval(&format!("{name}._id"), "test")
@@ -165,7 +170,13 @@ fn selection_paint_ranges_and_native_text_offsets() {
     engine
         .eval("getSelection().removeAllRanges()", "test")
         .unwrap();
-    assert!(host.borrow().dom[&1].interaction.selection.is_empty());
+    assert!(
+        host.borrow().pages[&1]
+            .state
+            .interaction
+            .selection
+            .is_empty()
+    );
     engine
         .eval("getSelection().collapse(c,1);__appsInput('x')", "test")
         .unwrap();
@@ -180,7 +191,7 @@ fn empty_selection_fragments_are_not_carets() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<div contenteditable><span>A</span><span></span><span>\n</span><span>B</span></div><textarea>A\n\nB</textarea><pre>read only</pre>"),
-        dirty: false,
+        dirty: false, ..Default::default()
     });
     let engine = JsContext::new(
         JavaScriptCore::load().unwrap(),
@@ -194,8 +205,14 @@ fn empty_selection_fragments_are_not_carets() {
         .unwrap()
         .parse()
         .unwrap();
-    assert_eq!(host.borrow().dom[&1].interaction.selection[&empty], [0, 0]);
-    assert_eq!(host.borrow().dom[&1].interaction.selection_caret, None);
+    assert_eq!(
+        host.borrow().pages[&1].state.interaction.selection[&empty],
+        [0, 0]
+    );
+    assert_eq!(
+        host.borrow().pages[&1].state.interaction.selection_caret,
+        None
+    );
     engine
         .eval(
             "getSelection().collapse(editor.children[1].firstChild,0)",
@@ -203,7 +220,7 @@ fn empty_selection_fragments_are_not_carets() {
         )
         .unwrap();
     assert_eq!(
-        host.borrow().dom[&1].interaction.selection_caret,
+        host.borrow().pages[&1].state.interaction.selection_caret,
         Some(empty)
     );
     engine
@@ -212,22 +229,31 @@ fn empty_selection_fragments_are_not_carets() {
             "test",
         )
         .unwrap();
-    assert_eq!(host.borrow().dom[&1].interaction.selection_caret, None);
+    assert_eq!(
+        host.borrow().pages[&1].state.interaction.selection_caret,
+        None
+    );
     engine
         .eval("getSelection().removeAllRanges()", "test")
         .unwrap();
-    assert_eq!(host.borrow().dom[&1].interaction.selection_caret, None);
+    assert_eq!(
+        host.borrow().pages[&1].state.interaction.selection_caret,
+        None
+    );
     engine
         .eval(
             "const input=document.querySelector('textarea');input.focus();input.select()",
             "test",
         )
         .unwrap();
-    assert_eq!(host.borrow().dom[&1].interaction.selection_caret, None);
+    assert_eq!(
+        host.borrow().pages[&1].state.interaction.selection_caret,
+        None
+    );
     engine.eval("input.setSelectionRange(2,2)", "test").unwrap();
     let input: usize = engine.eval("input._id", "test").unwrap().parse().unwrap();
     assert_eq!(
-        host.borrow().dom[&1].interaction.selection_caret,
+        host.borrow().pages[&1].state.interaction.selection_caret,
         Some(input)
     );
 }
@@ -235,7 +261,7 @@ fn empty_selection_fragments_are_not_carets() {
 #[test]
 fn native_ranges_respect_element_boundaries_and_utf16_offsets() {
     let mut doc = Document::parse("<div><span>A😀</span><b>BC</b><i>文D</i><em>outside</em></div>");
-    let mut state = apps_runtime::dom::State::default();
+    let mut state = apps_runtime::render::PageState::default();
     let parent = doc.nodes.iter().position(|node| node.tag == "div").unwrap();
     let children = doc.nodes[parent].children.clone();
     let text: Vec<_> = children
@@ -278,7 +304,7 @@ fn caret_hit_testing_uses_the_nearest_visible_text() {
     let mut doc = Document::parse(
         "<html><body><div contenteditable><span>first</span><span>second</span><span style='visibility:hidden'>hidden</span></div></body></html>",
     );
-    let mut state = apps_runtime::dom::State::default();
+    let mut state = apps_runtime::render::PageState::default();
     for (id, node) in doc.nodes.iter().enumerate() {
         let text = if node.tag == "span" {
             &doc.nodes[node.children[0]].text
@@ -325,7 +351,7 @@ fn contenteditable_spaces_block_joins_and_typing_style_like_chrome() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><body><div id=a contenteditable>ab</div><div id=b contenteditable><p>one</p><p>two <i>it</i></p></div><div id=c contenteditable>x <b id=cb>bold</b></div><div id=e contenteditable>one <b id=eb>twZo</b> three</div><div id=g contenteditable>x <b>bold</b> rest</div><div id=h contenteditable><p>one</p><p>two</p></div><div id=k contenteditable>start</div><div id=m contenteditable><p>a <b>b</b></p><p>c <i>d</i></p></div><div id=n contenteditable><p id=n0>alpha one</p><p>beta</p><p>gamma</p></div><div id=r contenteditable><p>one</p><p>two</p></div><div id=t contenteditable><p>bee</p></div><div id=q contenteditable>\n<p>one</p>\n<blockquote>\n<p>two</p>\n</blockquote>\n</div></body></html>"),
-        dirty: false,
+        dirty: false, ..Default::default()
     });
     let engine = JsContext::new(
         JavaScriptCore::load().unwrap(),

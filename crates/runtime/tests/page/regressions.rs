@@ -18,6 +18,7 @@ fn page() -> (JsContext, Rc<RefCell<Host>>) {
         Page {
             doc: Document::parse("<body></body>"),
             dirty: false,
+            ..Default::default()
         },
     );
     (

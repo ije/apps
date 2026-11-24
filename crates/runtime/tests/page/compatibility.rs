@@ -337,6 +337,7 @@ fn bridge_preload_calls_main_and_publishes_events() {
         Page {
             doc: Document::parse("<body></body>"),
             dirty: false,
+            ..Default::default()
         },
     );
     let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
@@ -384,6 +385,7 @@ fn bridge_clones_files_and_preload_reads_dropped_paths() {
         Page {
             doc: Document::parse("<body></body>"),
             dirty: false,
+            ..Default::default()
         },
     );
     host.borrow_mut()
@@ -450,6 +452,7 @@ fn bridge_capabilities_failures_and_closed_contexts() {
         Page {
             doc: Document::parse("<body></body>"),
             dirty: false,
+            ..Default::default()
         },
     );
     let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
@@ -527,6 +530,7 @@ fn contexts() -> (Rc<RefCell<Host>>, JsContext, JsContext) {
         Page {
             doc: Document::parse("<body><p id='x'>before</p><span>a</span><span>b</span></body>"),
             dirty: false,
+            ..Default::default()
         },
     );
     let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
@@ -671,6 +675,7 @@ fn renderer_cannot_forge_native_worker_requests() {
         Page {
             doc: Document::parse("<body></body>"),
             dirty: false,
+            ..Default::default()
         },
     );
     let page = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
@@ -720,6 +725,7 @@ fn page_workers_from_strings_need_js_execute() {
         Page {
             doc: Document::parse("<body></body>"),
             dirty: false,
+            ..Default::default()
         },
     );
     let page = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();

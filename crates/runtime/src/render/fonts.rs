@@ -1,5 +1,6 @@
+use super::PageState;
 use crate::css::{sheet::parser::FONT_FORMATS, sheet::parser::FONT_TECHS};
-use crate::dom::{Document, State};
+use crate::dom::Document;
 use std::{collections::HashMap, path::PathBuf};
 
 pub(crate) fn sources(src: &str) -> Vec<(&'static str, String)> {
@@ -50,7 +51,7 @@ pub(crate) type Face = (String, String, Option<String>, &'static str);
 
 pub(crate) fn load(
     doc: &Document,
-    state: &mut State,
+    state: &mut PageState,
     assets: &HashMap<String, PathBuf>,
 ) -> (bool, Vec<Face>) {
     if state.fonts.system.is_none() {
@@ -253,11 +254,11 @@ mod tests {
             @font-face { font-family: Ranked; src: url(latin.woff2); unicode-range: U+0000-00FF, U+0131 }
             </style><p>AB →</p>"#,
         );
-        let mut state = State::default();
+        let mut state = PageState::default();
         state.fonts.system = Some(system.clone());
         state.pixel_ratio = 1.;
         state.base = url::Url::parse("apps:///index.html").ok();
-        let load = |doc: &mut Document, state: &mut State| {
+        let load = |doc: &mut Document, state: &mut PageState| {
             crate::dom::styles(doc, state, [800., 600.]);
             load(doc, state, &assets)
         };
@@ -281,7 +282,7 @@ mod tests {
         assert!(!state.fonts.files.contains_key("cyrillic.woff2"));
         // Added faces go under their CSS family, so no alias is needed.
         assert!(!state.fonts.aliases.contains_key("Ranked"));
-        let width = |state: &State, font: &str, text: &str| {
+        let width = |state: &PageState, font: &str, text: &str| {
             crate::render::canvas::line(&system, &state.fonts.aliases, font, text, [0.; 2])
                 .0
                 .width
@@ -331,7 +332,7 @@ mod tests {
             "<style>@font-face { font-family: Brand; src: url(test.woff2) }
             @font-face { font-family: Brand; src: url(test-medium.woff2) }</style><p>AB</p>",
         );
-        let mut state = State::default();
+        let mut state = PageState::default();
         state.fonts.system = Some(system.clone());
         state.pixel_ratio = 1.;
         state.base = url::Url::parse("apps:///index.html").ok();

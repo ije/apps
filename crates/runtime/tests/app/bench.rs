@@ -91,6 +91,7 @@ fn page(html: &str, script: &str) -> String {
         Page {
             doc: Document::parse(html),
             dirty: false,
+            ..Default::default()
         },
     );
     let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
@@ -177,6 +178,7 @@ fn release_sweep() {
                 "<x-h></x-h>".repeat(1000)
             )),
             dirty: false,
+            ..Default::default()
         },
     );
     let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
@@ -237,6 +239,7 @@ fn host_calls() {
         apps_runtime::host::Page {
             doc: Document::parse("<body><p id=a class='x y'>hi</p></body>"),
             dirty: false,
+            ..Default::default()
         },
     );
     let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
@@ -263,6 +266,7 @@ fn dom_updates() {
         Page {
             doc: Document::parse("<body><main></main><section></section></body>"),
             dirty: false,
+            ..Default::default()
         },
     );
     let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
@@ -359,9 +363,10 @@ fn image_decode() {
         Page {
             doc: Document::parse("<body></body>"),
             dirty: false,
+            ..Default::default()
         },
     );
-    host.borrow_mut().dom.entry(1).or_default().base =
+    host.borrow_mut().pages.get_mut(&1).unwrap().state.base =
         Some(url::Url::from_directory_path(directory.path()).unwrap());
     let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     let source = url::Url::from_file_path(&path).unwrap();
@@ -393,6 +398,7 @@ fn webgpu_present() {
         Page {
             doc: Document::parse("<canvas id=c width=1920 height=1080></canvas>"),
             dirty: false,
+            ..Default::default()
         },
     );
     let engine = JsContext::new(
@@ -535,6 +541,7 @@ fn layout_reads() {
         Page {
             doc: Document::parse(&html),
             dirty: false,
+            ..Default::default()
         },
     );
     {
@@ -542,12 +549,7 @@ fn layout_reads() {
         let bounds: Vec<_> = (0..host.pages[&1].doc.nodes.len())
             .map(|id| (id, [0., (id * 7 % 3000) as f32, 300., 20.]))
             .collect();
-        host.dom
-            .entry(1)
-            .or_default()
-            .geometry
-            .mirror
-            .extend(bounds);
+        host.state(1).geometry.mirror.extend(bounds);
     }
     let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     engine.eval("globalThis.targets = [...document.querySelectorAll('.t')]; globalThis.p = targets[0]; if (targets.length !== 2000) throw Error('targets');", "bench").unwrap();

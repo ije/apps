@@ -29,6 +29,7 @@ pub(crate) fn run(mut job: Job) -> Result<()> {
             Page {
                 doc: Document::parse("<html><body></body></html>"),
                 dirty: false,
+                ..Default::default()
             },
         );
         Role::Renderer(WORKER_PAGE)

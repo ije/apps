@@ -52,6 +52,19 @@ pub struct Media {
 }
 
 impl Media {
+    // Only the first replaced image can be on the GPU. Drop later images at once to bound memory in unrendered
+    // windows.
+    pub(crate) fn retire(&mut self, id: usize, old: Option<Arc<renderer::RenderImage>>) {
+        if self.retired.is_empty() {
+            self.retired_canvases.clear();
+        }
+        if let Some(old) = old
+            && self.retired_canvases.insert(id)
+        {
+            self.retired.push(old);
+        }
+    }
+
     pub(crate) fn forget(&mut self, id: usize) {
         self.retired.extend(self.images.remove(&id));
         self.retired.extend(

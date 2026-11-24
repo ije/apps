@@ -180,7 +180,7 @@ impl renderer::Hooks for FieldText {
         let window = &mut *cx.window;
         let view = &*self.view;
         let mut host = view.host.borrow_mut();
-        let dom = host.dom.entry(view.id).or_default();
+        let dom = host.state(view.id);
         let selected = dom
             .interaction
             .selection
@@ -482,7 +482,7 @@ impl renderer::View for PageView {
     fn drawn(&mut self, snapshots: Vec<renderer::Snapshot>, window: &mut Window, cx: &mut App) {
         // The paint order of boxes, which hit tests sort by.
         if let Ok(mut host) = self.host.try_borrow_mut() {
-            let dom = host.dom.entry(self.id).or_default();
+            let dom = host.state(self.id);
             dom.layout.painted.fill(0);
             let page = self.id;
             for (order, &mark) in window.marks().iter().enumerate() {
@@ -503,12 +503,11 @@ impl renderer::View for PageView {
         {
             let mut host = self.host.borrow_mut();
             let host = &mut *host;
-            let dom = host.dom.entry(self.id).or_default();
+            let (doc, dom, _) = host.page_parts(self.id);
             // An element that is no longer drawable gives its pixels back.
-            if let Some(page) = host.pages.get(&self.id).filter(|_| !snapshots.is_empty()) {
+            if let Some(doc) = doc.filter(|_| !snapshots.is_empty()) {
                 let drawable = |id: &usize| {
-                    (page.doc.nodes.get(*id))
-                        .is_some_and(|node| node.attrs.contains_key("drawable"))
+                    (doc.nodes.get(*id)).is_some_and(|node| node.attrs.contains_key("drawable"))
                 };
                 dom.media.snapshots.retain(|id, _| drawable(id));
                 dom.geometry.drawn.retain(|id, _| drawable(id));
@@ -546,7 +545,7 @@ impl renderer::View for PageView {
     fn window_changed(&mut self, window: &mut Window, cx: &mut App) {
         self.origin.set(None);
         if let Ok(mut host) = self.host.try_borrow_mut() {
-            if let Some(state) = host.dom.get_mut(&self.id) {
+            if let Some(state) = host.pages.get_mut(&self.id).map(|page| &mut page.state) {
                 state.window = window.window_state();
             }
             if !host.window_changes.contains(&self.id) {
@@ -754,7 +753,7 @@ impl renderer::View for PageView {
         super::scripted(cx, Some(window), || super::reflow(self.id));
         let id = state["id"].as_u64()? as usize;
         let host = self.host.borrow();
-        let dom = host.dom.get(&self.id)?;
+        let dom = host.pages.get(&self.id).map(|page| &page.state)?;
         let password = password(&host, self.id, id, &state);
         let caret = state["node"]
             .as_u64()
@@ -825,7 +824,7 @@ impl renderer::View for PageView {
         let state = self.editing()?;
         let id = state["id"].as_u64()? as usize;
         let host = self.host.borrow();
-        let dom = host.dom.get(&self.id)?;
+        let dom = host.pages.get(&self.id).map(|page| &page.state)?;
         if let Some((layout, text, span, rows, _)) = dom.layout.text_layouts.get(&id) {
             let [dx, dy] = dom.geometry.scroll_shift(&dom.styles.walk, id);
             let point = point - renderer::point(px(dx), px(dy));

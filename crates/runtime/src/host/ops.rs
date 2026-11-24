@@ -203,7 +203,7 @@ pub(super) unsafe extern "C" fn call(
             let mut host = binding.host.try_borrow_mut().context("Host is busy")?;
             let host = &mut *host;
             let page = host.pages.get_mut(&id).context("Window is closed")?;
-            let state = host.dom.entry(id).or_default();
+            let state = &mut page.state;
             let viewport = *host.viewports.get(&id).unwrap_or(&[800., 600.]);
             if values.get(2).is_some_and(|&value| api.to_bool(ctx, value)) {
                 crate::dom::layout_flags(&mut page.doc, state, viewport);
@@ -631,11 +631,15 @@ pub(super) fn dispatch(
 
 // Account for native DOM memory so removed wrappers trigger GC before row churn exhausts memory.
 fn report_nodes(binding: &Binding, ctx: Ptr, id: u64) {
-    let created = binding
-        .host
-        .try_borrow_mut()
-        .ok()
-        .and_then(|mut host| Some(host.dom.get_mut(&id)?.tree.take_created()));
+    let created = binding.host.try_borrow_mut().ok().and_then(|mut host| {
+        Some(
+            host.pages
+                .get_mut(&id)
+                .map(|page| &mut page.state)?
+                .tree
+                .take_created(),
+        )
+    });
     if let Some(created) = created.filter(|&created| created > 0) {
         // Count only wrapped nodes: JSC resets this cost only after a full GC.
         binding.api.add_memory(ctx, created * 65536);
@@ -705,9 +709,8 @@ impl Host {
         let result = self.graphics.entry(id).or_default().call(op, args)?;
         if op == "resetCanvas"
             && let Ok([node]) = serde_json::from_slice::<[usize; 1]>(args)
-            && let Some(state) = self.dom.get_mut(&id)
         {
-            state.media.images.remove(&node);
+            page.state.media.images.remove(&node);
         }
         if matches!(op, "submit" | "writeTexture" | "resetCanvas") {
             page.dirty = true;
@@ -718,7 +721,7 @@ impl Host {
     pub fn media(&mut self, id: u64, op: &str, args: &Value) -> Result<Value> {
         let features = self.app.features;
         let page = self.pages.get_mut(&id).context("Window is closed")?;
-        let state = self.dom.entry(id).or_default();
+        let state = &mut page.state;
         let media = self.media.entry(id).or_default();
         if op == "poll" {
             let events: Value = serde_json::from_slice(&media.poll())?;
@@ -835,15 +838,13 @@ impl Host {
                 return Ok(json!([
                     viewport[0].round(),
                     viewport[1].round(),
-                    self.dom
-                        .get(&id)
-                        .map(|state| state.pixel_ratio)
+                    Some(page.state.pixel_ratio)
                         .filter(|&ratio| ratio > 0.)
                         .unwrap_or(1.),
                     crate::native::theme_state()
                 ]));
             }
-            let state = self.dom.entry(id).or_default();
+            let state = &mut page.state;
             if id == WORKER_PAGE
                 && matches!(op, "dom.canvas" | "dom.measureText")
                 && state.fonts.system.is_none()
@@ -989,7 +990,9 @@ impl Host {
                     if let (Some(media), Some(node)) = (self.media.get_mut(&id), node.as_u64()) {
                         media.close(node);
                     }
-                    if let (Some(state), Some(node)) = (self.dom.get(&id), node.as_u64()) {
+                    if let (Some(state), Some(node)) =
+                        (self.pages.get(&id).map(|page| &page.state), node.as_u64())
+                    {
                         state.media.terminals.borrow_mut().release(node as usize);
                     }
                 }

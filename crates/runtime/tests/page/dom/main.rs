@@ -17,6 +17,7 @@ fn offscreen_page(source: &str) -> (Rc<RefCell<Host>>, JsContext, String) {
         Page {
             doc: Document::parse("<body><canvas id=shown width=8 height=8></canvas></body>"),
             dirty: false,
+            ..Default::default()
         },
     );
     let engine = JsContext::new(
@@ -62,6 +63,7 @@ fn checked_page(html: &str, script: &str) -> (Rc<RefCell<Host>>, JsContext) {
         Page {
             doc: Document::parse(html),
             dirty: false,
+            ..Default::default()
         },
     );
     let engine = JsContext::new(
@@ -89,6 +91,7 @@ fn css_page(html: &str) -> (Rc<RefCell<Host>>, JsContext) {
         Page {
             doc: Document::parse(html),
             dirty: false,
+            ..Default::default()
         },
     );
     let engine = JsContext::new(

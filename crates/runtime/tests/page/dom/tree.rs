@@ -5,7 +5,7 @@ fn svg_presentation_attributes_links_and_attribute_nodes() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><head><style>.c{fill:blue}</style></head><body><svg><g style='fill:red;stroke:blue'><path id=a fill=none /><path id=b stroke-width=5 /><path id=c class=c fill=green /></g><g fill=green><path id=d /></g></svg><p id=p fill=red></p></body></html>"),
-        dirty: false,
+        dirty: false, ..Default::default()
     });
     let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     engine.eval(r#"
@@ -33,7 +33,7 @@ fn core_dom_interfaces_follow_the_standard() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><body><div id='a' z='1' b='2' class='x y'>t<!--c-->u</div><template id='t'><p>hi</p></template></body></html>"),
-        dirty: false,
+        dirty: false, ..Default::default()
     });
     let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     engine.eval(r#"
@@ -143,6 +143,7 @@ fn sibling_walks_follow_mutations() {
         Page {
             doc: Document::parse("<body><ul></ul><ol><li>a</li><li>b</li></ol></body>"),
             dirty: false,
+            ..Default::default()
         },
     );
     let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
@@ -717,6 +718,7 @@ fn same_text_writes_large_fragments_and_id_queries() {
         Page {
             doc: Document::parse("<body><p id=label>a</p><div id=empty></div></body>"),
             dirty: false,
+            ..Default::default()
         },
     );
     let engine = JsContext::new(

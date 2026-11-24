@@ -20,6 +20,7 @@ fn canvas_identity_and_webgl_errors() {
         Page {
             doc: Document::parse("<html><body><canvas id='parsed'></canvas></body></html>"),
             dirty: false,
+            ..Default::default()
         },
     );
     let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
@@ -60,6 +61,7 @@ fn page(html: &str) -> (Rc<RefCell<Host>>, JsContext) {
         Page {
             doc: Document::parse(html),
             dirty: false,
+            ..Default::default()
         },
     );
     let engine = JsContext::new(
@@ -321,6 +323,6 @@ fn static_canvas_stops_presenting_when_idle() {
         assert!(!gpu.presented());
         assert_eq!(gpu.image(node).unwrap().unwrap().id, image.id);
         assert!(!state.pages[&1].dirty);
-        assert!(!state.dom[&1].frame_requested);
+        assert!(!state.pages[&1].state.frame_requested);
     }
 }

@@ -309,7 +309,7 @@ pub(super) fn css_background(
                         }
                         let view = &*view;
                         let mut host = view.host.borrow_mut();
-                        let dom = host.dom.entry(view.id).or_default();
+                        let dom = host.state(view.id);
                         let (backgrounds, bitmaps, sources) =
                             (&mut dom.rasters.backgrounds, &mut dom.rasters.bitmaps, &mut dom.rasters.layer_sources);
                         let scale = window.scale_factor();
@@ -769,7 +769,7 @@ pub(super) fn css_background(
             }
             let view = &*view;
             let mut host = view.host.borrow_mut();
-            let dom = host.dom.entry(view.id).or_default();
+            let dom = host.state(view.id);
             let key = (id, slot * 64 + index);
             let fits = |image: &renderer::RenderImage| {
                 [image.size().width, image.size().height].map(|side| side as u32) == [rw, rh]
@@ -967,7 +967,11 @@ pub(super) fn border_image(
     {
         Some(url) => {
             let host = view.host.borrow();
-            let base = host.dom.get(&view.id).and_then(|state| state.base.clone());
+            let base = host
+                .pages
+                .get(&view.id)
+                .map(|page| &page.state)
+                .and_then(|state| state.base.clone());
             let path =
                 super::image::url_file(url, base.as_ref(), &host.app.assets).filter(|path| {
                     path.to_str()
@@ -1053,7 +1057,7 @@ pub(super) fn border_image(
             let scale = window.scale_factor();
             let view = &*view;
             let mut host = view.host.borrow_mut();
-            let dom = host.dom.entry(view.id).or_default();
+            let dom = host.state(view.id);
             let key = (id, BORDER_IMAGE + slot);
             let mut held = held.borrow_mut();
             if gradient.is_none() && held.is_none() {

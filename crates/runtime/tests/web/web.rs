@@ -20,6 +20,7 @@ fn web_apis_in_every_context() {
             Page {
                 doc: apps_runtime::dom::Document::parse("<html><body></body></html>"),
                 dirty: false,
+                ..Default::default()
             },
         );
         let engine = JsContext::new(api.clone(), host, role).unwrap();
@@ -307,6 +308,7 @@ fn runtime_imports_follow_features() {
             Page {
                 doc: apps_runtime::dom::Document::parse("<html><body></body></html>"),
                 dirty: false,
+                ..Default::default()
             },
         );
         let engine = JsContext::new(api.clone(), host, role).unwrap();

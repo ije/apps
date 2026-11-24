@@ -472,6 +472,7 @@ mod tests {
             Page {
                 doc: Document::parse("<body><p id='value'>before</p></body>"),
                 dirty: false,
+                ..Default::default()
             },
         );
         let engine = JsContext::new(
@@ -542,7 +543,7 @@ mod tests {
             1,
             Page {
                 doc: Document::parse("<head><title>t</title></head><body><p id='value' class='a b'>before</p> <script></script></body>"),
-                dirty: false,
+                dirty: false, ..Default::default()
             },
         );
         let engine = JsContext::new(

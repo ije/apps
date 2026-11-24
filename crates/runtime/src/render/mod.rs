@@ -14,6 +14,7 @@ pub(crate) mod inspect;
 pub mod layout;
 pub mod media;
 pub(crate) mod native;
+mod page;
 mod paint;
 mod plan;
 mod resvg;
@@ -28,6 +29,7 @@ pub(crate) use element::dimension;
 use element::{Build, element};
 pub(crate) use hud::Hud;
 pub(crate) use inspect::Inspect;
+pub use page::PageState;
 use renderer::{App, Color, Event, Window, WindowId};
 use std::{
     cell::{Cell, RefCell},
@@ -205,12 +207,17 @@ fn reflow(id: u64) {
     // mirror without one.
     if view.host.try_borrow_mut().map_or(true, |mut host| {
         let shifted = !host.pages.get(&id).is_some_and(|page| page.dirty)
-            && host.dom.get_mut(&id).is_some_and(|dom| dom.shift_scrolls());
+            && host
+                .pages
+                .get_mut(&id)
+                .map(|page| &mut page.state)
+                .is_some_and(|dom| dom.shift_scrolls());
         shifted
             || !host.pages.get(&id).is_some_and(|page| page.dirty)
                 && !host
-                    .dom
+                    .pages
                     .get(&id)
+                    .map(|page| &page.state)
                     .is_some_and(|dom| dom.geometry.mirror.moved() || dom.layout.cull.reskipped)
     }) {
         return;
@@ -284,8 +291,9 @@ fn animation_frame(view: Rc<ViewState>, window: &mut Window, cx: &mut App) {
         .try_borrow_mut()
         .ok()
         .and_then(|mut host| {
-            host.dom
+            host.pages
                 .get_mut(&view.id)
+                .map(|page| &mut page.state)
                 .map(|dom| std::mem::take(&mut dom.frame_requested))
         })
         .unwrap_or(false)
@@ -463,7 +471,7 @@ impl PageView {
         let started = std::time::Instant::now();
         {
             let mut host = self.host.borrow_mut();
-            let state = host.dom.entry(self.id).or_default();
+            let state = host.state(self.id);
             state.fonts.system = Some(window.text_system().clone());
             state.pixel_ratio = window.scale_factor();
             state.window = window.window_state();
@@ -517,7 +525,7 @@ impl PageView {
             let size = window.viewport_size();
             if !parked.is_empty()
                 && data.host.try_borrow().is_ok_and(|host| {
-                    host.dom.get(&data.id).is_some_and(|dom| {
+                    host.pages.get(&data.id).map(|page| &page.state).is_some_and(|dom| {
                         parked.iter().any(|(id, clips)| {
                             in_view(&dom.geometry.mirror, [f32::from(size.width), f32::from(size.height)], *id, clips.iter().copied())
                         })
@@ -610,7 +618,7 @@ impl PageView {
                 let (mut target, mut wheel, mut terminal) = (None, false, None);
                 if let Ok(host) = view.host.try_borrow() {
                     let viewport = *host.viewports.get(&view.id).unwrap_or(&[800., 600.]);
-                    if let (Some(page), Some(state)) = (host.pages.get(&view.id), host.dom.get(&view.id)) {
+                    if let (Some(page), Some(state)) = (host.pages.get(&view.id), host.pages.get(&view.id).map(|page| &page.state)) {
                         let seen = state.layout.cull.seen.as_ref().map(|seen| seen.2.clone()).or_else(|| state.styles.computed.clone());
                         target = seen.as_ref().and_then(|computed| {
                             let at = [position.x, position.y].map(f32::from);
@@ -666,13 +674,13 @@ impl PageView {
             cx.defer(move |cx| runtime.drive(cx));
         }
         let inspectable = !host.app.packaged;
-        let Some(page) = host.pages.get_mut(&self.id) else {
+        let state = &mut *host;
+        let Some(page) = state.pages.get_mut(&self.id) else {
             return renderer::node().size_full().into();
         };
         page.dirty = false;
         let mut doc = std::mem::take(&mut page.doc);
-        let state = &mut *host;
-        let dom = state.dom.entry(self.id).or_default();
+        let dom = &mut page.state;
         // Clear node-ID caches on reload or navigation: the new DOM reuses IDs. Stamp its layout revision on
         // the first frame.
         if dom.layout.layout_revision == 0 {
@@ -2302,7 +2310,10 @@ impl PageView {
                             Default::default(),
                             [[0.; 4]; 3],
                             self.0.clone(),
-                            host.dom.get(&self.id).and_then(|state| state.base.as_ref()),
+                            host.pages
+                                .get(&self.id)
+                                .map(|page| &page.state)
+                                .and_then(|state| state.base.as_ref()),
                             &host.app.assets,
                             false,
                         ));
@@ -2564,7 +2575,7 @@ impl PageView {
         }
         let repass = {
             let mut host = self.host.borrow_mut();
-            let dom = host.dom.entry(self.id).or_default();
+            let dom = host.state(self.id);
             for id in dom.styles.unanchored.drain(..) {
                 window.suppress_anchoring(id);
             }
@@ -2690,7 +2701,8 @@ impl PageView {
                 renderer::canvas(
                     move |_, _| {
                         if let Ok(mut host) = data.host.try_borrow_mut()
-                            && let Some(dom) = host.dom.get_mut(&data.id)
+                            && let Some(dom) =
+                                host.pages.get_mut(&data.id).map(|page| &mut page.state)
                         {
                             dom.geometry.sync_scroll();
                             dom.geometry.prepainted(dom.pixel_ratio);
@@ -2825,7 +2837,7 @@ fn composites(a: &css::properties::Style, b: &css::properties::Style) -> bool {
 
 fn animate(
     view: &Rc<ViewState>,
-    dom: &mut crate::dom::State,
+    dom: &mut crate::render::PageState,
     next: Option<std::time::Instant>,
     now: std::time::Instant,
     composite: bool,
@@ -2908,10 +2920,10 @@ fn composite(view: Rc<ViewState>, window: &mut Window, cx: &mut App) {
         return window.refresh();
     };
     let state = &mut *host;
-    let (Some(page), Some(dom)) = (state.pages.get(&view.id), state.dom.get_mut(&view.id)) else {
+    let Some(page) = state.pages.get_mut(&view.id) else {
         return window.refresh();
     };
-    let doc = &page.doc;
+    let (doc, dom) = (&page.doc, &mut page.state);
     let Some((.., styles)) = dom.layout.cull.seen.clone().filter(|(latest, focus, _)| {
         !page.dirty
             && !dom.dirty
@@ -3295,7 +3307,7 @@ fn clips<'a>(
 // Returns whether the walk changed by a patch that kept the lists of cells, canvases and iframes.
 fn walk(
     doc: &crate::dom::Document,
-    dom: &mut crate::dom::State,
+    dom: &mut crate::render::PageState,
     styles: &style::ComputedStyles,
 ) -> bool {
     let serial = dom.layout.cull.walk.serial;
@@ -3375,7 +3387,7 @@ fn walk(
 // Without `forced`, also the boxes that show their contents only for the geometry that a script reads.
 pub(crate) fn skipping(
     doc: &crate::dom::Document,
-    dom: &crate::dom::State,
+    dom: &crate::render::PageState,
     styles: &style::ComputedStyles,
     id: usize,
     forced: bool,
@@ -3390,7 +3402,7 @@ pub(crate) fn skipping(
 
 fn visibility(
     doc: &crate::dom::Document,
-    dom: &crate::dom::State,
+    dom: &crate::render::PageState,
     styles: &style::ComputedStyles,
 ) -> Vec<bool> {
     let mut visible = vec![false; doc.nodes.len()];
@@ -3424,7 +3436,7 @@ fn visibility(
 }
 
 fn drop_hidden_images(
-    dom: &mut crate::dom::State,
+    dom: &mut crate::render::PageState,
     visible: &[bool],
     styles: &style::ComputedStyles,
     mut release: impl FnMut(Arc<renderer::RenderImage>),
@@ -3566,7 +3578,7 @@ mod tests {
         let mut doc = crate::dom::Document::parse(
             "<style>p{background-image:linear-gradient(red,blue)}</style><canvas></canvas><p></p><p></p>",
         );
-        let mut dom = crate::dom::State::default();
+        let mut dom = crate::render::PageState::default();
         let canvas = doc
             .nodes
             .iter()
@@ -3638,7 +3650,7 @@ mod tests {
         let doc = crate::dom::Document::parse(
             "<i style='mask-image:url(m.png)'></i><b style='clip-path:circle()'></b><u></u>",
         );
-        let mut dom = crate::dom::State::default();
+        let mut dom = crate::render::PageState::default();
         let styles = crate::dom::styles(&mut doc.clone(), &mut dom, [800., 600.]);
         let ids =
             ["i", "b", "u"].map(|tag| doc.nodes.iter().position(|node| node.tag == tag).unwrap());
@@ -3724,7 +3736,7 @@ mod tests {
         let mut doc = crate::dom::Document::parse(
             "<style>div{transition:display 1s allow-discrete}div.off{display:none}span{display:block;mask-image:url(m.svg);background-image:url(b.png)}</style><div><img src=a.svg width=200 height=200><span></span></div>",
         );
-        let mut dom = crate::dom::State::default();
+        let mut dom = crate::render::PageState::default();
         let [div, img, span] = ["div", "img", "span"]
             .map(|tag| doc.nodes.iter().position(|node| node.tag == tag).unwrap());
         let image = |size: u32| {
@@ -3743,7 +3755,7 @@ mod tests {
             .backgrounds
             .insert((span, 0), ("b.png".into(), decoded.clone()));
         dom.rasters.bitmaps.insert("b.png".into(), decoded);
-        let ids = |dom: &crate::dom::State| {
+        let ids = |dom: &crate::render::PageState| {
             [
                 dom.rasters.svgs[&img].1.id,
                 dom.rasters.masks[&(span, 0)].1.as_ref().unwrap().id,
@@ -3754,7 +3766,7 @@ mod tests {
         let start = std::time::Instant::now();
         let mut released = Vec::new();
         let mut frame =
-            |doc: &mut crate::dom::Document, dom: &mut crate::dom::State, seconds: f64| {
+            |doc: &mut crate::dom::Document, dom: &mut crate::render::PageState, seconds: f64| {
                 let styles = crate::dom::styles(doc, dom, [800., 600.]);
                 let mut visible = vec![false; doc.nodes.len()];
                 for id in 0..doc.nodes.len() {

@@ -8,6 +8,7 @@ fn window_scroll_moves_the_page() {
         Page {
             doc: Document::parse("<html><body><main></main></body></html>"),
             dirty: false,
+            ..Default::default()
         },
     );
     let engine = JsContext::new(
@@ -33,7 +34,7 @@ fn window_scroll_moves_the_page() {
         document.documentElement.style.scrollBehavior = '';
         scrollTo(0, 50);
     "#, "test").unwrap();
-    host.borrow().dom[&1].geometry.scroll[&0]
+    host.borrow().pages[&1].state.geometry.scroll[&0]
         .set_offset(renderer::point(renderer::px(0.), renderer::px(-120.)));
     engine
         .eval(
@@ -48,7 +49,7 @@ fn hit_testing_follows_paint_order_clipping_and_shadow_trees() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><body><div id='back'></div><div id='front'></div><div id='clip' style='overflow:hidden'><span id='child'></span></div><test-hit></test-hit></body></html>"),
-        dirty: false,
+        dirty: false, ..Default::default()
     });
     let engine = JsContext::new(
         JavaScriptCore::load().unwrap(),
@@ -75,12 +76,7 @@ fn hit_testing_follows_paint_order_clipping_and_shadow_trees() {
                 (id, bounds)
             })
             .collect();
-        host.dom
-            .entry(1)
-            .or_default()
-            .geometry
-            .mirror
-            .extend(bounds);
+        host.state(1).geometry.mirror.extend(bounds);
     }
     engine.eval(r#"
         const front=document.getElementById('front'),back=document.getElementById('back');
@@ -108,7 +104,7 @@ fn hit_testing_takes_the_box_painted_last() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><body><div id='panel' style='height:0'><button id='button'></button></div><pre id='code'><span id='line'>x</span></pre></body></html>"),
-        dirty: false,
+        dirty: false, ..Default::default()
     });
     let engine = JsContext::new(
         JavaScriptCore::load().unwrap(),
@@ -128,7 +124,7 @@ fn hit_testing_takes_the_box_painted_last() {
         .collect();
     {
         let mut host = host.borrow_mut();
-        let dom = host.dom.entry(1).or_default();
+        let dom = host.state(1);
         for (&id, bounds) in ids.iter().zip([
             [0., 0., 100., 100.],
             [0., 0., 100., 0.],
@@ -158,7 +154,7 @@ fn scrolling_snaps_to_device_pixels_and_respects_scroll_margins() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><body><div id='box' style='overflow:scroll;scroll-padding:0 10px 0 20%'><i id='caret' style='scroll-margin:0 8px 0 50px'></i><i id='plain'></i></div></body></html>"),
-        dirty: false,
+        dirty: false, ..Default::default()
     });
     let engine = JsContext::new(
         JavaScriptCore::load().unwrap(),
@@ -178,7 +174,7 @@ fn scrolling_snaps_to_device_pixels_and_respects_scroll_margins() {
         .collect();
     {
         let mut host = host.borrow_mut();
-        let dom = host.dom.entry(1).or_default();
+        let dom = host.state(1);
         dom.pixel_ratio = 2.;
         for (&id, bounds) in
             ids.iter()
@@ -220,7 +216,7 @@ fn screen_describes_the_viewport_without_a_window() {
 fn mirror_follows_random_mutations_and_releases() {
     for seed in 1..17u32 {
         let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(1, Page { doc: Document::parse("<html><body><div id=a class='x y'>t<!--c-->u<p>p</p></div><ul><li>1</li><li>2</li></ul></body></html>"), dirty: false });
+        host.borrow_mut().pages.insert(1, Page { doc: Document::parse("<html><body><div id=a class='x y'>t<!--c-->u<p>p</p></div><ul><li>1</li><li>2</li></ul></body></html>"), dirty: false, ..Default::default() });
         let engine = JsContext::new(
             JavaScriptCore::load().unwrap(),
             host.clone(),
@@ -262,7 +258,7 @@ fn mirror_follows_random_mutations_and_releases() {
         for round in 0..4 {
             let rust = {
                 let host = host.borrow();
-                let (doc, shadows) = (&host.pages[&1].doc, &host.dom[&1].tree.shadows);
+                let (doc, shadows) = (&host.pages[&1].doc, &host.pages[&1].state.tree.shadows);
                 let (mut out, mut pending) = (String::new(), vec![Ok(0)]);
                 while let Some(item) = pending.pop() {
                     let id = match item {
@@ -313,7 +309,7 @@ fn layout_mirror_feeds_observers_offsets_and_scrolling() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><body><div id='clip' style='overflow:hidden'><p id='a'>a</p><p id='b'>b</p></div><div id='rel' style='position:relative'><span id='c'>c</span></div><div id='gone' style='display:none'></div></body></html>"),
-        dirty: false,
+        dirty: false, ..Default::default()
     });
     let engine = JsContext::new(
         JavaScriptCore::load().unwrap(),
@@ -324,8 +320,8 @@ fn layout_mirror_feeds_observers_offsets_and_scrolling() {
     let place = |rects: &[(&str, [f32; 4])]| {
         let mut host = host.borrow_mut();
         let host = &mut *host;
-        let doc = &host.pages[&1].doc;
-        let state = host.dom.entry(1).or_default();
+        let page = host.pages.get_mut(&1).unwrap();
+        let (doc, state) = (&page.doc, &mut page.state);
         for (name, rect) in rects {
             let id = doc
                 .nodes
@@ -566,6 +562,7 @@ fn throwing_resize_observer_does_not_stop_layout_callbacks() {
                 "<html><body><main><div id='box' style='overflow:auto'></div></main></body></html>",
             ),
             dirty: false,
+            ..Default::default()
         },
     );
     let engine = JsContext::new(

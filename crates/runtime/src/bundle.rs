@@ -985,7 +985,14 @@ mod tests {
             }
         }
         let mut host = Host::default();
-        host.pages.insert(1, Page { doc, dirty: false });
+        host.pages.insert(
+            1,
+            Page {
+                doc,
+                dirty: false,
+                ..Default::default()
+            },
+        );
         let tree = host
             .call(Role::Renderer(1), "dom.tree", json!([card]))
             .unwrap();

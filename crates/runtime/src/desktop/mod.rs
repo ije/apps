@@ -426,7 +426,7 @@ impl Desktop {
                         let Some(page) = host.pages.get_mut(&id) else {
                             continue;
                         };
-                        let state = host.dom.entry(id).or_default();
+                        let state = &mut page.state;
                         let key = args[2].as_str().unwrap_or_default();
                         if action == "insertCSS" {
                             let css = args[3].as_str().unwrap_or_default();
@@ -864,7 +864,10 @@ impl Desktop {
                     (
                         host.pages.get(&id).is_some_and(|p| p.dirty)
                             || host.graphics.get(&id).is_some_and(|gpu| gpu.presented()),
-                        host.dom.get(&id).is_some_and(|dom| dom.frame_requested),
+                        host.pages
+                            .get(&id)
+                            .map(|page| &page.state)
+                            .is_some_and(|dom| dom.frame_requested),
                     )
                 };
                 if frame
@@ -874,7 +877,12 @@ impl Desktop {
                             crate::render::queue_animation_frame(data, window)
                         })
                         .is_some()
-                    && let Some(dom) = app.host.borrow_mut().dom.get_mut(&id)
+                    && let Some(dom) = app
+                        .host
+                        .borrow_mut()
+                        .pages
+                        .get_mut(&id)
+                        .map(|page| &mut page.state)
                 {
                     dom.frame_requested = false;
                 }
@@ -1203,10 +1211,8 @@ fn shrink_when_quiet(runtime: Rc<RefCell<Desktop>>, cx: &mut App) {
                 }
             }
             let host = &mut *app.host.borrow_mut();
-            for (id, dom) in &mut host.dom {
-                if let Some(page) = host.pages.get_mut(id)
-                    && dom.trim(&mut page.doc)
-                {
+            for page in host.pages.values_mut() {
+                if page.state.trim(&mut page.doc) {
                     page.dirty = true;
                 }
             }

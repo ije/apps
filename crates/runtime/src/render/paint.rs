@@ -220,11 +220,11 @@ impl Hooks for Masked {
     fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let mask = {
             let mut host = self.view.host.borrow_mut();
-            let host = &mut *host;
+            let (_, state, app) = host.page_parts(self.view.id);
             mask(
                 &self.view,
-                host.dom.entry(self.view.id).or_default(),
-                &host.app.assets,
+                state,
+                &app.assets,
                 self.key,
                 &self.style,
                 self.units,
@@ -310,7 +310,7 @@ impl Hooks for Picture {
     fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let view = &*self.view;
         let image = view.host.try_borrow().ok().and_then(|host| {
-            let dom = host.dom.get(&view.id);
+            let dom = host.pages.get(&view.id).map(|page| &page.state);
             match self.source {
                 Source::Element => dom?.media.images.get(&self.id).cloned(),
                 Source::Presented => view
@@ -418,7 +418,7 @@ impl PseudoPart {
         .map(f32::from);
         let view = &*self.view;
         let mut host = view.host.borrow_mut();
-        let dom = host.dom.entry(view.id).or_default();
+        let dom = host.state(view.id);
         let pieces = dom.geometry.pieces.entry(self.node).or_default();
         match pieces.iter_mut().find(|(key, _)| *key == self.key) {
             Some((_, old)) => *old = rect,
@@ -479,7 +479,7 @@ impl Hooks for PseudoBox {
         let view = &*self.view;
         let scale = cx.window.scale_factor();
         let mut host = view.host.borrow_mut();
-        let dom = host.dom.entry(view.id).or_default();
+        let dom = host.state(view.id);
         let scroll = dom
             .geometry
             .scroll
@@ -553,24 +553,27 @@ impl Contained {
     ) -> Point<Pixels> {
         let block = {
             let host = view.host.borrow();
-            host.dom.get(&view.id).and_then(|dom| match self.container {
-                usize::MAX => Some(Rect::new(
-                    Point::default(),
-                    renderer::size(px(self.viewport[0]), px(self.viewport[1])),
-                )),
-                0 => dom.geometry.scroll.get(&0).map(|scroll| {
-                    let [width, height] = self.viewport;
-                    Rect::new(
-                        scroll.bounds().origin + scroll.painted(),
-                        renderer::size(px(width), px(height)),
-                    )
-                }),
-                // The boxes that a scroll container contains move with its scroll.
-                container => dom.layout.blocks.get(&container).map(|block| {
-                    let scroll = dom.geometry.scroll.get(&container);
-                    *block + scroll.map_or(Point::default(), |s| s.painted())
-                }),
-            })
+            host.pages
+                .get(&view.id)
+                .map(|page| &page.state)
+                .and_then(|dom| match self.container {
+                    usize::MAX => Some(Rect::new(
+                        Point::default(),
+                        renderer::size(px(self.viewport[0]), px(self.viewport[1])),
+                    )),
+                    0 => dom.geometry.scroll.get(&0).map(|scroll| {
+                        let [width, height] = self.viewport;
+                        Rect::new(
+                            scroll.bounds().origin + scroll.painted(),
+                            renderer::size(px(width), px(height)),
+                        )
+                    }),
+                    // The boxes that a scroll container contains move with its scroll.
+                    container => dom.layout.blocks.get(&container).map(|block| {
+                        let scroll = dom.geometry.scroll.get(&container);
+                        *block + scroll.map_or(Point::default(), |s| s.painted())
+                    }),
+                })
         };
         let Some(block) = block else {
             return Point::default();
@@ -631,8 +634,9 @@ impl Hooks for PseudoBlock {
             && let Some(anchor) = {
                 let view = &*self.view;
                 let host = view.host.borrow();
-                host.dom
+                host.pages
                     .get(&view.id)
+                    .map(|page| &page.state)
                     .and_then(|dom| dom.layout.anchors.get(&key).copied())
             }
         {
@@ -753,18 +757,13 @@ impl DomBox {
                 ),
             );
             padding.origin += translation;
-            host.dom
-                .entry(view.id)
-                .or_default()
-                .layout
-                .blocks
-                .insert(self.id, padding);
+            host.state(view.id).layout.blocks.insert(self.id, padding);
         }
     }
 
     fn mirror(
         &self,
-        dom: &mut crate::dom::State,
+        dom: &mut crate::render::PageState,
         window_bounds: Rect<Pixels>,
         size: Size<Pixels>,
         parts: &[Rect<Pixels>],
@@ -824,7 +823,7 @@ impl DomBox {
         let view = &*self.view;
         if let Some(([first, last], [above, below])) = self.text {
             let mut host = view.host.borrow_mut();
-            let bounds = &mut host.dom.entry(view.id).or_default().geometry.mirror;
+            let bounds = &mut host.state(view.id).geometry.mirror;
             if let (Some(&[x, _, width, _]), Some(&[_, top, ..]), Some(&[_, y, _, height])) = (
                 bounds.get(&self.id),
                 bounds.get(&(first as usize)),
@@ -839,7 +838,7 @@ impl DomBox {
         }
         if let Some(Parts::Cuts { sides, boxes }) = self.parts.as_deref() {
             let mut host = view.host.borrow_mut();
-            let dom = host.dom.entry(view.id).or_default();
+            let dom = host.state(view.id);
             if let Some(&[x, _, width, _]) = dom.geometry.mirror.get(&self.id) {
                 let union = |rects: &mut dyn Iterator<Item = [f32; 4]>| {
                     rects.reduce(|[x, y, w, h], [a, b, c, d]| {
@@ -932,7 +931,7 @@ impl DomBox {
         }
         if let Some(Parts::Rows(rows)) = self.parts.as_deref() {
             let mut host = view.host.borrow_mut();
-            let bounds = &mut host.dom.entry(view.id).or_default().geometry.mirror;
+            let bounds = &mut host.state(view.id).geometry.mirror;
             // Rows and row groups span all columns of the table. A row ends where its first cell that
             // spans no rows below ends.
             let mut across = [f32::INFINITY, f32::NEG_INFINITY];
@@ -1031,8 +1030,9 @@ impl Hooks for DomBox {
             && let Some(anchor) = {
                 let view = &*self.view;
                 let host = view.host.borrow();
-                host.dom
+                host.pages
                     .get(&view.id)
+                    .map(|page| &page.state)
                     .and_then(|dom| dom.layout.anchors.get(&self.id).copied())
             }
         {
@@ -1078,8 +1078,9 @@ impl Hooks for DomBox {
                     let view = &*self.view;
                     let host = view.host.borrow();
                     let [x, y, width, height] = host
-                        .dom
-                        .get(&view.id)?
+                        .pages
+                        .get(&view.id)
+                        .map(|page| &page.state)?
                         .geometry
                         .mirror
                         .get(&parent)
@@ -1165,7 +1166,13 @@ impl Hooks for DomBox {
             .and_then(|((distance, origin), parent)| {
                 let view = &*self.view;
                 let host = view.host.borrow();
-                let [x, y, width, height] = *host.dom.get(&view.id)?.geometry.mirror.get(parent)?;
+                let [x, y, width, height] = *host
+                    .pages
+                    .get(&view.id)
+                    .map(|page| &page.state)?
+                    .geometry
+                    .mirror
+                    .get(parent)?;
                 let [ox, oy, _] =
                     crate::css::value::transform::origin(origin, &self.units, [width, height]);
                 Some((*distance, [x + ox, y + oy]))
@@ -1201,8 +1208,9 @@ impl Hooks for DomBox {
                 && let Some(block) = view
                     .host
                     .borrow_mut()
-                    .dom
+                    .pages
                     .get_mut(&view.id)
+                    .map(|page| &mut page.state)
                     .and_then(|dom| dom.layout.blocks.get_mut(&self.id))
             {
                 block.origin += translation;
@@ -1218,7 +1226,7 @@ impl Hooks for DomBox {
             let view = &*self.view;
             let flags = {
                 let mut host = view.host.borrow_mut();
-                let dom = host.dom.entry(view.id).or_default();
+                let dom = host.state(view.id);
                 // Grid tracks are sized before transforms, so they compare with the untransformed box.
                 if let Some(axes) = dom.layout.flexed_grids.get(&self.id)
                     && axes
@@ -1313,18 +1321,24 @@ impl Hooks for DomBox {
                 // The box takes the pointer where its canvas drew it.
                 let view = &*self.view;
                 let content = view.drawing.get();
-                let drawn = view.host.borrow().dom.get(&view.id).and_then(|dom| {
-                    let to_canvas = dom.geometry.drawn.get(&self.id)?.matrix;
-                    let [x, y] = [bounds.origin.x, bounds.origin.y].map(f32::from);
-                    let from_box = crate::css::value::transform::translate(-x, -y, 0.);
-                    let to_window = crate::css::value::transform::translate(
-                        content.x.into(),
-                        content.y.into(),
-                        0.,
-                    );
-                    let placed = crate::css::value::transform::multiply(&to_canvas, &from_box);
-                    Some(crate::css::value::transform::multiply(&to_window, &placed))
-                });
+                let drawn = view
+                    .host
+                    .borrow()
+                    .pages
+                    .get(&view.id)
+                    .map(|page| &page.state)
+                    .and_then(|dom| {
+                        let to_canvas = dom.geometry.drawn.get(&self.id)?.matrix;
+                        let [x, y] = [bounds.origin.x, bounds.origin.y].map(f32::from);
+                        let from_box = crate::css::value::transform::translate(-x, -y, 0.);
+                        let to_window = crate::css::value::transform::translate(
+                            content.x.into(),
+                            content.y.into(),
+                            0.,
+                        );
+                        let placed = crate::css::value::transform::multiply(&to_canvas, &from_box);
+                        Some(crate::css::value::transform::multiply(&to_window, &placed))
+                    });
                 window.with_hits_at(drawn, &mut prepaint)
             }
             Some(matrix) => window.with_keyed_hit_transform(
@@ -1390,7 +1404,7 @@ impl Hooks for DomBox {
         }
         let view = &*self.view;
         let mut host = view.host.borrow_mut();
-        let dom = host.dom.entry(view.id).or_default();
+        let dom = host.state(view.id);
         let walk = &dom.styles.walk;
         let Some(start) = walk.place(self.id) else {
             return false;
@@ -1489,7 +1503,7 @@ impl Hooks for DomBox {
             let view = &*self.view;
             let flags = {
                 let mut host = view.host.borrow_mut();
-                let dom = host.dom.entry(view.id).or_default();
+                let dom = host.state(view.id);
                 if moved {
                     self.mirror(dom, window_bounds, bounds.size, &parts);
                 }
@@ -1521,8 +1535,8 @@ impl Hooks for DomBox {
         // A new page or a new node with this number has no snapshot of the box yet.
         let view = &*self.view;
         let host = view.host.borrow();
-        let fresh =
-            (host.dom.get(&view.id)).is_none_or(|dom| !dom.media.snapshots.contains_key(&self.id));
+        let fresh = (host.pages.get(&view.id).map(|page| &page.state))
+            .is_none_or(|dom| !dom.media.snapshots.contains_key(&self.id));
         drop(host);
         let key = Some((self.id as u64, fresh));
         (cx.window).with_snapshot(key, self.placed.get().0, |window| self.draw(window, inner));
@@ -1577,8 +1591,8 @@ impl DomBox {
         let view = &*self.view;
         let mut host = view.host.borrow_mut();
         let empty = crate::dom::Document::default();
-        let host = &mut *host;
-        let doc = host.pages.get(&view.id).map_or(&empty, |page| &page.doc);
+        let (doc, state, app) = host.page_parts(view.id);
+        let doc = doc.unwrap_or(&empty);
         let mut layers = value(&[Prop::FILTER, Prop::WEBKIT_FILTER])
             .map(|value| effects::filters(value, &units, doc, &self.ids))
             .unwrap_or_default();
@@ -1601,8 +1615,8 @@ impl DomBox {
         }
         let mask = mask(
             view,
-            host.dom.entry(view.id).or_default(),
-            &host.app.assets,
+            state,
+            &app.assets,
             (self.id, 0),
             style,
             units,
@@ -1682,8 +1696,9 @@ impl DomBox {
             .get(Prop::ISOLATION)
             .is_some_and(|value| value == "isolate")
             && host
-                .dom
+                .pages
                 .get(&view.id)
+                .map(|page| &page.state)
                 .and_then(|dom| dom.styles.last())
                 .is_none_or(|styles| styles.blended());
         let needed = outer.transform.is_some()
@@ -1715,7 +1730,7 @@ impl DomBox {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn mask(
     view: &super::ViewState,
-    dom: &mut crate::dom::State,
+    dom: &mut crate::render::PageState,
     assets: &HashMap<String, std::path::PathBuf>,
     key: (usize, u8),
     style: &css::properties::Style,

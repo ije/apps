@@ -610,6 +610,7 @@ mod tests {
             crate::host::Page {
                 doc: crate::dom::Document::parse(html),
                 dirty: false,
+                ..Default::default()
             },
         );
         host
@@ -1029,7 +1030,7 @@ mod tests {
             "ab,false,1,40,true,x"
         );
         let host = host.borrow();
-        let used = host.pages[&1].doc.nodes.len() - host.dom[&1].tree.free_count();
+        let used = host.pages[&1].doc.nodes.len() - host.pages[&1].state.tree.free_count();
         assert!(used < 400, "{used}");
     }
 
@@ -1048,7 +1049,7 @@ mod tests {
             .unwrap();
         let layout = || {
             let mut host = host.borrow_mut();
-            let bounds = &mut host.dom.entry(1).or_default().geometry.mirror;
+            let bounds = &mut host.state(1).geometry.mirror;
             bounds.insert(id, [0., 0., 110., 10.]);
             bounds.touch();
         };

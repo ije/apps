@@ -13,6 +13,7 @@ mod selector;
 mod tree;
 mod walk;
 
+use crate::render::PageState;
 use crate::render::media::Placeholder;
 pub use document::{Document, Node, escape};
 pub(crate) use geometry::Drawn;
@@ -104,182 +105,6 @@ impl Node {
     }
 }
 
-#[derive(Default)]
-pub struct State {
-    pub tree: Tree,
-    pub geometry: Geometry,
-    pub interaction: Interaction,
-    pub(crate) styles: style::Styles,
-    pub layout: crate::render::layout::Layout,
-    pub rasters: crate::render::layout::Rasters,
-    pub media: crate::render::media::Media,
-    pub fonts: crate::render::fonts::Fonts,
-    pub base: Option<url::Url>,
-    pub(crate) dirty: bool,
-    pub frame_requested: bool,
-    pub(crate) wheel: bool,
-    pub(crate) window: renderer::WindowState,
-    pub pixel_ratio: f32,
-    pub(crate) paint_requested: bool,
-}
-
-impl State {
-    // Only the first replaced image can be on the GPU. Drop later images at once to bound memory in unrendered
-    // windows.
-    fn retire(&mut self, id: usize, old: Option<Arc<renderer::RenderImage>>) {
-        if self.media.retired.is_empty() {
-            self.media.retired_canvases.clear();
-        }
-        if let Some(old) = old
-            && self.media.retired_canvases.insert(id)
-        {
-            self.media.retired.push(old);
-        }
-    }
-
-    fn theme(&self) -> u32 {
-        crate::native::theme_state()
-            | ((self.pixel_ratio.clamp(0., 600.) * 100.).round() as u32) << 16
-    }
-
-    // Moves the mirror for the user scrolls since the last prepaint. See `Geometry::shift_scrolls`.
-    pub(crate) fn shift_scrolls(&mut self) -> bool {
-        let computed = self.styles.computed.as_ref();
-        let top_layer = self.interaction.top_layer.is_empty();
-        let walk = &self.styles.walk;
-        self.geometry.shift_scrolls(
-            walk,
-            computed.map(|_| self.styles.epoch),
-            self.pixel_ratio,
-            |id, nodes| {
-                let computed = computed?;
-                // A transform, zoom or perspective on the scroll, around it or in it doesn't move boxes by the offset.
-                let flat = |node: usize| {
-                    computed.values.get(node).is_some_and(|style| {
-                        [
-                            Prop::TRANSFORM,
-                            Prop::TRANSLATE,
-                            Prop::ROTATE,
-                            Prop::SCALE,
-                            Prop::PERSPECTIVE,
-                        ]
-                        .into_iter()
-                        .all(|prop| style.get(prop).is_none_or(|value| value == "none"))
-                            && style.get(Prop::ZOOM).is_none_or(|value| {
-                                matches!(value, "normal" | "reset" | "1" | "100%")
-                            })
-                    })
-                };
-                let contains = crate::render::effects::establishes(&computed.values[id]).absolute;
-                Some(
-                    top_layer
-                        && std::iter::successors(Some(id as u32), |&node| {
-                            walk.parent(node as usize)
-                                .filter(|&parent| parent != ABSENT)
-                        })
-                        .all(|node| flat(node as usize))
-                        && nodes.iter().all(|&(node, _)| {
-                            let position = computed
-                                .values
-                                .get(node as usize)
-                                .map_or("static", |style| {
-                                    style.get(Prop::POSITION).unwrap_or("static")
-                                });
-                            !matches!(position, "fixed" | "sticky")
-                                && (contains || position != "absolute")
-                                && flat(node as usize)
-                        }),
-                )
-            },
-        )
-    }
-
-    // Free removed nodes' data now: row churn can outpace GC and retain more than the live document.
-    fn drop_removed(&mut self, doc: &Document) {
-        let gone = self.tree.take_removed(doc);
-        self.styles.cache.forget(&gone);
-        for id in gone {
-            self.layout.forget_removed(id);
-        }
-    }
-
-    // Frees the detached subtrees that no wrapper holds. Returns the media elements among them and all freed
-    // nodes.
-    pub(crate) fn release(&mut self, doc: &mut Document) -> (Vec<usize>, Vec<usize>) {
-        self.drop_removed(doc);
-        let freed = self.tree.collect(doc);
-        let retired = self.media.retired.len();
-        let mut canvases = Vec::new();
-        for &id in &freed {
-            if matches!(
-                doc.nodes[id].tag.as_str(),
-                "canvas" | "apps-canvas" | "video" | "audio" | "terminal"
-            ) {
-                canvases.push(id);
-            }
-            self.tree.free(doc, id);
-            self.geometry.forget(id);
-            self.layout.forget(id);
-            self.media.forget(id);
-            self.rasters.forget(id, &mut self.media.retired);
-            self.styles.cache.adopted.remove(&id);
-            self.styles.motion.forget(id);
-            self.interaction.forget(id);
-            if doc.target == Some(id) {
-                doc.target = None;
-            }
-        }
-        if !freed.is_empty() {
-            self.styles.cache.forget(&freed);
-            let gone: rustc_hash::FxHashSet<usize> = freed.iter().copied().collect();
-            self.interaction.forget_all(&gone);
-            self.layout.forget_all(&gone);
-            self.rasters.forget_all(&gone, &mut self.media.retired);
-            self.dirty |= self.media.retired.len() > retired;
-        }
-        (canvases, freed)
-    }
-
-    pub(crate) fn trim(&mut self, doc: &mut Document) -> bool {
-        self.drop_removed(doc);
-        let before = doc.nodes.len();
-        let len = self.tree.trim(before);
-        self.styles.walk = Default::default();
-        self.styles.select_marks = Vec::new();
-        self.styles.cache.trim(len);
-        self.styles.motion.trim(len);
-        self.layout.trim(len);
-        self.geometry.mirror.shrink(len);
-        if len < before {
-            doc.nodes.truncate(len);
-            self.styles.invalidate();
-        }
-        len < before
-    }
-
-    pub(crate) fn update_containers(&mut self, doc: &Document) -> bool {
-        let changed = self
-            .styles
-            .cache
-            .set_containers(&self.layout.containers, doc);
-        if changed {
-            self.styles.invalidate();
-        }
-        changed
-    }
-
-    pub(crate) fn allocate(&mut self, doc: &mut Document, node: Node) -> usize {
-        let id = self.tree.slot(doc);
-        self.place(doc, id, node);
-        id
-    }
-
-    pub(crate) fn place(&mut self, doc: &mut Document, id: usize, node: Node) {
-        self.tree.place(doc, id, node);
-        self.styles.place(id, doc.nodes.len());
-    }
-}
-
 pub(crate) fn slots(
     doc: &Document,
     roots: impl IntoIterator<Item = (usize, usize)>,
@@ -332,7 +157,7 @@ fn new_canvas(node: &Node) -> Result<crate::render::canvas::Canvas> {
 const SNAPSHOT: usize = 1 << 32;
 
 fn source_pixels(
-    state: &State,
+    state: &PageState,
     id: usize,
     size: Option<[u32; 2]>,
 ) -> Option<crate::render::canvas::Source<'_>> {
@@ -384,7 +209,7 @@ fn source_pixels(
 }
 
 pub(crate) fn show_frame(
-    state: &mut State,
+    state: &mut PageState,
     id: usize,
     image: Option<Arc<renderer::RenderImage>>,
 ) -> Option<Arc<renderer::RenderImage>> {
@@ -425,7 +250,7 @@ pub(crate) fn show_frame(
 }
 
 pub(crate) fn load_image(
-    state: &mut State,
+    state: &mut PageState,
     id: usize,
     read: impl FnOnce() -> Result<Vec<u8>> + Send + 'static,
 ) -> Value {
@@ -463,7 +288,7 @@ pub(crate) fn load_image(
     json!(request)
 }
 
-fn parsed(state: &mut State, source: &Value) -> Result<Rc<[Selector]>> {
+fn parsed(state: &mut PageState, source: &Value) -> Result<Rc<[Selector]>> {
     let source = source.as_str().context("Expected selector")?;
     if let Some(found) = state.styles.queries.get(source) {
         return Ok(found.clone());
@@ -481,7 +306,7 @@ pub fn call(
     op: &str,
     args: &Value,
     doc: &mut Document,
-    state: &mut State,
+    state: &mut PageState,
     viewport: [f32; 2],
 ) -> Result<Value> {
     if op == "dom.scrollEvents" {
@@ -566,7 +391,7 @@ pub fn call(
             let size = image.size();
             results.push(json!([node, size.width as u32, size.height as u32]));
             let old = state.media.images.insert(node, image);
-            state.retire(node, old);
+            state.media.retire(node, old);
             state.dirty = true;
         }
         return Ok(json!(results));
@@ -2046,7 +1871,7 @@ pub fn call(
                         .map(|system| (system, &state.fonts.aliases)),
                 );
                 state.media.canvases.insert(id, canvas);
-                state.retire(id, result?);
+                state.media.retire(id, result?);
             } else {
                 state.media.retired.extend(
                     state
@@ -2160,7 +1985,9 @@ pub fn call(
             state.tree.note_created(taken.pixels.data().len() >> 16);
             state.dirty |= taken.present;
             let old = state.media.canvases.insert(to, taken);
-            state.retire(to, old.filter(|old| old.present).map(|old| old.image));
+            state
+                .media
+                .retire(to, old.filter(|old| old.present).map(|old| old.image));
             Ok(Value::Null)
         }
         "dom.canvasAdopt" => {
@@ -2724,7 +2551,7 @@ fn tree(doc: &Document, root: usize, inclusive: bool) -> Value {
     Value::String(String::from_utf8(list).unwrap_or_default())
 }
 
-pub(crate) fn add_font(state: &mut State, family: &str, bytes: Vec<u8>) -> Result<String> {
+pub(crate) fn add_font(state: &mut PageState, family: &str, bytes: Vec<u8>) -> Result<String> {
     const LIMIT: usize = 32 * 1024 * 1024;
     let system = state
         .fonts
@@ -2793,7 +2620,7 @@ pub(crate) fn add_font(state: &mut State, family: &str, bytes: Vec<u8>) -> Resul
     Ok(name)
 }
 
-pub(crate) fn local_font(state: &mut State, family: &str, name: &str) -> bool {
+pub(crate) fn local_font(state: &mut PageState, family: &str, name: &str) -> bool {
     let Some(system) = state.fonts.system.clone() else {
         return false;
     };
@@ -2807,7 +2634,7 @@ pub(crate) fn local_font(state: &mut State, family: &str, name: &str) -> bool {
     true
 }
 
-pub(crate) fn use_font(state: &mut State, family: &str, name: &str, added: bool) {
+pub(crate) fn use_font(state: &mut PageState, family: &str, name: &str, added: bool) {
     let same = name.eq_ignore_ascii_case(family);
     if !added && (same || state.fonts.aliases.contains_key(family)) {
         return;
@@ -2826,7 +2653,7 @@ pub(crate) fn use_font(state: &mut State, family: &str, name: &str, added: bool)
     state.dirty = true;
 }
 
-pub(crate) fn layout_flags(doc: &mut Document, state: &mut State, viewport: [f32; 2]) {
+pub(crate) fn layout_flags(doc: &mut Document, state: &mut PageState, viewport: [f32; 2]) {
     let computed = styles(doc, state, viewport);
     if state.geometry.layout_epoch == state.styles.epoch {
         return;
@@ -2852,7 +2679,7 @@ pub(crate) fn layout_flags(doc: &mut Document, state: &mut State, viewport: [f32
 
 pub(crate) fn flat_parent(
     doc: &Document,
-    state: &State,
+    state: &PageState,
     styles: &style::ComputedStyles,
     id: usize,
 ) -> Option<usize> {
@@ -3144,7 +2971,7 @@ fn caret_text(
 // the text nodes in it count.
 fn rendered_text(
     doc: &Document,
-    state: &State,
+    state: &PageState,
     computed: &style::ComputedStyles,
     root: usize,
     range: Option<&rustc_hash::FxHashMap<usize, [usize; 2]>>,
@@ -3321,7 +3148,7 @@ fn rendered_text(
 
 pub(crate) fn hit_test(
     doc: &Document,
-    state: &State,
+    state: &PageState,
     computed: &style::ComputedStyles,
     viewport: [f32; 2],
     [x, y]: [f32; 2],
@@ -3669,7 +3496,7 @@ pub(crate) fn hit_test(
 
 pub(crate) fn styles(
     doc: &mut Document,
-    state: &mut State,
+    state: &mut PageState,
     viewport: [f32; 2],
 ) -> Rc<style::ComputedStyles> {
     let scale = state.fonts.system.is_some().then_some(state.pixel_ratio);
@@ -3869,6 +3696,7 @@ mod tests {
         let page = Page {
             doc: Document::parse(html),
             dirty: false,
+            ..Default::default()
         };
         host.borrow_mut().pages.insert(1, page);
         let engine = JsContext::new(
@@ -4011,7 +3839,7 @@ mod tests {
 
     #[test]
     fn kept_containers_keep_their_sizes_between_frames() {
-        let mut state = super::State::default();
+        let mut state = crate::render::PageState::default();
         state.layout.containers.insert(1, [150., 20.]);
         state.update_containers(&Document::default());
         assert_eq!(state.layout.containers.get(&1), Some(&[150., 20.]));
@@ -4051,7 +3879,7 @@ mod tests {
             .insert("test.woff".into(), fixtures.join("test.woff"));
         {
             let mut host = host.borrow_mut();
-            let state = host.dom.entry(1).or_default();
+            let state = host.state(1);
             state.fonts.system = Some(Rc::new(renderer::TextSystem::new()));
             state.base = url::Url::parse("apps:///index.html").ok();
         }
@@ -4098,7 +3926,12 @@ mod tests {
                 "test",
             )
             .unwrap();
-        let held = host.borrow().dom[&1].styles.computed.clone().unwrap();
+        let held = host.borrow().pages[&1]
+            .state
+            .styles
+            .computed
+            .clone()
+            .unwrap();
         engine
             .eval(
                 "for(let i=0;i<20;i++)document.createElement('b').textContent='x';getComputedStyle(editor).color",
@@ -4107,7 +3940,12 @@ mod tests {
             .unwrap();
         assert!(Rc::ptr_eq(
             &held,
-            host.borrow().dom[&1].styles.computed.as_ref().unwrap()
+            host.borrow().pages[&1]
+                .state
+                .styles
+                .computed
+                .as_ref()
+                .unwrap()
         ));
     }
     #[test]
@@ -4120,7 +3958,14 @@ mod tests {
                 "test",
             )
             .unwrap();
-        let cached = Rc::as_ptr(host.borrow().dom[&1].styles.computed.as_ref().unwrap());
+        let cached = Rc::as_ptr(
+            host.borrow().pages[&1]
+                .state
+                .styles
+                .computed
+                .as_ref()
+                .unwrap(),
+        );
         engine
             .eval(
                 "editor.setAttribute('style','color:red');editor.removeAttribute('missing')",
@@ -4129,7 +3974,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             cached,
-            Rc::as_ptr(host.borrow().dom[&1].styles.computed.as_ref().unwrap())
+            Rc::as_ptr(
+                host.borrow().pages[&1]
+                    .state
+                    .styles
+                    .computed
+                    .as_ref()
+                    .unwrap()
+            )
         );
         engine
             .eval(
@@ -4149,14 +4001,21 @@ mod tests {
             .unwrap();
         assert_eq!(
             cached,
-            Rc::as_ptr(host.borrow().dom[&1].styles.computed.as_ref().unwrap())
+            Rc::as_ptr(
+                host.borrow().pages[&1]
+                    .state
+                    .styles
+                    .computed
+                    .as_ref()
+                    .unwrap()
+            )
         );
         engine.eval(r#"
             editor.append(fragment);
             if(getComputedStyle(editor.firstChild).color!=='rgb(0, 0, 255)')throw Error('Inserted style was stale');
             fragment.append(editor.firstChild);
         "#, "test").unwrap();
-        assert!(host.borrow().dom[&1].styles.computed.is_none());
+        assert!(host.borrow().pages[&1].state.styles.computed.is_none());
         engine.eval(r#"
             const root=editor.attachShadow({mode:'open'});
             root.innerHTML='<span style="color:green">text</span>';
@@ -4172,7 +4031,8 @@ mod tests {
             "<html><head><style id=s>p:empty{color:red}</style></head><body><p id=p>text</p><svg><text>a</text></svg></body></html>",
         );
         let computed = || {
-            host.borrow().dom[&1]
+            host.borrow().pages[&1]
+                .state
                 .styles
                 .computed
                 .as_ref()
@@ -4231,8 +4091,9 @@ mod tests {
             )
             .unwrap();
         host.borrow_mut()
-            .dom
+            .pages
             .get_mut(&1)
+            .map(|page| &mut page.state)
             .unwrap()
             .fonts
             .aliases
@@ -4240,18 +4101,26 @@ mod tests {
         engine
             .eval("p.style.fontFamily='Brand';if(getComputedStyle(p).fontFamily!=='Real Font')throw Error('Alias')", "test")
             .unwrap();
-        let first = host.borrow().dom[&1]
+        let first = host.borrow().pages[&1]
+            .state
             .styles
             .computed
             .as_ref()
             .unwrap()
             .values[p]
             .clone();
-        host.borrow_mut().dom.get_mut(&1).unwrap().styles.computed = None;
+        host.borrow_mut()
+            .pages
+            .get_mut(&1)
+            .map(|page| &mut page.state)
+            .unwrap()
+            .styles
+            .computed = None;
         engine.eval("getComputedStyle(p).color", "test").unwrap();
         assert!(Rc::ptr_eq(
             &first,
-            &host.borrow().dom[&1]
+            &host.borrow().pages[&1]
+                .state
                 .styles
                 .computed
                 .as_ref()
@@ -4315,7 +4184,7 @@ mod tests {
             engine.eval(read, "test").unwrap();
         }
         #[cfg(debug_assertions)]
-        assert!(host.borrow().dom[&1].styles.cache.incremental >= 20);
+        assert!(host.borrow().pages[&1].state.styles.cache.incremental >= 20);
     }
 
     #[test]
@@ -4353,7 +4222,7 @@ mod tests {
             engine.eval(&format!("{step};{read}"), "test").unwrap();
         }
         #[cfg(debug_assertions)]
-        assert!(host.borrow().dom[&1].styles.cache.incremental >= 15);
+        assert!(host.borrow().pages[&1].state.styles.cache.incremental >= 15);
     }
 
     #[test]
@@ -4406,12 +4275,12 @@ mod tests {
             ),
             ("sheet.deleteRule(0)", "css(leaf,'marginLeft')==='0px'"),
         ] {
-            let before = host.borrow().dom[&1].styles.cache.incremental;
+            let before = host.borrow().pages[&1].state.styles.cache.incremental;
             let result = engine
                 .eval(&format!("{step};{read}{check}"), "test")
                 .unwrap();
             assert_eq!(result, "true", "{step}");
-            passes.push(host.borrow().dom[&1].styles.cache.incremental > before);
+            passes.push(host.borrow().pages[&1].state.styles.cache.incremental > before);
         }
         // A rule that any node can match needs a full pass.
         assert_eq!(
@@ -4431,7 +4300,7 @@ mod tests {
             "[...document.querySelectorAll('h2')].map(h=>getComputedStyle(h).color&&h._id).join()";
         let text = |ids: String| {
             let host = host.borrow();
-            let computed = host.dom[&1].styles.computed.as_ref().unwrap();
+            let computed = host.pages[&1].state.styles.computed.as_ref().unwrap();
             ids.split(',')
                 .map(|id| {
                     let pseudos = &computed.pseudos[&id.parse::<usize>().unwrap()];
@@ -4465,10 +4334,10 @@ mod tests {
             ("s.style.counterReset=''", &["1", "2", "3"]),
             ("a.className='big'", &["1", "2", "3"]),
         ] {
-            let before = host.borrow().dom[&1].styles.cache.incremental;
+            let before = host.borrow().pages[&1].state.styles.cache.incremental;
             let result = text(engine.eval(&format!("{step};{read}"), "test").unwrap());
             assert_eq!(result, numbers(expected), "{step}");
-            passes.push(host.borrow().dom[&1].styles.cache.incremental > before);
+            passes.push(host.borrow().pages[&1].state.styles.cache.incremental > before);
         }
         assert_eq!(passes, [true; 6]);
     }
@@ -4507,7 +4376,7 @@ mod tests {
             .unwrap();
         engine.eval(read, "test").unwrap();
         #[cfg(debug_assertions)]
-        assert!(host.borrow().dom[&1].styles.cache.incremental >= 8);
+        assert!(host.borrow().pages[&1].state.styles.cache.incremental >= 8);
     }
 
     #[test]
@@ -4544,7 +4413,7 @@ mod tests {
             engine.eval(&format!("{step};{read}"), "test").unwrap();
         }
         #[cfg(debug_assertions)]
-        assert!(host.borrow().dom[&1].styles.cache.incremental >= 12);
+        assert!(host.borrow().pages[&1].state.styles.cache.incremental >= 12);
     }
 
     #[test]
@@ -4618,10 +4487,10 @@ mod tests {
             "card.classList.add('on')",
         ] {
             #[cfg(debug_assertions)]
-            let before = host.borrow().dom[&1].styles.cache.incremental;
+            let before = host.borrow().pages[&1].state.styles.cache.incremental;
             engine.eval(&format!("{step};{read}"), "test").unwrap();
             #[cfg(debug_assertions)]
-            if host.borrow().dom[&1].styles.cache.incremental == before {
+            if host.borrow().pages[&1].state.styles.cache.incremental == before {
                 full.push(step);
             }
         }
@@ -4655,7 +4524,7 @@ mod tests {
                 .map(|index| format!("<style>.item{index}{{color:red}}</style>"))
                 .collect::<String>(),
         );
-        let mut state = State::default();
+        let mut state = PageState::default();
         styles(&mut doc, &mut state, [800., 600.]);
         let sheets = state.styles.sheets.clone();
         assert_eq!(sheets.len(), 200);
@@ -4689,7 +4558,7 @@ mod tests {
         let mut doc = Document::parse(
             "<style>p{width:var(--w,5px)}b{--x:1}b span{height:var(--x,2px)}i{color:red}</style><p>x</p><b><span>y</span></b><i>z</i>",
         );
-        let mut state = State::default();
+        let mut state = PageState::default();
         styles(&mut doc, &mut state, [800., 600.]);
         for (name, initial) in [("--w", "initial-value:7px"), ("--x", "")] {
             let rule = format!("@property {name}{{syntax:\"*\";inherits:false;{initial}}}");
@@ -4721,7 +4590,7 @@ mod tests {
                 .filter(|(_, node)| node.tag == tag);
             found.nth(nth).unwrap().0
         };
-        let mut state = State::default();
+        let mut state = PageState::default();
         styles(&mut doc, &mut state, [800., 600.]);
         let sheet = find(&doc, "style", 1);
         let text = doc.nodes[sheet].children[0];
@@ -4744,7 +4613,7 @@ mod tests {
         let find = |doc: &Document, tag: &str| doc.nodes.iter().position(|node| node.tag == tag);
         let p = find(&doc, "p").unwrap();
         let on = doc.nodes[p].parent.unwrap();
-        let mut state = State::default();
+        let mut state = PageState::default();
         let viewport = [800., 600.];
         styles(&mut doc, &mut state, viewport);
         doc.nodes[on].children.retain(|&id| id != p);
@@ -4757,7 +4626,7 @@ mod tests {
         doc.nodes[p].parent = Some(on);
         state.styles.invalidate();
         let returned = styles(&mut doc, &mut state, viewport);
-        let fresh = styles(&mut doc, &mut State::default(), viewport);
+        let fresh = styles(&mut doc, &mut PageState::default(), viewport);
         assert_eq!(returned.values[p], fresh.values[p]);
         assert_eq!(returned.values[p].get(Prop::COLOR), Some("red"));
     }
@@ -4765,7 +4634,7 @@ mod tests {
     #[test]
     fn new_nodes_grow_cached_styles_like_a_full_pass() {
         let mut doc = Document::parse("<p style='font-size:30px;--x:1'>a</p>");
-        let mut state = State::default();
+        let mut state = PageState::default();
         let viewport = [800., 600.];
         styles(&mut doc, &mut state, viewport);
         let id = state.allocate(
@@ -4775,7 +4644,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let read = |doc: &mut Document, state: &mut State| {
+        let read = |doc: &mut Document, state: &mut PageState| {
             call(
                 "dom.computed",
                 &json!([id, "color", ""]),
@@ -4787,7 +4656,7 @@ mod tests {
         };
         assert_eq!(read(&mut doc, &mut state), json!(""));
         let cached = styles(&mut doc, &mut state, viewport);
-        let fresh = styles(&mut doc, &mut State::default(), viewport);
+        let fresh = styles(&mut doc, &mut PageState::default(), viewport);
         assert_eq!(cached.vars.len(), doc.nodes.len());
         for node in 0..doc.nodes.len() {
             assert!(cached.lengths[node] == fresh.lengths[node], "{node}");
@@ -4803,7 +4672,7 @@ mod tests {
     #[test]
     fn trim_cuts_the_free_end_of_the_arena_and_ids_come_back_lowest_first() {
         let mut doc = Document::parse("<div></div>");
-        let mut state = State::default();
+        let mut state = PageState::default();
         let viewport = [800., 600.];
         let node = || Node {
             tag: "p".into(),
@@ -4833,7 +4702,7 @@ mod tests {
     fn reused_ids_drop_the_old_style_while_the_styles_are_shared() {
         let mut doc =
             Document::parse("<body><div><p style='color: rgb(255, 0, 0)'></p></div></body>");
-        let mut state = State::default();
+        let mut state = PageState::default();
         let viewport = [800., 600.];
         let p = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
         let div = doc.nodes[p].parent.unwrap();
@@ -4872,10 +4741,8 @@ mod tests {
         let grow = |rect| {
             let mut host = host.borrow_mut();
             let host = &mut *host;
-            let (doc, state) = (
-                &mut host.pages.get_mut(&1).unwrap().doc,
-                host.dom.entry(1).or_default(),
-            );
+            let page = host.pages.get_mut(&1).unwrap();
+            let (doc, state) = (&mut page.doc, &mut page.state);
             let ids: Vec<usize> = (0..20_000)
                 .map(|_| state.allocate(doc, Node::default()))
                 .collect();
@@ -4896,10 +4763,8 @@ mod tests {
         {
             let mut host = host.borrow_mut();
             let host = &mut *host;
-            let (doc, state) = (
-                &mut host.pages.get_mut(&1).unwrap().doc,
-                host.dom.get_mut(&1).unwrap(),
-            );
+            let page = host.pages.get_mut(&1).unwrap();
+            let (doc, state) = (&mut page.doc, &mut page.state);
             for &id in &ids {
                 state.tree.free.push(std::cmp::Reverse(id));
             }

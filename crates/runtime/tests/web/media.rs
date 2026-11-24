@@ -19,9 +19,10 @@ fn page(features: apps_runtime::bundle::Features) -> (Rc<RefCell<Host>>, JsConte
             Page {
                 doc: Document::parse("<html><body></body></html>"),
                 dirty: false,
+                ..Default::default()
             },
         );
-        host.dom.entry(1).or_default().base = Some(base.clone());
+        host.state(1).base = Some(base.clone());
     }
     let engine = JsContext::new(
         JavaScriptCore::load().unwrap(),
@@ -82,7 +83,7 @@ fn videos_decode_frames_seek_and_end() {
             .unwrap()
             .parse()
             .unwrap();
-        let image = host.borrow().dom[&1].media.images[&id].clone();
+        let image = host.borrow().pages[&1].state.media.images[&id].clone();
         assert_eq!(
             [image.size().width as u32, image.size().height as u32],
             [64, 48]
@@ -122,7 +123,7 @@ fn videos_decode_frames_seek_and_end() {
         );
         assert!(!std::sync::Arc::ptr_eq(
             &image,
-            &host.borrow().dom[&1].media.images[&id]
+            &host.borrow().pages[&1].state.media.images[&id]
         ));
     }
 }
@@ -142,14 +143,14 @@ fn seeking_past_the_last_frame_shows_it() {
         .unwrap()
         .parse()
         .unwrap();
-    let first = host.borrow().dom[&1].media.images[&id].clone();
+    let first = host.borrow().pages[&1].state.media.images[&id].clone();
     engine
         .eval("media.currentTime = media.duration", "media-test")
         .unwrap();
     wait(&engine, "media.seeking ? 'pending' : 'done'");
     assert!(!std::sync::Arc::ptr_eq(
         &first,
-        &host.borrow().dom[&1].media.images[&id]
+        &host.borrow().pages[&1].state.media.images[&id]
     ));
 }
 
@@ -396,7 +397,7 @@ fn absurd_pixel_aspect_ratios_fit_the_frame_size_limit() {
         .unwrap()
         .parse()
         .unwrap();
-    let image = host.borrow().dom[&1].media.images[&id].clone();
+    let image = host.borrow().pages[&1].state.media.images[&id].clone();
     assert_eq!(
         [image.size().width as u32, image.size().height as u32],
         [8192, 32]

@@ -46,6 +46,7 @@ fn canvas_pixels_survive_partial_updates_and_clipping() {
         Page {
             doc: Document::parse("<html><body></body></html>"),
             dirty: false,
+            ..Default::default()
         },
     );
     let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
@@ -82,7 +83,7 @@ fn hostile_selectors_canvas_data_and_traversal() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><body><ul id='list'><li id='a'>1</li><li id=\"it's\">2</li><li id='c'>3</li></ul><svg><g><circle></circle></g><foreignObject><div id='html'></div></foreignObject></svg></body></html>"),
-        dirty: false,
+        dirty: false, ..Default::default()
     });
     let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     engine.eval(r#"
@@ -113,6 +114,7 @@ fn shadow_cycles_child_access_release_and_retired_images() {
         Page {
             doc: Document::parse("<html><body><div id='box'></div></body></html>"),
             dirty: false,
+            ..Default::default()
         },
     );
     let engine = JsContext::new(
@@ -192,7 +194,7 @@ fn shadow_cycles_child_access_release_and_retired_images() {
             }
         }
     }
-    assert_eq!(host.borrow().dom[&1].media.retired.len(), 3);
+    assert_eq!(host.borrow().pages[&1].state.media.retired.len(), 3);
 }
 
 #[test]
@@ -491,7 +493,7 @@ fn bitmaps_and_canvases_move_between_threads() {
     assert_eq!(result, "ok");
     let node = |name: &str| -> usize { engine.eval(name, "test").unwrap().parse().unwrap() };
     let host = host.borrow();
-    let dom = &host.dom[&1];
+    let dom = &host.pages[&1].state;
     assert_eq!(
         dom.media.images[&node("placeholder")].size().width as u32,
         16
@@ -512,16 +514,22 @@ fn bitmaps_free_their_pixels() {
     );
     assert_eq!(result, "ok");
     let id: usize = engine.eval("closedId", "test").unwrap().parse().unwrap();
-    assert!(!host.borrow().dom[&1].media.canvases.contains_key(&id));
+    assert!(
+        !host.borrow().pages[&1]
+            .state
+            .media
+            .canvases
+            .contains_key(&id)
+    );
     host.borrow_mut().pages.get_mut(&1).unwrap().dirty = false;
     engine.eval("globalThis.kept = new OffscreenCanvas(1, 1); kept.getContext('2d').fillRect(0, 0, 1, 1); kept._context._flush();", "test").unwrap();
     let kept: usize = engine.eval("kept._id", "test").unwrap().parse().unwrap();
     {
         let host = host.borrow();
         assert!(!host.pages[&1].dirty);
-        assert!(!host.dom[&1].media.canvases[&kept].present);
+        assert!(!host.pages[&1].state.media.canvases[&kept].present);
         assert_eq!(
-            host.dom[&1].media.canvases[&kept].pixels.pixels()[0].alpha(),
+            host.pages[&1].state.media.canvases[&kept].pixels.pixels()[0].alpha(),
             255
         );
     }
@@ -539,7 +547,7 @@ fn bitmaps_free_their_pixels() {
         engine.eval("drop()", "test").unwrap();
         made += 1;
         engine.tick().unwrap();
-        most = most.max(host.borrow().dom[&1].media.canvases.len());
+        most = most.max(host.borrow().pages[&1].state.media.canvases.len());
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert!(
@@ -569,10 +577,11 @@ fn images_decode_on_workers_and_load_after_a_wake() {
         Page {
             doc: Document::parse("<body></body>"),
             dirty: false,
+            ..Default::default()
         },
     );
     let base = url::Url::from_directory_path(directory.path()).unwrap();
-    host.borrow_mut().dom.entry(1).or_default().base = Some(base.clone());
+    host.borrow_mut().pages.get_mut(&1).unwrap().state.base = Some(base.clone());
     let engine = JsContext::new(
         JavaScriptCore::load().unwrap(),
         host.clone(),
@@ -617,8 +626,8 @@ fn images_decode_on_workers_and_load_after_a_wake() {
     let id: usize = engine.eval("image._id", "test").unwrap().parse().unwrap();
     {
         let host = host.borrow();
-        assert!(host.pages[&1].dirty && host.dom[&1].media.images.contains_key(&id));
-        assert!(host.dom[&1].media.retired.is_empty());
+        assert!(host.pages[&1].dirty && host.pages[&1].state.media.images.contains_key(&id));
+        assert!(host.pages[&1].state.media.retired.is_empty());
     }
     engine.eval(r#"
         const svg = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="30" height="12"></svg>');
@@ -634,6 +643,6 @@ fn images_decode_on_workers_and_load_after_a_wake() {
         .unwrap();
     assert_eq!(settle(1), r#"["error"]"#);
     let host = host.borrow();
-    assert_eq!(host.dom[&1].media.retired.len(), 1);
-    assert!(host.dom[&1].media.images.contains_key(&id));
+    assert_eq!(host.pages[&1].state.media.retired.len(), 1);
+    assert!(host.pages[&1].state.media.images.contains_key(&id));
 }

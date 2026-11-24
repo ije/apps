@@ -645,9 +645,10 @@ pub(super) fn spacer(
             let view = &*view;
             let mut host = view.host.borrow_mut();
             let host = &mut *host;
-            let Some(dom) = host.dom.get_mut(&view.id) else {
+            let Some(page) = host.pages.get_mut(&view.id) else {
                 return;
             };
+            let dom = &mut page.state;
             let [low, high] = zone.visible(&dom.geometry.mirror, window);
             let y = f32::from(bounds.top());
             let x = dom.geometry.mirror.get(&parent).map(|rect| {
@@ -683,9 +684,7 @@ pub(super) fn spacer(
             }
             let delta = [at[0] - last.get()[0], at[1] - last.get()[1]];
             last.set(at);
-            if delta != [0., 0.]
-                && let Some(page) = host.pages.get(&view.id)
-            {
+            if delta != [0., 0.] {
                 shift(
                     &page.doc,
                     &dom.tree.shadows,
@@ -720,10 +719,10 @@ pub(super) fn anchor(
             let view = &*view;
             let mut host = view.host.borrow_mut();
             let host = &mut *host;
-            let (Some(dom), Some(page)) = (host.dom.get_mut(&view.id), host.pages.get(&view.id))
-            else {
+            let Some(page) = host.pages.get_mut(&view.id) else {
                 return;
             };
+            let dom = &mut page.state;
             let [low, high] = zone.visible(&dom.geometry.mirror, window);
             let [left, top] = [f32::from(bounds.left()), f32::from(bounds.top())];
             let moved = first.get().is_some_and(|first| first != [left, top]);
@@ -768,10 +767,10 @@ pub(super) fn autos(view: Rc<super::ViewState>) -> Child {
             let view = &*view;
             let mut guard = view.host.borrow_mut();
             let host = &mut *guard;
-            let (Some(dom), Some(page)) = (host.dom.get_mut(&view.id), host.pages.get(&view.id))
-            else {
+            let Some(page) = host.pages.get_mut(&view.id) else {
                 return;
             };
+            let dom = &mut page.state;
             // Like in Chrome, the view and each clip reach 150% of the view size further on each side.
             let size = window.viewport_size();
             let [x, y] = [f32::from(size.width), f32::from(size.height)].map(|side| side * 1.5);
@@ -924,7 +923,7 @@ pub(super) fn autos(view: Rc<super::ViewState>) -> Child {
 // Builds the boxes on the path again, and the visibility of all nodes, when a box starts or stops to skip its contents.
 pub(super) fn reskip(
     view: &super::ViewState,
-    dom: &mut crate::dom::State,
+    dom: &mut crate::render::PageState,
     nodes: &rustc_hash::FxHashSet<usize>,
 ) {
     dom.layout.cull.reskipped = true;

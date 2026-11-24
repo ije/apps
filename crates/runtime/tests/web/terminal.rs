@@ -26,6 +26,7 @@ fn contexts(features: &str) -> Contexts {
             Page {
                 doc: Document::parse("<html><body><terminal id=parsed></terminal></body></html>"),
                 dirty: false,
+                ..Default::default()
             },
         );
     }

@@ -177,6 +177,7 @@ fn native_addons_values_callbacks_and_contexts() {
         apps_runtime::host::Page {
             doc: apps_runtime::dom::Document::parse("<body></body>"),
             dirty: false,
+            ..Default::default()
         },
     );
     let renderer = JsContext::new(

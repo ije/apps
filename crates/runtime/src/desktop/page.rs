@@ -300,14 +300,14 @@ impl Desktop {
             let mut host = self.host.borrow_mut();
             host.load_page(id, doc);
             // Preload scripts see the page URL, like page scripts.
-            host.dom.entry(id).or_default().base = url::Url::parse(&location).ok();
+            host.state(id).base = url::Url::parse(&location).ok();
         }
         let view = self.views.get_mut(&id).context("Window is closed")?;
         view.focused = true;
         if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
             cx.update_window(handle, |window, _| {
                 let mut host = self.host.borrow_mut();
-                let state = host.dom.entry(id).or_default();
+                let state = host.state(id);
                 state.fonts.system = Some(window.text_system().clone());
                 state.pixel_ratio = window.scale_factor();
                 state.window = window.window_state();

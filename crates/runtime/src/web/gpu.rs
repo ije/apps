@@ -249,6 +249,7 @@ mod tests {
             Page {
                 doc: Document::parse("<body></body>"),
                 dirty: false,
+                ..Default::default()
             },
         );
         let engine = JsContext::new(

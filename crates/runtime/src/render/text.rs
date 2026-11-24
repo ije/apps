@@ -684,9 +684,7 @@ impl renderer::Hooks for AtomBox {
             let view = &*self.view;
             view.host
                 .borrow_mut()
-                .dom
-                .entry(view.id)
-                .or_default()
+                .state(view.id)
                 .layout
                 .atoms
                 .insert(self.node, size);
@@ -883,7 +881,7 @@ impl From<InlineText> for renderer::Node {
 
 // The mirror of a node of the text. A spliced inline box has a part in each line of text, which its block joins.
 fn place(
-    dom: &mut crate::dom::State,
+    dom: &mut crate::render::PageState,
     data: &crate::render::inline::InlineText,
     id: usize,
     rect: [f32; 4],
@@ -900,7 +898,7 @@ fn place(
 }
 
 // Drops the parts that the text gave its spliced boxes before it gives them again.
-fn unplace(dom: &mut crate::dom::State, data: &crate::render::inline::InlineText) {
+fn unplace(dom: &mut crate::render::PageState, data: &crate::render::inline::InlineText) {
     for cut in &data.cuts {
         if let Some(pieces) = dom.geometry.pieces.get_mut(cut) {
             pieces.retain(|(key, _)| *key != data.key);
@@ -973,7 +971,7 @@ impl renderer::Hooks for InlineText {
     fn skip(&self, _: Rect<Pixels>, _: &mut Window) -> bool {
         let view = &*self.view;
         let mut host = view.host.borrow_mut();
-        let dom = host.dom.entry(view.id).or_default();
+        let dom = host.state(view.id);
         for (id, entry) in self.prepainted.borrow().layouts.iter() {
             dom.layout.text_layouts.insert(*id, entry.clone());
         }
@@ -1032,7 +1030,10 @@ impl renderer::Hooks for InlineText {
         let base = (style.text_indent_percent != 0.)
             .then(|| {
                 let host = self.view.host.borrow();
-                let (page, dom) = (host.pages.get(&self.view.id)?, host.dom.get(&self.view.id)?);
+                let (page, dom) = (
+                    host.pages.get(&self.view.id)?,
+                    host.pages.get(&self.view.id).map(|page| &page.state)?,
+                );
                 let &(node, _) = self.data.ranges.first()?;
                 let (up, inner) = std::iter::successors(page.doc.nodes.get(node)?.parent, |&up| {
                     page.doc.nodes[up].parent
@@ -1162,8 +1163,9 @@ impl renderer::Hooks for InlineText {
                 .get_or_insert_with(|| {
                     view.host
                         .borrow()
-                        .dom
+                        .pages
                         .get(&view.id)
+                        .map(|page| &page.state)
                         .and_then(|dom| dom.styles.last().cloned())
                 })
                 .as_ref()
@@ -1229,7 +1231,7 @@ impl renderer::Hooks for InlineText {
             .collect();
         let shift = exact.origin - bounds.origin;
         let mut host = view.host.borrow_mut();
-        let dom = host.dom.entry(view.id).or_default();
+        let dom = host.state(view.id);
         let computed = dom.styles.last().cloned();
         let mut spans: Option<Vec<(usize, Pixels)>> = None;
         unplace(dom, &self.data);
@@ -1475,7 +1477,7 @@ impl renderer::Hooks for InlineText {
         }
         let view = &*self.view;
         let mut host = view.host.borrow_mut();
-        let dom = host.dom.entry(view.id).or_default();
+        let dom = host.state(view.id);
         if moved {
             let [x, y] = [origin.x - at.x, origin.y - at.y].map(f32::from);
             *at = origin;
@@ -1540,7 +1542,7 @@ impl renderer::Hooks for InlineText {
         {
             let view = &*self.view;
             let host = view.host.borrow();
-            let dom = &host.dom[&view.id];
+            let dom = &host.pages[&view.id].state;
             if let Some(styles) = dom.styles.last() {
                 let base = window.text_system().baseline(
                     strut,

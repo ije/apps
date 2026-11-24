@@ -1,7 +1,7 @@
 use apps_runtime::dom::{self, Document};
 use serde_json::{Value, json};
 
-fn decoded(doc: &mut Document, state: &mut dom::State) -> Value {
+fn decoded(doc: &mut Document, state: &mut apps_runtime::render::PageState) -> Value {
     let started = std::time::Instant::now();
     loop {
         let results = dom::call("dom.decoded", &json!([]), doc, state, [640., 480.]).unwrap();
@@ -16,7 +16,7 @@ fn decoded(doc: &mut Document, state: &mut dom::State) -> Value {
 #[test]
 fn web_images_decode_in_the_dom() {
     let mut doc = Document::parse("<body><img></body>");
-    let mut state = dom::State::default();
+    let mut state = apps_runtime::render::PageState::default();
     for (bytes, size) in [
         (include_bytes!("../images/sample.png").as_slice(), [4, 3]),
         (include_bytes!("../images/sample.jpg"), [4, 3]),
@@ -147,7 +147,7 @@ fn svg_and_bundled_images_load_through_the_host() {
     };
     use std::io::Write;
     let mut doc = Document::parse("<body><img></body>");
-    let mut state = dom::State::default();
+    let mut state = apps_runtime::render::PageState::default();
     let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="30" height="12"><rect width="30" height="12"/></svg>"#;
     let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     gzip.write_all(svg).unwrap();
@@ -184,9 +184,10 @@ fn svg_and_bundled_images_load_through_the_host() {
         Page {
             doc: Document::parse("<body><img></body>"),
             dirty: false,
+            ..Default::default()
         },
     );
-    host.dom.entry(1).or_default().base = Some(url::Url::parse("apps:///page-0.html").unwrap());
+    host.state(1).base = Some(url::Url::parse("apps:///page-0.html").unwrap());
     let load = |host: &mut Host, source: &str| {
         host.call(Role::Renderer(1), "dom.imageURL", json!([1, source]))
     };
@@ -204,14 +205,17 @@ fn svg_and_bundled_images_load_through_the_host() {
         }
     };
     assert!(load(&mut host, "assets/sample.png").unwrap().is_u64());
-    assert!(!host.pages[&1].dirty && !host.dom[&1].media.images.contains_key(&1));
+    assert!(!host.pages[&1].dirty && !host.pages[&1].state.media.images.contains_key(&1));
     assert_eq!(decoded(&mut host), json!([4, 3]));
-    assert!(host.pages[&1].dirty && host.dom[&1].media.images.contains_key(&1));
+    assert!(host.pages[&1].dirty && host.pages[&1].state.media.images.contains_key(&1));
     assert!(load(&mut host, "apps:///assets/missing.png").is_err());
     assert!(load(&mut host, png.to_str().unwrap()).is_err());
     assert!(load(&mut host, url::Url::from_file_path(&png).unwrap().as_str()).is_err());
-    host.dom.get_mut(&1).unwrap().base =
-        Some(url::Url::from_directory_path(directory.path()).unwrap());
+    host.pages
+        .get_mut(&1)
+        .map(|page| &mut page.state)
+        .unwrap()
+        .base = Some(url::Url::from_directory_path(directory.path()).unwrap());
     load(&mut host, "sample.png").unwrap();
     assert_eq!(decoded(&mut host), json!([4, 3]));
     load(&mut host, "missing.png").unwrap();
