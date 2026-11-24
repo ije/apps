@@ -6,7 +6,7 @@ use anyhow::{Context, Result, ensure};
 use calls::{Callback, Info};
 use hooks::Hooks;
 use libloading::Library;
-use objects::{Finalizer, Kind, Objects};
+use objects::{Finalize, Finalizer, Kind, Objects};
 use scope::Handles;
 use std::{
     cell::{Cell, RefCell},
@@ -205,7 +205,7 @@ impl State {
         let holder = unsafe {
             (self.api.make_buffer)(
                 self.ctx,
-                objects::holder_byte(holder),
+                (&raw mut (*holder).byte).cast(),
                 1,
                 Some(objects::release_holder),
                 holder.cast(),
@@ -232,7 +232,9 @@ impl State {
                 });
             }
             if let Some(finalizer) = finalizer {
-                self.scoped(|| unsafe { finalizer.run(self.env()) });
+                self.scoped(|| unsafe {
+                    (finalizer.callback)(self.env(), finalizer.data, finalizer.hint)
+                });
             }
         }
     }
@@ -504,12 +506,12 @@ impl State {
             }
             for id in ids {
                 if let Some(finalizer) = self.objects.take_finalizer(id) {
-                    unsafe { finalizer.run(self.env()) };
+                    unsafe { (finalizer.callback)(self.env(), finalizer.data, finalizer.hint) };
                 }
             }
         }
         if let Some(finalizer) = self.instance_finalizer.take() {
-            unsafe { finalizer.run(self.env()) };
+            unsafe { (finalizer.callback)(self.env(), finalizer.data, finalizer.hint) };
         }
         self.objects.drop_references(&self.api, self.ctx);
         self.handles.release(&self.api, self.ctx);
@@ -550,10 +552,6 @@ impl State {
         }
     }
 
-    fn pending(&self) -> bool {
-        self.tasks.pending()
-    }
-
     fn run_threadsafe(&self, function: &work::Threadsafe) {
         // One function can have several entries here, so a later one may name a function that already ended.
         if function.ended() {
@@ -567,7 +565,7 @@ impl State {
             });
         }
         if function.released() {
-            let live = self.tasks.end(function);
+            let live = self.tasks.remove_live(function);
             self.scoped(|| function.end(self.env(), &self.api, self.ctx));
             drop(live);
         }
@@ -610,7 +608,7 @@ impl Root {
         self.environments
             .borrow()
             .iter()
-            .any(|environment| environment.pending())
+            .any(|environment| environment.tasks.pending())
     }
 
     pub(crate) fn close(&self) {
@@ -765,6 +763,17 @@ const MESSAGES: [Option<&CStr>; 24] = [
 ];
 
 impl State {
+    api!(napi_set_instance_data(env, data: Ptr, callback: Option<Finalize>, hint: Ptr) {
+        env.instance.set(data);
+        env.instance_finalizer
+            .set(callback.map(|callback| Finalizer { callback, data, hint }));
+        Ok(())
+    });
+    api!(napi_get_instance_data(env, result: *mut Ptr) {
+        check(!result.is_null(), 1)?;
+        *result = env.instance.get();
+        Ok(())
+    });
     api!(napi_get_last_error_info(env, result: *mut *const ErrorInfo) {
         check(!result.is_null(), 1)?;
         *result = env.error.as_ptr();

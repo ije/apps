@@ -16,12 +16,6 @@ pub(super) struct Finalizer {
     pub(super) hint: Ptr,
 }
 
-impl Finalizer {
-    pub(super) unsafe fn run(self, env: Env) {
-        unsafe { (self.callback)(env, self.data, self.hint) };
-    }
-}
-
 #[derive(Clone, Copy)]
 pub(super) enum Kind {
     Finalizer,
@@ -39,11 +33,7 @@ struct Tracked {
 pub(super) struct Holder {
     queue: Arc<Mutex<Vec<u64>>>,
     id: u64,
-    byte: u8,
-}
-
-pub(super) fn holder_byte(holder: *mut Holder) -> Ptr {
-    unsafe { (&raw mut (*holder).byte).cast() }
+    pub(super) byte: u8,
 }
 
 pub(super) unsafe extern "C" fn release_holder(_: Ptr, holder: Ptr) {
@@ -60,7 +50,8 @@ struct Reference {
     count: u32,
 }
 
-// The JavaScript objects that addon data follows: wraps, externals, finalizers, functions and references.
+// The JavaScript objects that addon data follows: wraps, externals, finalizers and references, and the holders of
+// native functions.
 #[derive(Default)]
 pub(super) struct Objects {
     next: Cell<u64>,

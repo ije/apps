@@ -91,7 +91,7 @@ impl Tasks {
             .collect()
     }
 
-    pub(super) fn end(&self, function: &Threadsafe) -> Option<Arc<Threadsafe>> {
+    pub(super) fn remove_live(&self, function: &Threadsafe) -> Option<Arc<Threadsafe>> {
         self.live
             .borrow_mut()
             .remove(&(ptr::from_ref(function) as usize))
@@ -303,10 +303,6 @@ impl Threadsafe {
         }
     }
 
-    fn reference(&self, referenced: bool) {
-        self.referenced.store(referenced, Ordering::Release);
-    }
-
     raw_api!(napi_get_threadsafe_function_context(function: *const Threadsafe, result: *mut Ptr) {
         if function.is_null() || result.is_null() {
             return 1;
@@ -435,12 +431,12 @@ impl State {
     });
     api!(napi_unref_threadsafe_function(env, function: Ptr) {
         check(!function.is_null(), 1)?;
-        (*function.cast::<Threadsafe>()).reference(false);
+        (*function.cast::<Threadsafe>()).referenced.store(false, Ordering::Release);
         Ok(())
     });
     api!(napi_ref_threadsafe_function(env, function: Ptr) {
         check(!function.is_null(), 1)?;
-        (*function.cast::<Threadsafe>()).reference(true);
+        (*function.cast::<Threadsafe>()).referenced.store(true, Ordering::Release);
         Ok(())
     });
 }

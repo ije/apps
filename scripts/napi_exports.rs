@@ -16,8 +16,8 @@ pub fn link_args(source: &str, target: &str, release: bool) -> Vec<String> {
     args
 }
 
-// `folder` holds the Node-API source files.
-pub fn export_symbols(folder: &Path) {
+// `folder` holds the Node-API source files. Returns their text.
+pub fn export_symbols(folder: &Path) -> String {
     println!("cargo:rerun-if-changed={}", folder.display());
     let mut source = String::new();
     for entry in fs::read_dir(folder).unwrap() {
@@ -30,4 +30,5 @@ pub fn export_symbols(folder: &Path) {
     ) {
         println!("cargo:rustc-link-arg={arg}");
     }
+    source
 }

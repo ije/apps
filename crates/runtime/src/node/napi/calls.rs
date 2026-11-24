@@ -25,20 +25,19 @@ pub(super) struct Property {
 
 impl State {
     unsafe fn settle(&self, deferred: Ptr, value: Ptr, name: &str) -> Status {
-        let env = self;
         let mut state = ptr::null_mut();
         check(
-            unsafe { Self::napi_get_reference_value(env, deferred, &mut state) } == 0,
+            unsafe { Self::napi_get_reference_value(self, deferred, &mut state) } == 0,
             1,
         )?;
-        let callback = env.js("get", &[state, env.text(name)])?;
+        let callback = self.js("get", &[state, self.text(name)])?;
         check(
-            unsafe { Self::napi_call_function(env, state, callback, 1, &value, ptr::null_mut()) }
+            unsafe { Self::napi_call_function(self, state, callback, 1, &value, ptr::null_mut()) }
                 == 0,
             10,
         )?;
         check(
-            unsafe { Self::napi_delete_reference(env, deferred) } == 0,
+            unsafe { Self::napi_delete_reference(self, deferred) } == 0,
             1,
         )
     }

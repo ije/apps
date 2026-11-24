@@ -21,7 +21,7 @@ pub(super) struct Handles {
     #[allow(clippy::vec_box)]
     scopes: RefCell<Vec<Box<Scope>>>,
     held: RefCell<Vec<Ptr>>,
-    callbacks: Cell<usize>,
+    callback_scopes: Cell<usize>,
 }
 
 impl Handles {
@@ -117,12 +117,12 @@ impl Handles {
     }
 
     fn enter_callback(&self) {
-        self.callbacks.set(self.callbacks.get() + 1);
+        self.callback_scopes.set(self.callback_scopes.get() + 1);
     }
 
     fn exit_callback(&self) -> Status {
-        check(self.callbacks.get() > 0, 14)?;
-        self.callbacks.set(self.callbacks.get() - 1);
+        check(self.callback_scopes.get() > 0, 14)?;
+        self.callback_scopes.set(self.callback_scopes.get() - 1);
         Ok(())
     }
 
