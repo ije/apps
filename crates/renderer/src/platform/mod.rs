@@ -65,7 +65,8 @@ pub(crate) struct Callbacks {
     pub thread: AppThread,
 }
 
-/// The newest pointer move that waits for the app, which later moves replace.
+/// The newest pointer move or wheel the app thread has not taken yet, to merge more into it, and when its
+/// device sent it.
 #[cfg(target_os = "macos")]
 pub(crate) type Motion = std::sync::Arc<std::sync::Mutex<Option<(Event, std::time::Instant)>>>;
 

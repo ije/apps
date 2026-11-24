@@ -846,9 +846,6 @@ impl AppsWindow {
 const RESIZE_WAIT: Duration = Duration::from_millis(8);
 const DRAG_REPEAT: Duration = Duration::from_millis(16);
 
-// The newest pointer move or wheel the app thread has not taken yet, to merge more into it, and
-// when its device sent it.
-
 pub(crate) struct Input {
     callbacks: Callbacks,
     pub layer: Retained<CAMetalLayer>,

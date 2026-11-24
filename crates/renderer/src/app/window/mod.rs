@@ -419,11 +419,12 @@ impl Track {
 
 pub struct Window {
     id: WindowId,
+    // The glyph and image tiles that paint takes, which the GPU backend of the window holds. Declared before
+    // `platform`, so the backend drops the last handle, with its GPU device.
+    atlas: Rc<platform::Atlas>,
     platform: platform::Window,
     pub(super) view: Option<Box<dyn View>>,
     text_system: Rc<TextSystem>,
-    // The glyph and image tiles that paint takes, which the GPU backend of the window holds.
-    atlas: Rc<platform::Atlas>,
     scale_factor: f32,
     viewport_size: Size<Pixels>,
     zoom: f32,

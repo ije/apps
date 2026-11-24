@@ -1189,8 +1189,6 @@ struct LayoutTree<'a> {
     roomed: Vec<u32>,
 }
 
-impl LayoutTree<'_> {}
-
 // The border box size of a layout in CSS pixels, before it snaps to device pixels.
 fn unsnapped(layout: &Layout, scale: f32) -> Size<Pixels> {
     Size::new(
