@@ -429,6 +429,8 @@ pub struct Window {
     // The glyph and image tiles that paint takes, which the GPU backend of the window holds. Declared before
     // `platform`, so the backend drops the last handle, with its GPU device.
     atlas: Rc<platform::Atlas>,
+    // A buffer that the atlas and the scene trade the removed atlas tiles in.
+    removed: Vec<(bool, u32, Rect<i32>)>,
     platform: platform::Window,
     pub(super) view: Option<Box<dyn View>>,
     text_system: Rc<TextSystem>,
@@ -523,6 +525,7 @@ impl Window {
             view: None,
             text_system,
             atlas,
+            removed: Vec::new(),
             scale_factor,
             viewport_size,
             zoom: 1.,

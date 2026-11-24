@@ -17,14 +17,14 @@ fn copied_spans_draw_like_their_paint() {
         scene.push(at(x + 3.));
     };
     let mut scene = Scene::default();
-    scene.begin_paint(1, Vec::new());
+    scene.begin_paint(1, &mut Vec::new());
     scene.push(at(90.));
     let mark = scene.mark();
     paint(&mut scene, 20.);
     let span = scene.span(mark).unwrap();
     let painted = scene.records(&span, false, None);
     scene.clear();
-    scene.begin_paint(2, Vec::new());
+    scene.begin_paint(2, &mut Vec::new());
     // The copy lands after other content, in a nested layer.
     scene.push(at(50.));
     scene.push_effect(effect(mask), None);
@@ -43,7 +43,7 @@ fn layers_that_the_mask_hides_count_as_cut() {
     let mask = Clip::from(bounds([0., 0., 100., 100.]));
     let open = Clip::from(bounds([-1e6, -1e6, 2e6, 2e6]));
     let mut scene = Scene::default();
-    scene.begin_paint(1, Vec::new());
+    scene.begin_paint(1, &mut Vec::new());
     for (x, culled) in [(10., 0), (300., 1)] {
         scene.push_effect(effect(mask), None);
         scene.push(Instance::new(BOX, bounds([x, x, 10., 10.]), open));
@@ -60,7 +60,7 @@ fn copied_spans_keep_their_scrolls_once() {
     let mut spans: Vec<Span> = Vec::new();
     let mut scene = Scene::default();
     for pass in 1..6 {
-        scene.begin_paint(pass, Vec::new());
+        scene.begin_paint(pass, &mut Vec::new());
         let last = mem::take(&mut spans);
         // A scroll with content, an empty scroll, and a box next to them, each in its own span.
         let paint = |scene: &mut Scene, index: usize, y: f32| match index {
@@ -102,7 +102,7 @@ fn nested_escapes_close_their_cuts() {
     let open = Clip::from(bounds([0., -100., 100., 300.]));
     let at = |y: f32| Instance::new(BOX, bounds([0., y, 10., 10.]), open);
     let mut scene = Scene::default();
-    scene.begin_paint(1, Vec::new());
+    scene.begin_paint(1, &mut Vec::new());
     scene.begin_scroll(1, viewport, point(0., 0.), true);
     scene.push(at(150.));
     scene.pause_cuts(0);
@@ -129,7 +129,7 @@ fn layers_take_back_their_own_buffers() {
     let mut scene = Scene::default();
     let mut capacities = Vec::new();
     for pass in 1..5 {
-        scene.begin_paint(pass, Vec::new());
+        scene.begin_paint(pass, &mut Vec::new());
         for _ in 0..1000 {
             scene.push(at);
         }
@@ -163,7 +163,7 @@ fn moved_spans_draw_like_their_paint_at_the_new_place() {
         scene.push(Instance::new(BOX, bounds([30., y + 20., 10., 10.]), mask));
     };
     let mut scene = Scene::default();
-    scene.begin_paint(1, Vec::new());
+    scene.begin_paint(1, &mut Vec::new());
     let mark = scene.mark();
     paint(&mut scene, 60., mask);
     let span = scene.span(mark).unwrap();
@@ -172,12 +172,12 @@ fn moved_spans_draw_like_their_paint_at_the_new_place() {
     // A box that the clip cuts can't move.
     assert_eq!(scene.plain(&span, &cut), None);
     scene.clear();
-    scene.begin_paint(2, Vec::new());
+    scene.begin_paint(2, &mut Vec::new());
     let moved = scene
         .replay_moved(&span, point(0., -8.), &mask, &cut)
         .unwrap();
     let mut fresh = Scene::default();
-    fresh.begin_paint(3, Vec::new());
+    fresh.begin_paint(3, &mut Vec::new());
     let mark = fresh.mark();
     paint(&mut fresh, 52., cut);
     let painted = fresh.records(&fresh.span(mark).unwrap(), false, None);
@@ -224,7 +224,7 @@ fn moved_spans_carry_their_layers_and_inner_clips() {
         scene.pop_effect();
     };
     let mut scene = Scene::default();
-    scene.begin_paint(1, Vec::new());
+    scene.begin_paint(1, &mut Vec::new());
     let mark = scene.mark();
     paint(&mut scene, 60.);
     let span = scene.span(mark).unwrap();
@@ -236,12 +236,12 @@ fn moved_spans_carry_their_layers_and_inner_clips() {
     let cut = Clip::from(bounds([0., 65., 200., 100.]));
     assert_eq!(scene.plain(&span, &cut), None);
     scene.clear();
-    scene.begin_paint(2, Vec::new());
+    scene.begin_paint(2, &mut Vec::new());
     let moved = scene
         .replay_moved(&span, point(0., -8.), &mask, &mask)
         .unwrap();
     let mut fresh = Scene::default();
-    fresh.begin_paint(3, Vec::new());
+    fresh.begin_paint(3, &mut Vec::new());
     let mark = fresh.mark();
     paint(&mut fresh, 52.);
     let painted = fresh.records(&fresh.span(mark).unwrap(), false, None);

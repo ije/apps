@@ -39,8 +39,8 @@ impl Window {
     pub(crate) fn begin_paint(&mut self) -> (u32, Option<u32>) {
         self.paints = self.paints.wrapping_add(1);
         let generation = self.text_system.generation();
-        let (removed, evicted) = self.atlas.take_removed();
-        self.scene.begin_paint(self.paints, removed);
+        let evicted = self.atlas.take_removed(&mut self.removed);
+        self.scene.begin_paint(self.paints, &mut self.removed);
         let fresh = mem::take(&mut self.repaint) || evicted || generation != self.generation;
         self.generation = generation;
         self.pending.pass = Some(self.paints);

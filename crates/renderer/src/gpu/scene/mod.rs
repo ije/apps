@@ -552,9 +552,10 @@ impl Scene {
         }
     }
 
-    // `removed` lists the atlas tiles removed since the last paint.
-    pub(crate) fn begin_paint(&mut self, pass: u32, removed: Vec<(bool, u32, Rect<i32>)>) {
-        (self.pass, self.removed) = (Some(pass), removed);
+    // `removed` lists the atlas tiles removed since the last paint, and gets the buffer of the last list back.
+    pub(crate) fn begin_paint(&mut self, pass: u32, removed: &mut Vec<(bool, u32, Rect<i32>)>) {
+        self.pass = Some(pass);
+        mem::swap(&mut self.removed, removed);
     }
 
     /// Paint left out content, so a copy of it can't move.

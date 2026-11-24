@@ -7,6 +7,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
+    mem,
 };
 
 const MAX_GLYPH_PIXELS: usize = 4 << 20;
@@ -113,13 +114,15 @@ impl<B: PageStore> Atlas<B> {
     // The tiles removed since the last call. Canvases and videos remove one each frame, so only the copies
     // that read them paint again. Many removals stop all copies. Returns true when tiles that copies read were
     // freed.
-    pub(crate) fn take_removed(&self) -> (Vec<(bool, u32, Rect<i32>)>, bool) {
-        let mut removed = self.removed.take();
-        if removed.len() > 64 {
+    // `into` gets the list, and the atlas keeps the cleared buffer of `into` for later removals.
+    pub(crate) fn take_removed(&self, into: &mut Vec<(bool, u32, Rect<i32>)>) -> bool {
+        into.clear();
+        mem::swap(into, &mut self.removed.borrow_mut());
+        if into.len() > 64 {
             self.evicted.set(true);
-            removed.clear();
+            into.clear();
         }
-        (removed, self.evicted.replace(false))
+        self.evicted.replace(false)
     }
 
     // Instances that read new pixels in the place of old ones look the same, so they must draw again.
@@ -638,7 +641,7 @@ mod tests {
         let (shown, gone) = (insert(&glyph(1)), insert(&glyph(2)));
         let (photo, hidden) = (insert(&TileKey::Image(1)), insert(&TileKey::Image(2)));
         let mut scene = Scene::default();
-        scene.begin_paint(0, Vec::new());
+        scene.begin_paint(0, &mut Vec::new());
         let mark = scene.mark();
         scene.push(sprite(GLYPH, shown));
         let mut cropped = sprite(IMAGE, photo);
@@ -652,7 +655,7 @@ mod tests {
         let mut retired_at = None;
         for pass in 1..=MAX_AGE * 2 {
             scene.clear();
-            scene.begin_paint(pass, Vec::new());
+            scene.begin_paint(pass, &mut Vec::new());
             span = scene.replay(&span).unwrap();
             atlas.glyph_pixels.set(MAX_GLYPH_PIXELS + 1);
             atlas.finish_frame(scene.texels());
@@ -680,16 +683,16 @@ mod tests {
         }
         // A removed tile stops only the copies that read it.
         scene.clear();
-        scene.begin_paint(MAX_AGE * 2 + 1, Vec::new());
+        scene.begin_paint(MAX_AGE * 2 + 1, &mut Vec::new());
         let photo_span = scene.replay(&span).unwrap();
         let mark = scene.mark();
         scene.push(sprite(GLYPH, shown));
         let glyph_span = scene.span(mark).unwrap();
         scene.clear();
         atlas.remove(&TileKey::Image(1));
-        let (removed, evicted) = atlas.take_removed();
-        assert!(!evicted);
-        scene.begin_paint(MAX_AGE * 2 + 2, removed);
+        let mut removed = Vec::new();
+        assert!(!atlas.take_removed(&mut removed));
+        scene.begin_paint(MAX_AGE * 2 + 2, &mut removed);
         assert!(
             scene.replay(&glyph_span).is_some(),
             "the glyph copy reads no removed tile"
