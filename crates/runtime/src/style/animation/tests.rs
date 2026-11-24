@@ -269,11 +269,7 @@ fn animated_styles_drop_values_that_stop_animating() {
     let start = Instant::now();
     let mut motion = Motion::default();
     let mut style = |seconds: f64| {
-        let Frame {
-            animated,
-            pseudos: _,
-            ..
-        } = motion.update(
+        let Frame { animated, .. } = motion.update(
             &doc,
             &styles,
             &visible,
@@ -452,11 +448,7 @@ fn starting_styles_transition_new_and_shown_elements() {
         false,
         &mut events,
     );
-    let Frame {
-        animated,
-        pseudos: _,
-        ..
-    } = motion.update(
+    let Frame { animated, .. } = motion.update(
         &doc,
         &styles,
         &visible,
@@ -495,11 +487,7 @@ fn starting_styles_transition_new_and_shown_elements() {
         false,
         &mut events,
     );
-    let Frame {
-        animated,
-        pseudos: _,
-        ..
-    } = motion.update(
+    let Frame { animated, .. } = motion.update(
         &doc,
         &computed_styles(&doc),
         &visible,
@@ -828,11 +816,7 @@ fn filled_animations_keep_one_style_while_unchanged() {
     let mut motion = Motion::default();
     let mut style = |time: f64| {
         let now = start + Duration::from_secs_f64(time);
-        let Frame {
-            animated,
-            pseudos: _,
-            ..
-        } = motion.update(
+        let Frame { animated, .. } = motion.update(
             &doc,
             &styles,
             &visible,
