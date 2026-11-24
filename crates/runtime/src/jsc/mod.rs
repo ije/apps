@@ -136,7 +136,7 @@ static SCRIPTS: std::sync::Mutex<Scripts> = std::sync::Mutex::new(Scripts {
 
 pub struct JavaScriptCore {
     aot: Option<&'static aot::Image>,
-    pub(crate) group: Ptr,
+    group: Ptr,
     group_release: unsafe extern "C" fn(Ptr),
     garbage_collect: unsafe extern "C" fn(Ptr),
     shrink: unsafe extern "C" fn(Ptr),
@@ -161,7 +161,7 @@ pub struct JavaScriptCore {
     inspectable: unsafe extern "C" fn(Ptr, bool),
     pub(crate) extra_memory: unsafe extern "C" fn(Ptr, usize),
     // An older library has no such functions. Buffers are then copied, and shared buffers can't be sent.
-    pub(crate) contents: Option<payload::Contents>,
+    contents: Option<payload::Contents>,
     terminate: Option<unsafe extern "C" fn(Ptr)>,
     set_name: unsafe extern "C" fn(Ptr, Ptr),
     execution_limit: Limit,

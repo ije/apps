@@ -712,7 +712,7 @@ pub(crate) unsafe extern "C" fn url_parts(
             } else {
                 href[..end].encode_utf16().count()
             };
-            *item = unsafe { (api.number)(ctx, end as f64) };
+            *item = api.make_number(ctx, end as f64);
         }
         Ok(api.array(ctx, &items))
     })

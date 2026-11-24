@@ -148,8 +148,8 @@ unsafe extern "C" fn ffi_call(
         || -> Result<crate::node::ffi::Output> {
             anyhow::ensure!(count > 0, "Missing FFI request");
             let values = unsafe { std::slice::from_raw_parts(args, count) };
-            if unsafe { (api.value_type)(ctx, values[0]) } == 3 {
-                let id = unsafe { (api.to_number)(ctx, values[0], ptr::null_mut()) } as u64;
+            if api.kind(ctx, values[0]) == 3 {
+                let id = api.to_f64(ctx, values[0]) as u64;
                 return ffi
                     .invoke(api, ctx, role, id, &values[1..])
                     .map(crate::node::ffi::Output::Object);
@@ -164,15 +164,10 @@ unsafe extern "C" fn ffi_call(
         Ok(Err(error)) => serde_json::json!({"error":error.to_string()}),
         Err(_) => serde_json::json!({"error":"FFI call failed"}),
     };
-    let string = api.string(&value.to_string());
-    unsafe {
-        let result = (api.make_string)(ctx, string);
-        (api.string_release)(string);
-        if !exception.is_null() {
-            *exception = ptr::null_mut();
-        }
-        result
+    if !exception.is_null() {
+        unsafe { *exception = ptr::null_mut() };
     }
+    api.make_text(ctx, &value.to_string())
 }
 
 unsafe extern "C" fn page_limit(ctx: Ptr, _: Ptr) -> bool {
@@ -501,8 +496,8 @@ impl JsContext {
         loop {
             let delay = self
                 .api
-                .call_json(self.ctx, "__appsTick", &[], |value| unsafe {
-                    (self.api.to_number)(self.ctx, value, ptr::null_mut())
+                .call_json(self.ctx, "__appsTick", &[], |value| {
+                    self.api.to_f64(self.ctx, value)
                 })
                 .inspect_err(|error| self.log("apps:tick", &error.to_string()))?;
             if delay != -2. {
@@ -969,12 +964,7 @@ mod tests {
             "test",
         )
         .unwrap();
-        let items = unsafe {
-            let name = api.string("items");
-            let items = (api.get)(page.ctx, (api.global)(page.ctx), name, ptr::null_mut());
-            (api.string_release)(name);
-            items
-        };
+        let items = api.global_value(page.ctx, "items");
         let (buffers, roots) = payload::input(&api, page.ctx, items).unwrap();
         page.eval("delete globalThis.items", "test").unwrap();
         page.collect_garbage();
