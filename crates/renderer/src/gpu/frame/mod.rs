@@ -28,7 +28,6 @@ pub struct Layer {
     scale: f32,
     bounds: [f32; 4],
     // The texels of the texture that the layer holds. A pooled texture can be larger, or hold other tiles.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     scissor: [u32; 4],
 }
 
@@ -71,6 +70,9 @@ pub enum Command {
         backdrop: Option<Target>,
         index: u32,
     },
+    // Draws into the window stay inside this region, and clearing the window clears only it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Scissor(Option<[i32; 4]>),
 }
 
 #[derive(Default)]
@@ -113,6 +115,8 @@ pub struct RenderFrame {
     // Set by a backend that draws damage regions over the last frame: it then keeps the window below what paints
     // after a scrolled content, so a scroll draws again only what changed there and what paints after it.
     keeps_under: bool,
+    // Set by a backend that draws damage regions straight into the window under a scissor, with no layer for each.
+    scissors: bool,
     under: Option<KeptUnder>,
     // Draws only the items of the window layer before the split of `Under`, or only those after it.
     half: Option<([u32; 2], bool)>,
@@ -233,7 +237,7 @@ impl<T> Pool<T> {
     }
 
     // The sizes of textures that hold no cached layer.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn spare(&self, sizes: &mut Vec<[u32; 2]>) {
         sizes.clear();
         sizes.extend(
@@ -290,7 +294,7 @@ impl RenderFrame {
     }
 
     // New layers take the sizes of the spare textures of `pool` first.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn take_spare<T>(&mut self, pool: &Pool<T>) {
         pool.spare(&mut self.spare);
     }
@@ -325,6 +329,19 @@ impl RenderFrame {
         // A layer that left or joined the backend draws otherwise in the whole window.
         self.damage = if same { damage } else { Vec::new() };
         (self.fresh, self.keeps_under) = (fresh, keeps_under);
+    }
+
+    // The window regions that the next frames draw straight into the window under a scissor, over the last frame,
+    // or none for the whole window. `keep` keeps the window below what paints after a scrolled content.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prepare_scissors(&mut self, damage: Vec<[i32; 4]>, keep: bool) {
+        self.damage = damage;
+        (self.keeps_under, self.scissors) = (keep, keep);
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn clear_damage(&mut self) {
+        self.damage.clear();
     }
 
     // Whether the frame skips exactly `layers`, which the backend draws.
@@ -380,10 +397,31 @@ impl RenderFrame {
                 None => self.record_layer(scene, 0, Target::Frame, true, 0),
             }
         }
+        if self.scissors && !self.damage.is_empty() {
+            self.bases.push(Target::Frame);
+        }
         // The regions copy into the window together, since each pass into a target loads and stores all of it.
         let mut copies = Vec::with_capacity(self.damage.len());
         for at in 0..self.damage.len() {
             let region = self.damage[at];
+            if self.scissors {
+                self.commands.push(Command::Scissor(Some(region)));
+                match under {
+                    Some(split) => {
+                        self.copy_kept(Target::Frame, region, false);
+                        self.record_region(
+                            scene,
+                            Target::Frame,
+                            region,
+                            Some((split, true)),
+                            false,
+                        );
+                    }
+                    None => self.record_region(scene, Target::Frame, region, None, true),
+                }
+                self.commands.push(Command::Scissor(None));
+                continue;
+            }
             let base = self.region_base(region);
             match under {
                 Some(split) => {

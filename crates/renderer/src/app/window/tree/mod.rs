@@ -110,7 +110,15 @@ struct Slot {
     // in `touched` of that pass.
     regions: Option<(u32, [u32; 2])>,
     touched: [u32; 2],
-    // All hooks in the box allow a skip, and no box in it is listed in a stacking context outside it.
+    // The regions and touched boxes of the last prepaint that went through the boxes in it. Copies of the
+    // regions relocate them as a block.
+    base_regions: Option<(u32, [u32; 2])>,
+    base_touched: [u32; 2],
+    // The regions and touched boxes that the last prepaint of the box gave, which they relocate from with the
+    // copies of the regions of its parent.
+    own_regions: Option<(u32, [u32; 2])>,
+    own_touched: [u32; 2],
+    // All hooks in the box allow a skip, and all boxes in it that paint outside it are in `listing`.
     skips: bool,
     // The prepaint pass that skipped the box.
     skipped: u32,
@@ -122,6 +130,12 @@ struct Slot {
     flat: bool,
     // How far scrolls moved the box without a prepaint of the boxes in it, since one last went through them.
     lag: Point<Pixels>,
+    // The part of `lag` that a skip of an ancestor already gave the box, because it is listed outside that ancestor.
+    ahead: Point<Pixels>,
+    // The boxes inside that the box listed in the stacking context around it, which a skip of the box lists again.
+    listing: Box<[u32]>,
+    // The content mask of the box where it was listed.
+    list_mask: Clip<Pixels>,
 }
 
 #[derive(Clone, Copy)]
@@ -138,6 +152,22 @@ struct Chunk {
     area: Option<Rect<f32>>,
     // A copy can move with the box when its mask moves with it, as in a scroll.
     translates: bool,
+    // The last paint of the box that went through the boxes in it. Copies relocate that span as a block, so the
+    // chunks of the boxes in it follow the copies.
+    base: Output,
+    // The last paint or copy of the box, which the chunk relocates from with the copies of its parent.
+    origin: Output,
+}
+
+// What a paint or a copy of a box drew, and where.
+#[derive(Clone, Copy)]
+struct Output {
+    pass: u32,
+    span: PaintSpan,
+    key: PaintKey,
+    at: Point<Pixels>,
+    mask: Clip<Pixels>,
+    area: Option<Rect<f32>>,
 }
 
 type Spill = (Vec<[f32; 5]>, f32, f32);
@@ -200,12 +230,19 @@ impl Slot {
             chunk: None,
             regions: None,
             touched: [0; 2],
+            base_regions: None,
+            base_touched: [0; 2],
+            own_regions: None,
+            own_touched: [0; 2],
             skips: false,
             skipped: 0,
             contained: false,
             cut: 0,
             flat: false,
             lag: Point::default(),
+            ahead: Point::default(),
+            listing: Box::new([]),
+            list_mask: Clip::default(),
         }
     }
 }
@@ -259,6 +296,8 @@ impl Slot {
         self.split = None;
         self.chunk = None;
         self.regions = None;
+        self.base_regions = None;
+        self.own_regions = None;
     }
 
     fn taffy(&self) -> &taffy::Style {
@@ -372,6 +411,14 @@ pub struct Tree {
     hidden: Vec<Vec<Option<Rect<Pixels>>>>,
     // The move of the box that `keep` visits when its layout stayed and only the scroll offset moved it.
     delta: Option<Point<Pixels>>,
+    // For each box that `keep` goes through, how far scrolls moved it without a prepaint of the boxes in it.
+    lags: Vec<Point<Pixels>>,
+    // For each box that a debug paint goes through where a release paint copies, the chunks before the paint.
+    #[cfg(debug_assertions)]
+    copied: Vec<Vec<(u32, Option<Chunk>)>>,
+    // A prepaint since the last paint went through all boxes again for a check.
+    #[cfg(debug_assertions)]
+    checked: bool,
     // The boxes whose hooks skip also inside a skipped box, in this pass and the last one.
     touched: Vec<u32>,
     last_touched: (u32, Vec<u32>),
@@ -1291,7 +1338,33 @@ fn cache_input(free: [bool; 2], relative: bool, input: &LayoutInput) -> LayoutIn
     input
 }
 
-// Records of a paint and of a copy match, but for the rounding of a transform that turns about a moved point.
+// A move by `by` from the mask `was` to `now`.
+type Mv = (Point<Pixels>, Clip<Pixels>, Clip<Pixels>);
+
+// A mask that moved by `by`, as a moved copy moves it: the mask `old` around the copy becomes `now`.
+fn moved_mask(
+    mask: Clip<Pixels>,
+    by: Point<Pixels>,
+    old: Clip<Pixels>,
+    now: Clip<Pixels>,
+) -> Clip<Pixels> {
+    if mask == old {
+        return now;
+    }
+    let mut moved = mask;
+    if mask.bounds.size.width.0 < crate::gpu::scene::OPEN {
+        moved.bounds.origin += by;
+    }
+    if (old.rounded, old.radii) == (mask.rounded, mask.radii) {
+        (moved.rounded, moved.radii) = (now.rounded, now.radii);
+    } else if !mask.radii.is_zero() {
+        moved.rounded.origin += by;
+    }
+    moved
+}
+
+// Records of a paint and of a copy match, but for the rounding of moved places and of a transform that turns about a
+// moved point.
 #[cfg(debug_assertions)]
 fn same_records(now: &[String], last: &[String]) -> bool {
     let split = |text: &str| {
@@ -1315,7 +1388,8 @@ fn same_records(now: &[String], last: &[String]) -> bool {
                     && x.len() == y.len()
                     && x.iter()
                         .zip(&y)
-                        .all(|(x, y)| (x - y).abs() <= 1e-3 * (1. + x.abs()))
+                        // A copy moved over many frames adds up the rounding of f32 places, far below a pixel.
+                        .all(|(x, y)| (x - y).abs() <= 1e-2 + 1e-6 * x.abs())
         })
 }
 

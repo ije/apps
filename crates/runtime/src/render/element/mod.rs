@@ -250,6 +250,8 @@ pub(crate) type Adjoined = ((u64, u32, Option<[u32; 2]>), Sets);
 pub(crate) type Walked = ((u64, u32, [bool; 2], Option<[u32; 2]>), Used);
 
 thread_local! {
+    // The reads that the box being built keeps, so each query is kept once.
+    static SEEN: RefCell<rustc_hash::FxHashSet<(Query, bool)>> = RefCell::default();
     // Reserve a quarter of the stack for layout and paint, which recurse as deeply as build.
     pub(super) static STACK_LIMIT: usize = {
         let marker = 0u8;
@@ -484,17 +486,16 @@ pub(crate) fn element(
         let below = |read: &Read| usize::from(read.reader) > depth;
         let mut log = build.reads.borrow_mut();
         let mut end = mark;
-        for at in mark..log.len() {
-            let read = log[at];
-            if usize::from(read.scope) <= depth
-                && !log[end.saturating_sub(16).max(mark)..end]
-                    .iter()
-                    .any(|old| old.query == read.query && below(old) == below(&read))
-            {
-                log[end] = read;
-                end += 1;
+        SEEN.with_borrow_mut(|seen| {
+            seen.clear();
+            for at in mark..log.len() {
+                let read = log[at];
+                if usize::from(read.scope) <= depth && seen.insert((read.query, below(&read))) {
+                    log[end] = read;
+                    end += 1;
+                }
             }
-        }
+        });
         log.truncate(end);
         let reads = storable.then(|| {
             log[mark..]

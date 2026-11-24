@@ -7,6 +7,10 @@ impl Tree {
         self.deferred.clear();
         self.unbounded = 0;
         self.paint_node(index_of(root), false, window);
+        #[cfg(debug_assertions)]
+        {
+            self.checked = false;
+        }
     }
 
     // An out-of-flow box escapes the clips of the scroll viewports inside its containing block.
@@ -53,32 +57,41 @@ impl Tree {
             .chunk
             .filter(|chunk| {
                 !matches!(slot.kind, Kind::Layers(_))
+                    && !self.checked()
                     && slot.calm == self.prepaints
                     && slot.since <= chunk.prepass.wrapping_add(1)
                     && Some(chunk.pass) == self.paints.1
                     && chunk.unbounded == outside
             })
-            .and_then(|chunk| match chunk.area {
-                _ if (chunk.key, chunk.at) == (key, at) => Some((chunk, None)),
-                // Paint in a mask that moved with the box drew all of it moved, culled parts too.
-                _ if chunk.translates
-                    && chunk.key.same_paint(&key)
-                    && window.translated(chunk.mask, mask, at - chunk.at) =>
-                {
-                    Some((chunk, Some((at - chunk.at, chunk.mask, mask))))
-                }
-                // A span that drew nothing can't show that the box draws nothing in its new place.
-                Some(area)
-                    if !area.is_empty()
+            .and_then(|chunk| {
+                let by = window.snap_move(at - chunk.at);
+                match chunk.area {
+                    _ if (chunk.key, chunk.at) == (key, at) => Some((chunk, None)),
+                    // Paint in a mask that moved with the box drew all of it moved, culled parts too.
+                    _ if chunk.translates
                         && chunk.key.same_paint(&key)
-                        && window.movable(area, at - chunk.at, mask) =>
-                {
-                    Some((chunk, Some((at - chunk.at, chunk.mask, mask))))
+                        && window.translated(chunk.mask, mask, by) =>
+                    {
+                        Some((chunk, Some((by, chunk.mask, mask))))
+                    }
+                    // A span that drew nothing can't show that the box draws nothing in its new place, unless its
+                    // mask stayed: it cut nothing there.
+                    Some(area)
+                        if chunk.key.same_paint(&key)
+                            && match area.is_empty() {
+                                true => chunk.mask == mask,
+                                false => window.movable(area, by, mask),
+                            } =>
+                    {
+                        Some((chunk, Some((by, chunk.mask, mask))))
+                    }
+                    _ => None,
                 }
-                _ => None,
             });
-        #[cfg(not(debug_assertions))]
-        if let Some((chunk, moved)) = copy
+        // Debug builds paint the box to check the copy, unless the boxes inside have old places.
+        let lagged = self.slots[index as usize].lag != Point::default();
+        if (cfg!(not(debug_assertions)) || lagged)
+            && let Some((chunk, moved)) = copy
             && let Some(span) = window.replay(&chunk.span, moved)
         {
             let area = moved.map_or(chunk.area, |(by, ..)| {
@@ -86,6 +99,14 @@ impl Tree {
                     .area
                     .map(|area| area + by.scale(window.scale_factor()))
             });
+            let output = Output {
+                pass: self.paints.0,
+                span,
+                key,
+                at,
+                mask,
+                area,
+            };
             self.slots[index as usize].chunk = Some(Chunk {
                 pass: self.paints.0,
                 span,
@@ -93,6 +114,7 @@ impl Tree {
                 at,
                 mask,
                 area,
+                origin: output,
                 ..chunk
             });
             if foreign {
@@ -101,21 +123,33 @@ impl Tree {
             return;
         }
         // The boxes inside a box that a scroll moved without a prepaint have old places, so it can't paint.
-        #[cfg(not(debug_assertions))]
-        if self.slots[index as usize].lag != Point::default() {
+        if lagged {
             // WARNING: an ancestor that copies its regions keeps the lag, so the prepaint of the restart must go
-            // through all of them, or each pass restarts again.
-            let mut at = self.slots[index as usize].parent;
-            while at != NONE {
-                let slot = &mut self.slots[at as usize];
-                slot.regions = None;
-                at = slot.parent;
+            // through all of them, or each pass restarts again. That holds for each box with a lag: this paint
+            // copied chunks that the next one can't, so it may reach boxes that this one didn't.
+            if !self.unshift {
+                for at in 0..self.slots.len() {
+                    if !self.slots[at].live || self.slots[at].lag == Point::default() {
+                        continue;
+                    }
+                    let mut at = self.slots[at].parent;
+                    while at != NONE {
+                        let slot = &mut self.slots[at as usize];
+                        slot.regions = None;
+                        at = slot.parent;
+                    }
+                }
             }
             self.unshift = true;
             window.restart_frame();
             return;
         }
         let (mark, deferred) = (window.paint_mark(), self.deferred.len());
+        // A debug paint of a box that release builds copy keeps the chunks of the boxes in it as a copy does.
+        #[cfg(debug_assertions)]
+        if copy.is_some() {
+            self.copied.push(Vec::new());
+        }
         if slot.hooks.as_ref().is_some_and(|hooks| !hooks.cached()) {
             window.paint_volatile();
         }
@@ -160,19 +194,69 @@ impl Tree {
                     ))
             );
         }
+        #[cfg(debug_assertions)]
+        if copy.is_some() {
+            for (at, chunk) in self.copied.pop().unwrap_or_default().into_iter().rev() {
+                self.slots[at as usize].chunk = chunk;
+            }
+        }
         #[cfg(not(debug_assertions))]
         let _ = copy;
-        self.slots[index as usize].chunk = span.map(|span| Chunk {
-            pass: self.paints.0,
-            prepass: self.prepaints,
-            key,
-            unbounded: outside,
-            at,
-            mask,
-            area: window.plain(&span, mark, mask),
-            translates: slot_contained && window.translatable(&span),
-            span,
+        let fresh = span.map(|span| {
+            let output = Output {
+                pass: self.paints.0,
+                span,
+                key,
+                at,
+                mask,
+                area: window.plain(&span, mark, mask),
+            };
+            Chunk {
+                pass: self.paints.0,
+                prepass: self.prepaints,
+                key,
+                unbounded: outside,
+                at,
+                mask,
+                area: output.area,
+                translates: slot_contained && window.translatable(&span),
+                span,
+                base: output,
+                origin: output,
+            }
         });
+        #[cfg(debug_assertions)]
+        let fresh = match (copy, span) {
+            (Some((chunk, moved)), Some(span)) => {
+                let area = moved.map_or(chunk.area, |(by, ..)| {
+                    (chunk.area).map(|area| area + by.scale(window.scale_factor()))
+                });
+                let output = Output {
+                    pass: self.paints.0,
+                    span,
+                    key,
+                    at,
+                    mask,
+                    area,
+                };
+                Some(Chunk {
+                    pass: self.paints.0,
+                    span,
+                    key,
+                    at,
+                    mask,
+                    area,
+                    origin: output,
+                    ..chunk
+                })
+            }
+            _ => fresh,
+        };
+        #[cfg(debug_assertions)]
+        if let Some(copied) = self.copied.last_mut() {
+            copied.push((index, self.slots[index as usize].chunk));
+        }
+        self.slots[index as usize].chunk = fresh;
         if foreign {
             window.cull();
         }

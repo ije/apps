@@ -10,8 +10,14 @@ impl RenderFrame {
         release: bool,
         mirror: bool,
     ) -> (Target, f32) {
+        // A pooled texture can be larger than its layer, so the blur covers only the texels that the layer holds.
         let covered = match src {
-            Target::Layer(_) => self.rect(src).map(|value| value as i32),
+            Target::Layer(index) => {
+                let layer = &self.layers[index];
+                let [x, y, width, height] = layer.scissor.map(|value| value as f32 * layer.scale);
+                let [left, top] = [layer.origin[0] as f32 + x, layer.origin[1] as f32 + y];
+                [left, top, width, height].map(|value| value as i32)
+            }
             Target::Frame => region,
         };
         if sigma < HALF_RESOLUTION_SIGMA {
@@ -256,8 +262,9 @@ impl RenderFrame {
         }
         let (w, h) = (self.window[0] as f32, self.window[1] as f32);
         // The region of a transformed layer is in its own space: the visible part mapped back through the
-        // transform. A composited transform moves the layer without a repaint, so the region keeps a window
-        // of room on each side and moves in steps of a window, and small moves keep its pixels.
+        // transform. A composited transform moves a kept layer without a repaint, so its region keeps a window
+        // of room on each side and moves in steps of a window, and small moves keep its pixels. A layer that
+        // changed draws only the visible part.
         let content = content.outset(spread);
         let [reach, around] = match &effect.transform {
             Some(transform) => {
@@ -283,7 +290,7 @@ impl RenderFrame {
                         },
                     )
                 });
-                let reach = match seen {
+                let room = match seen {
                     Some([left, top, right, bottom]) => {
                         // At most 4 windows on a side, around the middle of the visible part.
                         let span = |low: f32, high: f32, step: f32| {
@@ -297,7 +304,10 @@ impl RenderFrame {
                     }
                     None => [-w, -h, 3. * w, 3. * h],
                 };
-                [reach; 2]
+                let tight = seen.map(|[left, top, right, bottom]| {
+                    [left - 1., top - 1., right - left + 2., bottom - top + 2.]
+                });
+                [tight.unwrap_or(room), room]
             }
             None => {
                 let at = crate::point(content.origin.x.floor(), content.origin.y.floor());

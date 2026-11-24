@@ -1468,6 +1468,19 @@ impl Hooks for DomBox {
         true
     }
 
+    // The shift of a box around it moved the mirror of its nodes.
+    fn lag(&self, by: Point<Pixels>) {
+        let (placed, matrix) = self.placed.get();
+        let bounds = Rect::new(placed.origin + by, placed.size);
+        let matrix = matrix.and_then(|_| {
+            super::effects::transform::transform_at(&self.local, &self.style, &self.units, bounds)
+        });
+        self.placed.set((bounds, matrix));
+        let (window_bounds, flags) = self.reached_at.get();
+        let window_bounds = Rect::new(window_bounds.origin + by, window_bounds.size);
+        self.reached_at.set((window_bounds, flags));
+    }
+
     fn skip(&self, exact: Rect<Pixels>, _: &mut Window) -> bool {
         if Rect::new(exact.origin + self.offset.get(), exact.size) != self.placed.get().0 {
             return false;

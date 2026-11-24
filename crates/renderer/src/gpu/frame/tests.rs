@@ -343,6 +343,7 @@ fn patched_blurs_draw_like_new_frames() {
                 Command::Blur { index, .. } => format!("blur {index}"),
                 Command::Copy { region, .. } => format!("copy {region:?}"),
                 Command::Composite { index, .. } => format!("composite {index}"),
+                Command::Scissor(region) => format!("scissor {region:?}"),
             })
             .collect();
         (
@@ -733,4 +734,30 @@ fn layers_that_read_below_draw_whole_with_damage_that_reaches_them() {
         None,
         "most of the window"
     );
+}
+
+#[test]
+fn scissor_regions_draw_into_the_window() {
+    let mask = Clip::from(bounds([0., 0., 400., 300.]));
+    let mut scene = Scene::default();
+    scene.push(Instance::new(BOX, bounds([0., 0., 400., 300.]), mask));
+    let mut frame = RenderFrame {
+        damage: vec![[10, 10, 50, 50]],
+        scissors: true,
+        ..Default::default()
+    };
+    frame.record(&scene, [400, 300], 16384, true);
+    assert!(matches!(
+        frame.commands[0],
+        Command::Scissor(Some([10, 10, 50, 50]))
+    ));
+    assert!(matches!(
+        frame.commands[1],
+        Command::Pass(super::Target::Frame, true)
+    ));
+    assert!(matches!(
+        frame.commands.last(),
+        Some(Command::Scissor(None))
+    ));
+    assert!(frame.layers.is_empty());
 }

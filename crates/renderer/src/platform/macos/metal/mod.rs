@@ -1298,6 +1298,7 @@ impl Renderer {
                         [region[0] - to[0], region[1] - to[1], region[2], region[3]],
                     );
                 }
+                Command::Scissor(_) => {}
                 Command::Composite {
                     src,
                     mask,

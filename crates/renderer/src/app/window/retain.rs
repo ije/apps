@@ -82,6 +82,17 @@ impl Window {
             .flatten()
     }
 
+    // A move within a rounding error of whole device pixels, as layout far down the page gives, is made whole.
+    pub(crate) fn snap_move(&self, by: Point<Pixels>) -> Point<Pixels> {
+        by.map(|value| {
+            let device = value.0 * self.scale_factor;
+            match (device - device.round()).abs() < 1e-3 {
+                true => Pixels(device.round() / self.scale_factor),
+                false => value,
+            }
+        })
+    }
+
     // Whether a plain span that drew `area` can move by `by` and draw in `mask`, as a paint there would draw.
     pub(crate) fn movable(&self, area: Rect<f32>, by: Point<Pixels>, mask: Clip<Pixels>) -> bool {
         let by = by.scale(self.scale_factor);
@@ -165,8 +176,6 @@ impl Window {
     }
 
     // Copies a span of the last paint.
-    // Debug builds paint instead, to check the copy.
-    #[cfg_attr(debug_assertions, allow(dead_code))]
     pub(crate) fn replay(
         &mut self,
         span: &PaintSpan,

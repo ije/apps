@@ -292,13 +292,36 @@ pub(crate) struct PaintSpan {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PaintKey {
     pub(crate) mask: Clip<Pixels>,
-    offset: Point<Pixels>,
+    pub(crate) offset: Point<Pixels>,
     opacity: f32,
     smoothing: bool,
     scale: f32,
 }
 
+impl PaintSpan {
+    // Where this span, inside the span `from`, is in `to`, a copy of `from`.
+    pub(crate) fn rebased(&self, from: &PaintSpan, to: &PaintSpan) -> Option<PaintSpan> {
+        let mut input = self.input;
+        for ((own, was), now) in input.iter_mut().zip(from.input).zip(to.input) {
+            *own = scene::rebased(*own, was, now)?;
+        }
+        Some(PaintSpan {
+            scene: self.scene.rebased(&from.scene, &to.scene)?,
+            input,
+        })
+    }
+}
+
 impl PaintKey {
+    // The key of paint that moved with its offset, in the mask `mask`.
+    pub(crate) fn moved(&self, by: Point<Pixels>, mask: Clip<Pixels>) -> Self {
+        Self {
+            mask,
+            offset: self.offset + by,
+            ..*self
+        }
+    }
+
     // Paint under both keys differs only by the place and clip of the content.
     pub(crate) fn same_paint(&self, other: &Self) -> bool {
         (self.opacity, self.smoothing, self.scale) == (other.opacity, other.smoothing, other.scale)
@@ -1125,6 +1148,9 @@ impl Window {
         let captures = mem::take(&mut self.captures);
         self.scene.read_shots(&mut self.shots);
         let fresh = self.atlas.take_fresh();
+        // Patches of composited animations before a paint in the same frame can't place their damage, but the diff
+        // finds it.
+        self.scene.rediff_patches();
         self.scene.diff(fresh.as_deref());
         let (mut frame, snapshots) =
             (self.platform).draw(&self.scene, Some(self.native), !captures.is_empty());
@@ -1458,7 +1484,6 @@ impl Window {
     }
 
     // The frame starts again after this paint, which the next paint doesn't copy.
-    #[cfg_attr(debug_assertions, allow(dead_code))]
     pub(crate) fn restart_frame(&mut self) {
         self.restart = true;
         self.scene.abort();
@@ -1529,18 +1554,6 @@ impl Window {
     // The count of scroll viewports around the current box.
     pub(crate) fn depth(&self) -> usize {
         self.viewports.len()
-    }
-
-    // The content mask cut by the scroll viewports inside the first `depth`.
-    pub(crate) fn visible_below(&self, depth: usize) -> Clip<Pixels> {
-        let mut mask = self.content_mask();
-        for viewport in self.viewports[depth.min(self.viewports.len())..]
-            .iter()
-            .flatten()
-        {
-            mask.bounds = mask.bounds.intersect(*viewport);
-        }
-        mask
     }
 
     // `mask` cut by the scroll viewports from `from` to `to`.

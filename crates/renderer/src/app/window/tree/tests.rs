@@ -210,3 +210,12 @@ fn placed_boxes_keep_their_subtree_at_a_new_place() {
     );
     assert_eq!(cell.children, inner);
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn copies_match_their_paint_but_for_rounding() {
+    let same = |now: &str, last: &str| super::same_records(&[now.into()], &[last.into()]);
+    assert!(same("-1 [1966.2743, 2.0]", "-1 [1966.2744, 2.0]"));
+    assert!(!same("-1 [1966.27, 2.0]", "-1 [1966.52, 2.0]"));
+    assert!(!same("-1 [1966.27, 2.0]", "-1 [1966.27, 3.0]"));
+}

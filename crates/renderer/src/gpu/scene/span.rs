@@ -1,7 +1,7 @@
 use super::*;
 
 // Clips at least this wide are the open mask of an effect layer.
-const OPEN: f32 = 1e6;
+pub(crate) const OPEN: f32 = 1e6;
 
 // A clip of a moved span: the mask `old` around the span becomes the mask `now` there, the open mask of an
 // effect layer stays, and other clips are inside the span and move with it.
@@ -160,7 +160,14 @@ impl Scene {
                 let instance = moved.map_or(*instance, |(by, old, now)| {
                     moved_instance(instance, by, &old, &now)
                 });
-                out.push(format!("{name} {:?}", bytes(slice::from_ref(&instance))));
+                // Fields as floats, so the check can allow the rounding of moved copies.
+                let fields: Vec<f32> = bytes(slice::from_ref(&instance))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|word| f32::from_ne_bytes(*word))
+                    .collect();
+                out.push(format!("{name} {fields:?}"));
             }
             for nested in &layer.nested[start as usize..stop as usize] {
                 let nested = moved.map_or(*nested, |(by, old, now)| {
@@ -210,9 +217,6 @@ impl Scene {
         out
     }
 
-    // Copies a span of the last paint into the current layer, and returns where it is now.
-    // Debug builds paint instead, to check the copy.
-    #[cfg_attr(debug_assertions, allow(dead_code))]
     // Whether the span of `last` reads an atlas tile that was removed since that paint.
     fn reads_removed(&self, span: &Span) -> bool {
         if self.removed.is_empty() {
@@ -352,8 +356,6 @@ impl Scene {
     }
 
     // Copies a plain span of the last paint moved by `by` device pixels, from the mask `old` into `now`.
-    // Debug builds paint instead, to check the copy.
-    #[cfg_attr(debug_assertions, allow(dead_code))]
     pub(crate) fn replay_moved(
         &mut self,
         span: &Span,

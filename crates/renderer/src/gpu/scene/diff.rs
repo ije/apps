@@ -38,12 +38,49 @@ impl Damage {
             ];
             [x, y, right - x, bottom - y]
         };
+        let area = |[.., width, height]: [i32; 4]| i64::from(width) * i64::from(height);
         let mut regions: Vec<[i32; 4]> = Vec::new();
-        let add = |regions: &mut Vec<[i32; 4]>, mut region: [i32; 4]| {
-            while let Some(at) = regions.iter().position(|other| meets(*other, region)) {
-                region = join(regions.swap_remove(at), region);
+        let mut pending = Vec::new();
+        // Regions don't overlap. Two that meet join when that adds little, or else the new one keeps only its parts
+        // outside the other.
+        let mut add = |regions: &mut Vec<[i32; 4]>, region: [i32; 4]| {
+            pending.push(region);
+            while let Some(region) = pending.pop() {
+                let Some(at) = regions.iter().position(|other| meets(*other, region)) else {
+                    regions.push(region);
+                    continue;
+                };
+                let other = regions[at];
+                let joined = join(other, region);
+                if area(joined) <= area(other) + area(region) + 64 * 64 {
+                    regions.swap_remove(at);
+                    pending.push(joined);
+                    continue;
+                }
+                let [x, y, width, height] = region;
+                let [right, bottom] = [x + width, y + height];
+                let top = y.max(other[1]);
+                let end = bottom.min(other[1] + other[3]);
+                pending.extend(
+                    [
+                        [x, y, width, top - y],
+                        [x, end, width, bottom - end],
+                        [x, top, other[0] - x, end - top],
+                        [
+                            other[0] + other[2],
+                            top,
+                            right - other[0] - other[2],
+                            end - top,
+                        ],
+                    ]
+                    .into_iter()
+                    .map(|[x, y, width, height]| {
+                        let left = x.max(region[0]);
+                        [left, y, (x + width).min(right) - left, height]
+                    })
+                    .filter(|part| part[2] > 0 && part[3] > 0),
+                );
             }
-            regions.push(region);
         };
         // Edges blend into the pixel next to them.
         for rect in &self.rects {
@@ -55,23 +92,23 @@ impl Damage {
         for &region in extra {
             add(&mut regions, region);
         }
-        let reads: Vec<[i32; 4]> = reads
+        let mut reads: Vec<[i32; 4]> = reads
             .map(|read| read.intersect(bounds))
             .filter(|read| !read.is_empty())
             .map(region)
             .collect();
-        while let Some(&read) = reads.iter().find(|read| {
-            regions.iter().any(|region| meets(*region, **read))
-                && !regions
-                    .iter()
-                    .any(|region| join(*region, **read) == *region)
-        }) {
-            add(&mut regions, read);
+        // A layer that reads below it draws in one region.
+        while let Some(at) =
+            (reads.iter()).position(|read| regions.iter().any(|region| meets(*region, *read)))
+        {
+            let mut read = reads.swap_remove(at);
+            while let Some(at) = regions.iter().position(|region| meets(*region, read)) {
+                read = join(regions.swap_remove(at), read);
+            }
+            regions.push(read);
         }
-        let area: i64 = (regions.iter())
-            .map(|region| i64::from(region[2]) * i64::from(region[3]))
-            .sum();
-        (area * 2 <= i64::from(window[0]) * i64::from(window[1])).then_some(regions)
+        let drawn: i64 = regions.iter().copied().map(area).sum();
+        (drawn * 2 <= i64::from(window[0]) * i64::from(window[1])).then_some(regions)
     }
 
     pub fn add(&mut self, rect: Rect<f32>) {
@@ -139,16 +176,30 @@ fn place(origin: Point<f32>) -> u64 {
     u64::from(origin.x.to_bits()) << 32 | u64::from(origin.y.to_bits())
 }
 
-// In a scroll, the mask around the content stays where the content moves, so a clip that is only that mask
-// counts as the place of the instance itself.
+// In a scroll, the mask around the content stays where the content moves, so the sides of a clip that are only that
+// mask count as the place of the drawing itself. A scroll draws again what they hid.
+fn unmasked(clip: Rect<f32>, viewport: Rect<f32>, area: Rect<f32>) -> Rect<f32> {
+    let side = |clip: f32, viewport: f32, area: f32| if clip == viewport { area } else { clip };
+    let start = point(
+        side(clip.left(), viewport.left(), area.left()),
+        side(clip.top(), viewport.top(), area.top()),
+    );
+    let end = point(
+        side(clip.right(), viewport.right(), area.right()),
+        side(clip.bottom(), viewport.bottom(), area.bottom()),
+    );
+    Rect::between(start, end).intersect(area)
+}
+
 fn instance_hash(instance: &Instance, origin: Point<f32>, viewport: Option<&Clip<f32>>) -> u64 {
     let mut copy = *instance;
     let shift = |[x, y, width, height]: [f32; 4]| [x - origin.x, y - origin.y, width, height];
-    let masked = viewport.is_some_and(|viewport| instance.clip == viewport.bounds.to_array());
     copy.rect = shift(instance.rect);
-    copy.clip = shift(match masked {
-        true => instance.area().to_array(),
-        false => instance.reach().to_array(),
+    copy.clip = shift(match viewport {
+        Some(viewport) => {
+            unmasked(rect(instance.clip), viewport.bounds, instance.area()).to_array()
+        }
+        None => instance.reach().to_array(),
     });
     copy.round = match instance.round_radii == [0.; 8] {
         true => [0.; 4],
@@ -298,7 +349,7 @@ impl Scene {
     }
 
     // The window regions to draw again, or `None` for the whole window.
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     pub(crate) fn damage_regions(
         &self,
         window: [u32; 2],
@@ -413,6 +464,13 @@ impl Scene {
             layer = parent;
         }
         patched
+    }
+
+    // The next diff finds the patches since the last one by itself, when the window shows the prior entries.
+    pub(crate) fn rediff_patches(&mut self) {
+        if !self.undiffed {
+            self.patched.clear();
+        }
     }
 
     // Finds what changed since the drawn window, and the digest of each layer. `fresh` holds atlas tiles
@@ -859,6 +917,7 @@ impl Scene {
         }
         // A new scene without a diff leaves the prior entries behind.
         self.drawn = self.diffed != Some(false);
+        self.undiffed = self.diffed.is_none();
         if self.diffed.take() == Some(true) {
             mem::swap(&mut self.prior, &mut self.entries);
             self.prior_maps.clone_from(&self.maps);
@@ -1025,7 +1084,6 @@ impl Walk<'_> {
                 ])
             };
             let spreads = effect.blur != 0. || effect.shadow.is_some() || effect.backdrop.is_some();
-            let masked = clip == scroll.viewport.bounds && !spreads;
             let mut hasher = rustc_hash::FxHasher::default();
             (
                 effect.transform.map(|matrix| {
@@ -1061,9 +1119,9 @@ impl Walk<'_> {
                     .glass
                     .as_ref()
                     .map(|glass| (glass.key, rect(glass.bounds))),
-                match masked {
-                    true => rect(nested.bounds),
-                    false => rect(clip.intersect(nested.bounds)),
+                match spreads {
+                    false => rect(unmasked(clip, scroll.viewport.bounds, nested.bounds)),
+                    true => rect(clip.intersect(nested.bounds)),
                 },
                 (nested.clip.radii != Default::default()).then(|| {
                     match nested.clip.rounded == scroll.viewport.rounded {

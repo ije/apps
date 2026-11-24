@@ -10,6 +10,7 @@ use crate::{
 };
 use diff::{Damage, Entry, Map, effect_bounds};
 use rustc_hash::FxHashMap;
+pub(crate) use span::OPEN;
 use span::moved_clip;
 use std::{
     hash::{Hash, Hasher},
@@ -53,6 +54,8 @@ pub struct Scene {
     culled: u32,
     // Patched regions since the last diff, which the prior entries don't know.
     patched: Damage,
+    // A frame drew patches without a diff, so the prior entries don't show the window.
+    undiffed: bool,
     salt: u64,
     // The content of scroll containers in the window layer, in paint order, and those of the last painted scene.
     scrolls: Vec<Scroll>,
@@ -208,6 +211,40 @@ pub(crate) struct Span {
     cuts: [u32; 2],
 }
 
+// Where the range `own`, inside `was`, is in `now`, a copy of `was`.
+pub(crate) fn rebased(own: [u32; 2], was: [u32; 2], now: [u32; 2]) -> Option<[u32; 2]> {
+    (was[0] <= own[0] && own[1] <= was[1] && was[1] - was[0] == now[1] - now[0])
+        .then(|| own.map(|at| at - was[0] + now[0]))
+}
+
+impl Span {
+    // Where this span, inside the span `from`, is in `to`, a copy of `from`.
+    pub(crate) fn rebased(&self, from: &Span, to: &Span) -> Option<Span> {
+        let layers = rebased(self.layers, from.layers, to.layers)?;
+        let (layer, instances, nested) = match self.layer == from.layer {
+            true => (
+                to.layer,
+                rebased(self.instances, from.instances, to.instances)?,
+                rebased(self.nested, from.nested, to.nested)?,
+            ),
+            // A span in a layer that `from` made.
+            false => (
+                rebased([self.layer, self.layer + 1], from.layers, to.layers)?[0],
+                self.instances,
+                self.nested,
+            ),
+        };
+        Some(Span {
+            layer,
+            instances,
+            nested,
+            layers,
+            scrolls: rebased(self.scrolls, from.scrolls, to.scrolls)?,
+            cuts: rebased(self.cuts, from.cuts, to.cuts)?,
+        })
+    }
+}
+
 impl Nested {
     pub(crate) fn reach(&self) -> Rect<f32> {
         self.bounds.intersect(self.clip.bounds)
@@ -241,6 +278,7 @@ impl Default for Scene {
             drawn: false,
             diffed: None,
             patched: Damage::default(),
+            undiffed: false,
             culled: 0,
             salt: 0,
             scrolls: Vec::new(),

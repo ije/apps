@@ -610,3 +610,68 @@ fn damage_joins_near_rectangles_and_keeps_a_few() {
     damage.add(bounds([0., 0., f32::INFINITY, 1.]));
     assert!(damage.whole);
 }
+
+#[test]
+fn damage_regions_that_meet_split_instead_of_joining() {
+    let mut damage = Damage::default();
+    damage.add(bounds([0., 280., 400., 20.]));
+    damage.add(bounds([10., 0., 10., 299.]));
+    damage.add(bounds([380., 0., 10., 299.]));
+    let regions = damage.regions(std::iter::empty(), [400, 300], &[]).unwrap();
+    let area: i32 = regions.iter().map(|region| region[2] * region[3]).sum();
+    assert!(area < 400 * 30 + 2 * 12 * 300, "{regions:?}");
+    for (at, a) in regions.iter().enumerate() {
+        for b in &regions[at + 1..] {
+            let meet = a[0] < b[0] + b[2]
+                && b[0] < a[0] + a[2]
+                && a[1] < b[1] + b[3]
+                && b[1] < a[1] + a[3];
+            assert!(!meet, "{a:?} overlaps {b:?}");
+        }
+    }
+}
+
+#[test]
+fn patches_before_a_paint_damage_only_what_the_diff_finds() {
+    let mask = Clip::from(bounds([0., 0., 800., 600.]));
+    let fill = |scene: &mut Scene, opacity: f32| {
+        scene.clear();
+        scene.push(Instance::new(BOX, bounds([0., 0., 800., 600.]), mask));
+        // A blend around the layer leaves its patches without a place in the window.
+        let blend_mode = crate::BlendMode::Multiply;
+        scene.push_effect(
+            EffectState {
+                blend_mode,
+                ..effect(mask)
+            },
+            None,
+        );
+        scene.push_effect(
+            EffectState {
+                opacity,
+                ..effect(mask)
+            },
+            Some(7),
+        );
+        scene.push(Instance::new(BOX, bounds([20., 20., 40., 40.]), mask));
+        scene.pop_effect();
+        scene.pop_effect();
+    };
+    for shown in [false, true] {
+        let mut scene = Scene::default();
+        fill(&mut scene, 0.9);
+        scene.diff(Some(&[]));
+        scene.drawn();
+        assert!(scene.patch(7, 0.5, None, [None; 2]));
+        assert!(scene.damage.whole);
+        // A frame that draws the patch alone shows what the prior entries don't.
+        if shown {
+            scene.drawn();
+        }
+        fill(&mut scene, 0.5);
+        scene.rediff_patches();
+        scene.diff(Some(&[]));
+        assert_eq!(scene.damage.whole, shown);
+        assert!(shown || !scene.damage.rects.is_empty());
+    }
+}
