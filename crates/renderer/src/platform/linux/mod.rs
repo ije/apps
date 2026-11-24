@@ -3,7 +3,6 @@
 
 mod gpu;
 mod input;
-mod text;
 mod wayland;
 mod x11;
 
@@ -18,8 +17,6 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::{cell::Cell, cell::RefCell, collections::BTreeMap, collections::VecDeque};
 use std::{rc::Rc, rc::Weak, time::Duration, time::Instant};
-
-pub(crate) use text::TextSystem;
 
 // A window that stops drawing releases its spare GPU resources after this.
 const QUIET: Duration = Duration::from_secs(1);

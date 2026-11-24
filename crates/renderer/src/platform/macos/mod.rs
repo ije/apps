@@ -7,8 +7,6 @@ mod glass;
 mod metal;
 mod nsview;
 mod nswindow;
-mod open_type;
-mod text;
 mod threads;
 mod vsync;
 mod window;
@@ -33,7 +31,6 @@ use std::{
 pub use controls::control_size;
 pub(crate) use glass::available as supports_glass;
 pub(crate) use metal::prewarm;
-pub(crate) use text::TextSystem;
 pub(crate) use threads::{
     AppThread, app_thread, ask, end_thread, native_after, native_post, native_sync, park_render,
     post, run_after, spawn_render,
