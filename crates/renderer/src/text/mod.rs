@@ -25,10 +25,9 @@ pub use draw::TextCanvas;
 
 pub use line::*;
 pub use paragraph::*;
-pub use raster::*;
 pub use style::*;
 
-use crate::{Pixels, Rect, px};
+use crate::{Pixels, Rect, Size, px};
 use anyhow::Result;
 use cache::Cache;
 use rustc_hash::FxHashMap;
@@ -114,6 +113,38 @@ impl Hash for Font {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlyphRaster {
+    pub font: FontId,
+    pub glyph: GlyphId,
+    pub size: Pixels,
+    pub scale: f32,
+    pub subpixel: u8,
+    pub emoji: bool,
+    pub dilation: u8,
+    /// The width of a line along the outline, in CSS pixels, for `-webkit-text-stroke` and `strokeText()`. 0 fills.
+    pub stroke: f32,
+}
+
+impl Eq for GlyphRaster {}
+
+impl Hash for GlyphRaster {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let bits = [self.size.0, self.scale, self.stroke].map(f32::to_bits);
+        (
+            self.font,
+            self.glyph,
+            bits,
+            [self.subpixel, self.dilation],
+            self.emoji,
+        )
+            .hash(state);
+    }
+}
+
+// The place a glyph raster shows at, its size, and its bytes.
+pub(crate) type GlyphPixels = (Rect<i32>, Size<i32>, Vec<u8>);
 
 /// In em units. `descent` is negative.
 #[derive(Clone, Copy)]

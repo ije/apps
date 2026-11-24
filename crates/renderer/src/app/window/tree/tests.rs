@@ -10,48 +10,6 @@ fn slot(tree: &Tree, id: usize) -> &super::Slot {
 }
 
 #[test]
-fn interned_styles_stay_bounded() {
-    let mut styles = super::Interned::<super::Styled>::default();
-    let kept = styles.styled(crate::Style::default(), 2.);
-    let mut style = crate::Style {
-        box_shadow: vec![Default::default(); 2],
-        ..Default::default()
-    };
-    // An animated value that the fingerprint skips lands in one bucket.
-    for frame in 0..10_000 {
-        style.box_shadow[1].blur_radius = px(frame as f32);
-        styles.styled(style.clone(), 2.);
-    }
-    let stored: usize = styles.values.values().map(Vec::len).sum();
-    assert!(stored == styles.count && stored <= 1024, "{stored}");
-    assert!(std::rc::Rc::ptr_eq(
-        &kept,
-        &styles.styled(crate::Style::default(), 2.)
-    ));
-}
-
-#[test]
-fn column_and_break_styles_intern_apart() {
-    let mut styles = super::Interned::<super::Styled>::default();
-    let mut style = crate::Style::default();
-    let plain = styles.styled(style.clone(), 2.);
-    style.breaks = crate::Break::AVOID_INSIDE;
-    let avoid = styles.styled(style.clone(), 2.);
-    style.columns = Some(Box::new(crate::Columns {
-        count: 2,
-        gap: px(10.),
-        height: None,
-        fill: false,
-    }));
-    let set = styles.styled(style.clone(), 2.);
-    style.text.set_lines_kept([3, 2]);
-    let kept = styles.styled(style, 2.);
-    assert!(!std::rc::Rc::ptr_eq(&plain, &avoid));
-    assert!(!std::rc::Rc::ptr_eq(&avoid, &set));
-    assert!(!std::rc::Rc::ptr_eq(&set, &kept));
-}
-
-#[test]
 fn kept_subtrees_link_and_dropped_boxes_free() {
     let mut tree = Tree::default();
     let viewport = size(px(100.), px(100.));

@@ -1,39 +1,6 @@
-use super::{FontId, Fonts, GlyphId};
+use super::{FontId, Fonts, GlyphId, GlyphPixels, GlyphRaster};
 use crate::{Color, Pixels, Point, Rect, Size};
 use anyhow::Result;
-use std::hash::{Hash, Hasher};
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GlyphRaster {
-    pub font: FontId,
-    pub glyph: GlyphId,
-    pub size: Pixels,
-    pub scale: f32,
-    pub subpixel: u8,
-    pub emoji: bool,
-    pub dilation: u8,
-    /// The width of a line along the outline, in CSS pixels, for `-webkit-text-stroke` and `strokeText()`. 0 fills.
-    pub stroke: f32,
-}
-
-// The place a glyph raster shows at, its size, and its bytes.
-pub(crate) type GlyphPixels = (Rect<i32>, Size<i32>, Vec<u8>);
-
-impl Eq for GlyphRaster {}
-
-impl Hash for GlyphRaster {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        let bits = [self.size.0, self.scale, self.stroke].map(f32::to_bits);
-        (
-            self.font,
-            self.glyph,
-            bits,
-            [self.subpixel, self.dilation],
-            self.emoji,
-        )
-            .hash(state);
-    }
-}
 
 impl Fonts {
     /// Offset from the pen in device pixels, size, and alpha bytes, or RGBA for emoji.

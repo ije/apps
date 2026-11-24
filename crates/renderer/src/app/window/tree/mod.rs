@@ -1,6 +1,7 @@
 mod columns;
 mod flex;
 mod flow;
+mod intern;
 mod layout;
 mod paint;
 mod prepaint;
@@ -20,6 +21,7 @@ use crate::{
     point, px, size,
     text::{TextState, same_shaping},
 };
+use intern::Interned;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use std::{
     any::Any,
@@ -1132,205 +1134,6 @@ fn index_of(node: NodeId) -> u32 {
     usize::from(node) as u32
 }
 
-struct Interned<T> {
-    values: FxHashMap<u64, Vec<Rc<T>>>,
-    // The number of stored values in all buckets, which bounds memory and the cost of a bucket scan.
-    count: usize,
-    limit: usize,
-}
-
-impl<T> Default for Interned<T> {
-    fn default() -> Self {
-        Self {
-            values: FxHashMap::default(),
-            count: 0,
-            limit: 1024,
-        }
-    }
-}
-
-trait Fingerprint {
-    fn fingerprint(&self, hasher: &mut FxHasher);
-}
-
-impl Fingerprint for Style {
-    fn fingerprint(&self, hasher: &mut FxHasher) {
-        let length = |hasher: &mut FxHasher, length: crate::Length| match length {
-            crate::Length::Auto => 0u32.hash(hasher),
-            crate::Length::Px(value) => value.0.to_bits().hash(hasher),
-            crate::Length::Fraction(value) => (1, value.to_bits()).hash(hasher),
-            crate::Length::Calc(value, offset) => {
-                (value.to_bits(), offset.0.to_bits()).hash(hasher)
-            }
-            crate::Length::Bound(index) => (2, index).hash(hasher),
-        };
-        (
-            self.display as u8,
-            self.position as u8,
-            self.flex_direction as u8,
-        )
-            .hash(hasher);
-        for value in [
-            self.size.width,
-            self.size.height,
-            self.padding.top,
-            self.padding.left,
-        ]
-        .into_iter()
-        .chain([self.margin.top, self.margin.left, self.margin.bottom])
-        .chain([self.inset.top, self.inset.left])
-        {
-            length(hasher, value);
-        }
-        for color in [self.background, self.border_color, self.text.color] {
-            color
-                .map(|color| [color.r, color.g, color.b, color.a].map(f32::to_bits))
-                .hash(hasher);
-        }
-        self.border_widths.top.0.to_bits().hash(hasher);
-        length(hasher, self.corner_radii.x.top_left);
-        (
-            self.opacity.map(f32::to_bits),
-            self.z_index,
-            self.border_style as u8,
-            self.box_shadow.len(),
-        )
-            .hash(hasher);
-        if let Some(shadow) = self.box_shadow.first() {
-            [
-                shadow.offset.x.0,
-                shadow.offset.y.0,
-                shadow.blur_radius.0,
-                shadow.spread_radius.0,
-                shadow.color.a,
-            ]
-            .map(f32::to_bits)
-            .hash(hasher);
-        }
-        self.text
-            .font_size
-            .map(|size| size.0.to_bits())
-            .hash(hasher);
-        (
-            self.breaks,
-            self.text.lines_kept,
-            self.columns.as_deref().map(|columns| {
-                let height = columns.height.map(|height| height.0.to_bits());
-                (columns.count, columns.gap.0.to_bits(), height, columns.fill)
-            }),
-        )
-            .hash(hasher);
-        self.bounds.iter().for_each(|bound| bound.hash(hasher));
-    }
-}
-
-impl Fingerprint for TextStyle {
-    fn fingerprint(&self, hasher: &mut FxHasher) {
-        [
-            self.font_size.0,
-            self.line_height.0,
-            self.color.r,
-            self.color.g,
-            self.color.b,
-        ]
-        .map(f32::to_bits)
-        .hash(hasher);
-        (
-            self.font_family.len(),
-            self.white_space as u8,
-            self.text_align as u8,
-            self.lines_kept,
-        )
-            .hash(hasher);
-    }
-}
-
-impl<T: Fingerprint + PartialEq> Interned<T> {
-    fn get(&mut self, value: T) -> Rc<T> {
-        let mut hasher = FxHasher::default();
-        value.fingerprint(&mut hasher);
-        self.find(
-            hasher.finish(),
-            value,
-            |kept, value| kept == value,
-            |value| value,
-        )
-    }
-}
-
-impl Interned<Styled> {
-    fn styled(&mut self, style: Style, scale: f32) -> Rc<Styled> {
-        let mut hasher = FxHasher::default();
-        style.fingerprint(&mut hasher);
-        self.find(
-            hasher.finish(),
-            style,
-            |kept, style| kept.style == *style,
-            |style| {
-                let (taffy, bounds) = style.to_taffy(scale);
-                let fixed = |raw: taffy::CompactLength| {
-                    matches!(
-                        raw.tag(),
-                        taffy::CompactLength::LENGTH_TAG | taffy::CompactLength::AUTO_TAG
-                    )
-                };
-                let sides = |rect: taffy::Rect<taffy::CompactLength>| {
-                    [rect.top, rect.right, rect.bottom, rect.left]
-                };
-                let relative = ![taffy.size.width.into_raw(), taffy.size.height.into_raw()]
-                    .into_iter()
-                    .chain([
-                        taffy.min_size.width.into_raw(),
-                        taffy.min_size.height.into_raw(),
-                    ])
-                    .chain([
-                        taffy.max_size.width.into_raw(),
-                        taffy.max_size.height.into_raw(),
-                    ])
-                    .chain(sides(taffy.padding.map(|value| value.into_raw())))
-                    .chain(sides(taffy.border.map(|value| value.into_raw())))
-                    .chain(sides(taffy.margin.map(|value| value.into_raw())))
-                    .all(fixed);
-                Styled {
-                    taffy,
-                    _bounds: bounds,
-                    style,
-                    relative,
-                }
-            },
-        )
-    }
-}
-
-impl<T> Interned<T> {
-    fn find<V>(
-        &mut self,
-        fingerprint: u64,
-        value: V,
-        same: impl Fn(&T, &V) -> bool,
-        make: impl FnOnce(V) -> T,
-    ) -> Rc<T> {
-        let list = self.values.entry(fingerprint).or_default();
-        if let Some(kept) = list.iter().find(|kept| same(kept, &value)) {
-            return kept.clone();
-        }
-        let value = Rc::new(make(value));
-        list.push(value.clone());
-        self.count += 1;
-        if self.count > self.limit {
-            let mut count = 0;
-            self.values.retain(|_, list| {
-                list.retain(|value| Rc::strong_count(value) > 1);
-                count += list.len();
-                !list.is_empty()
-            });
-            self.count = count;
-            self.limit = (count * 2).max(1024);
-        }
-        value
-    }
-}
-
 struct TextMeasurement(TextState);
 
 impl Measurement for TextMeasurement {
@@ -1529,6 +1332,434 @@ fn place_region(window: &mut Window, style: &Style, first: Rect, old: Option<&Re
         window.round_region(corners);
     }
     region
+}
+
+impl LayoutTree<'_> {
+    fn compute(
+        &mut self,
+        node: NodeId,
+        mut inputs: LayoutInput,
+        block: Option<&mut BlockContext<'_>>,
+    ) -> LayoutOutput {
+        let joined = mem::take(&mut self.active);
+        if inputs.run_mode == RunMode::PerformHiddenLayout {
+            return taffy::compute_hidden_layout(self, node);
+        }
+        if inputs.run_mode == RunMode::PerformLayout {
+            let slot = &mut self.slots[usize::from(node)];
+            slot.held = false;
+            slot.inputs = slot.boundary().then_some(inputs);
+        }
+        let slot = &self.slots[usize::from(node)];
+        let style = slot.taffy();
+        if !self.exact
+            && inputs.run_mode == RunMode::ComputeSize
+            && inputs.sizing_mode == taffy::SizingMode::ContentSize
+            && slot.parent != NONE
+            && style.position != taffy::Position::Absolute
+        {
+            let parent = self.slots[slot.parent as usize].taffy();
+            let row = matches!(
+                parent.flex_direction,
+                FlexDirection::Row | FlexDirection::RowReverse
+            );
+            let (axis, main, cross, size, line) = match row {
+                true => (
+                    taffy::RequestedAxis::Vertical,
+                    inputs.known_dimensions.width,
+                    inputs.known_dimensions.height,
+                    style.size.height,
+                    inputs.parent_size.height,
+                ),
+                false => (
+                    taffy::RequestedAxis::Horizontal,
+                    inputs.known_dimensions.height,
+                    inputs.known_dimensions.width,
+                    style.size.width,
+                    inputs.parent_size.width,
+                ),
+            };
+            let margins = match row {
+                true => [style.margin.top, style.margin.bottom],
+                false => [style.margin.left, style.margin.right],
+            };
+            if parent.display == taffy::Display::Flex
+                && parent.flex_wrap == taffy::FlexWrap::NoWrap
+                && inputs.axis == axis
+                && cross.is_none()
+                && size.is_auto()
+                && margins.iter().all(|margin| !margin.is_auto())
+                && matches!(
+                    style.align_self.unwrap_or(parent.align_items).keyword,
+                    AlignItemsKeyword::Normal | AlignItemsKeyword::Stretch
+                )
+                && let (Some(main), Some(line)) = (main, line)
+            {
+                let size = match row {
+                    true => taffy::Size {
+                        width: main,
+                        height: line,
+                    },
+                    false => taffy::Size {
+                        width: line,
+                        height: main,
+                    },
+                };
+                return LayoutOutput::from_outer_size(size);
+            }
+        }
+        // Taffy treats measured absolute heights as definite. With auto height and no paired insets, child
+        // percentage heights must stay auto.
+        if style.position == taffy::Position::Absolute
+            && inputs.run_mode == RunMode::PerformLayout
+            && style.size.height.is_auto()
+            && (style.inset.top.is_auto() || style.inset.bottom.is_auto())
+        {
+            inputs.known_dimensions_are_definite.height = false;
+        }
+        // Taffy lays out a block as a flex column, whose items get definite heights. In a block, an auto height is
+        // not definite, unless a ratio gives it, so percent heights in the child stay auto.
+        if inputs.known_dimensions.height.is_some()
+            && style.size.height.is_auto()
+            && style.aspect_ratio.is_none()
+            && style.position != taffy::Position::Absolute
+            && slot.parent != NONE
+            && self.slots[slot.parent as usize].style.block
+        {
+            inputs.known_dimensions_are_definite.height = false;
+        }
+        let layout = |tree: &mut Self, node: NodeId, inputs: LayoutInput| {
+            tree.joined = joined;
+            let slot = &tree.slots[usize::from(node)];
+            let leaf = slot.children.is_empty();
+            let mut output = match slot.taffy().display {
+                taffy::Display::None => taffy::compute_hidden_layout(tree, node),
+                _ if leaf => tree.measure(usize::from(node), inputs),
+                taffy::Display::Flex => tree
+                    .stack(node, inputs)
+                    .or_else(|| tree.row(node, inputs))
+                    .unwrap_or_else(|| tree.flexbox(node, inputs)),
+                taffy::Display::Grid => taffy::compute_grid_layout(tree, node, inputs),
+                _ => taffy::compute_block_layout(tree, node, inputs, block),
+            };
+            if tree.slots[usize::from(node)].style.columns.is_some() {
+                output = tree.columns(node, inputs, output);
+            }
+            if inputs.run_mode == RunMode::PerformLayout {
+                // Taffy reads `direction` in all layout, which handles right-to-left itself, so a right-to-left
+                // box gives it only to the pass of its absolute boxes.
+                let index = usize::from(node);
+                // Like Chrome, a box that escapes its parent takes the room of its containing block, so its auto
+                // size doesn't shrink to the parent.
+                if tree.slots[index].style.flow & Flow::RTL_BLOCK == 0
+                    && let Some(area) = output.oof_positioning_area
+                    && output.oof_candidates.as_slice().iter().any(|candidate| {
+                        let escape = tree.slots[usize::from(candidate.node)].style.escape
+                            & (Escape::ABSOLUTE | Escape::FIXED);
+                        escape != 0 && tree.slots[index].style.contains & escape == 0
+                    })
+                {
+                    let mut claims =
+                        taffy::CoreStyle::is_containing_block(tree.slots[index].taffy());
+                    (claims.absolute, claims.fixed) = (true, true);
+                    let mut rest = taffy::OofCandidates::new();
+                    for &candidate in output.oof_candidates.take().as_slice() {
+                        let child = usize::from(candidate.node);
+                        let escape =
+                            tree.slots[child].style.escape & (Escape::ABSOLUTE | Escape::FIXED);
+                        let Some(room) = (escape != 0)
+                            .then(|| room(tree.slots, index as u32, escape, tree.viewport))
+                            .flatten()
+                        else {
+                            rest.push(candidate);
+                            continue;
+                        };
+                        tree.slots[child].room = Some(room);
+                        tree.roomed.push(child as u32);
+                        let area = taffy::OofPositioningArea {
+                            size: taffy::Size {
+                                width: area.size.width.max(room[0]),
+                                height: area.size.height.max(room[1]),
+                            },
+                            ..area
+                        };
+                        taffy::compute_oof_layout_for_area(
+                            tree,
+                            node,
+                            &[candidate],
+                            area,
+                            taffy::Direction::Ltr,
+                            claims,
+                        );
+                    }
+                    output.oof_candidates = rest;
+                }
+                if tree.slots[index].style.flow & Flow::RTL_BLOCK != 0 {
+                    if let Some(area) = output.oof_positioning_area
+                        && !output.oof_candidates.is_empty()
+                    {
+                        let claims =
+                            taffy::CoreStyle::is_containing_block(&tree.slots[index].taffy());
+                        let candidates = output.oof_candidates.take();
+                        let result = taffy::compute_oof_layout_for_area(
+                            tree,
+                            node,
+                            candidates.as_slice(),
+                            area,
+                            taffy::Direction::Rtl,
+                            claims,
+                        );
+                        output.oof_candidates = result.unclaimed;
+                        // Warning: with Taffy's `content_size` feature, merge `result.scrollable_overflow_rect`
+                        // into the output here, as `compute_oof_layout` does.
+                    }
+                } else {
+                    taffy::compute_oof_layout(tree, node, &mut output);
+                }
+                output.baselines = tree.baselines(usize::from(node), &output);
+            }
+            output
+        };
+        let index = usize::from(node);
+        // A box with floats that no float of its context reaches lays out the same each time: it keeps its cache,
+        // and the floats it placed.
+        let quiet = joined
+            && self.slots[index].floats
+            && self.floats.iter().all(|float| float[3] <= self.origin[1]);
+        let output = if quiet {
+            let [x, y] = self.origin;
+            self.floats.clear();
+            match self.cache_get(node, &inputs) {
+                Some(output) if self.slots[index].spill.is_some() => {
+                    let (floats, ceiling, reach) = self.slots[index].spill.as_deref().unwrap();
+                    self.floats.extend(
+                        floats
+                            .iter()
+                            .map(|f| [f[0] + x, f[1] + y, f[2] + x, f[3] + y, f[4]]),
+                    );
+                    (self.ceiling, self.reach) =
+                        (self.ceiling.max(ceiling + y), self.reach.max(reach + y));
+                    output
+                }
+                _ => {
+                    let outer = (self.ceiling, self.reach);
+                    (self.ceiling, self.reach) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+                    let output = layout(self, node, inputs);
+                    let floats = self
+                        .floats
+                        .iter()
+                        .map(|f| [f[0] - x, f[1] - y, f[2] - x, f[3] - y, f[4]])
+                        .collect();
+                    self.slots[index].spill =
+                        Some(Box::new((floats, self.ceiling - y, self.reach - y)));
+                    (self.ceiling, self.reach) =
+                        (outer.0.max(self.ceiling), outer.1.max(self.reach));
+                    self.cache_store(node, &inputs, output.clone());
+                    output
+                }
+            }
+        } else if joined {
+            // Beside floats, the result depends on them, so the cache is neither read nor stored, and a later
+            // layout without floats must not find a result from before them.
+            self.slots[index].cache.clear();
+            self.slots[index].uncached = true;
+            layout(self, node, inputs)
+        } else {
+            taffy::compute_cached_layout(self, node, inputs, layout)
+        };
+        if inputs.run_mode == RunMode::PerformLayout
+            && self.slots[usize::from(node)].baselines != output.baselines
+        {
+            self.slots[usize::from(node)].baselines = output.baselines;
+            if !self.exact {
+                changed(self.slots, usize::from(node));
+            }
+        }
+        output
+    }
+}
+
+impl TraversePartialTree for LayoutTree<'_> {
+    type ChildIter<'a>
+        = std::iter::Copied<std::slice::Iter<'a, NodeId>>
+    where
+        Self: 'a;
+
+    fn child_ids(&self, node: NodeId) -> Self::ChildIter<'_> {
+        self.slots[usize::from(node)].children.iter().copied()
+    }
+
+    fn child_count(&self, node: NodeId) -> usize {
+        self.slots[usize::from(node)].children.len()
+    }
+
+    fn get_child_id(&self, node: NodeId, child: usize) -> NodeId {
+        self.slots[usize::from(node)].children[child]
+    }
+}
+
+impl LayoutPartialTree for LayoutTree<'_> {
+    type CoreContainerStyle<'a>
+        = &'a taffy::Style
+    where
+        Self: 'a;
+    type CustomIdent = String;
+
+    fn get_core_container_style(&self, node: NodeId) -> &taffy::Style {
+        self.slots[usize::from(node)].taffy()
+    }
+
+    fn resolve_calc_value(&self, handle: *const (), basis: f32) -> f32 {
+        crate::style::resolve_calc(handle, basis)
+    }
+
+    // A box that only moved is not marked changed, since its kept prepaint follows it.
+    fn set_unrounded_layout(&mut self, node: NodeId, layout: &Layout) {
+        let index = usize::from(node);
+        let mut layout = *layout;
+        // Taffy gives negative free space to cross-axis auto margins. In CSS the start margin is then 0, and the
+        // end margin takes the rest.
+        let margin = layout.margin;
+        if margin.left.min(margin.right).min(margin.top) < 0. {
+            let slot = &self.slots[index];
+            let style = slot.taffy();
+            if style.position != taffy::Position::Absolute {
+                if margin.top < 0. && style.margin.top.is_auto() {
+                    layout.location.y -= margin.top;
+                    layout.margin.bottom += margin.top;
+                    layout.margin.top = 0.;
+                }
+                let rtl = slot.style.flow & Flow::RTL != 0;
+                if !rtl && margin.left < 0. && style.margin.left.is_auto() {
+                    layout.location.x -= margin.left;
+                    layout.margin.right += margin.left;
+                    layout.margin.left = 0.;
+                } else if rtl && margin.right < 0. && style.margin.right.is_auto() {
+                    layout.location.x += margin.right;
+                    layout.margin.left += margin.right;
+                    layout.margin.right = 0.;
+                }
+            }
+        }
+        let old = mem::replace(&mut self.slots[index].layout, layout);
+        if !self.exact
+            && (Layout {
+                location: old.location,
+                ..layout
+            }) != old
+        {
+            changed(self.slots, index);
+        }
+    }
+
+    fn compute_child_layout(&mut self, node: NodeId, inputs: LayoutInput) -> LayoutOutput {
+        self.compute(node, inputs, None)
+    }
+}
+
+// Hoisted lists are unnecessary: parents position out-of-flow boxes, and layout stays unrounded.
+impl LayoutContainingBlock for LayoutTree<'_> {
+    type OofItemStyle<'a>
+        = &'a taffy::Style
+    where
+        Self: 'a;
+
+    fn get_oof_item_style(&self, node: NodeId) -> &taffy::Style {
+        self.slots[usize::from(node)].taffy()
+    }
+
+    fn clear_hoisted_children(&mut self, _: NodeId) {}
+
+    fn add_hoisted_children(&mut self, _: NodeId, _: &[NodeId]) {}
+}
+
+impl CacheTree for LayoutTree<'_> {
+    fn cache_get(&mut self, node: NodeId, input: &LayoutInput) -> Option<LayoutOutput> {
+        let slot = &mut self.slots[usize::from(node)];
+        let relative = self.exact || slot.style.relative;
+        slot.cache.get(&cache_input(slot.free, relative, input))
+    }
+
+    fn cache_store(&mut self, node: NodeId, input: &LayoutInput, output: LayoutOutput) {
+        let slot = &mut self.slots[usize::from(node)];
+        let relative = self.exact || slot.style.relative;
+        slot.uncached = false;
+        slot.cache
+            .store(&cache_input(slot.free, relative, input), output);
+    }
+
+    fn cache_clear(&mut self, node: NodeId) {
+        self.slots[usize::from(node)].cache.clear();
+    }
+}
+
+impl LayoutBlockContainer for LayoutTree<'_> {
+    type BlockContainerStyle<'a>
+        = &'a taffy::Style
+    where
+        Self: 'a;
+    type BlockItemStyle<'a>
+        = &'a taffy::Style
+    where
+        Self: 'a;
+
+    fn get_block_container_style(&self, node: NodeId) -> &taffy::Style {
+        self.slots[usize::from(node)].taffy()
+    }
+
+    fn get_block_child_style(&self, node: NodeId) -> &taffy::Style {
+        self.slots[usize::from(node)].taffy()
+    }
+
+    fn compute_block_child_layout(
+        &mut self,
+        node: NodeId,
+        inputs: LayoutInput,
+        block: Option<&mut BlockContext<'_>>,
+    ) -> LayoutOutput {
+        self.compute(node, inputs, block)
+    }
+}
+
+impl LayoutFlexboxContainer for LayoutTree<'_> {
+    type FlexboxContainerStyle<'a>
+        = &'a taffy::Style
+    where
+        Self: 'a;
+    type FlexboxItemStyle<'a>
+        = &'a taffy::Style
+    where
+        Self: 'a;
+
+    fn get_flexbox_container_style(&self, node: NodeId) -> &taffy::Style {
+        self.slots[usize::from(node)].taffy()
+    }
+
+    fn get_flexbox_child_style(&self, node: NodeId) -> &taffy::Style {
+        match self.hung.iter().rfind(|(hung, ..)| *hung == node) {
+            Some((_, _, style)) => style,
+            None => self.slots[usize::from(node)].taffy(),
+        }
+    }
+}
+
+impl LayoutGridContainer for LayoutTree<'_> {
+    type GridContainerStyle<'a>
+        = &'a taffy::Style
+    where
+        Self: 'a;
+    type GridItemStyle<'a>
+        = &'a taffy::Style
+    where
+        Self: 'a;
+
+    fn get_grid_container_style(&self, node: NodeId) -> &taffy::Style {
+        self.slots[usize::from(node)].taffy()
+    }
+
+    fn get_grid_child_style(&self, node: NodeId) -> &taffy::Style {
+        self.slots[usize::from(node)].taffy()
+    }
 }
 
 #[cfg(test)]
