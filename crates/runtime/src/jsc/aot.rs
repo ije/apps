@@ -1,13 +1,50 @@
-use super::{JavaScriptCore, Ptr};
+use super::Ptr;
 use anyhow::{Context, Result, anyhow, ensure};
 use libloading::Library;
 use std::{
     collections::HashMap,
     ffi::{CStr, c_char},
     path::Path,
-    ptr,
     sync::OnceLock,
 };
+
+pub const AOT_PREFIX: &str = "\"apps:aot:";
+
+pub fn aot_source(build: &str, name: &str) -> String {
+    format!("{AOT_PREFIX}{build}:{name}\";throw Error(\"Missing AOT image\");")
+}
+
+pub fn aot_image_name(platform: &str) -> &'static str {
+    if platform == "linux" {
+        "app.so"
+    } else {
+        "app.dylib"
+    }
+}
+
+pub fn aot_engine_library(platform: &str) -> &'static str {
+    if platform == "linux" {
+        "libJavaScriptCoreAOT.so"
+    } else {
+        "libJavaScriptCoreAOT.dylib"
+    }
+}
+
+pub fn aot_compiler_library(platform: &str) -> &'static str {
+    if platform == "linux" {
+        "libJavaScriptCoreCompiler.so"
+    } else {
+        "libJavaScriptCoreCompiler.dylib"
+    }
+}
+
+pub fn aot_front_end_library(platform: &str) -> &'static str {
+    if platform == "linux" {
+        "libapps_aot.so"
+    } else {
+        "libapps_aot.dylib"
+    }
+}
 
 #[derive(serde::Deserialize)]
 struct Manifest {
@@ -52,7 +89,7 @@ fn read(jsc: &Library, path: &Path) -> Result<Option<Image>> {
         ensure!(
             manifest.runtime == super::RUNTIME_SCRIPTS,
             "{} was built for another runtime",
-            super::aot_image_name(std::env::consts::OS)
+            aot_image_name(std::env::consts::OS)
         );
         ensure!(
             manifest.scripts.values().all(|&module| module != 0),
@@ -62,7 +99,7 @@ fn read(jsc: &Library, path: &Path) -> Result<Option<Image>> {
             *jsc.get(b"JSLoadAOT\0").with_context(|| {
                 format!(
                     "{} needs the JavaScriptCore of its build",
-                    super::aot_image_name(std::env::consts::OS)
+                    aot_image_name(std::env::consts::OS)
                 )
             })?;
         let mut error = [0; 1024];
@@ -97,7 +134,7 @@ impl Image {
     }
 
     pub(super) fn find(&self, source: &[u8]) -> Result<Option<u32>> {
-        let Some(reference) = source.strip_prefix(crate::bundle::AOT_PREFIX.as_bytes()) else {
+        let Some(reference) = source.strip_prefix(AOT_PREFIX.as_bytes()) else {
             return Ok(None);
         };
         let reference = reference
@@ -111,7 +148,7 @@ impl Image {
         ensure!(
             build == self.build,
             "{} does not match app.bundle",
-            super::aot_image_name(std::env::consts::OS)
+            aot_image_name(std::env::consts::OS)
         );
         self.modules
             .get(name)
@@ -120,21 +157,8 @@ impl Image {
             .with_context(|| format!("Missing AOT code for {name}"))
     }
 
-    pub(super) fn call(
-        &self,
-        api: &JavaScriptCore,
-        ctx: Ptr,
-        module: u32,
-        this: Ptr,
-        exception: *mut Ptr,
-    ) -> Ptr {
-        unsafe {
-            let function = (self.function)(ctx, module, exception);
-            if function.is_null() {
-                return ptr::null_mut();
-            }
-            // entries read `process`, `require` and such from this argument. See the CLI's aot.rs.
-            (api.invoke)(ctx, function, this, 1, &(api.global)(ctx), exception)
-        }
+    // The compiled function of `module`, or null with `exception` set.
+    pub(super) fn function(&self, ctx: Ptr, module: u32, exception: *mut Ptr) -> Ptr {
+        unsafe { (self.function)(ctx, module, exception) }
     }
 }

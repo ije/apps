@@ -75,28 +75,6 @@ pub struct Bundle {
     pub main: Option<bytes::Bytes>,
 }
 
-pub const AOT_PREFIX: &str = "\"apps:aot:";
-
-pub fn aot_source(build: &str, name: &str) -> String {
-    format!("{AOT_PREFIX}{build}:{name}\";throw Error(\"Missing AOT image\");")
-}
-
-// Keep module code outside the loader scope to hide internals such as `compile`. Expose only `$appsDefine`.
-pub fn script_source(files: &BBTreeMap<String, String>, execute: bool) -> String {
-    let app = files.get("app.js").map_or("", String::as_str);
-    if execute && app.starts_with(AOT_PREFIX) {
-        return app.to_owned();
-    }
-    let modules = js!("modules.js");
-    let mut source = String::with_capacity(modules.len() + app.len() + 64);
-    source.push_str("(()=>{");
-    source.push_str(modules);
-    source.push_str("})()(($appsDefine)=>{\n");
-    source.push_str(app);
-    source.push_str(if execute { "\n},true);" } else { "\n},false);" });
-    source
-}
-
 pub fn package_metadata(source: Option<&str>) -> Result<(String, String, String, String)> {
     let package: serde_json::Value =
         serde_json::from_str(source.unwrap_or("{}")).context("Invalid package.json")?;
@@ -303,7 +281,10 @@ pub fn write(
             ));
         } else if name == "app.js" {
             // The bundle holds the main script as it runs, so the app reads it in place.
-            owned.push((name.clone(), script_source(files, true).into_bytes()));
+            owned.push((
+                name.clone(),
+                crate::jsc::script_source(files, true).into_bytes(),
+            ));
         } else {
             ensure!(
                 name.ends_with(".js") || name == "package.json",
@@ -921,7 +902,7 @@ mod tests {
         assert!(bundle.files.is_empty());
         assert_eq!(
             &bundle.main.as_ref().unwrap()[..],
-            script_source(&files, true).as_bytes()
+            crate::jsc::script_source(&files, true).as_bytes()
         );
         assert_eq!(
             &bundle.scripts["script-0.js"][..],
@@ -935,7 +916,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             &bundle.main.as_ref().unwrap()[..],
-            script_source(&files, true).as_bytes()
+            crate::jsc::script_source(&files, true).as_bytes()
         );
         assert_eq!(
             &bundle.scripts["script-0.js"][..],

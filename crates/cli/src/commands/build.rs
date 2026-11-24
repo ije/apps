@@ -33,7 +33,7 @@ pub fn run(
     let app = rust.is_none().then(|| {
         (
             "app.js".to_owned(),
-            apps_runtime::bundle::script_source(&files, false),
+            apps_runtime::jsc::script_source(&files, false),
         )
     });
     for (name, source) in files
@@ -90,7 +90,7 @@ pub fn run(
             .map(|directory| {
                 directory
                     .path()
-                    .join(apps_runtime::jsc::aot_image_name(target.platform))
+                    .join(apps_runtime::jsc::aot::aot_image_name(target.platform))
             })
             .as_deref(),
     )?;

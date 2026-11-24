@@ -1718,7 +1718,7 @@ fn load_file_literals_bundle_plain_electron_pages() {
             files.contains_key("index.html")
                 && files.keys().filter(|name| name.ends_with(".html")).count() == 1
         );
-        let app = apps_runtime::bundle::script_source(&files, false);
+        let app = apps_runtime::jsc::script_source(&files, false);
         assert!(app.matches("apps:///index.html").count() == 2 && app.contains("missing.html"));
         assert_eq!(
             apps_runtime::desktop::Desktop::new(&files)

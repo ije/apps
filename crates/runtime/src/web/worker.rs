@@ -82,7 +82,7 @@ static CHANNELS: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, Subscriber>>>
     std::sync::LazyLock::new(Default::default);
 
 // The VM of a worker while its thread runs, and the function that stops its script from another thread.
-type Running = Arc<std::sync::Mutex<Option<(usize, unsafe extern "C" fn(crate::jsc::Ptr))>>>;
+type Running = Arc<std::sync::Mutex<Option<crate::jsc::Terminator>>>;
 
 struct Worker {
     input: mpsc::Sender<Payload>,
@@ -99,8 +99,8 @@ impl Worker {
             .running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((group, terminate)) = *running {
-            unsafe { terminate(group as crate::jsc::Ptr) };
+        if let Some(terminator) = *running {
+            terminator.terminate();
         }
     }
 }
@@ -322,7 +322,7 @@ impl State {
                         // Declared after the engine, so it is cleared before the VM goes away.
                         struct Clear(Running);
                         impl Drop for Clear { fn drop(&mut self) { self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take(); } }
-                        *started.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = api.terminate.map(|terminate| (api.group as usize, terminate));
+                        *started.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = api.terminator();
                         let _clear = Clear(started);
                         engine.eval("for (const name of ['document', 'window', 'screen', 'screenX', 'screenY', 'screenLeft', 'screenTop', 'outerWidth', 'outerHeight', 'localStorage', 'sessionStorage']) delete globalThis[name]; globalThis.self=globalThis;", "apps:worker-scope")?;
                         if native { engine.eval("globalThis.require = globalThis.__apps.module.createRequire(); globalThis.onmessage = null;", "apps:worker-modules")?; }

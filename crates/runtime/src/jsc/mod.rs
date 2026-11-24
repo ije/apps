@@ -1,4 +1,4 @@
-mod aot;
+pub mod aot;
 pub(crate) mod encoding;
 pub(crate) mod payload;
 
@@ -158,12 +158,13 @@ pub struct JavaScriptCore {
     burst: std::cell::Cell<bool>,
     quiet: std::cell::Cell<u32>,
     shrunk: std::cell::Cell<std::time::Instant>,
-    pub(crate) idle: std::cell::Cell<bool>,
+    shrink_scheduled: std::cell::Cell<bool>,
+    ticks: std::cell::Cell<(std::time::Duration, u32)>,
     inspectable: unsafe extern "C" fn(Ptr, bool),
     pub(crate) extra_memory: unsafe extern "C" fn(Ptr, usize),
     // An older library has no such functions. Buffers are then copied, and shared buffers can't be sent.
     pub(crate) contents: Option<payload::Contents>,
-    pub(crate) terminate: Option<unsafe extern "C" fn(Ptr)>,
+    terminate: Option<unsafe extern "C" fn(Ptr)>,
     set_name: unsafe extern "C" fn(Ptr, Ptr),
     execution_limit: Limit,
     create: unsafe extern "C" fn(Ptr, Ptr) -> Ptr,
@@ -226,7 +227,6 @@ pub struct JavaScriptCore {
     make_utf8: unsafe extern "C" fn(Ptr, *const c_char, usize) -> Ptr,
     make_uint8: unsafe extern "C" fn(Ptr, usize, *mut Ptr, *mut Ptr) -> Ptr,
     to_utf8: unsafe extern "C" fn(*const c_void, usize, bool, *mut c_char) -> usize,
-    inspector: Option<Inspector>,
 }
 
 type Limit = unsafe extern "C" fn(Ptr, f64, Option<unsafe extern "C" fn(Ptr, Ptr) -> bool>, Ptr);
@@ -239,6 +239,34 @@ struct Inspector {
     disconnect: unsafe extern "C" fn(Ptr, Ptr),
 }
 
+// Every VM loads the same library, so one table serves all of them.
+static INSPECTOR: std::sync::OnceLock<Option<Inspector>> = std::sync::OnceLock::new();
+
+fn inspector() -> Result<&'static Inspector> {
+    INSPECTOR
+        .get()
+        .and_then(Option::as_ref)
+        .context("This JavaScriptCore has no inspector. Rebuild it with scripts/build-jsc.sh")
+}
+
+// Returns the connection, which `inspector_disconnect` closes.
+pub(crate) fn inspector_connect(ctx: usize) -> Result<Ptr> {
+    let inspector = inspector()?;
+    Ok(unsafe { (inspector.connect)(ctx as Ptr, inspector_message, inspector_pause, ctx as Ptr) })
+}
+
+pub(crate) fn inspector_dispatch(ctx: usize, message: &str) -> Result<()> {
+    let inspector = inspector()?;
+    unsafe { (inspector.dispatch)(ctx as Ptr, message.as_ptr().cast(), message.len()) };
+    Ok(())
+}
+
+pub(crate) fn inspector_disconnect(ctx: Ptr, connection: Ptr) {
+    if let Some(inspector) = INSPECTOR.get().and_then(Option::as_ref) {
+        unsafe { (inspector.disconnect)(ctx, connection) };
+    }
+}
+
 pub fn library_name(platform: &str) -> Result<&'static str> {
     match platform {
         "macos" => Ok("libJavaScriptCore.dylib"),
@@ -248,36 +276,20 @@ pub fn library_name(platform: &str) -> Result<&'static str> {
     }
 }
 
-pub fn aot_image_name(platform: &str) -> &'static str {
-    if platform == "linux" {
-        "app.so"
-    } else {
-        "app.dylib"
+// Keep module code outside the loader scope to hide internals such as `compile`. Expose only `$appsDefine`.
+pub fn script_source(files: &BBTreeMap<String, String>, execute: bool) -> String {
+    let app = files.get("app.js").map_or("", String::as_str);
+    if execute && app.starts_with(aot::AOT_PREFIX) {
+        return app.to_owned();
     }
-}
-
-pub fn aot_engine_library(platform: &str) -> &'static str {
-    if platform == "linux" {
-        "libJavaScriptCoreAOT.so"
-    } else {
-        "libJavaScriptCoreAOT.dylib"
-    }
-}
-
-pub fn aot_compiler_library(platform: &str) -> &'static str {
-    if platform == "linux" {
-        "libJavaScriptCoreCompiler.so"
-    } else {
-        "libJavaScriptCoreCompiler.dylib"
-    }
-}
-
-pub fn aot_front_end_library(platform: &str) -> &'static str {
-    if platform == "linux" {
-        "libapps_aot.so"
-    } else {
-        "libapps_aot.dylib"
-    }
+    let modules = js!("modules.js");
+    let mut source = String::with_capacity(modules.len() + app.len() + 64);
+    source.push_str("(()=>{");
+    source.push_str(modules);
+    source.push_str("})()(($appsDefine)=>{\n");
+    source.push_str(app);
+    source.push_str(if execute { "\n},true);" } else { "\n},false);" });
+    source
 }
 
 pub fn library_path(executable: &Path, platform: &str) -> Result<PathBuf> {
@@ -359,8 +371,17 @@ impl JavaScriptCore {
         let image = if cfg!(target_os = "macos") {
             path.with_file_name("../Resources/app.dylib")
         } else {
-            path.with_file_name(aot_image_name(std::env::consts::OS))
+            path.with_file_name(aot::aot_image_name(std::env::consts::OS))
         };
+        INSPECTOR.get_or_init(|| unsafe {
+            Some(Inspector {
+                connect: *library.get(b"JSGlobalContextConnectInspector\0").ok()?,
+                dispatch: *library
+                    .get(b"JSGlobalContextDispatchInspectorMessage\0")
+                    .ok()?,
+                disconnect: *library.get(b"JSGlobalContextDisconnectInspector\0").ok()?,
+            })
+        });
         unsafe {
             let group_create: unsafe extern "C" fn() -> Ptr =
                 *library.get(b"JSContextGroupCreate\0")?;
@@ -415,7 +436,8 @@ impl JavaScriptCore {
                 burst: Default::default(),
                 quiet: Default::default(),
                 shrunk: std::cell::Cell::new(std::time::Instant::now()),
-                idle: Default::default(),
+                shrink_scheduled: Default::default(),
+                ticks: Default::default(),
                 create: *library.get(b"JSGlobalContextCreateInGroup\0")?,
                 release: *library.get(b"JSGlobalContextRelease\0")?,
                 string_create: *library.get(b"JSStringCreateWithCharacters\0")?,
@@ -470,15 +492,6 @@ impl JavaScriptCore {
                 make_utf8: *library.get(b"JSValueMakeStringUTF8\0")?,
                 make_uint8: *library.get(b"JSObjectMakeUint8ArrayUninitialized\0")?,
                 to_utf8: *library.get(b"JSStringConvertCharactersToUTF8\0")?,
-                inspector: (|| {
-                    Some(Inspector {
-                        connect: *library.get(b"JSGlobalContextConnectInspector\0").ok()?,
-                        dispatch: *library
-                            .get(b"JSGlobalContextDispatchInspectorMessage\0")
-                            .ok()?,
-                        disconnect: *library.get(b"JSGlobalContextDisconnectInspector\0").ok()?,
-                    })
-                })(),
                 _library: library,
             }))
         }
@@ -550,6 +563,47 @@ impl JavaScriptCore {
         }
     }
 
+    pub(crate) fn run_aot(&self, ctx: Ptr, module: u32, this: Ptr, exception: *mut Ptr) -> Ptr {
+        let Some(aot) = self.aot else {
+            return ptr::null_mut();
+        };
+        let function = aot.function(ctx, module, exception);
+        if function.is_null() {
+            return ptr::null_mut();
+        }
+        // entries read `process`, `require` and such from this argument. See the CLI's aot.rs.
+        unsafe { (self.invoke)(ctx, function, this, 1, &(self.global)(ctx), exception) }
+    }
+
+    // Adds the time of a script run to the busy time.
+    pub(crate) fn timed<R>(&self, run: impl FnOnce() -> R) -> R {
+        let start = std::time::Instant::now();
+        let result = run();
+        self.busy.set(self.busy.get() + start.elapsed());
+        result
+    }
+
+    // Counts watchdog ticks per busy value: JSC resets its budget per run but does not identify each tick's run.
+    fn over_limit(&self) -> bool {
+        let busy = self.busy.get();
+        let ticks = match self.ticks.get() {
+            (last, ticks) if last == busy => ticks + 1,
+            _ => 1,
+        };
+        self.ticks.set((busy, ticks));
+        f64::from(ticks) * PAGE_TICK >= PAGE_LIMIT as f64
+    }
+
+    // True once after scripts ran enough to collect later, until `shrink`.
+    pub(crate) fn schedule_shrink(&self) -> bool {
+        self.shrink_pending() && !self.shrink_scheduled.replace(true)
+    }
+
+    pub(crate) fn terminator(&self) -> Option<Terminator> {
+        self.terminate
+            .map(|terminate| Terminator(self.group as usize, terminate))
+    }
+
     pub(crate) fn shrink_pending(&self) -> bool {
         self.busy.get() >= std::time::Duration::from_millis(20)
     }
@@ -578,6 +632,7 @@ impl JavaScriptCore {
     }
 
     pub(crate) fn shrink(&self) {
+        self.shrink_scheduled.set(false);
         self.busy.set(Default::default());
         self.burst.set(false);
         self.quiet.set(0);
@@ -607,30 +662,43 @@ fn create_bytecode(api: &JavaScriptCore, ctx: Ptr, url: &str, source: &str) -> &
     }
 }
 
-pub(crate) fn prebuild(api: &JavaScriptCore, webgpu: bool, node: bool) {
-    if api.aot.is_some() {
-        return;
+// Stops the scripts of a VM from another thread.
+#[derive(Clone, Copy)]
+pub(crate) struct Terminator(usize, unsafe extern "C" fn(Ptr));
+
+impl Terminator {
+    pub(crate) fn terminate(self) {
+        unsafe { (self.1)(self.0 as Ptr) };
     }
-    let mut scripts = SCRIPTS.lock().unwrap();
-    let count = scripts.list.len();
-    let node = NODE_SCRIPTS.into_iter().filter(|_| node);
-    for (url, source) in WEB_SCRIPTS.into_iter().chain(PAGE_SCRIPTS).chain(node) {
-        if (webgpu || url != "apps:gpu") && !scripts.list.iter().any(|script| script.url == url) {
-            scripts.list.push(Script {
-                url,
-                source: source(),
-                bytecode: None,
-            });
+}
+
+impl JavaScriptCore {
+    pub(crate) fn prebuild(&self, webgpu: bool, node: bool) {
+        if self.aot.is_some() {
+            return;
         }
+        let mut scripts = SCRIPTS.lock().unwrap();
+        let count = scripts.list.len();
+        let node = NODE_SCRIPTS.into_iter().filter(|_| node);
+        for (url, source) in WEB_SCRIPTS.into_iter().chain(PAGE_SCRIPTS).chain(node) {
+            if (webgpu || url != "apps:gpu") && !scripts.list.iter().any(|script| script.url == url)
+            {
+                scripts.list.push(Script {
+                    url,
+                    source: source(),
+                    bytecode: None,
+                });
+            }
+        }
+        if scripts.building || scripts.list.len() == count {
+            return;
+        }
+        scripts.building = true;
+        drop(scripts);
+        let _ = std::thread::Builder::new()
+            .name("apps-bytecode".into())
+            .spawn(build_bytecode);
     }
-    if scripts.building || scripts.list.len() == count {
-        return;
-    }
-    scripts.building = true;
-    drop(scripts);
-    let _ = std::thread::Builder::new()
-        .name("apps-bytecode".into())
-        .spawn(build_bytecode);
 }
 
 fn build_bytecode() -> Result<()> {
@@ -661,11 +729,7 @@ pub fn bytecode<'a>(
 ) -> Result<Vec<(&'a str, &'static [u8])>> {
     SCRIPTS.lock().unwrap().building = true;
     let api = JavaScriptCore::load()?;
-    prebuild(
-        &api,
-        disabled & crate::bundle::feature_bit("webgpu") == 0,
-        true,
-    );
+    api.prebuild(disabled & crate::bundle::feature_bit("webgpu") == 0, true);
     build_bytecode()?;
     let mut bytecode: Vec<(&str, &[u8])> = SCRIPTS
         .lock()
@@ -751,7 +815,6 @@ thread_local! {
     pub(crate) static NATIVE: std::cell::Cell<Option<NativeCall>> = const { std::cell::Cell::new(None) };
     // The render thread must stop before statics go, so the main thread sets this.
     pub(crate) static BEFORE_EXIT: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
-    static RUN_TICKS: std::cell::Cell<(std::time::Duration, u32)> = const { std::cell::Cell::new((std::time::Duration::ZERO, 0)) };
 }
 
 type Clipboard = fn(Option<String>) -> Option<String>;
@@ -848,24 +911,13 @@ pub(crate) fn connect_inspector(ctx: usize) -> Result<bool> {
     if !binding.inspector.get().is_null() {
         return Ok(false);
     }
-    let inspector =
-        binding.api.inspector.as_ref().context(
-            "This JavaScriptCore has no inspector. Rebuild it with scripts/build-jsc.sh",
-        )?;
-    let connection =
-        unsafe { (inspector.connect)(ctx as Ptr, inspector_message, inspector_pause, ctx as Ptr) };
-    binding.inspector.set(connection);
+    binding.inspector.set(inspector_connect(ctx)?);
     Ok(true)
 }
 
 pub(crate) fn inspect(ctx: usize, message: &str) -> Result<()> {
     connect_inspector(ctx)?;
-    let api = HOSTS
-        .with_borrow(|hosts| hosts.get(&ctx).map(|binding| binding.api.clone()))
-        .context("The JavaScript context is closed")?;
-    let inspector = api.inspector.as_ref().context("Missing inspector")?;
-    unsafe { (inspector.dispatch)(ctx as Ptr, message.as_ptr().cast(), message.len()) };
-    Ok(())
+    inspector_dispatch(ctx, message)
 }
 
 pub(crate) fn inspector_messages() -> Vec<(usize, String)> {
@@ -1001,7 +1053,7 @@ unsafe extern "C" fn chunk(
     };
     if let Some(aot) = api.aot {
         match aot.find(&source) {
-            Ok(Some(module)) => return aot.call(&api, ctx, module, ptr::null_mut(), exception),
+            Ok(Some(module)) => return api.run_aot(ctx, module, ptr::null_mut(), exception),
             Ok(None) => {}
             Err(error) => {
                 throw(&api, ctx, exception, &format!("Error: {error:#}"));
@@ -2029,8 +2081,7 @@ fn call_json<T>(
     let result = if values.iter().any(|value| value.is_null()) {
         Err(anyhow::anyhow!("Invalid JSON argument for {name}"))
     } else {
-        let start = std::time::Instant::now();
-        let result = unsafe {
+        let result = api.timed(|| unsafe {
             (api.invoke)(
                 ctx,
                 function,
@@ -2039,8 +2090,7 @@ fn call_json<T>(
                 values.as_ptr(),
                 &mut exception,
             )
-        };
-        api.busy.set(api.busy.get() + start.elapsed());
+        });
         if exception.is_null() {
             Ok(read(result))
         } else {
@@ -2078,15 +2128,7 @@ unsafe extern "C" fn page_limit(ctx: Ptr, _: Ptr) -> bool {
     if !matches!(role, Role::Renderer(_)) {
         return again();
     }
-    // Count watchdog ticks per busy value: JSC resets its budget per run but does not identify each tick's
-    // run.
-    let busy = api.busy.get();
-    let ticks = match RUN_TICKS.get() {
-        (last, ticks) if last == busy => ticks + 1,
-        _ => 1,
-    };
-    RUN_TICKS.set((busy, ticks));
-    if f64::from(ticks) * PAGE_TICK >= PAGE_LIMIT as f64 {
+    if api.over_limit() {
         eprintln!("apps: stopped a page script that ran for more than {PAGE_LIMIT} seconds");
         return true;
     }
@@ -2380,9 +2422,10 @@ impl JsContext {
             && let Some(module) = aot.runtime(url)
         {
             let mut exception = ptr::null_mut();
-            let start = std::time::Instant::now();
-            let result = aot.call(&self.api, self.ctx, module, ptr::null_mut(), &mut exception);
-            self.api.busy.set(self.api.busy.get() + start.elapsed());
+            let result = self.api.timed(|| {
+                self.api
+                    .run_aot(self.ctx, module, ptr::null_mut(), &mut exception)
+            });
             return self.checked(url, result, exception).map(drop);
         }
         let (bytecode, build) = {
@@ -2410,8 +2453,7 @@ impl JsContext {
         }
         let source_url = self.api.string(url);
         let mut exception = ptr::null_mut();
-        let start = std::time::Instant::now();
-        let result = unsafe {
+        let result = self.api.timed(|| unsafe {
             self.api.evaluate_latin1(
                 self.ctx,
                 source.as_bytes(),
@@ -2420,8 +2462,7 @@ impl JsContext {
                 bytecode,
                 &mut exception,
             )
-        };
-        self.api.busy.set(self.api.busy.get() + start.elapsed());
+        });
         unsafe { (self.api.string_release)(source_url) };
         self.checked(url, result, exception).map(drop)
     }
@@ -2459,35 +2500,35 @@ impl JsContext {
 
     fn evaluate(&self, source: &str, url: &str, this: Ptr) -> Result<String> {
         let compiled = match self.api.aot {
-            Some(aot) => aot.find(source.as_bytes())?.map(|module| (aot, module)),
+            Some(aot) => aot.find(source.as_bytes())?,
             None => None,
         };
         let source_url = self.api.string(url);
         let mut exception = ptr::null_mut();
-        let start = std::time::Instant::now();
-        let bytecode = bundled(source.as_bytes());
-        let result = match compiled {
-            Some((aot, module)) => aot.call(&self.api, self.ctx, module, this, &mut exception),
-            None if bytecode.is_some() || in_place(source.as_bytes()) => unsafe {
-                self.api.evaluate_latin1(
-                    self.ctx,
-                    source.as_bytes(),
-                    this,
-                    source_url,
-                    bytecode.unwrap_or_default(),
-                    &mut exception,
-                )
-            },
-            _ => {
-                let script = self.api.string(source);
-                let result = unsafe {
-                    (self.api.evaluate)(self.ctx, script, this, source_url, 1, &mut exception)
-                };
-                unsafe { (self.api.string_release)(script) };
-                result
+        let result = self.api.timed(|| {
+            let bytecode = bundled(source.as_bytes());
+            match compiled {
+                Some(module) => self.api.run_aot(self.ctx, module, this, &mut exception),
+                None if bytecode.is_some() || in_place(source.as_bytes()) => unsafe {
+                    self.api.evaluate_latin1(
+                        self.ctx,
+                        source.as_bytes(),
+                        this,
+                        source_url,
+                        bytecode.unwrap_or_default(),
+                        &mut exception,
+                    )
+                },
+                _ => {
+                    let script = self.api.string(source);
+                    let result = unsafe {
+                        (self.api.evaluate)(self.ctx, script, this, source_url, 1, &mut exception)
+                    };
+                    unsafe { (self.api.string_release)(script) };
+                    result
+                }
             }
-        };
-        self.api.busy.set(self.api.busy.get() + start.elapsed());
+        });
         unsafe { (self.api.string_release)(source_url) };
         Ok(self
             .api
@@ -2563,12 +2604,12 @@ impl JsContext {
 
     pub fn validate_bundle(&self, files: &BBTreeMap<String, String>) -> Result<()> {
         self.install(files)?;
-        self.eval_page(&crate::bundle::script_source(files, false), "apps:validate")?;
+        self.eval_page(&script_source(files, false), "apps:validate")?;
         Ok(())
     }
 
     pub fn load_bundle(&self, files: &BBTreeMap<String, String>, entry: &str) -> Result<()> {
-        self.load_main(files, &crate::bundle::script_source(files, true), entry)
+        self.load_main(files, &script_source(files, true), entry)
     }
 
     // `source` is a main script from `script_source`. A built app keeps it in its mapped bundle.
@@ -2646,10 +2687,9 @@ impl Drop for JsContext {
         if let Some(connection) = binding
             .map(|binding| binding.inspector.get())
             .filter(|connection| !connection.is_null())
-            && let Some(inspector) = &self.api.inspector
         {
             // A connected inspector keeps the global object alive.
-            unsafe { (inspector.disconnect)(self.ctx, connection) };
+            inspector_disconnect(self.ctx, connection);
         }
         unsafe {
             (self.api.release)(self.ctx);

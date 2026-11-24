@@ -266,11 +266,7 @@ impl Desktop {
         let (_, name, version, _) = crate::bundle::package_metadata(package)?;
         let disabled = crate::bundle::disabled_features(package)?;
         if windows {
-            crate::jsc::prebuild(
-                &api,
-                disabled & crate::bundle::feature_bit("webgpu") == 0,
-                !rust,
-            );
+            api.prebuild(disabled & crate::bundle::feature_bit("webgpu") == 0, !rust);
         }
         crate::web::LOCAL_NETWORK.store(
             disabled & crate::bundle::feature_bit("localNetwork") == 0,
@@ -1455,7 +1451,7 @@ impl Desktop {
             });
         }
         let api = runtime.borrow().api.clone();
-        if api.shrink_pending() && !api.idle.replace(true) {
+        if api.schedule_shrink() {
             shrink_when_quiet(runtime.clone(), cx);
         }
         match result {
@@ -1723,8 +1719,7 @@ impl Desktop {
                 return;
             }
         };
-        crate::jsc::prebuild(
-            &api,
+        api.prebuild(
             template.disabled & crate::bundle::feature_bit("webgpu") == 0,
             !template.rust_main,
         );
@@ -1803,7 +1798,6 @@ fn shrink_when_quiet(runtime: Rc<RefCell<Desktop>>, cx: &mut App) {
         if drawing || !api.shrink_due() {
             return shrink_when_quiet(runtime, cx);
         }
-        api.idle.set(false);
         api.shrink();
         if let Ok(app) = runtime.try_borrow() {
             for view in app.views.values() {

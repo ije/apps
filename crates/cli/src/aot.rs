@@ -22,12 +22,12 @@ const NO_SOURCE: &str = "/*apps:no-source*/";
 pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<tempfile::TempDir> {
     let platform = std::env::consts::OS;
     let library = apps_runtime::jsc::library_path(runtime, platform)?;
-    let engine = apps_runtime::jsc::aot_engine_library(platform);
+    let engine = apps_runtime::jsc::aot::aot_engine_library(platform);
     ensure!(
         library.with_file_name(engine).is_file(),
         "--aot needs {engine}; run bash scripts/build-jsc.sh --aot"
     );
-    let compiler_name = apps_runtime::jsc::aot_compiler_library(platform);
+    let compiler_name = apps_runtime::jsc::aot::aot_compiler_library(platform);
     let compiler = library.with_file_name(compiler_name);
     let compiler = unsafe { libloading::Library::new(&compiler) }.with_context(|| {
         format!(
@@ -46,7 +46,7 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
         usize,
     ) -> bool;
     let compile = unsafe { *compiler.get::<Compile>(b"JSCompileAOT\0")? };
-    let front_name = apps_runtime::jsc::aot_front_end_library(platform);
+    let front_name = apps_runtime::jsc::aot::aot_front_end_library(platform);
     let front = library.with_file_name(front_name);
     let front = unsafe { libloading::Library::new(&front) }.with_context(|| {
         format!(
@@ -104,8 +104,8 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
             }
         }
     }
-    let app = apps_runtime::bundle::script_source(files, true);
-    let wrapper = apps_runtime::bundle::script_source(&BBTreeMap::new(), true);
+    let app = apps_runtime::jsc::script_source(files, true);
+    let wrapper = apps_runtime::jsc::script_source(&BBTreeMap::new(), true);
     let loader = wrapper.strip_suffix("\n},true);").unwrap();
     let mut scripts: Vec<(&str, &str)> = files
         .iter()
@@ -389,7 +389,7 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
     }))?;
     for name in &names {
         if let Some(source) = files.get_mut(name) {
-            *source = apps_runtime::bundle::aot_source(&build, name);
+            *source = apps_runtime::jsc::aot::aot_source(&build, name);
         }
     }
     fs::write(directory.path().join("manifest.json"), &manifest)?;
