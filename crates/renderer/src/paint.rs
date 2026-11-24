@@ -11,6 +11,48 @@ pub struct Border {
     pub sides: u8,
 }
 
+impl crate::text::TextCanvas for Window {
+    fn text_system(&self) -> &TextSystem {
+        &self.text_system
+    }
+
+    fn content_mask(&self) -> Clip<Pixels> {
+        Window::content_mask(self)
+    }
+
+    fn cull(&mut self) {
+        Window::cull(self);
+    }
+
+    fn draw_rect(&mut self, bounds: Rect<Pixels>, color: Color) {
+        Window::draw_rect(self, bounds, color);
+    }
+
+    fn draw_line(
+        &mut self,
+        origin: Point<Pixels>,
+        width: Pixels,
+        thickness: Pixels,
+        color: Color,
+        style: DecorationStyle,
+    ) {
+        Window::draw_line(self, origin, width, thickness, color, style);
+    }
+
+    fn draw_glyph(
+        &mut self,
+        origin: Point<Pixels>,
+        font: FontId,
+        glyph: GlyphId,
+        size: Pixels,
+        color: Color,
+        emoji: bool,
+        stroke: Pixels,
+    ) {
+        Window::draw_glyph(self, origin, font, glyph, size, color, emoji, stroke);
+    }
+}
+
 impl Window {
     pub(super) fn snap_bounds(&self, bounds: Rect<Pixels>) -> Rect<f32> {
         let scale = self.scale_factor;

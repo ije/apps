@@ -1009,8 +1009,16 @@ impl renderer::Hooks for InlineText {
             let floats = cx_floats;
             let system = window.text_system().clone();
             *system.floats.borrow_mut() = floats;
-            let layout =
-                renderer::Paragraph::shape(text, runs.clone(), &style, wrap, placed, window);
+            let scale = window.scale_factor();
+            let layout = renderer::Paragraph::shape(
+                text,
+                runs.clone(),
+                &style,
+                wrap,
+                placed,
+                &system,
+                scale,
+            );
             *system.floats.borrow_mut() = None;
             *self.shaped.borrow_mut() = Some((layout, runs));
         }

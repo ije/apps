@@ -21,6 +21,7 @@ use windows as sys;
 
 pub use breaks::{Banded, Wrapping};
 pub use cache::Span;
+pub use draw::TextCanvas;
 
 pub use line::*;
 pub use paragraph::*;

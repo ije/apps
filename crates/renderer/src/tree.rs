@@ -1834,7 +1834,8 @@ impl Tree {
             let sides = slot.layout.padding + slot.layout.border;
             state.fit(
                 px((slot.layout.size.width - sides.left - sides.right) / scale),
-                window,
+                window.text_system(),
+                scale,
             );
             state.layout.place(Rect::new(
                 exact.origin + point(left, top),
@@ -3045,7 +3046,14 @@ fn text_measurement(state: TextState) -> (Rc<dyn Any>, Box<MeasureFn>) {
     let kept = state.clone();
     (
         state,
-        Box::new(move |_, known, available, window| kept.measure(known, available, window)),
+        Box::new(move |_, known, available, window| {
+            kept.measure(
+                known,
+                available,
+                window.text_system(),
+                window.scale_factor(),
+            )
+        }),
     )
 }
 
