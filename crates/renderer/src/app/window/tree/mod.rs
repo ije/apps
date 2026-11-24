@@ -1,14 +1,17 @@
+use super::{
+    PaintKey, PaintSpan, Placement,
+    node::{
+        Child, Content, Events, MeasureFn, Measurement, Node, NodeCx, NodeKey, NodeStyle, Split,
+    },
+    scroll::Anchor,
+};
 use crate::{
     AlignContent, AlignItems, AvailableSpace, Baseline, Clip, Display, Escape, Flow, Hit, Hooks,
     Inline, Overflow, Pixels, Point, Position, Rect, Region, Scope, ScrollAnchor, ScrollRef, Size,
     Style, TextStyle, Visibility, Window,
     geometry::round_half_up,
-    node::{
-        Anchor, Child, Content, Events, MeasureFn, Measurement, Node, NodeCx, NodeKey, NodeStyle,
-    },
     point, px, size,
     text::{TextState, same_shaping},
-    window::{PaintKey, PaintSpan, Placement},
 };
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use std::{
@@ -126,17 +129,6 @@ struct Chunk {
     area: Option<Rect<f32>>,
     // A copy can move with the box when its mask moves with it, as in a scroll.
     translates: bool,
-}
-
-// Where a column set puts a box of its flow, in layout units.
-#[derive(Debug, PartialEq)]
-pub(crate) struct Split {
-    // The move into its column, beyond the move of its parent.
-    pub(crate) shift: Point<f32>,
-    // A box that spans columns: its part in each column from its moved origin, and for text, the first row of
-    // each column after the first with its move.
-    pub(crate) rects: Box<[Rect<f32>]>,
-    pub(crate) rows: Box<[(u32, Point<f32>)]>,
 }
 
 type Spill = (Vec<[f32; 5]>, f32, f32);

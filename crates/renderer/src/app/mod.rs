@@ -1,3 +1,5 @@
+pub(crate) mod window;
+
 use crate::{
     Event, Pixels, Point, Rect, Size, TextSystem, Utf16Selection, View, Window, WindowId,
     WindowOptions, platform,
@@ -423,7 +425,7 @@ impl WindowEvents for Events {
     #[cfg(windows)]
     fn in_drag_area(&self, at: Callbacks, point: Point<Pixels>) -> bool {
         with(at, move |window, _| {
-            window.in_drag_area(point / window.zoom)
+            window.in_drag_area(point / window.zoom())
         })
         .unwrap_or(false)
     }
@@ -511,7 +513,7 @@ impl WindowEvents for Events {
 
     fn rect_of(&self, at: Callbacks, range: Range<usize>) -> Option<Rect> {
         with(at, move |window, app| {
-            let zoom = window.zoom;
+            let zoom = window.zoom();
             let rect = window.with_view(app, |view, window, app| view.rect_of(range, window, app));
             Some(rect.flatten()? * zoom)
         })
@@ -521,7 +523,7 @@ impl WindowEvents for Events {
     #[cfg(target_os = "macos")]
     fn index_at(&self, at: Callbacks, point: Point<Pixels>) -> Option<usize> {
         with(at, move |window, app| {
-            let point = point / window.zoom;
+            let point = point / window.zoom();
             window.with_view(app, |view, window, app| view.index_at(point, window, app))
         })
         .flatten()
