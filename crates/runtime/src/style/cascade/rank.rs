@@ -1,5 +1,5 @@
 // Origin values are in precedence order and important ones rank `IMPORTANT - origin`, so don't reorder them.
-use crate::css::{LOGICAL, Prop, Style};
+use crate::css::{properties::LOGICAL, properties::Prop, properties::Style};
 use bbtree::unsync::BBTreeMap;
 pub(crate) const AGENT: u8 = 0;
 pub(crate) const USER: u8 = 1;

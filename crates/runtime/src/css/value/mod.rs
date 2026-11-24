@@ -1,15 +1,17 @@
-pub(crate) mod color;
-pub(super) mod counter;
-pub(super) mod easing;
-pub(super) mod grammar;
-pub(super) mod resolved;
-pub(super) mod shorthand;
-pub(super) mod specified;
-pub(super) mod tokens;
-pub(super) mod transform;
-pub(super) mod units;
+pub mod color;
+pub(crate) mod counter;
+pub(crate) mod easing;
+pub(crate) mod grammar;
+pub(crate) mod resolved;
+pub(crate) mod shorthand;
+pub(crate) mod specified;
+pub(crate) mod tokens;
+pub(crate) mod transform;
+pub(crate) mod units;
 
-use crate::css::{Kind, Lengths, components, paint};
+use crate::css::{
+    value::color::paint, value::tokens::components, value::units::Kind, value::units::Lengths,
+};
 
 // The superellipse parameter of a `corner-shape` value, like 2 for `squircle`.
 pub(crate) fn corner_shape(value: &str) -> Option<f64> {

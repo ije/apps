@@ -30,8 +30,8 @@ fn scrollbar_parts_reach_scroll_containers_only() {
 fn shadows_split_inset_and_outer_lists() {
     let units = Lengths::new(16., 800., 600.);
     let value = "inset 0 0 0 2px red, 0 4px 8px blue, inset 1px 2px 6px green";
-    let outer = crate::css::box_shadows(&units, value, false);
-    let inset = crate::css::box_shadows(&units, value, true);
+    let outer = crate::css::value::box_shadows(&units, value, false);
+    let inset = crate::css::value::box_shadows(&units, value, true);
     assert_eq!(outer.len(), 1);
     assert_eq!(outer[0].blur_radius, renderer::px(4.));
     assert_eq!(inset.len(), 2);
@@ -128,7 +128,7 @@ fn hosts_take_pseudo_elements_from_their_shadow_tree() {
     doc.nodes[host].attrs.set("class", "on");
     let out = shadowed(&doc, &shadows, &mut cache, &mut last);
     assert_eq!(out.pseudos[&host][1].get(Prop::CONTENT), Some("'B'"));
-    doc.nodes[host].state = crate::css::HOVER;
+    doc.nodes[host].state = crate::css::selector::HOVER;
     let out = shadowed(&doc, &shadows, &mut cache, &mut last);
     assert_eq!(out.pseudos[&host][1].get(Prop::COLOR), Some("purple"));
     #[cfg(debug_assertions)]
@@ -361,8 +361,8 @@ fn slotted_and_part_rules_style_pseudo_elements() {
     assert_eq!(out.starting[&a].get(Prop::OPACITY), Some("0"));
     assert_eq!(out.starting[&p].get(Prop::OPACITY), Some("0.5"));
     assert!(!out.starting.contains_key(&b));
-    doc.nodes[a].state = crate::css::HOVER;
-    doc.nodes[p].state = crate::css::HOVER;
+    doc.nodes[a].state = crate::css::selector::HOVER;
+    doc.nodes[p].state = crate::css::selector::HOVER;
     doc.nodes[p].attrs.set("class", "x");
     let out = shadowed(&doc, &shadows, &mut cache, &mut last);
     assert_eq!(out.values[a].get(Prop::COLOR), Some("green"));
@@ -420,7 +420,7 @@ fn parts_take_pseudo_classes_names_and_their_own_trees_host_rules() {
         assert_eq!(get(t, Prop::MARGIN_BOTTOM).as_deref(), Some("9px"));
     };
     step(&doc, false, true);
-    doc.nodes[p].state = crate::css::HOVER;
+    doc.nodes[p].state = crate::css::selector::HOVER;
     step(&doc, true, true);
     doc.nodes[host].attrs.set("class", "off");
     step(&doc, true, false);

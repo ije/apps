@@ -1,6 +1,6 @@
 use super::paint::Effected;
 use crate::css;
-use crate::css::Prop;
+use crate::css::properties::Prop;
 use crate::style;
 use renderer::{Child, px};
 use std::{
@@ -111,7 +111,7 @@ pub(super) fn canvas_source(
     let style = &styles.values[html];
     let painted = style
         .get(Prop::BACKGROUND_COLOR)
-        .and_then(css::color)
+        .and_then(css::value::color::color)
         .is_some_and(|color| color.1 > 0)
         || style
             .get(Prop::BACKGROUND_IMAGE)
@@ -132,7 +132,7 @@ enum ImageLayer {
 // The layers of `background-image`. A box that builds again on each frame keeps its style value, which can hold
 // large `data:` URLs, so its layers are parsed once per value.
 fn image_layers(
-    style: &css::Style,
+    style: &css::properties::Style,
     base: Option<&url::Url>,
     assets: &HashMap<String, std::path::PathBuf>,
 ) -> Rc<[ImageLayer]> {
@@ -151,7 +151,7 @@ fn image_layers(
         {
             return layers.clone();
         }
-        let layers: Rc<[ImageLayer]> = css::components(value, ',')
+        let layers: Rc<[ImageLayer]> = css::value::tokens::components(value, ',')
             .into_iter()
             .map(
                 |image| match image.strip_prefix("url(").and_then(|v| v.strip_suffix(')')) {
@@ -170,8 +170,8 @@ fn image_layers(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn css_background(
-    style: &css::Style,
-    units: css::Lengths,
+    style: &css::properties::Style,
+    units: css::value::units::Lengths,
     id: usize,
     slot: usize,
     radius: renderer::Radii<renderer::Length>,
@@ -184,7 +184,7 @@ pub(super) fn css_background(
     canvas: bool,
 ) -> Vec<Child> {
     let list = |prop| {
-        css::components(style.get(prop).unwrap_or(""), ',')
+        css::value::tokens::components(style.get(prop).unwrap_or(""), ',')
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>()
@@ -682,10 +682,12 @@ pub(super) fn css_background(
                 !canvas
                     && matches!(size.as_str(), "" | "auto" | "auto auto")
                     && (area == [0.; 4] || repeated)
-                    && css::components(&position, ' ').iter().all(|token| {
-                        token.ends_with('%')
-                            || matches!(*token, "left" | "right" | "top" | "bottom" | "center")
-                    })
+                    && css::value::tokens::components(&position, ' ')
+                        .iter()
+                        .all(|token| {
+                            token.ends_with('%')
+                                || matches!(*token, "left" | "right" | "top" | "bottom" | "center")
+                        })
             });
             let whole = |value: f32| (value * scale - (value * scale).round()).abs() < 0.01;
             let radii = corners(bounds);
@@ -910,7 +912,10 @@ pub(super) fn css_background(
         return layers.into_iter().map(Into::into).collect();
     }
     let mut group = renderer::node().absolute().top_0().left_0().size_full();
-    if let Some(ink) = style.get(Prop::BACKGROUND_COLOR).and_then(css::paint) {
+    if let Some(ink) = style
+        .get(Prop::BACKGROUND_COLOR)
+        .and_then(css::value::color::paint)
+    {
         let mut color = renderer::node().absolute().size_full().bg(ink);
         color.style().corner_radii = radius;
         group = group.child(color);
@@ -941,8 +946,8 @@ pub(super) const BORDER_IMAGE: usize = usize::MAX - 63;
 /// The `border-image` of a box, as a node in its padding box. `None` when the box draws its normal border: without a
 /// source, or when the source file doesn't exist.
 pub(super) fn border_image(
-    style: &css::Style,
-    units: css::Lengths,
+    style: &css::properties::Style,
+    units: css::value::units::Lengths,
     id: usize,
     slot: usize,
     borders: [f32; 4],
@@ -978,10 +983,11 @@ pub(super) fn border_image(
     let file = path.to_string_lossy().into_owned();
     // The four sides of a longhand, in CSS order.
     let sides = |prop, initial: &str| -> [String; 4] {
-        let parts: Vec<&str> = css::components(style.get(prop).unwrap_or(initial), ' ')
-            .into_iter()
-            .filter(|part| *part != "fill")
-            .collect();
+        let parts: Vec<&str> =
+            css::value::tokens::components(style.get(prop).unwrap_or(initial), ' ')
+                .into_iter()
+                .filter(|part| *part != "fill")
+                .collect();
         let at = |index: usize, fallback: usize| {
             parts
                 .get(index)

@@ -1,5 +1,5 @@
 use super::super::{StyleCache, compute_styles};
-use crate::css::{Prop, length};
+use crate::css::{properties::Prop, value::length};
 use crate::dom::Document;
 use std::{collections::HashMap, fmt::Write, rc::Rc};
 
@@ -9,7 +9,7 @@ fn computed(source: &str, hovered: Option<&str>) -> (Document, super::super::Com
         let id = (0..doc.nodes.len())
             .find(|&id| doc.matches(id, selector))
             .unwrap();
-        doc.nodes[id].state = crate::css::HOVER;
+        doc.nodes[id].state = crate::css::selector::HOVER;
     }
     let styles = compute_styles(
         &doc,
@@ -1067,7 +1067,11 @@ fn bg_glass_tint_tracks_runtime_theme_overrides_and_apply() {
         doc.nodes[root]
             .attrs
             .set("class", if night { "night" } else { "" });
-        doc.nodes[hovered].state = if night { crate::css::HOVER } else { 0 };
+        doc.nodes[hovered].state = if night {
+            crate::css::selector::HOVER
+        } else {
+            0
+        };
         let styles = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
         let fresh = compute_styles(
             &doc,

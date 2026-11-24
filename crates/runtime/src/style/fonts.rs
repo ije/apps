@@ -1,4 +1,4 @@
-use crate::css::{Declaration, Rule, components};
+use crate::css::{sheet::Declaration, sheet::Rule, value::tokens::components};
 use crate::dom::Document;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;

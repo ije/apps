@@ -1,6 +1,6 @@
 use crate::css;
-use crate::css::Prop;
-use crate::css::Style;
+use crate::css::properties::Prop;
+use crate::css::properties::Style;
 use renderer::{
     Button, Color, Corners, Edges, Event, Hit, Pixels, Point, Rect, Region, ScrollRef, Timer,
     Window, point, px, size,
@@ -27,20 +27,25 @@ struct Part {
 }
 
 impl Part {
-    fn new(style: &Style, units: &css::Lengths, thickness: f32) -> Self {
+    fn new(style: &Style, units: &css::value::units::Lengths, thickness: f32) -> Self {
         let length = |prop| {
             style
                 .get(prop)
-                .and_then(|value| units.resolve(css::components(value, ' ').first()?, thickness))
+                .and_then(|value| {
+                    units.resolve(
+                        css::value::tokens::components(value, ' ').first()?,
+                        thickness,
+                    )
+                })
                 .unwrap_or(0.)
                 .max(0.)
         };
         let color = |prop| {
             style
                 .get(prop)
-                .and_then(css::color)
+                .and_then(css::value::color::color)
                 .map_or(Color::TRANSPARENT, |(ink, alpha)| {
-                    crate::css::rgba((ink, alpha))
+                    crate::css::value::color::rgba((ink, alpha))
                 })
         };
         let border = if style
@@ -102,7 +107,7 @@ impl Look {
     pub(crate) fn new(
         style: &Style,
         parts: Option<&[Option<Style>; 5]>,
-        units: &css::Lengths,
+        units: &css::value::units::Lengths,
         backdrop: Option<u32>,
     ) -> Option<Self> {
         let width = style.get(Prop::SCROLLBAR_WIDTH).unwrap_or("auto");
@@ -123,9 +128,10 @@ impl Look {
             },
             thin: width == "thin",
             colors: style.get(Prop::SCROLLBAR_COLOR).and_then(|value| {
-                let parts = css::components(value, ' ');
-                let [thumb, track] = [parts.first()?, parts.get(1)?].map(|value| css::color(value));
-                Some([thumb?, track?].map(crate::css::rgba))
+                let parts = css::value::tokens::components(value, ' ');
+                let [thumb, track] =
+                    [parts.first()?, parts.get(1)?].map(|value| css::value::color::color(value));
+                Some([thumb?, track?].map(crate::css::value::color::rgba))
             }),
             custom: None,
             forced: [

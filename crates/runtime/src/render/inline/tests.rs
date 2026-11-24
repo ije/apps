@@ -1,5 +1,4 @@
 use super::*;
-use crate::css::*;
 use crate::dom::Document;
 use crate::style::*;
 use std::collections::HashMap;

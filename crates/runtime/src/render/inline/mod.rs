@@ -1,4 +1,8 @@
-use crate::css::{BORDERS, Lengths, MARGIN, PADDING, Prop, Style, color, components, paint, rgba};
+use crate::css::{
+    properties::BORDERS, properties::MARGIN, properties::PADDING, properties::Prop,
+    properties::Style, value::color::color, value::color::paint, value::color::rgba,
+    value::tokens::components, value::units::Lengths,
+};
 use crate::dom::Document;
 use crate::style::ComputedStyles;
 use crate::style::{

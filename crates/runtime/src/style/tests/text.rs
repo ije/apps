@@ -854,7 +854,7 @@ fn review_cases_follow_chrome() {
         ("calc(2000) 12px serif", "calc(2000)", "12px"),
     ] {
         let mut out = Vec::new();
-        crate::css::expand("font", value, &mut out);
+        crate::css::value::shorthand::expand("font", value, &mut out);
         let get = |name| {
             out.iter()
                 .find(|(key, _)| key == name)
@@ -867,7 +867,7 @@ fn review_cases_follow_chrome() {
         );
     }
     let mut out = Vec::new();
-    crate::css::expand("font", "bold calc(1px) a", &mut out);
+    crate::css::value::shorthand::expand("font", "bold calc(1px) a", &mut out);
     assert!(
         out.iter()
             .any(|(key, value)| key == "font-size" && value == "calc(1px)")
@@ -884,7 +884,7 @@ fn review_cases_follow_chrome() {
     }
     for value in ["12px 1001", "bold 900 12px a", "900 bold 12px a"] {
         let mut out = Vec::new();
-        crate::css::expand("font", value, &mut out);
+        crate::css::value::shorthand::expand("font", value, &mut out);
         assert!(out.is_empty(), "{value}");
     }
 }

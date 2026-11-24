@@ -1,5 +1,5 @@
 use crate::{
-    css::{Declarations, Stylesheet},
+    css::{sheet::Declarations, sheet::Stylesheet},
     dom::Document,
 };
 use anyhow::{Context, Result, ensure};

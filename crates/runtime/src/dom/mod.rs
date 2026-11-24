@@ -1,9 +1,9 @@
-use crate::css::ACTIVE;
-use crate::css::FOCUS;
-use crate::css::FOCUS_VISIBLE;
-use crate::css::FOCUS_WITHIN;
-use crate::css::HOVER;
-use crate::css::Selector;
+use crate::css::selector::ACTIVE;
+use crate::css::selector::FOCUS;
+use crate::css::selector::FOCUS_VISIBLE;
+use crate::css::selector::FOCUS_WITHIN;
+use crate::css::selector::HOVER;
+use crate::css::selector::Selector;
 mod document;
 mod entities;
 mod selector;
@@ -12,7 +12,7 @@ pub use document::{Document, Node, escape};
 pub(crate) use selector::{Dependency, Named, SelectorCache};
 
 use crate::css;
-use crate::css::Prop;
+use crate::css::properties::Prop;
 use crate::style;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -64,8 +64,8 @@ pub(crate) struct LayoutNode {
     pub shape: u64,
     pub attrs: u64,
     pub seen: u64,
-    pub style: Rc<css::Style>,
-    pub pseudos: Option<Rc<[css::Style; 2]>>,
+    pub style: Rc<css::properties::Style>,
+    pub pseudos: Option<Rc<[css::properties::Style; 2]>>,
     pub units: u64,
     pub list: u64,
     pub kids: u64,
@@ -1544,7 +1544,7 @@ pub fn call(
     if op == "dom.easing" {
         let progress = args[1].as_f64().unwrap_or(0.);
         return Ok(json!(
-            css::Easing::parse(args[0].as_str().unwrap_or("linear"))
+            css::value::easing::Easing::parse(args[0].as_str().unwrap_or("linear"))
                 .map_or(progress, |easing| easing.at(progress, args[2] == true))
         ));
     }
@@ -1634,19 +1634,19 @@ pub fn call(
             .styles
             .sheets
             .entry(source.as_str().into())
-            .or_insert_with(|| Rc::new(css::Stylesheet::parse(&source)));
+            .or_insert_with(|| Rc::new(css::sheet::Stylesheet::parse(&source)));
         return Ok(sheet.matches_media(viewport[0], viewport[1], theme).into());
     }
     if op == "dom.properties" {
-        return Ok(json!(css::Prop::names()));
+        return Ok(json!(css::properties::Prop::names()));
     }
     if op == "dom.aliases" {
-        let aliases = css::Prop::names()
+        let aliases = css::properties::Prop::names()
             .iter()
             .map(|name| format!("-webkit-{name}"));
         return Ok(json!(
             aliases
-                .filter(|alias| css::Prop::unprefixed(alias).is_some())
+                .filter(|alias| css::properties::Prop::unprefixed(alias).is_some())
                 .collect::<Vec<_>>()
         ));
     }
@@ -1656,14 +1656,14 @@ pub fn call(
         )));
     }
     if op == "dom.specified" {
-        return Ok(json!(css::specified(
+        return Ok(json!(css::value::specified::specified(
             args[0].as_str().unwrap_or_default(),
             args[1].as_str().unwrap_or_default()
         )));
     }
     if op == "dom.declare" {
         return Ok(json!(
-            css::declare(args[0].as_str().unwrap_or_default()).concat()
+            css::sheet::declare(args[0].as_str().unwrap_or_default()).concat()
         ));
     }
     if matches!(
@@ -1675,8 +1675,10 @@ pub fn call(
             "dom.supports" => {
                 let name = args[0].as_str().context("Expected CSS text")?;
                 return Ok(json!(match args[1].as_str() {
-                    Some(value) => css::supports(&name.to_ascii_lowercase(), value) == Some(true),
-                    None => css::supports_condition(name),
+                    Some(value) =>
+                        css::value::grammar::supports(&name.to_ascii_lowercase(), value)
+                            == Some(true),
+                    None => css::sheet::parser::supports_condition(name),
                 }));
             }
             "dom.registerProperty" => {
@@ -1689,11 +1691,11 @@ pub fn call(
                     args[2].as_bool().unwrap_or(false),
                     initial.map_or(String::new(), |value| format!("initial-value:{value}"))
                 );
-                let registered = css::Stylesheet::parse(&rule).property();
+                let registered = css::sheet::Stylesheet::parse(&rule).property();
                 // `Prop::new` leaks the names it interns, so only a valid new registration interns one.
                 match registered {
                     _ if !name.starts_with("--") => Err("SyntaxError"),
-                    _ if css::Prop::find(name)
+                    _ if css::properties::Prop::find(name)
                         .is_some_and(|prop| state.styles.cache.scripted.contains_key(&prop)) =>
                     {
                         Err("InvalidModificationError")
@@ -1703,7 +1705,7 @@ pub fn call(
                             .styles
                             .cache
                             .scripted
-                            .insert(css::Prop::new(name), value);
+                            .insert(css::properties::Prop::new(name), value);
                         Ok(Value::Null)
                     }
                     None => Err("SyntaxError"),
@@ -1727,9 +1729,9 @@ pub fn call(
             _ => {
                 let id = args[0].as_u64().context("Expected a sheet")? as u32;
                 match args[1].as_str().unwrap_or_default() {
-                    "parse" => return Ok(css::Stylesheet::parse(text).cssom()),
+                    "parse" => return Ok(css::sheet::Stylesheet::parse(text).cssom()),
                     kind @ ("replace" | "load") => {
-                        let sheet = css::Stylesheet::parse(text);
+                        let sheet = css::sheet::Stylesheet::parse(text);
                         let tree = if kind == "load" {
                             Value::Null
                         } else {
@@ -2416,9 +2418,12 @@ pub fn call(
                     && unsafe { *state.bounds.flags(node) } & MIRROR_HIDDEN == 0
             };
             // Padding, plus borders when `borders`, of each side, with percentages of `base`.
-            let edges = |style: &css::Style, units: &css::Lengths, base, borders| {
-                let mut edges = units.edges(style, css::PADDING, base);
-                for (edge, [width, kind, _]) in edges.iter_mut().zip(css::BORDERS) {
+            let edges = |style: &css::properties::Style,
+                         units: &css::value::units::Lengths,
+                         base,
+                         borders| {
+                let mut edges = units.edges(style, css::properties::PADDING, base);
+                for (edge, [width, kind, _]) in edges.iter_mut().zip(css::properties::BORDERS) {
                     if borders
                         && style
                             .get(kind)
@@ -2555,8 +2560,10 @@ pub fn call(
                     })
                 });
             let value = |name: &str| -> String {
-                let name = css::physical_name(style, name);
-                let get = |name| css::resolved(style, &units, name, size, &container, &registry);
+                let name = css::value::resolved::physical_name(style, name);
+                let get = |name| {
+                    css::value::resolved::resolved(style, &units, name, size, &container, &registry)
+                };
                 let value = get(&name);
                 match (&*name, value.as_str()) {
                     ("display", display_value) if pseudo.is_empty() => {
@@ -2608,7 +2615,9 @@ pub fn call(
                                 .map(|rect| rect[2 + axis])
                         });
                         match viewport.and_then(|base| units.resolve(given, base)) {
-                            Some(length) => format!("{}px", css::number(f64::from(length))),
+                            Some(length) => {
+                                format!("{}px", css::value::tokens::number(f64::from(length)))
+                            }
                             None => "0px".to_owned(),
                         }
                     }
@@ -2629,7 +2638,7 @@ pub fn call(
                                 .and_then(|px| px.parse::<f32>().ok())
                             {
                                 Some(px) if px != 0. => {
-                                    format!("{}px", css::number(f64::from(-px)))
+                                    format!("{}px", css::value::tokens::number(f64::from(-px)))
                                 }
                                 _ => "0px".to_owned(),
                             };
@@ -2653,7 +2662,9 @@ pub fn call(
                                 renderer::point(renderer::px(0.), renderer::px(0.)),
                                 renderer::size(renderer::px(size[0]), renderer::px(size[1])),
                             );
-                            let center = match crate::css::transform(style, &units, bounds, None) {
+                            let center = match crate::css::value::transform::transform(
+                                style, &units, bounds, None,
+                            ) {
                                 Some(m) if m[3] == 0. && m[7] == 0. && m[15] == 1. => {
                                     let [cx, cy] = [size[0] / 2., size[1] / 2.];
                                     [m[0] * cx + m[4] * cy + m[12], m[1] * cx + m[5] * cy + m[13]]
@@ -2665,7 +2676,7 @@ pub fn call(
                         let Some(size) = size else {
                             return value;
                         };
-                        let margin = units.edges(style, css::MARGIN, block[2]);
+                        let margin = units.edges(style, css::properties::MARGIN, block[2]);
                         let start = corner[axis] - margin[3 - 3 * axis] - block[axis];
                         let used = if name == "top" || name == "left" {
                             start
@@ -2676,7 +2687,10 @@ pub fn call(
                                 - margin[3 - 3 * axis]
                                 - margin[1 + axis]
                         };
-                        format!("{}px", css::number(f64::from((used * 64.).round() / 64.)))
+                        format!(
+                            "{}px",
+                            css::value::tokens::number(f64::from((used * 64.).round() / 64.))
+                        )
                     }
                     ("margin-left" | "margin-right", "auto") if size.is_some() => {
                         if !flow || position == "absolute" || position == "fixed" {
@@ -2703,7 +2717,10 @@ pub fn call(
                             Some(_) => free,
                             None => free / 2.,
                         };
-                        format!("{}px", css::number(f64::from((used * 64.).round() / 64.)))
+                        format!(
+                            "{}px",
+                            css::value::tokens::number(f64::from((used * 64.).round() / 64.))
+                        )
                     }
                     ("margin-top" | "margin-bottom", "auto") if size.is_some() => "0px".to_owned(),
                     // Layout gives a pseudo-element box its padding, so its sizes are not resolved again.
@@ -2747,7 +2764,9 @@ pub fn call(
                         };
                         format!(
                             "{}px",
-                            css::number(f64::from((used.max(0.) * 64.).round() / 64.))
+                            css::value::tokens::number(f64::from(
+                                (used.max(0.) * 64.).round() / 64.
+                            ))
                         )
                     }
                     // The image layers set the number of layers of the other lists.
@@ -2773,8 +2792,8 @@ pub fn call(
                         } else {
                             "background-image"
                         };
-                        let count = css::components(&get(image), ',').len();
-                        let layers = css::components(&value, ',');
+                        let count = css::value::tokens::components(&get(image), ',').len();
+                        let layers = css::value::tokens::components(&value, ',');
                         if layers.len() == count {
                             return value;
                         }
@@ -2796,11 +2815,14 @@ pub fn call(
                         };
                         let used = &tracks[usize::from(name == "grid-template-rows")];
                         let mut used = used.iter().map(|&track| {
-                            format!("{}px", css::number(f64::from((track * 64.).round() / 64.)))
+                            format!(
+                                "{}px",
+                                css::value::tokens::number(f64::from((track * 64.).round() / 64.))
+                            )
                         });
                         // `repeat()` with a count gives its tracks and names that many times.
                         let mut parts = Vec::new();
-                        for part in css::components(&value, ' ') {
+                        for part in css::value::tokens::components(&value, ' ') {
                             let repeat = part
                                 .strip_prefix("repeat(")
                                 .and_then(|inner| inner.strip_suffix(')')?.split_once(','))
@@ -2810,7 +2832,7 @@ pub fn call(
                             match repeat {
                                 Some((count, body)) => {
                                     for _ in 0..count.min(1000) {
-                                        parts.extend(css::components(body, ' '));
+                                        parts.extend(css::value::tokens::components(body, ' '));
                                     }
                                 }
                                 None => parts.push(part),
@@ -2857,7 +2879,7 @@ pub fn call(
                         let quote = |text: String| {
                             format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
                         };
-                        for part in css::components(&value, ' ') {
+                        for part in css::value::tokens::components(&value, ' ') {
                             let mut input = cssparser::Parser::new(part);
                             let mut strings = None::<String>;
                             while let Ok(string) = input.expect_string() {
@@ -2889,11 +2911,13 @@ pub fn call(
                         ["margin-top", "margin-right", "margin-bottom", "margin-left"]
                     }
                     .map(value);
-                    json!(css::shortest(sides.each_ref().map(String::as_str)))
+                    json!(css::value::specified::shortest(
+                        sides.each_ref().map(String::as_str)
+                    ))
                 }
                 Some(name) => json!(value(name)),
                 None => json!(
-                    css::computed_names()
+                    css::value::grammar::computed_names()
                         .chain(style.vars().iter().map(|(prop, _)| prop.name()))
                         .collect::<Vec<_>>()
                 ),
@@ -3272,7 +3296,7 @@ pub fn call(
                     let new = Drawn {
                         matrix: matrix
                             .or(old.as_ref().map(|old| old.matrix))
-                            .unwrap_or(crate::css::IDENTITY),
+                            .unwrap_or(crate::css::value::transform::IDENTITY),
                         clip: clip.or(old.as_ref().and_then(|old| old.clip)),
                         order: match &old {
                             Some(old) if args[4] == true => old.order,
@@ -3328,22 +3352,24 @@ pub fn call(
             args[1].as_str().unwrap_or("")
         ))),
         // As a canvas serializes a color: `#rrggbb`, or `rgba()` with the shortest alpha that rounds back.
-        "dom.canvasColor" => Ok(match crate::css::color(args[1].as_str().unwrap_or("")) {
-            Some((rgb, 255)) => json!(format!("#{:06x}", rgb & 0xff_ffff)),
-            Some((rgb, alpha)) => {
-                let [_, r, g, b] = rgb.to_be_bytes();
-                let value = (1..=3)
-                    .map(|digits| format!("{:.*}", digits, f64::from(alpha) / 255.))
-                    .find(|text| {
-                        text.parse::<f64>()
-                            .is_ok_and(|v| (v * 255.).round() as u8 == alpha)
-                    })
-                    .unwrap_or_else(|| format!("{:.3}", f64::from(alpha) / 255.));
-                let value = value.trim_end_matches('0').trim_end_matches('.');
-                json!(format!("rgba({r}, {g}, {b}, {value})"))
-            }
-            None => Value::Null,
-        }),
+        "dom.canvasColor" => Ok(
+            match crate::css::value::color::color(args[1].as_str().unwrap_or("")) {
+                Some((rgb, 255)) => json!(format!("#{:06x}", rgb & 0xff_ffff)),
+                Some((rgb, alpha)) => {
+                    let [_, r, g, b] = rgb.to_be_bytes();
+                    let value = (1..=3)
+                        .map(|digits| format!("{:.*}", digits, f64::from(alpha) / 255.))
+                        .find(|text| {
+                            text.parse::<f64>()
+                                .is_ok_and(|v| (v * 255.).round() as u8 == alpha)
+                        })
+                        .unwrap_or_else(|| format!("{:.3}", f64::from(alpha) / 255.));
+                    let value = value.trim_end_matches('0').trim_end_matches('.');
+                    json!(format!("rgba({r}, {g}, {b}, {value})"))
+                }
+                None => Value::Null,
+            },
+        ),
         "dom.fontSources" => Ok(json!(crate::render::fonts::sources(
             args[1].as_str().context("Expected font sources")?
         ))),
@@ -3585,7 +3611,7 @@ pub fn call(
                 .borders(now, base)
                 .map(|width| width / if shared { 2. } else { 1. });
             let padding = units
-                .edges(now, css::PADDING, base)
+                .edges(now, css::properties::PADDING, base)
                 .map(|value| value.max(0.));
             let bars = state
                 .scroll
@@ -3631,7 +3657,7 @@ pub fn call(
             );
             // The bounds are those of the last frame, so its animated transform moved them.
             let shift = match transformed
-                .then(|| crate::css::transform(now, units, local, None))
+                .then(|| crate::css::value::transform::transform(now, units, local, None))
                 .flatten()
             {
                 Some(m) if m[3] == 0. && m[7] == 0. && m[15] == 1. => {
@@ -4492,7 +4518,7 @@ pub(crate) fn hit_test(
                         let (style, units) = (&computed.values[canvas], &computed.lengths[canvas]);
                         let (border, padding) = (
                             units.borders(style, wide),
-                            units.edges(style, css::PADDING, wide),
+                            units.edges(style, css::properties::PADDING, wide),
                         );
                         let [x, y] = [
                             x + left + border[3] + padding[3],
@@ -4750,7 +4776,7 @@ pub(crate) fn styles(
 }
 
 // Like Chrome, a change of these properties of the scroll anchor or a box around it keeps the scroll offset.
-pub(crate) const ANCHORING_PROPS: css::PropSet = css::PropSet::new(&[
+pub(crate) const ANCHORING_PROPS: css::properties::PropSet = css::properties::PropSet::new(&[
     Prop::POSITION,
     Prop::TOP,
     Prop::RIGHT,
@@ -4810,14 +4836,14 @@ fn path(kind: &str, value: &Value) -> (Vec<usize>, Option<(usize, bool)>) {
     (path, top)
 }
 
-fn edit<'a>(kind: &str, text: &'a str) -> css::Edit<'a> {
+fn edit<'a>(kind: &str, text: &'a str) -> css::sheet::Edit<'a> {
     match kind {
-        "insert" => css::Edit::Insert(text),
-        "style" => css::Edit::Declarations(text),
-        "selector" => css::Edit::Selector(text),
-        "keyframe" => css::Edit::Keyframe(text),
-        "replace" => css::Edit::Replace(text),
-        _ => css::Edit::Delete,
+        "insert" => css::sheet::Edit::Insert(text),
+        "style" => css::sheet::Edit::Declarations(text),
+        "selector" => css::sheet::Edit::Selector(text),
+        "keyframe" => css::sheet::Edit::Keyframe(text),
+        "replace" => css::sheet::Edit::Replace(text),
+        _ => css::sheet::Edit::Delete,
     }
 }
 
@@ -5750,12 +5776,12 @@ mod tests {
         styles(&mut doc, &mut state, [800., 600.]);
         for (name, initial) in [("--w", "initial-value:7px"), ("--x", "")] {
             let rule = format!("@property {name}{{syntax:\"*\";inherits:false;{initial}}}");
-            let value = css::Stylesheet::parse(&rule).property().unwrap();
+            let value = css::sheet::Stylesheet::parse(&rule).property().unwrap();
             state
                 .styles
                 .cache
                 .scripted
-                .insert(css::Prop::new(name), value);
+                .insert(css::properties::Prop::new(name), value);
         }
         state.invalidate();
         let computed = styles(&mut doc, &mut state, [800., 600.]);

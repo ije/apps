@@ -1,6 +1,7 @@
 use crate::css::{
-    Declarations, FontUnits, Lengths, Prop, Registry, Selector, Style, Stylesheet, Vars, color,
-    number,
+    properties::Prop, properties::Registry, properties::Style, properties::Vars,
+    selector::Selector, sheet::Declarations, sheet::Stylesheet, value::color::color,
+    value::tokens::number, value::units::FontUnits, value::units::Lengths,
 };
 use crate::dom::{Document, SelectorCache};
 use crate::style::cascade::computed::{
@@ -1347,7 +1348,7 @@ pub(crate) fn compute_styles(
                     candidates.extend(&scoped.universal);
                     let classes = node.attrs.get("class").into_iter();
                     // Keys are lowercase. Only SVG names have uppercase letters, so HTML names need no copy.
-                    let lower = crate::css::lowercase;
+                    let lower = crate::css::selector::lowercase;
                     for (kind, name) in std::iter::once((2, lower(&node.tag)))
                         .chain(node.attrs.get("id").map(|id| (0, id.as_str().into())))
                         .chain(classes.flat_map(|c| {
@@ -2260,10 +2261,10 @@ pub(crate) fn compute_styles(
         }
         // AppKit draws the control, so the box has no padding, border or background.
         if node.native_control(&style).is_some() {
-            for prop in crate::css::PADDING
+            for prop in crate::css::properties::PADDING
                 .into_iter()
                 .chain(
-                    crate::css::BORDERS
+                    crate::css::properties::BORDERS
                         .into_iter()
                         .flat_map(|side| [side[0], side[1]]),
                 )

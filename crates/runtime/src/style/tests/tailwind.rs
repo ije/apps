@@ -55,7 +55,7 @@ fn math_values_work_in_variables_shorthands_shadows_and_utilities() {
     assert_eq!(units.edges(style, PADDING, 800.), [22., 30., 22., 30.]);
     assert_eq!(units.resolve(&style["height"], 600.), Some(560.));
     assert_eq!(units.resolve(&style["width"], 800.), Some(400.));
-    let shadows = crate::css::box_shadows(&units, &style["box-shadow"], false);
+    let shadows = crate::css::value::box_shadows(&units, &style["box-shadow"], false);
     assert_eq!(shadows[0].offset.y, renderer::px(30.));
     assert_eq!(shadows[0].blur_radius, renderer::px(4.));
 }
@@ -84,7 +84,7 @@ fn theme_colors_and_apply_reach_native_paint() {
     );
     assert!(!style.contains_key("border-top-left-radius"));
     let paint =
-        crate::css::box_shadows(&Lengths::new(16., 800., 600.), &style["box-shadow"], false);
+        crate::css::value::box_shadows(&Lengths::new(16., 800., 600.), &style["box-shadow"], false);
     let paint: Vec<_> = paint.iter().filter(|shadow| shadow.color.a > 0.).collect();
     assert_eq!(paint.len(), 2);
     assert_eq!(
@@ -140,7 +140,7 @@ fn theme_tokens_apply_order_and_scoped_overrides() {
     );
     assert_eq!(length(&style["width"], 799., 32., 799., 600.), 23.);
     assert_eq!(
-        crate::css::box_shadows(&Lengths::new(32., 799., 600.), &style["box-shadow"], false)
+        crate::css::value::box_shadows(&Lengths::new(32., 799., 600.), &style["box-shadow"], false)
             .iter()
             .filter(|shadow| shadow.color.a > 0.)
             .count(),
@@ -276,7 +276,11 @@ fn tailwind_state_variants_follow_interaction_states() {
     let mut sheets = HashMap::new();
     let mut cache = StyleCache::default();
     for hovered in [false, true, false] {
-        doc.nodes[card].state = if hovered { crate::css::HOVER } else { 0 };
+        doc.nodes[card].state = if hovered {
+            crate::css::selector::HOVER
+        } else {
+            0
+        };
         let cached = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
         let fresh = compute_styles(
             &doc,

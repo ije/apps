@@ -20,7 +20,7 @@ pub(crate) mod terminal;
 pub(crate) mod text;
 
 use crate::css;
-use crate::css::Prop;
+use crate::css::properties::Prop;
 use crate::{desktop::Desktop, host::Host, style};
 pub(crate) use element::dimension;
 use element::{Build, element};
@@ -753,8 +753,8 @@ impl PageView {
         let mut visible = std::mem::take(&mut dom.cull.visible);
         let mut previous = None;
         let patched = !same && walk(&doc, dom, &styles);
-        let none = |style: &Rc<css::Style>| style.get(Prop::DISPLAY) == Some("none");
-        let skips = |id: usize, style: &Rc<css::Style>| {
+        let none = |style: &Rc<css::properties::Style>| style.get(Prop::DISPLAY) == Some("none");
+        let skips = |id: usize, style: &Rc<css::properties::Style>| {
             let value = style.get(Prop::CONTENT_VISIBILITY);
             let tag = doc.nodes.get(id).map_or("", |node| node.tag.as_str());
             (
@@ -1018,7 +1018,7 @@ impl PageView {
             }
             paint.sort_unstable_by_key(|(id, _)| *id);
         }
-        let painting = |paint: &[(usize, Rc<css::Style>)], id: usize| {
+        let painting = |paint: &[(usize, Rc<css::properties::Style>)], id: usize| {
             paint.binary_search_by_key(&id, |(id, _)| *id).ok()
         };
         if !lengths.is_empty() {
@@ -1201,7 +1201,7 @@ impl PageView {
         let canvas = |id: usize| {
             styles.values[id]
                 .get(Prop::BACKGROUND_COLOR)
-                .and_then(css::color)
+                .and_then(css::value::color::color)
                 .filter(|color| color.1 > 0)
         };
         let dark = html
@@ -1406,7 +1406,7 @@ impl PageView {
             dom.cull.painted.clear();
             dom.cull.painted.extend(paint.iter().map(|(id, _)| *id));
             // Compare units too: equal style values can resolve differently after a root font change.
-            let units = |lengths: &css::Lengths| {
+            let units = |lengths: &css::value::units::Lengths| {
                 let [font, root] = [lengths.font, lengths.root];
                 let mut hasher = rustc_hash::FxHasher::default();
                 std::hash::Hash::hash(
@@ -1420,7 +1420,7 @@ impl PageView {
                 std::hash::Hasher::finish(&hasher)
             };
             let mut memo = rustc_hash::FxHashMap::default();
-            let mut own_flags = |tag: &str, style: &Rc<css::Style>, id: usize| {
+            let mut own_flags = |tag: &str, style: &Rc<css::properties::Style>, id: usize| {
                 let kind = if tag.starts_with('#') {
                     1
                 } else {
@@ -1488,7 +1488,7 @@ impl PageView {
                     let (Some(before), Some(now)) = (&old.pseudos, pseudos) else {
                         return Some(true);
                     };
-                    let positioned = |style: &css::Style| {
+                    let positioned = |style: &css::properties::Style| {
                         style
                             .get(Prop::POSITION)
                             .is_some_and(|value| matches!(value, "absolute" | "fixed"))
@@ -1907,7 +1907,7 @@ impl PageView {
                 dom.styles.checked.clear();
                 dom.styles.checked_values.clear();
             }
-            for name in css::DROPPED.take() {
+            for name in css::sheet::parser::DROPPED.take() {
                 if name.contains(':') {
                     if dom.styles.warned.insert(name.clone()) {
                         warnings.push(format!(
@@ -1988,7 +1988,7 @@ impl PageView {
                             {
                                 continue;
                             }
-                            _ => match css::supports(name, value) {
+                            _ => match css::value::grammar::supports(name, value) {
                                 None => "the property is not supported",
                                 Some(false) => "the value is not supported",
                                 Some(true) => continue,
@@ -2228,7 +2228,10 @@ impl PageView {
                     .get(Prop::VISIBILITY)
                     .is_none_or(|value| value == "visible")
                 {
-                    if let Some(color) = backdrop.get(Prop::BACKGROUND_COLOR).and_then(css::paint) {
+                    if let Some(color) = backdrop
+                        .get(Prop::BACKGROUND_COLOR)
+                        .and_then(css::value::color::paint)
+                    {
                         el = el.bg(color);
                     }
                     if backdrop.get(Prop::OPACITY).is_some() {
@@ -2323,8 +2326,11 @@ impl PageView {
                     Some(bounds) => {
                         let mut units = styles.lengths[id];
                         units.container = Some(patch.container);
-                        let margin =
-                            units.edges(&styles.values[id], css::MARGIN, patch.containing[0]);
+                        let margin = units.edges(
+                            &styles.values[id],
+                            css::properties::MARGIN,
+                            patch.containing[0],
+                        );
                         element::place(child, margin, field.pixel_ratio, bounds)
                     }
                     None => child,
@@ -2402,8 +2408,11 @@ impl PageView {
                     Some(bounds) => {
                         let mut units = styles.lengths[id];
                         units.container = Some(patch.container);
-                        let margin =
-                            units.edges(&styles.values[id], css::MARGIN, patch.containing[0]);
+                        let margin = units.edges(
+                            &styles.values[id],
+                            css::properties::MARGIN,
+                            patch.containing[0],
+                        );
                         element::place(child, margin, inner.pixel_ratio, bounds)
                     }
                     None => child,
@@ -2701,7 +2710,7 @@ impl PageView {
 
 const BUTTONS: [u8; 5] = [1, 4, 2, 8, 16];
 const TRANSFORM_PROPS: [Prop; 4] = [Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE];
-// Must list every property that `effects::opacity` and `crate::css::transform` read.
+// Must list every property that `effects::opacity` and `crate::css::value::transform::transform` read.
 const COMPOSITED_PROPS: [Prop; 6] = [
     Prop::OPACITY,
     Prop::TRANSFORM,
@@ -2722,7 +2731,7 @@ pub(crate) fn composited(prop: Prop) -> bool {
 }
 
 /// The filter (0) or backdrop filter (1) of a style.
-fn filter(style: &css::Style, which: usize) -> Option<&str> {
+fn filter(style: &css::properties::Style, which: usize) -> Option<&str> {
     BLURS[which].iter().find_map(|&prop| style.get(prop))
 }
 
@@ -2732,7 +2741,7 @@ pub(super) fn pseudo_key(id: usize, slot: u8) -> u64 {
 }
 
 /// Whether an animated pair of pseudo-element styles differs from its base pair only in opacity.
-fn fades_only(base: &[css::Style; 2], pair: &[css::Style; 2]) -> bool {
+fn fades_only(base: &[css::properties::Style; 2], pair: &[css::properties::Style; 2]) -> bool {
     let rest = |(prop, _): &(Prop, &Rc<str>)| *prop != Prop::OPACITY;
     base.iter()
         .zip(pair.iter())
@@ -2740,7 +2749,7 @@ fn fades_only(base: &[css::Style; 2], pair: &[css::Style; 2]) -> bool {
 }
 
 /// Whether two styles differ only in what patches change: opacity, transforms and filters that are one `blur()`.
-fn composites(a: &css::Style, b: &css::Style) -> bool {
+fn composites(a: &css::properties::Style, b: &css::properties::Style) -> bool {
     let rest = |(prop, _): &(Prop, &Rc<str>)| {
         *prop != Prop::OPACITY
             && !TRANSFORM_PROPS.contains(prop)
@@ -2921,8 +2930,13 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
                 .any(|&prop| old.get(prop) != style.get(prop));
             let matrix = match composited_transforms.get(id).filter(|_| turns) {
                 Some((bounds, perspective)) => Some(
-                    crate::css::transform(style, &styles.lengths[*id], *bounds, *perspective)
-                        .unwrap_or(crate::css::IDENTITY),
+                    crate::css::value::transform::transform(
+                        style,
+                        &styles.lengths[*id],
+                        *bounds,
+                        *perspective,
+                    )
+                    .unwrap_or(crate::css::value::transform::IDENTITY),
                 ),
                 None if turns => return false,
                 None => None,
@@ -2955,7 +2969,7 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
                     |key: u64,
                      id: &usize,
                      slot: u8,
-                     base: &css::Style,
+                     base: &css::properties::Style,
                      transformed: Option<&CompositedTransform>| {
                         let origin = transformed
                             .filter(|(_, perspective)| perspective.is_none())
@@ -3024,13 +3038,13 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
                                     timeline
                                         .iter()
                                         .map(|style| {
-                                            crate::css::transform(
+                                            crate::css::value::transform::transform(
                                                 style,
                                                 &styles.lengths[*id],
                                                 bounds,
                                                 *perspective,
                                             )
-                                            .unwrap_or(crate::css::IDENTITY)
+                                            .unwrap_or(crate::css::value::transform::IDENTITY)
                                         })
                                         .collect()
                                 });
@@ -3052,19 +3066,23 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
                         if let Some(origin) = origin.filter(|_| local) {
                             let [x, y] = [f32::from(origin.x), f32::from(origin.y)];
                             let (there, back) = (
-                                crate::css::translate(x, y, 0.),
-                                crate::css::translate(-x, -y, 0.),
+                                crate::css::value::transform::translate(x, y, 0.),
+                                crate::css::value::transform::translate(-x, -y, 0.),
                             );
-                            let moved = samples.1.as_ref().map(|list: &Vec<crate::css::Matrix>| {
-                                list.iter()
-                                    .map(|matrix| {
-                                        crate::css::multiply(
-                                            &there,
-                                            &crate::css::multiply(matrix, &back),
-                                        )
-                                    })
-                                    .collect()
-                            });
+                            let moved = samples.1.as_ref().map(
+                                |list: &Vec<crate::css::value::transform::Matrix>| {
+                                    list.iter()
+                                        .map(|matrix| {
+                                            crate::css::value::transform::multiply(
+                                                &there,
+                                                &crate::css::value::transform::multiply(
+                                                    matrix, &back,
+                                                ),
+                                            )
+                                        })
+                                        .collect()
+                                },
+                            );
                             samples = Rc::new((samples.0.clone(), moved, samples.2));
                         }
                         samples.2
@@ -3373,7 +3391,7 @@ fn drop_hidden_images(
         }
     });
     dom.masks.retain(|&(id, slot), (_, image)| {
-        let masked = |style: &css::Style, props: &[Prop]| {
+        let masked = |style: &css::properties::Style, props: &[Prop]| {
             props
                 .iter()
                 .find_map(|&prop| style.get(prop))
@@ -3585,7 +3603,7 @@ mod tests {
     #[test]
     fn pseudo_layers_patch_only_opacity_changes() {
         let style = |props: &[(&str, &str)]| {
-            let mut style = css::Style::default();
+            let mut style = css::properties::Style::default();
             for (name, value) in props {
                 style.insert(Prop::find(name).unwrap(), Rc::from(*value));
             }
@@ -3606,7 +3624,7 @@ mod tests {
     #[test]
     fn blur_changes_patch_layers() {
         let style = |props: &[(&str, &str)]| {
-            let mut style = css::Style::default();
+            let mut style = css::properties::Style::default();
             for (name, value) in props {
                 style.insert(Prop::find(name).unwrap(), Rc::from(*value));
             }

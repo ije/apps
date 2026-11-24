@@ -1,4 +1,4 @@
-use crate::css::{Kind, Lengths, components};
+use crate::css::{value::tokens::components, value::units::Kind, value::units::Lengths};
 
 pub(crate) const BORDER_IMAGE: [&str; 5] = [
     "border-image-source",
@@ -642,7 +642,7 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                             ),
                             None => {
                                 part.eq_ignore_ascii_case("currentcolor")
-                                    || crate::css::color(part).is_some()
+                                    || crate::css::value::color::color(part).is_some()
                             }
                         }
                     {

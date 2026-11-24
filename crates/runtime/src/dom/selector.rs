@@ -1,16 +1,16 @@
 use super::Document;
-use crate::css::ACTIVE;
-use crate::css::Ancestry;
-use crate::css::BLOOM;
-use crate::css::Bloom;
-use crate::css::FOCUS;
-use crate::css::FOCUS_VISIBLE;
-use crate::css::FOCUS_WITHIN;
-use crate::css::HOVER;
-use crate::css::Selector;
-use crate::css::SimpleSelector;
-use crate::css::feature;
-use crate::css::lowercase;
+use crate::css::selector::ACTIVE;
+use crate::css::selector::Ancestry;
+use crate::css::selector::BLOOM;
+use crate::css::selector::Bloom;
+use crate::css::selector::FOCUS;
+use crate::css::selector::FOCUS_VISIBLE;
+use crate::css::selector::FOCUS_WITHIN;
+use crate::css::selector::HOVER;
+use crate::css::selector::Selector;
+use crate::css::selector::SimpleSelector;
+use crate::css::selector::feature;
+use crate::css::selector::lowercase;
 use std::{
     hash::{BuildHasher, Hash, Hasher},
     rc::Rc,
@@ -2086,17 +2086,17 @@ mod tests {
                 let style = &cached.values[id];
                 let position = shown.iter().position(|&shown| shown == index);
                 assert_eq!(
-                    style.get(crate::css::Prop::COLOR) == Some("red"),
+                    style.get(crate::css::properties::Prop::COLOR) == Some("red"),
                     position.is_some_and(|position| position % 2 == 0),
                     "step {step}: item {index}"
                 );
                 assert_eq!(
-                    style.get(crate::css::Prop::WIDTH) == Some("1px"),
+                    style.get(crate::css::properties::Prop::WIDTH) == Some("1px"),
                     shown.last() == Some(&index),
                     "step {step}: last {index}"
                 );
                 assert_eq!(
-                    style.get(crate::css::Prop::HEIGHT) == Some("2px"),
+                    style.get(crate::css::properties::Prop::HEIGHT) == Some("2px"),
                     index == owners[1],
                     "step {step}: marked {index}"
                 );
@@ -2591,7 +2591,7 @@ mod tests {
             );
             assert_eq!(cached.values, fresh.values, "step {step}");
             let color = |id: usize| {
-                let color = cached.values[id].get(crate::css::Prop::new("color"));
+                let color = cached.values[id].get(crate::css::properties::Prop::new("color"));
                 ["red", "blue"]
                     .into_iter()
                     .find(|&name| color.is_some_and(|value| value == name))
@@ -2690,7 +2690,7 @@ mod tests {
             for (index, (id, key, value)) in checks.into_iter().enumerate() {
                 assert_eq!(
                     cached.values[id]
-                        .get(crate::css::Prop::new(key))
+                        .get(crate::css::properties::Prop::new(key))
                         .is_some_and(|v| v == value),
                     expected.contains(&index),
                     "step {step}: {key}:{value}"

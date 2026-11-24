@@ -1,6 +1,7 @@
-use crate::css::Style;
+use crate::css::properties::Style;
 use crate::css::{
-    Declarations, Declared, MediaQuery, Prop, Registry, Rule, Selector, SelectorList, Stylesheet,
+    properties::Prop, properties::Registry, selector::Selector, selector::SelectorList,
+    sheet::Declarations, sheet::Declared, sheet::MediaQuery, sheet::Rule, sheet::Stylesheet,
 };
 use crate::dom::{Document, SelectorCache};
 use crate::style::StyleCache;
@@ -225,7 +226,7 @@ impl StyleScope {
                 name.split_ascii_whitespace()
                     .any(|class| classes.contains(class))
             };
-            let lower = crate::css::lowercase;
+            let lower = crate::css::selector::lowercase;
             if (tags.contains(&*lower(&node.tag))
                 || !attributes.is_empty()
                     && node

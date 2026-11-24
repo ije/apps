@@ -1,10 +1,15 @@
 use crate::css::value::grammar::grammar;
 use crate::css::value::specified::math_sum;
 use crate::css::{
-    BORDER_IMAGE, BORDERS, INITIAL, Kind, Lengths, PADDING, Prop, Registry, SHORTHANDS, Style,
-    area_cells, components, corner_shape, expand, number, specified, write_printed,
+    properties::BORDERS, properties::PADDING, properties::Prop, properties::Registry,
+    properties::Style, value::area_cells, value::corner_shape, value::grammar::INITIAL,
+    value::grammar::SHORTHANDS, value::shorthand::BORDER_IMAGE, value::shorthand::expand,
+    value::specified::specified, value::tokens::components, value::tokens::number,
+    value::tokens::write_printed, value::units::Kind, value::units::Lengths,
 };
-use crate::css::{LOGICAL, serialize_color, shortest};
+use crate::css::{
+    properties::LOGICAL, value::color::serialize as serialize_color, value::specified::shortest,
+};
 use std::borrow::Cow;
 pub(crate) fn resolved(
     style: &Style,
@@ -545,7 +550,7 @@ pub(crate) fn resolved(
             Some(k) if k.is_infinite() => {
                 format!("superellipse({}infinity)", if k < 0. { "-" } else { "" })
             }
-            Some(k) => format!("superellipse({})", crate::css::number(k)),
+            Some(k) => format!("superellipse({})", crate::css::value::tokens::number(k)),
             None => value,
         },
         "border-top-width" if none(Prop::BORDER_TOP_STYLE) => "0px".into(),
@@ -690,7 +695,7 @@ pub(crate) fn resolved(
                 renderer::point(renderer::px(0.), renderer::px(0.)),
                 renderer::size(renderer::px(width), renderer::px(height)),
             );
-            match crate::css::transform(&flat, units, bounds, None) {
+            match crate::css::value::transform::transform(&flat, units, bounds, None) {
                 Some(m)
                     if [m[2], m[3], m[6], m[7], m[8], m[9], m[11], m[14]] == [0.; 8]
                         && m[10] == 1.

@@ -1,4 +1,7 @@
-use crate::css::{Kind, Lengths, Prop, Style, components};
+use crate::css::{
+    properties::Prop, properties::Style, value::tokens::components, value::units::Kind,
+    value::units::Lengths,
+};
 use renderer::{Pixels, Rect};
 
 pub(crate) type Matrix = [f32; 16];

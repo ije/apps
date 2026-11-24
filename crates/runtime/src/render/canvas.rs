@@ -191,7 +191,7 @@ type Path2D = (Vec<f64>, [f64; 6], Option<skia::Path>);
 // in px and the families. `em` and `%` resolve against 10px, the default canvas font. `None` keeps the old font.
 pub fn font(value: &str) -> Option<String> {
     let mut longhands = Vec::new();
-    crate::css::expand("font", value.trim(), &mut longhands);
+    crate::css::value::shorthand::expand("font", value.trim(), &mut longhands);
     let get = |name: &str| {
         longhands
             .iter()
@@ -209,7 +209,7 @@ pub fn font(value: &str) -> Option<String> {
         "xxx-large" => 48.,
         "larger" => 12.,
         "smaller" => 10. / 1.2,
-        size => crate::css::Lengths::new(10., 0., 0.)
+        size => crate::css::value::units::Lengths::new(10., 0., 0.)
             .resolve(size, 10.)
             .filter(|size| *size >= 0.)?,
     };
@@ -226,16 +226,16 @@ pub fn font(value: &str) -> Option<String> {
                 .parse::<f32>()
                 .ok()
                 .filter(|w| (1. ..=1000.).contains(w))?;
-            crate::css::write_number(f64::from(weight), &mut out);
+            crate::css::value::tokens::write_number(f64::from(weight), &mut out);
             out.push(' ');
         }
     }
     if get("font-variant")? == "small-caps" {
         out.push_str("small-caps ");
     }
-    crate::css::write_number(f64::from(size), &mut out);
+    crate::css::value::tokens::write_number(f64::from(size), &mut out);
     out.push_str("px");
-    for (index, family) in crate::css::components(get("font-family")?, ',')
+    for (index, family) in crate::css::value::tokens::components(get("font-family")?, ',')
         .into_iter()
         .enumerate()
     {
@@ -262,10 +262,13 @@ pub fn line(
 ) -> (Rc<renderer::Line>, [f32; 4]) {
     let text = text.replace(['\n', '\r', '\t'], " ");
     let (size, family) = font.split_once("px").unwrap_or(("10", "sans-serif"));
-    let mut face = crate::style::font(&crate::css::Style::from_iter([
-        (crate::css::Prop::FONT_FAMILY, family.trim().into()),
+    let mut face = crate::style::font(&crate::css::properties::Style::from_iter([
         (
-            crate::css::Prop::FONT_WEIGHT,
+            crate::css::properties::Prop::FONT_FAMILY,
+            family.trim().into(),
+        ),
+        (
+            crate::css::properties::Prop::FONT_WEIGHT,
             size.split_whitespace()
                 .rev()
                 .skip(1)
@@ -274,7 +277,7 @@ pub fn line(
                 .into(),
         ),
         (
-            crate::css::Prop::FONT_STYLE,
+            crate::css::properties::Prop::FONT_STYLE,
             if size.contains("italic") {
                 "italic"
             } else {
@@ -347,7 +350,7 @@ fn gradient(spec: &str) -> Option<skia::Shader<'static>> {
     let stops = stops
         .iter()
         .filter_map(|(offset, color)| {
-            let (rgb, alpha) = crate::css::color(color)?;
+            let (rgb, alpha) = crate::css::value::color::color(color)?;
             let [_, r, g, b] = rgb.to_be_bytes();
             Some(skia::GradientStop::new(
                 *offset,
@@ -940,7 +943,7 @@ impl Canvas {
                             Brush::Pattern(pixels, [x != 0., y != 0.], m)
                         })
                     } else {
-                        crate::css::color(value).map(|(rgb, alpha)| {
+                        crate::css::value::color::color(value).map(|(rgb, alpha)| {
                             let [_, r, g, b] = rgb.to_be_bytes();
                             Brush::Shader(skia::Shader::SolidColor(skia::Color::from_rgba8(
                                 r, g, b, alpha,
@@ -1421,7 +1424,7 @@ impl Canvas {
                 39 => state.spacing[1] = a[0] as f32,
                 40 => state.smoothing = a[0] != 0.,
                 43 => {
-                    if let Some((rgb, alpha)) = crate::css::color(string(a[0])) {
+                    if let Some((rgb, alpha)) = crate::css::value::color::color(string(a[0])) {
                         let [_, r, g, b] = rgb.to_be_bytes();
                         state.shadow.0 = skia::Color::from_rgba8(r, g, b, alpha);
                     }

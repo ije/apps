@@ -2,7 +2,7 @@
 
 use super::PageState;
 use crate::css;
-use crate::css::Prop;
+use crate::css::properties::Prop;
 use crate::style;
 use crate::web::terminal::{
     BOLD, Cell, FAINT, FOCUS, Frame, INVERSE, INVISIBLE, ITALIC, OVERLINE, Placement, SCROLL_ROW,
@@ -54,11 +54,11 @@ const PALETTE: [Prop; 16] = [
 ];
 
 pub(super) fn look(
-    style: &css::Style,
-    selection: Option<&Rc<css::Style>>,
-    units: &css::Lengths,
+    style: &css::properties::Style,
+    selection: Option<&Rc<css::properties::Style>>,
+    units: &css::value::units::Lengths,
 ) -> Look {
-    let pick = |prop: Prop| style.get(prop).and_then(css::color);
+    let pick = |prop: Prop| style.get(prop).and_then(css::value::color::color);
     let set = |(rgb, _): (u32, u8)| 1 << 24 | rgb;
     let foreground = pick(Prop::COLOR).unwrap_or((0, 255));
     let luminance = |rgb: u32| {
@@ -307,7 +307,7 @@ impl Grid {
             host.pages
                 .get(&self.view.id)
                 .and_then(|page| page.doc.nodes.get(self.id))
-                .is_some_and(|node| node.state & crate::css::FOCUS != 0)
+                .is_some_and(|node| node.state & crate::css::selector::FOCUS != 0)
         });
         let scale = cx.window.scale_factor();
         if terminal

@@ -1,4 +1,4 @@
-use crate::css::{Registry, Stylesheet};
+use crate::css::{properties::Registry, sheet::Stylesheet};
 use crate::dom::Document;
 use crate::style::StyleCache;
 use std::collections::HashMap;

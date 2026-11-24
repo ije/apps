@@ -1,6 +1,8 @@
 use crate::css::{
-    LOGICAL, Prop, Registry, Style, Vars, computed, expand, fold, serialize_color, syntax_matches,
-    system_color,
+    properties::LOGICAL, properties::Prop, properties::Registry, properties::Style,
+    properties::Vars, value::color::serialize as serialize_color,
+    value::color::system as system_color, value::grammar::computed, value::grammar::fold,
+    value::grammar::syntax_matches, value::shorthand::expand,
 };
 use crate::style::used::dark;
 use std::rc::Rc;
@@ -296,7 +298,7 @@ pub(crate) fn resolve_style(
                 expanded
                     .get_or_insert_with(|| {
                         let mut expanded = Vec::new();
-                        if !crate::css::invalid(shorthand, value) {
+                        if !crate::css::sheet::parser::invalid(shorthand, value) {
                             expand(shorthand, value.trim(), &mut expanded);
                         }
                         expanded
@@ -314,7 +316,7 @@ pub(crate) fn resolve_style(
             None if raw.starts_with('\u{1}') => substituted.clone(),
             None => substituted.take(),
         }
-        .filter(|value| !crate::css::invalid(prop.name(), value))
+        .filter(|value| !crate::css::sheet::parser::invalid(prop.name(), value))
         .map(|value| fold(prop.name(), &value).unwrap_or(value));
         match value.map(Rc::from).or_else(|| {
             parent

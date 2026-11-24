@@ -10,7 +10,11 @@ fn glass_variants_follow_native_support_and_cached_states() {
     let mut sheets = HashMap::new();
     let mut cache = StyleCache::default();
     for (width, hovered) in [(800., false), (800., true), (600., true), (800., false)] {
-        doc.nodes[button].state = if hovered { crate::css::HOVER } else { 0 };
+        doc.nodes[button].state = if hovered {
+            crate::css::selector::HOVER
+        } else {
+            0
+        };
         let cached = compute_styles(&doc, width, 600., None, &mut sheets, &mut cache, None);
         let fresh = compute_styles(
             &doc,
@@ -132,9 +136,9 @@ fn glass_tints_follow_theme_changes_and_color_utilities() {
         doc.nodes[host]
             .attrs
             .set("class", if dark { "theme dark" } else { "theme" });
-        doc.nodes[variant].state = if dark { crate::css::HOVER } else { 0 };
+        doc.nodes[variant].state = if dark { crate::css::selector::HOVER } else { 0 };
         let hoveronly = element(&doc, "#hoveronly");
-        doc.nodes[hoveronly].state = if dark { crate::css::HOVER } else { 0 };
+        doc.nodes[hoveronly].state = if dark { crate::css::selector::HOVER } else { 0 };
         let cached = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
         let fresh = compute_styles(
             &doc,

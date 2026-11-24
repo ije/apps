@@ -1,5 +1,7 @@
 use crate::css::{
-    Easing, Lengths, Prop, Registry, Style, color, components, time, timing_function,
+    properties::Prop, properties::Registry, properties::Style, value::color::color,
+    value::easing::Easing, value::easing::time, value::easing::timing_function,
+    value::tokens::components, value::units::Lengths,
 };
 use std::borrow::Cow;
 use std::rc::Rc;
@@ -24,7 +26,7 @@ pub(crate) fn add(property: &str, under: &str, value: &str, accumulate: bool) ->
         (Some((a, unit)), Some((b, other))) if unit == other || a == 0. && unit.is_empty() => {
             Some(format!(
                 "{}{}",
-                crate::css::number(a + b - offset),
+                crate::css::value::tokens::number(a + b - offset),
                 if unit.is_empty() { other } else { unit }
             ))
         }
@@ -92,7 +94,7 @@ pub(crate) fn add(property: &str, under: &str, value: &str, accumulate: bool) ->
             channel(16),
             channel(8),
             channel(0),
-            crate::css::number(alpha)
+            crate::css::value::tokens::number(alpha)
         ));
     }
     let [a, b] = [under, value].map(|list| components(list, ' '));
@@ -345,8 +347,8 @@ pub(crate) fn rotation([x, y, z, w]: [f64; 4]) -> [f64; 16] {
 pub(crate) fn decompose(list: &str) -> Option<([f64; 13], bool)> {
     // Relative units and percentages give NaN with these units, so `math` rejects them.
     let units = Lengths {
-        font: crate::css::FontUnits::new(f32::NAN),
-        root: crate::css::FontUnits::new(f32::NAN),
+        font: crate::css::value::units::FontUnits::new(f32::NAN),
+        root: crate::css::value::units::FontUnits::new(f32::NAN),
         viewport: [f32::NAN; 2],
         container: None,
     };
@@ -357,7 +359,7 @@ pub(crate) fn decompose(list: &str) -> Option<([f64; 13], bool)> {
             .into_iter()
             .map(|arg| {
                 let (value, kind) = units.math(arg, f32::NAN, &[])?;
-                Some(if kind == crate::css::Kind::Angle {
+                Some(if kind == crate::css::value::units::Kind::Angle {
                     value.to_radians()
                 } else {
                     value
@@ -757,23 +759,28 @@ impl Lerp {
         }
         if let (Some(a), Some(b)) = (color(from), color(to)) {
             // As in browsers, colors interpolate in sRGB only when both are legacy sRGB colors.
-            return Some(match (crate::css::oklab(from), crate::css::oklab(to)) {
-                (Some((false, mut a)), Some((_, mut b)))
-                | (Some((_, mut a)), Some((false, mut b))) => {
-                    for (a, b) in a.iter_mut().zip(&mut b) {
-                        if a.is_nan() {
-                            *a = *b;
-                        } else if b.is_nan() {
-                            *b = *a;
+            return Some(
+                match (
+                    crate::css::value::color::oklab(from),
+                    crate::css::value::color::oklab(to),
+                ) {
+                    (Some((false, mut a)), Some((_, mut b)))
+                    | (Some((_, mut a)), Some((false, mut b))) => {
+                        for (a, b) in a.iter_mut().zip(&mut b) {
+                            if a.is_nan() {
+                                *a = *b;
+                            } else if b.is_nan() {
+                                *b = *a;
+                            }
                         }
+                        Self::Oklab(
+                            a.map(|v| if v.is_nan() { 0. } else { v }),
+                            b.map(|v| if v.is_nan() { 0. } else { v }),
+                        )
                     }
-                    Self::Oklab(
-                        a.map(|v| if v.is_nan() { 0. } else { v }),
-                        b.map(|v| if v.is_nan() { 0. } else { v }),
-                    )
-                }
-                _ => Self::Color(a, b),
-            });
+                    _ => Self::Color(a, b),
+                },
+            );
         }
         for separator in [',', ' '] {
             let (a, b) = (components(from, separator), components(to, separator));
@@ -863,7 +870,7 @@ impl Lerp {
             if integer {
                 let _ = write!(out, "{}", (value + 0.5).floor());
             } else {
-                crate::css::write_number(value, out);
+                crate::css::value::tokens::write_number(value, out);
             }
         };
         match self {

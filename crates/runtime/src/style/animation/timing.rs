@@ -1,4 +1,7 @@
-use crate::css::{Easing, Prop, Registry, Style, expand};
+use crate::css::{
+    properties::Prop, properties::Registry, properties::Style, value::easing::Easing,
+    value::shorthand::expand,
+};
 use crate::dom::Document;
 use crate::style::cascade::computed::ComputedStyles;
 use crate::style::keyframes::interpolate::{
@@ -319,7 +322,7 @@ pub(crate) struct Scripted {
     pub(crate) id: u32,
     pub(crate) rules: Vec<(f64, Style, Option<Easing>)>,
     pub(crate) effect: Animation,
-    pub(crate) base: Option<(Rc<dyn std::any::Any>, crate::css::Vars)>,
+    pub(crate) base: Option<(Rc<dyn std::any::Any>, crate::css::properties::Vars)>,
     pub(crate) playback: Playback,
 }
 
@@ -338,7 +341,7 @@ impl Scripted {
                 .map(|(offset, source, easing)| {
                     (
                         *offset,
-                        crate::css::declarations(source),
+                        crate::css::sheet::declarations(source),
                         Easing::parse(easing),
                     )
                 })

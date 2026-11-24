@@ -1,4 +1,6 @@
-use crate::css::{Kind, Lengths, components, number};
+use crate::css::{
+    value::tokens::components, value::tokens::number, value::units::Kind, value::units::Lengths,
+};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Space {
@@ -903,7 +905,7 @@ fn matrix(matrix: [[f64; 3]; 3], values: [f64; 3]) -> [f64; 3] {
 
 #[cfg(test)]
 mod tests {
-    use crate::css::color;
+    use crate::css::value::color::color;
 
     #[test]
     fn color_functions_spaces_and_keywords() {

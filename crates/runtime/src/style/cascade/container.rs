@@ -1,4 +1,6 @@
-use crate::css::{Lengths, MediaQuery, Prop, Style, Vars};
+use crate::css::{
+    properties::Prop, properties::Style, properties::Vars, sheet::MediaQuery, value::units::Lengths,
+};
 use crate::style::vars::var;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;

@@ -1,4 +1,4 @@
-use crate::css::{Prop, Style};
+use crate::css::{properties::Prop, properties::Style};
 use crate::dom::Document;
 use crate::style::animation::timing::{
     Clock, Events, Phase, Playback, Transition, Wake, advance, after, cancel, drop_important,

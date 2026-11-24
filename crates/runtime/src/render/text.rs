@@ -1,5 +1,5 @@
 use crate::css;
-use crate::css::Prop;
+use crate::css::properties::Prop;
 use crate::style;
 use anyhow::Result;
 use renderer::{AlignItems, Color, Pixels, Point, Rect, SharedString, Window, point, px, size};
@@ -487,7 +487,7 @@ fn inline_box(
     text: &str,
     rows: &[crate::dom::Row],
     range: &std::ops::Range<usize>,
-    style: Option<(&css::Style, css::Lengths)>,
+    style: Option<(&css::properties::Style, css::value::units::Lengths)>,
     base: Pixels,
     window: &Window,
 ) -> Option<(Point<Pixels>, Point<Pixels>, Pixels, Pixels)> {
@@ -1042,7 +1042,7 @@ impl renderer::Hooks for InlineText {
                     .last_styles()?
                     .values
                     .get(up)?
-                    .get(crate::css::Prop::DISPLAY);
+                    .get(crate::css::properties::Prop::DISPLAY);
                 (!display
                     .is_some_and(|display| display.ends_with("flex") || display.ends_with("grid")))
                 .then(|| px(inner[0]))
@@ -1610,7 +1610,9 @@ impl renderer::Hooks for InlineText {
                     });
                     Some((style, units, b.x - a.x, parts))
                 };
-                let radii = |style: &css::Style, units: css::Lengths, width: Pixels| {
+                let radii = |style: &css::properties::Style,
+                             units: css::value::units::Lengths,
+                             width: Pixels| {
                     [
                         Prop::BORDER_TOP_LEFT_RADIUS,
                         Prop::BORDER_TOP_RIGHT_RADIUS,
@@ -1645,7 +1647,7 @@ impl renderer::Hooks for InlineText {
                     let radii = radii(style, units, width);
                     // A spliced box has no box of its own, so each part draws its shadow.
                     let mut shadows = match shadowed {
-                        true => css::box_shadows(
+                        true => css::value::box_shadows(
                             &units,
                             style.get(Prop::BOX_SHADOW).unwrap_or("none"),
                             false,
@@ -1735,7 +1737,7 @@ impl renderer::Hooks for InlineText {
                     };
                     let color = [Prop::OUTLINE_COLOR, Prop::COLOR]
                         .into_iter()
-                        .find_map(|prop| style.get(prop).and_then(css::paint))
+                        .find_map(|prop| style.get(prop).and_then(css::value::color::paint))
                         .unwrap_or(Color::BLACK);
                     let offset = style
                         .get(Prop::OUTLINE_OFFSET)
@@ -1828,7 +1830,9 @@ impl renderer::Hooks for InlineText {
                     if caret {
                         let ink = [Prop::CARET_COLOR, Prop::COLOR]
                             .into_iter()
-                            .find_map(|prop| css::color(styles.values[*id].get(prop)?))
+                            .find_map(|prop| {
+                                css::value::color::color(styles.values[*id].get(prop)?)
+                            })
                             .map_or(0x000000ff, |(color, alpha)| color << 8 | alpha as u32);
                         if let Some(position) = text_position(layout, &self.data.text, rows, start)
                         {

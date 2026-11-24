@@ -81,9 +81,9 @@ pub struct Node {
     pub attrs: Attrs,
     pub children: Vec<usize>,
     pub parent: Option<usize>,
-    pub(crate) stylesheet: Option<Rc<crate::css::Stylesheet>>,
+    pub(crate) stylesheet: Option<Rc<crate::css::sheet::Stylesheet>>,
     // Clear this cache on every style attribute write.
-    pub(crate) inline: Option<crate::css::Declarations>,
+    pub(crate) inline: Option<crate::css::sheet::Declarations>,
     #[serde(skip)]
     pub(crate) state: u16,
     #[serde(skip)]

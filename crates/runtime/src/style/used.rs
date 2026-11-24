@@ -1,4 +1,7 @@
-use crate::css::{Lengths, Prop, Style, components, percent_sum, percent_text};
+use crate::css::{
+    properties::Prop, properties::Style, value::resolved::percent_sum,
+    value::resolved::percent_text, value::tokens::components, value::units::Lengths,
+};
 use std::rc::Rc;
 pub(crate) fn dark(style: &Style, theme: u32) -> bool {
     style

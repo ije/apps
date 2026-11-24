@@ -1,4 +1,7 @@
-use crate::css::{FontUnits, Lengths, Prop, Style, Vars};
+use crate::css::{
+    properties::Prop, properties::Style, properties::Vars, value::units::FontUnits,
+    value::units::Lengths,
+};
 use crate::style::cascade::Container;
 use crate::style::cascade::shadow::{ShadowRule, Shadowed};
 use crate::style::keyframes::Animation;

@@ -1,8 +1,9 @@
 use crate::css::{
-    Declaration, Declarations, MediaQuery, Prop, Rule, Stylesheet, components, computed, supports,
-    syntax_matches,
+    properties::Prop, sheet::Declaration, sheet::Declarations, sheet::MediaQuery, sheet::Rule,
+    sheet::Stylesheet, value::grammar::computed, value::grammar::supports,
+    value::grammar::syntax_matches, value::tokens::components,
 };
-use crate::css::{Lengths, Selector, SelectorList};
+use crate::css::{selector::Selector, selector::SelectorList, value::units::Lengths};
 use cssparser::{
     AtRuleParser, CowRcStr, DeclarationParser, Delimiter, ParseError, Parser, ParserState,
     QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser, StyleSheetParser, Token,
@@ -805,7 +806,7 @@ fn condition(
                     Some(_) => false,
                     None => text.split_once(':').is_some_and(|(name, value)| {
                         let value = value.trim();
-                        crate::css::supports(
+                        crate::css::value::grammar::supports(
                             &name.trim().to_ascii_lowercase(),
                             value
                                 .strip_suffix("!important")
@@ -1129,8 +1130,8 @@ pub(crate) fn supports_condition(condition: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::css::*;
-    use crate::css::{FontUnits, Lengths};
+    use super::*;
+    use crate::css::{value::units::FontUnits, value::units::Lengths};
 
     #[test]
     fn numbers_with_exponents_keep_their_own_validity() {

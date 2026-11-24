@@ -1,6 +1,6 @@
 use super::{PageState, PageView};
 use crate::css;
-use crate::css::Prop;
+use crate::css::properties::Prop;
 use crate::{
     desktop::{
         Desktop,
@@ -854,14 +854,14 @@ impl renderer::View for PageView {
         let style = dom.styles.computed.as_ref()?.values.get(id)?;
         let face = style::font(style);
         let text = state["text"].as_str()?;
-        let font_size = css::length(
+        let font_size = css::value::length(
             style.get(Prop::FONT_SIZE).unwrap_or("16px"),
             16.,
             16.,
             bounds[2],
             bounds[3],
         );
-        let line_height = css::length(
+        let line_height = css::value::length(
             style.get(Prop::LINE_HEIGHT).unwrap_or("20px"),
             font_size,
             font_size,

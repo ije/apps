@@ -1,5 +1,5 @@
 use super::*;
-use crate::css::{Easing, time};
+use crate::css::{value::easing::Easing, value::easing::time};
 use crate::dom::Document;
 use crate::style::animation::timing::{Events, after};
 use crate::style::cascade::computed::ComputedStyles;
@@ -1667,7 +1667,7 @@ fn tailwind_transform_lists_transition_smoothly() {
             0.,
             &[]
         ),
-        Some((-3., crate::css::Kind::Angle))
+        Some((-3., crate::css::value::units::Kind::Angle))
     );
     assert!(transform("skew-x-6", [2., 2.5]).starts_with("matrix3d("));
 }

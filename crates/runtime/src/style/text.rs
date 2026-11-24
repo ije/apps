@@ -1,5 +1,5 @@
 use super::{FONT_NAMES, Lengths, Style, color, components};
-use crate::css::{Prop, paint, rgba};
+use crate::css::{properties::Prop, value::color::paint, value::color::rgba};
 use crate::dom::Document;
 use std::rc::Rc;
 

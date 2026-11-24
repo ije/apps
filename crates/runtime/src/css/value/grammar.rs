@@ -1,6 +1,7 @@
 use crate::css::{
-    BORDER_IMAGE, BORDER_IMAGE_INITIAL, Easing, Kind, Lengths, Prop, color, components,
-    corner_shape, number,
+    properties::Prop, value::color::color, value::corner_shape, value::easing::Easing,
+    value::shorthand::BORDER_IMAGE, value::shorthand::BORDER_IMAGE_INITIAL,
+    value::tokens::components, value::tokens::number, value::units::Kind, value::units::Lengths,
 };
 pub(super) fn grammar(name: &str) -> Option<&'static str> {
     match name {
@@ -68,14 +69,16 @@ pub(crate) fn supports(name: &str, value: &str) -> Option<bool> {
             Some(3) => format!("100% / / {value}"),
             _ => value.to_owned(),
         };
-        return Some(crate::css::border_image(&text).is_some_and(|parts| {
-            index.is_none()
-                || (0..5).all(|other| {
-                    Some(other) == index
-                        || (other == 1 && matches!(index, Some(2 | 3)))
-                        || parts[other] == BORDER_IMAGE_INITIAL[other]
-                })
-        }));
+        return Some(
+            crate::css::value::shorthand::border_image(&text).is_some_and(|parts| {
+                index.is_none()
+                    || (0..5).all(|other| {
+                        Some(other) == index
+                            || (other == 1 && matches!(index, Some(2 | 3)))
+                            || parts[other] == BORDER_IMAGE_INITIAL[other]
+                    })
+            }),
+        );
     }
     if let Some(axis) = name.strip_prefix("contain-intrinsic-")
         && !matches!(

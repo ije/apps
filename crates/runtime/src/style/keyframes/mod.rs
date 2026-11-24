@@ -7,7 +7,11 @@ use std::collections::HashMap;
 use std::rc::Rc;
 pub(crate) mod interpolate;
 
-use crate::css::{Declarations, Easing, Prop, Registry, Style, components, time, timing_function};
+use crate::css::{
+    properties::Prop, properties::Registry, properties::Style, sheet::Declarations,
+    value::easing::Easing, value::easing::time, value::easing::timing_function,
+    value::tokens::components,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct Animation {

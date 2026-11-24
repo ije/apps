@@ -1,4 +1,6 @@
-use crate::css::{Prop, Style, components, counter_text};
+use crate::css::{
+    properties::Prop, properties::Style, value::counter::counter_text, value::tokens::components,
+};
 use crate::dom::Document;
 use crate::style::cascade::TreeWalk;
 use crate::style::cascade::computed::{ComputedStyles, DISPLAY_NONE};

@@ -1,4 +1,4 @@
-use crate::css::{Declared, SelectorList};
+use crate::css::{selector::SelectorList, sheet::Declared};
 use crate::style::cascade::container::ContainerQuery;
 use crate::style::cascade::rank::Layer;
 use std::rc::Rc;

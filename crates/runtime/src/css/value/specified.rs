@@ -1,5 +1,9 @@
 use crate::css::value::grammar::grammar;
-use crate::css::{Kind, Lengths, components, number, serialize_color, write_number, write_printed};
+use crate::css::{
+    value::color::serialize as serialize_color, value::tokens::components, value::tokens::number,
+    value::tokens::write_number, value::tokens::write_printed, value::units::Kind,
+    value::units::Lengths,
+};
 use std::borrow::Cow;
 
 // Chrome's text for a declared value: lowercase keywords, units and functions, short numbers, `0px` for

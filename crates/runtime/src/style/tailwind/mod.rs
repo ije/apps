@@ -1,5 +1,5 @@
 use super::{Declaration, Declarations, Prop, Rule, Style, Stylesheet};
-use crate::css::color;
+use crate::css::value::color::color;
 use crate::dom::Document;
 use crate::style::tailwind::tables::{
     BASE, DEFAULTS, INLINE, KEYFRAMES, ORDER_INDEX, PREFLIGHT, PROPERTIES,

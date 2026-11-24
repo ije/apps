@@ -1596,13 +1596,13 @@ fn glass_classes_work_with_nested_css_and_no_glass_import() {
             assert_eq!(
                 style
                     .get("-macos-glass-tint-color")
-                    .and_then(|value| apps_runtime::css::color(value)),
-                apps_runtime::css::color("oklch(62.3% 0.214 259.815)")
+                    .and_then(|value| apps_runtime::css::value::color::color(value)),
+                apps_runtime::css::value::color::color("oklch(62.3% 0.214 259.815)")
             );
         }
         for (property, expected) in [("padding-left", 16.), ("width", 48.), ("height", 24.)] {
             assert_eq!(
-                apps_runtime::css::length(&style[property], 0., 16., 800., 600.),
+                apps_runtime::css::value::length(&style[property], 0., 16., 800., 600.),
                 expected
             );
         }
@@ -1639,7 +1639,7 @@ fn tailwind_import_survives_nested_css_without_a_package() {
     assert_eq!(files.borrow().len(), 2);
     let doc = apps_runtime::bundle::page(&source);
     let style = apps_runtime::style::styles(&doc, 800., 600.).pop().unwrap();
-    let px = |key: &str| apps_runtime::css::length(&style[key], 0., 16., 800., 600.);
+    let px = |key: &str| apps_runtime::css::value::length(&style[key], 0., 16., 800., 600.);
     assert_eq!(px("height"), 16.);
     assert_eq!(px("width"), 16.);
     assert_eq!(style["display"], "flex");

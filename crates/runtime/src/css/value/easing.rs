@@ -1,4 +1,4 @@
-use crate::css::{Lengths, components};
+use crate::css::{value::tokens::components, value::units::Lengths};
 use std::rc::Rc;
 
 pub(crate) fn timing_function(part: &str) -> bool {
@@ -14,7 +14,9 @@ pub(crate) fn time(value: &str) -> Option<f64> {
     if value.ends_with(')') {
         return Lengths::new(16., 100., 100.)
             .math(value, f32::NAN, &[])
-            .filter(|(value, kind)| *kind == crate::css::Kind::Time && value.is_finite())
+            .filter(|(value, kind)| {
+                *kind == crate::css::value::units::Kind::Time && value.is_finite()
+            })
             .map(|(value, _)| value);
     }
     let (value, scale) = value

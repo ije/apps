@@ -1,4 +1,4 @@
-use crate::css::{BORDERS, Prop, Style};
+use crate::css::{properties::BORDERS, properties::Prop, properties::Style};
 use crate::dom::Document;
 use crate::style::cascade::TreeWalk;
 use crate::style::cascade::computed::{

@@ -1,4 +1,7 @@
-use crate::css::{Lengths, Prop, Registry, Style, Vars};
+use crate::css::{
+    properties::Prop, properties::Registry, properties::Style, properties::Vars,
+    value::units::Lengths,
+};
 use crate::style::cascade::Container;
 use crate::style::cascade::shadow::Shadowed;
 use crate::style::chunked::Chunked;

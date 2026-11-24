@@ -1,9 +1,11 @@
-pub(super) mod media;
-pub(super) mod parser;
+pub(crate) mod media;
+pub(crate) mod parser;
 
 // The last field is the position of the declaration in its block, which breaks ties between properties.
 use crate::css::{
-    BORDER_IMAGE, BORDER_IMAGE_INITIAL, Prop, Selector, SelectorList, Style, expand, fold, supports,
+    properties::Prop, properties::Style, selector::Selector, selector::SelectorList,
+    value::grammar::fold, value::grammar::supports, value::shorthand::BORDER_IMAGE,
+    value::shorthand::BORDER_IMAGE_INITIAL, value::shorthand::expand,
 };
 use std::rc::Rc;
 pub(crate) type Declared = (Prop, Rc<str>, bool, u16);

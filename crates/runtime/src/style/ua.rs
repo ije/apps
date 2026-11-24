@@ -1,4 +1,4 @@
-use crate::css::{Prop, Stylesheet};
+use crate::css::{properties::Prop, sheet::Stylesheet};
 use std::rc::Rc;
 pub(crate) const UA: &str = "
 html,body,address,blockquote,center,dialog,div,figure,figcaption,footer,form,header,hr,legend,main,p,pre,search,article,aside,h1,h2,h3,h4,h5,h6,hgroup,nav,section,dd,dl,dt,menu,ol,ul,details,summary,fieldset,optgroup,option{display:block}

@@ -1,6 +1,6 @@
 use super::background;
 use crate::css;
-use crate::css::Prop;
+use crate::css::properties::Prop;
 use renderer::{Child, Hooks, NodeCx, Pixels, Point, Rect, Size, Window, point, px};
 use std::{cell::Cell, collections::HashMap, rc::Rc};
 
@@ -8,7 +8,7 @@ pub(super) struct Turned {
     clockwise: bool,
     block: f32,
     inline: f32,
-    matrix: Cell<crate::css::Matrix>,
+    matrix: Cell<crate::css::value::transform::Matrix>,
 }
 
 impl Turned {
@@ -23,15 +23,15 @@ impl Turned {
             clockwise,
             block,
             inline,
-            matrix: Cell::new(crate::css::IDENTITY),
+            matrix: Cell::new(crate::css::value::transform::IDENTITY),
         });
         *node.style() = style;
         node
     }
 
-    fn matrix(&self, origin: Point<Pixels>) -> crate::css::Matrix {
+    fn matrix(&self, origin: Point<Pixels>) -> crate::css::value::transform::Matrix {
         let [x, y] = [f32::from(origin.x), f32::from(origin.y)];
-        let mut m = crate::css::IDENTITY;
+        let mut m = crate::css::value::transform::IDENTITY;
         if self.clockwise {
             [m[0], m[1], m[4], m[5]] = [0., 1., -1., 0.];
             [m[12], m[13]] = [x + self.block + y, y - x];
@@ -81,9 +81,9 @@ impl Hooks for Turned {
 }
 
 pub(super) struct Transformed {
-    pub(super) style: Rc<css::Style>,
-    pub(super) units: css::Lengths,
-    pub(super) matrix: Cell<Option<crate::css::Matrix>>,
+    pub(super) style: Rc<css::properties::Style>,
+    pub(super) units: css::value::units::Lengths,
+    pub(super) matrix: Cell<Option<crate::css::value::transform::Matrix>>,
     pub(super) local: super::effects::Local,
 }
 
@@ -183,8 +183,8 @@ impl Hooks for Effected {
 pub(super) struct Masked {
     pub(super) view: Rc<super::PageState>,
     pub(super) key: (usize, u8),
-    pub(super) style: Rc<css::Style>,
-    pub(super) units: css::Lengths,
+    pub(super) style: Rc<css::properties::Style>,
+    pub(super) units: css::value::units::Lengths,
 }
 
 impl Hooks for Masked {
@@ -273,7 +273,7 @@ pub(super) struct Picture {
     pub(super) fit: renderer::ObjectFit,
     pub(super) cropped: Option<renderer::Radii<Pixels>>,
     /// `object-position` when it isn't centered.
-    pub(super) position: Option<(Rc<str>, css::Lengths)>,
+    pub(super) position: Option<(Rc<str>, css::value::units::Lengths)>,
     pub(super) pixelated: bool,
 }
 
@@ -680,12 +680,12 @@ pub(super) struct DomBox {
     pub(super) rtl: bool,
     pub(super) sized: Option<[f32; 2]>,
     pub(super) inset: [Option<f32>; 4],
-    pub(super) style: Rc<css::Style>,
+    pub(super) style: Rc<css::properties::Style>,
     pub(super) effects: Option<f32>,
     pub(super) composited: bool,
     pub(super) transformed: bool,
     pub(super) perspective: Option<Box<((f32, String), usize)>>,
-    pub(super) units: css::Lengths,
+    pub(super) units: css::value::units::Lengths,
     pub(super) revision: u64,
     pub(super) sides: [f32; 2],
     pub(super) margin: [f32; 4],
@@ -696,7 +696,7 @@ pub(super) struct DomBox {
     pub(super) leading: Option<[f32; 3]>,
     pub(super) boxless: bool,
     pub(super) text: Option<([u32; 2], [f32; 2])>,
-    pub(super) placed: Cell<(Rect<Pixels>, Option<crate::css::Matrix>)>,
+    pub(super) placed: Cell<(Rect<Pixels>, Option<crate::css::value::transform::Matrix>)>,
     // The window bounds and cull flags of the last prepaint, which a skip gives to `merge`.
     pub(super) reached_at: Cell<(Rect<Pixels>, u32)>,
     pub(super) offset: Cell<Point<Pixels>>,
@@ -1109,7 +1109,8 @@ impl Hooks for DomBox {
             let viewport = window.viewport_size();
             for axis in 0..2 {
                 let [start, end] = if axis == 0 { [3, 1] } else { [0, 2] };
-                let auto = |side: usize| self.style.get(css::MARGIN[side]) == Some("auto");
+                let auto =
+                    |side: usize| self.style.get(css::properties::MARGIN[side]) == Some("auto");
                 let margin = |side: usize| {
                     if auto(side) {
                         px(0.)
@@ -1153,17 +1154,23 @@ impl Hooks for DomBox {
                 let view = &*self.view;
                 let host = view.host.borrow();
                 let [x, y, width, height] = *host.dom.get(&view.id)?.bounds.get(parent)?;
-                let [ox, oy, _] = crate::css::origin(origin, &self.units, [width, height]);
+                let [ox, oy, _] =
+                    crate::css::value::transform::origin(origin, &self.units, [width, height]);
                 Some((*distance, [x + ox, y + oy]))
             });
         // A canvas draws a drawable element as it is before its transform.
         let mut matrix = match perspective {
-            Some(_) => crate::css::transform(&self.style, &self.units, bounds, perspective),
+            Some(_) => crate::css::value::transform::transform(
+                &self.style,
+                &self.units,
+                bounds,
+                perspective,
+            ),
             None => super::effects::transform_at(&self.local, &self.style, &self.units, bounds),
         }
         .filter(|_| !self.drawn);
         if self.transformed && !self.drawn {
-            matrix.get_or_insert(crate::css::IDENTITY);
+            matrix.get_or_insert(crate::css::value::transform::IDENTITY);
             self.view
                 .composited_transforms
                 .borrow_mut()
@@ -1296,10 +1303,14 @@ impl Hooks for DomBox {
                 let drawn = view.host.borrow().dom.get(&view.id).and_then(|dom| {
                     let to_canvas = dom.drawn.get(&self.id)?.matrix;
                     let [x, y] = [bounds.origin.x, bounds.origin.y].map(f32::from);
-                    let from_box = crate::css::translate(-x, -y, 0.);
-                    let to_window = crate::css::translate(content.x.into(), content.y.into(), 0.);
-                    let placed = crate::css::multiply(&to_canvas, &from_box);
-                    Some(crate::css::multiply(&to_window, &placed))
+                    let from_box = crate::css::value::transform::translate(-x, -y, 0.);
+                    let to_window = crate::css::value::transform::translate(
+                        content.x.into(),
+                        content.y.into(),
+                        0.,
+                    );
+                    let placed = crate::css::value::transform::multiply(&to_canvas, &from_box);
+                    Some(crate::css::value::transform::multiply(&to_window, &placed))
                 });
                 window.with_hits_at(drawn, &mut prepaint)
             }
@@ -1533,7 +1544,7 @@ impl DomBox {
     fn effects(
         &self,
         bounds: Rect<Pixels>,
-        transform: Option<crate::css::Matrix>,
+        transform: Option<crate::css::value::transform::Matrix>,
         window: &mut Window,
     ) -> (Option<renderer::Clip<Pixels>>, Vec<renderer::PaintEffect>) {
         use super::effects::{self, Clip};
@@ -1623,9 +1634,9 @@ impl DomBox {
                     corner_radius: radius,
                     tint: style
                         .get(Prop::MACOS_GLASS_TINT_COLOR)
-                        .and_then(css::color)
+                        .and_then(css::value::color::color)
                         .filter(|(_, alpha)| *alpha > 0)
-                        .map(crate::css::rgba),
+                        .map(crate::css::value::color::rgba),
                     clear: kind == "clear",
                     interactive: style.get(Prop::MACOS_GLASS_INTERACTIVE) == Some("true")
                         && style.get(Prop::POINTER_EVENTS) != Some("none")
@@ -1690,8 +1701,8 @@ pub(super) fn mask(
     dom: &mut crate::dom::State,
     assets: &HashMap<String, std::path::PathBuf>,
     key: (usize, u8),
-    style: &css::Style,
-    units: css::Lengths,
+    style: &css::properties::Style,
+    units: css::value::units::Lengths,
     shapes: Option<&str>,
     bounds: Rect<Pixels>,
     window: &mut Window,
@@ -1823,8 +1834,8 @@ fn nest_effects(
 }
 
 pub(super) fn mask_svg<'a>(
-    style: &'a css::Style,
-    units: css::Lengths,
+    style: &'a css::properties::Style,
+    units: css::value::units::Lengths,
     [width, height]: [f32; 2],
     base: Option<&url::Url>,
     assets: &HashMap<String, std::path::PathBuf>,
@@ -1837,7 +1848,7 @@ pub(super) fn mask_svg<'a>(
     if images.is_empty() || images == "none" {
         return None;
     }
-    let list = |props| css::components(get(props), ',');
+    let list = |props| css::value::tokens::components(get(props), ',');
     let (sizes, positions, repeats) = (
         list([Prop::MASK_SIZE, Prop::WEBKIT_MASK_SIZE]),
         list([Prop::MASK_POSITION, Prop::WEBKIT_MASK_POSITION]),
@@ -1849,13 +1860,18 @@ pub(super) fn mask_svg<'a>(
             .copied()
             .unwrap_or("")
     };
-    let composites = css::components(style.get(Prop::MASK_COMPOSITE).unwrap_or(""), ',');
+    let composites =
+        css::value::tokens::components(style.get(Prop::MASK_COMPOSITE).unwrap_or(""), ',');
     // Layers go from the bottom up, and each one joins the layers below it by its `mask-composite`.
     let (mut defs, mut below) = (String::new(), None::<String>);
     let area = format!(
         "maskUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"{width}\" height=\"{height}\""
     );
-    for (index, image) in css::components(images, ',').into_iter().enumerate().rev() {
+    for (index, image) in css::value::tokens::components(images, ',')
+        .into_iter()
+        .enumerate()
+        .rev()
+    {
         let image = image.trim();
         let [size, position, repeat] = [
             (pick(&sizes, index), "auto"),

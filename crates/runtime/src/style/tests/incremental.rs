@@ -182,10 +182,10 @@ fn passes_drop_unused_scopes_and_report_interaction_states() {
     let mut sheets = HashMap::new();
     let mut cache = StyleCache::default();
     for (source, states) in [
-        (".a:hover{color:red}", crate::css::HOVER),
+        (".a:hover{color:red}", crate::css::selector::HOVER),
         (
             ".a{color:blue} .b:active{&>i{color:red}}",
-            crate::css::ACTIVE,
+            crate::css::selector::ACTIVE,
         ),
         (".a{color:green}", 0),
     ] {
@@ -199,7 +199,11 @@ fn passes_drop_unused_scopes_and_report_interaction_states() {
                 .keys()
                 .all(|key| key.scope == cache.scopes[0].id)
         );
-        assert_eq!(cache.states & !crate::css::FOCUS, states, "{source}");
+        assert_eq!(
+            cache.states & !crate::css::selector::FOCUS,
+            states,
+            "{source}"
+        );
     }
 }
 
@@ -836,7 +840,7 @@ fn cousins_share_matches_only_with_the_same_ancestors() {
             groups.replace('R', rows)
         ));
         if let Some(hovered) = (0..doc.nodes.len()).find(|&id| doc.matches(id, "#hovered")) {
-            doc.nodes[hovered].state = crate::css::HOVER;
+            doc.nodes[hovered].state = crate::css::selector::HOVER;
         }
         let pass = |unshared: bool| {
             compute_styles(
