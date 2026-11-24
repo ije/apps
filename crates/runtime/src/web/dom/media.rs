@@ -16,7 +16,7 @@ fn new_canvas(node: &Node) -> Result<crate::render::raster::canvas::Canvas> {
     let size = |name, default| {
         node.attrs
             .get(name)
-            .and_then(|value| crate::render::dimension(value, true))
+            .and_then(|value| crate::render::layout::size::dimension(value, true))
             .map_or(default, |value| value as u32)
     };
     let mut canvas =

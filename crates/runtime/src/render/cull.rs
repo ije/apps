@@ -298,7 +298,7 @@ pub(super) fn content(
     node.tag.hash(&mut shape);
     node.text.hash(&mut shape);
     // Exclude field values from revisions: element::Patch rebuilds changed fields in place.
-    if !super::element::text_field(node, style) {
+    if !super::layout::size::text_field(node, style) {
         node.value.hash(&mut shape);
     }
     (node.state & (crate::dom::CHECKED | crate::dom::DIRTY | crate::dom::BROKEN)).hash(&mut shape);

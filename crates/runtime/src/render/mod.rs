@@ -24,7 +24,6 @@ pub(crate) mod text;
 use crate::css;
 use crate::css::properties::Prop;
 use crate::{host::Host, style};
-pub(crate) use element::dimension;
 use element::{Build, element};
 pub(crate) use hud::Hud;
 pub(crate) use inspect::Inspect;
@@ -85,7 +84,7 @@ pub(crate) struct ViewState {
     pub(super) composited_transforms: RefCell<rustc_hash::FxHashMap<usize, CompositedTransform>>,
     reach: RefCell<Vec<[f32; 2]>>,
     reaching: RefCell<Vec<([f32; 2], u8)>>,
-    caret: RefCell<Option<input::Blink>>,
+    caret: RefCell<Option<text::Blink>>,
     /// The drawing of each terminal session, kept from frame to frame.
     terminals: RefCell<rustc_hash::FxHashMap<u32, terminal::Drawn>>,
     pub(crate) hud: RefCell<Option<hud::Hud>>,
@@ -1143,7 +1142,7 @@ impl PageView {
                     shown(id)
                         && id != 0
                         && !matches!(doc.nodes[id].tag.as_str(), "html" | "body")
-                        && !element::text_field(&doc.nodes[id], &styles.values[id])
+                        && !layout::size::text_field(&doc.nodes[id], &styles.values[id])
                         && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
                             .into_iter()
                             .all(|prop| {
@@ -2384,7 +2383,7 @@ impl PageView {
                             css::properties::MARGIN,
                             patch.containing[0],
                         );
-                        element::place(child, margin, field.pixel_ratio, bounds)
+                        layout::size::place(child, margin, field.pixel_ratio, bounds)
                     }
                     None => child,
                 };
@@ -2466,7 +2465,7 @@ impl PageView {
                             css::properties::MARGIN,
                             patch.containing[0],
                         );
-                        element::place(child, margin, inner.pixel_ratio, bounds)
+                        layout::size::place(child, margin, inner.pixel_ratio, bounds)
                     }
                     None => child,
                 };

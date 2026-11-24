@@ -1,0 +1,103 @@
+use crate::style;
+use renderer::{AlignItems, Pixels, px};
+
+// How far each line of a paragraph reaches above and below its baseline, with its inline boxes and the strut.
+pub(crate) fn row_extents<'a>(
+    lines: impl IntoIterator<Item = &'a renderer::TextLine>,
+    runs: &[renderer::TextRun],
+    heights: &[(usize, style::LineHeight)],
+    atoms: &[(usize, [f32; 3], Option<AlignItems>)],
+    strut: (renderer::FontId, Pixels, Pixels),
+    system: &renderer::TextSystem,
+    scale: f32,
+) -> Vec<[Pixels; 2]> {
+    let inline = |font, size: Pixels, line: Option<f32>| {
+        let [ascent, descent, gap] = system.line_metrics(font, size * scale).map(f32::from);
+        let line = line.unwrap_or(ascent + descent + gap);
+        let above = ascent + ((line - ascent - descent) / 2.).floor();
+        [above, line - above]
+    };
+    let root = inline(strut.0, strut.1, Some(f32::from(strut.2) * scale));
+    let run_ends: Vec<usize> = runs
+        .iter()
+        .scan(0, |end, run| {
+            *end += run.len;
+            Some(*end)
+        })
+        .collect();
+    let mut rows = Vec::new();
+    let mut edges = Vec::new();
+    let mut offset = 0;
+    for line in lines {
+        let layout = &line.line;
+        let ends: Vec<usize> = (line.breaks.iter())
+            .map(|&at| layout.glyphs[at as usize].index as usize)
+            .collect();
+        let first = rows.len();
+        rows.resize(first + ends.len() + 1, root);
+        // Glyphs of one face and size measure once per row, line height and source run.
+        let mut last = None;
+        for glyph in &layout.glyphs {
+            let row = first + ends.partition_point(|&end| end <= glyph.index as usize);
+            let at = offset + glyph.index as usize;
+            // Atoms are in text order.
+            if let Some((_, [_, height, baseline], align)) = atoms
+                .binary_search_by_key(&at, |(place, ..)| *place)
+                .ok()
+                .map(|atom| &atoms[atom])
+            {
+                if let Some(align @ (AlignItems::FlexStart | AlignItems::FlexEnd)) = align {
+                    edges.push((row, height * scale, *align == AlignItems::FlexEnd));
+                    continue;
+                }
+                // Do not shift the row for fractional-pixel differences between a full-line baseline box
+                // and the strut.
+                let [above, below] = [baseline * scale, (height - baseline) * scale];
+                rows[row] = [
+                    rows[row][0].max(if above - root[0] < 1. { 0. } else { above }),
+                    rows[row][1].max(if below - root[1] < 1. { 0. } else { below }),
+                ];
+                continue;
+            }
+            let kind = heights
+                .get(heights.partition_point(|(end, _)| *end <= at))
+                .map_or(style::LineHeight::Normal, |(_, kind)| *kind);
+            let source = (kind != style::LineHeight::Normal)
+                .then(|| run_ends.partition_point(|&end| end <= at));
+            if last == Some((glyph.font, glyph.size, row, kind, source)) {
+                continue;
+            }
+            last = Some((glyph.font, glyph.size, row, kind, source));
+            let size = f32::from(glyph.size);
+            let [above, below] = inline(
+                source
+                    .and_then(|index| runs.get(index))
+                    .map_or(glyph.font, |styled| system.face(&styled.font)),
+                glyph.size,
+                match kind {
+                    style::LineHeight::Normal => None,
+                    style::LineHeight::Scale(factor) => {
+                        Some((factor * size * scale * 64.).floor() / 64.)
+                    }
+                    style::LineHeight::Fixed(line) => Some((line * scale * 64.).round() / 64.),
+                },
+            );
+            rows[row] = [rows[row][0].max(above), rows[row][1].max(below)];
+        }
+        offset += line.len() + 1;
+    }
+    edges.sort_by(|a: &(usize, f32, bool), b| b.1.total_cmp(&a.1));
+    for (row, height, bottom) in edges {
+        let [above, below] = &mut rows[row];
+        if bottom {
+            *above = above.max(height - *below);
+        } else {
+            *below = below.max(height - *above);
+        }
+    }
+    rows.into_iter()
+        .map(|[above, below]| {
+            [above - root[0], below - root[1]].map(|extra| px(extra.max(0.) / scale))
+        })
+        .collect()
+}

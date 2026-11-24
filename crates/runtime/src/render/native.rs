@@ -46,15 +46,6 @@ impl Node {
     }
 }
 
-pub(super) fn size(kind: ControlKind) -> [f32; 2] {
-    let [width, height] = renderer::control_size(kind);
-    match kind {
-        ControlKind::Slider => [129., height],
-        ControlKind::Text | ControlKind::Search => [160., height],
-        _ => [width, height],
-    }
-}
-
 #[derive(Default)]
 pub(crate) struct Controls {
     shown: rustc_hash::FxHashMap<usize, (u64, u64)>,

@@ -684,7 +684,7 @@ fn size(
 // The renderer ceils each measured leaf to layout units, so sums of leaves must use the same widths.
 fn leaf_ceil(width: f32, pixel_ratio: f32) -> f32 {
     match pixel_ratio > 0. {
-        true => super::element::layout_ceil(width, pixel_ratio),
+        true => super::layout::size::layout_ceil(width, pixel_ratio),
         false => width,
     }
 }
@@ -756,7 +756,7 @@ pub(crate) fn intrinsic(
     let border_box = style
         .get(Prop::BOX_SIZING)
         .is_some_and(|v| v == "border-box");
-    let alt = super::element::broken_image(node)
+    let alt = super::layout::size::broken_image(node)
         .then(|| node.attrs.get("alt").filter(|alt| !alt.is_empty()))
         .flatten();
     let sizeless = alt.is_some()
@@ -817,7 +817,9 @@ pub(crate) fn intrinsic(
     let mut taken = [false; 2];
     let mut collapsed = None;
     let natural = (node.tag != "svg")
-        .then(|| super::element::natural_size(doc, id, measured.naturals.get(&id).copied(), style))
+        .then(|| {
+            super::layout::size::natural_size(doc, id, measured.naturals.get(&id).copied(), style)
+        })
         .flatten();
     let skipped = matches!(style.get(Prop::CONTENT_VISIBILITY), Some("hidden" | "auto"))
         && super::cull::skips(
@@ -839,7 +841,7 @@ pub(crate) fn intrinsic(
                     matches!(node.tag.as_str(), "img" | "video")
                         && style.get([Prop::WIDTH, Prop::HEIGHT][axis]).is_none()
                 })
-                .and_then(|v| super::element::dimension(v, false))
+                .and_then(|v| super::layout::size::dimension(v, false))
                 .map(|v| (v - if border_box { inner[axis] } else { 0. }).max(0.))
         });
         // Like layout, a video without a frame and with a CSS ratio has no natural size: it adds no width, and
@@ -864,7 +866,7 @@ pub(crate) fn intrinsic(
             [used[0], vertical[0]][axis].or_else(|| {
                 node.attrs
                     .get(["width", "height"][axis])
-                    .and_then(|v| super::element::dimension(v, false))
+                    .and_then(|v| super::layout::size::dimension(v, false))
             })
         });
         let ratio = node.attrs.get("viewBox").and_then(|view| {
@@ -887,8 +889,8 @@ pub(crate) fn intrinsic(
             _ => [width.unwrap_or(24.), height.unwrap_or(24.)],
         };
         content = [width, width, height];
-    } else if super::element::text_field(node, style) {
-        let [width, height] = super::element::field_size(
+    } else if super::layout::size::text_field(node, style) {
+        let [width, height] = super::layout::size::field_size(
             doc,
             id,
             style,
@@ -907,7 +909,7 @@ pub(crate) fn intrinsic(
             .and_then(|parts| parts[1].as_ref())
     {
         let [width, height] =
-            super::element::file_size(style, button, units, text, measured.pixel_ratio);
+            super::layout::size::file_size(style, button, units, text, measured.pixel_ratio);
         content = [width, width, height];
     } else if node.tag == "input"
         && let Some(kind) = Some(node.input_type()).filter(|value| {
@@ -935,7 +937,7 @@ pub(crate) fn intrinsic(
         let ceiled = leaf_ceil(width, measured.pixel_ratio);
         content = [ceiled, ceiled, units.font.lh];
         if node.native_control(style).is_some() {
-            let [padding, height] = super::native::size(renderer::ControlKind::Button);
+            let [padding, height] = super::layout::size::native_size(renderer::ControlKind::Button);
             let ceiled = leaf_ceil(width + padding, measured.pixel_ratio);
             content = [ceiled, ceiled, height];
         }
@@ -995,7 +997,7 @@ pub(crate) fn intrinsic(
                     .is_some_and(|v| v.contains('%'));
             runs[atom.run].inset[1] = renderer::px(if percent { used } else { max });
             // Like Chrome, a replaced box sits on the baseline, and other boxes on their last line.
-            let baseline = if super::element::natural_size(
+            let baseline = if super::layout::size::natural_size(
                 doc,
                 atom.node,
                 measured.naturals.get(&atom.node).copied(),
@@ -1085,7 +1087,7 @@ pub(crate) fn intrinsic(
                 renderer::px(units.font.em),
                 renderer::px(units.font.lh),
             );
-            for (row, [above, below]) in super::text::row_extents(
+            for (row, [above, below]) in super::layout::line::row_extents(
                 &lines,
                 &runs,
                 &heights,
@@ -1438,7 +1440,7 @@ pub(crate) fn intrinsic(
                             doc,
                             styles,
                             child,
-                            super::element::natural_size(
+                            super::layout::size::natural_size(
                                 doc,
                                 child,
                                 measured.naturals.get(&child).copied(),
@@ -1585,7 +1587,7 @@ pub(crate) fn intrinsic(
                                 && [Prop::APPEARANCE, Prop::WEBKIT_APPEARANCE]
                                     .into_iter()
                                     .any(|prop| child_style.get(prop) == Some("none"))
-                            || super::element::natural_size(
+                            || super::layout::size::natural_size(
                                 doc,
                                 child,
                                 measured.naturals.get(&child).copied(),
@@ -1787,7 +1789,7 @@ pub(crate) fn intrinsic(
         .filter(|value| {
             !(value.contains("auto") && natural.is_some_and(|(_, ratio)| ratio.is_some()))
         })
-        .and_then(super::element::aspect_ratio)
+        .and_then(super::layout::size::aspect_ratio)
         .zip(available)
         .map(|(ratio, width)| {
             let height = if border_box {
@@ -1854,7 +1856,7 @@ fn first_baseline(
     };
     // Like Chrome, a replaced box sits on its bottom edge.
     if node.tag == "svg"
-        || super::element::natural_size(doc, id, measured.naturals.get(&id).copied(), style)
+        || super::layout::size::natural_size(doc, id, measured.naturals.get(&id).copied(), style)
             .is_some()
     {
         return None;
@@ -2038,7 +2040,7 @@ fn pseudo_size(
         return None;
     }
     let units =
-        super::element::pseudo_lengths(&styles.lengths[id], style, pseudo, text, pixel_ratio);
+        super::layout::size::pseudo_lengths(&styles.lengths[id], style, pseudo, text, pixel_ratio);
     let [padding, margin] = [css::properties::PADDING, css::properties::MARGIN]
         .map(|edges| units.edges(pseudo, edges, base));
     let border = units.borders(pseudo, base);
@@ -2143,7 +2145,7 @@ pub(super) fn pseudo_atom(
     let [_, max, used, height] =
         pseudo_size(doc, id, index, styles, base, None, text, pixel_ratio)?;
     let pseudo = &styles.pseudos[&id][index];
-    let units = super::element::pseudo_lengths(
+    let units = super::layout::size::pseudo_lengths(
         &styles.lengths[id],
         &styles.values[id],
         pseudo,
@@ -2418,7 +2420,7 @@ pub(crate) fn layout(
         Default::default();
     let table = style::table_box(style::role(styles, id));
     let legend = (doc.nodes[id].tag == "fieldset")
-        .then(|| super::element::legend(doc, styles, id))
+        .then(|| super::layout::size::legend(doc, styles, id))
         .flatten()
         .map(|(legend, ..)| legend);
     let pseudos = styles.pseudos.get(&id).filter(|_| !table);
@@ -2431,7 +2433,7 @@ pub(crate) fn layout(
         let replaced = pseudo_item(child).is_none()
             && (doc.nodes[child].tag == "svg"
                 || doc.nodes[child].tag != "input"
-                    && super::element::natural_size(
+                    && super::layout::size::natural_size(
                         doc,
                         child,
                         measured.naturals.get(&child).copied(),

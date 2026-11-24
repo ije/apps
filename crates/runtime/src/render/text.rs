@@ -1,9 +1,49 @@
+use super::ViewState;
 use crate::css;
 use crate::css::properties::Prop;
 use crate::style;
 use anyhow::Result;
 use renderer::{AlignItems, Color, Pixels, Point, Rect, SharedString, Window, point, px, size};
-use std::{ops::Range, rc::Rc};
+use std::{
+    ops::Range,
+    rc::Rc,
+    time::{Duration, Instant},
+};
+
+pub(super) type Blink = ([usize; 3], Instant, Option<(u32, renderer::Timer)>);
+
+pub(super) fn paint_caret(
+    view: &ViewState,
+    key: [usize; 3],
+    bounds: Rect<Pixels>,
+    color: renderer::Color,
+    window: &mut Window,
+) {
+    const BLINK: Duration = renderer::CARET_BLINK;
+    if color.a == 0. || !window.is_active() {
+        return;
+    }
+    let now = Instant::now();
+    let mut caret = view.caret.borrow_mut();
+    if caret.as_ref().is_some_and(|(old, ..)| *old != key) {
+        *caret = None;
+    }
+    let (_, since, wake) = caret.get_or_insert((key, now, None));
+    // A timer can fire just before its time, so the phase rounds up within 8 ms.
+    let phase = ((now - *since + Duration::from_millis(8)).as_millis() / BLINK.as_millis()) as u32;
+    // The first phase draws, so typing and scrolling move the caret in the same frame as the text.
+    if phase > 0 && window.overlay_caret(bounds, color, *since, phase.is_multiple_of(2)) {
+        *wake = None;
+        return;
+    }
+    if wake.as_ref().is_none_or(|(old, _)| *old != phase) {
+        let due = *since + BLINK * (phase + 1);
+        *wake = Some((phase, window.timer(due - now, |window, _| window.refresh())));
+    }
+    if phase.is_multiple_of(2) {
+        window.draw_rect(bounds, color);
+    }
+}
 
 pub(super) struct TextHighlight {
     pub(super) range: Range<usize>,
@@ -288,106 +328,6 @@ pub(super) fn paint_text(
 
 pub(super) fn spaces(text: &str) -> f32 {
     text.bytes().filter(|byte| *byte == b' ').count() as f32
-}
-
-pub(super) fn row_extents<'a>(
-    lines: impl IntoIterator<Item = &'a renderer::TextLine>,
-    runs: &[renderer::TextRun],
-    heights: &[(usize, style::LineHeight)],
-    atoms: &[(usize, [f32; 3], Option<AlignItems>)],
-    strut: (renderer::FontId, Pixels, Pixels),
-    system: &renderer::TextSystem,
-    scale: f32,
-) -> Vec<[Pixels; 2]> {
-    let inline = |font, size: Pixels, line: Option<f32>| {
-        let [ascent, descent, gap] = system.line_metrics(font, size * scale).map(f32::from);
-        let line = line.unwrap_or(ascent + descent + gap);
-        let above = ascent + ((line - ascent - descent) / 2.).floor();
-        [above, line - above]
-    };
-    let root = inline(strut.0, strut.1, Some(f32::from(strut.2) * scale));
-    let run_ends: Vec<usize> = runs
-        .iter()
-        .scan(0, |end, run| {
-            *end += run.len;
-            Some(*end)
-        })
-        .collect();
-    let mut rows = Vec::new();
-    let mut edges = Vec::new();
-    let mut offset = 0;
-    for line in lines {
-        let layout = &line.line;
-        let ends: Vec<usize> = (line.breaks.iter())
-            .map(|&at| layout.glyphs[at as usize].index as usize)
-            .collect();
-        let first = rows.len();
-        rows.resize(first + ends.len() + 1, root);
-        // Glyphs of one face and size measure once per row, line height and source run.
-        let mut last = None;
-        for glyph in &layout.glyphs {
-            let row = first + ends.partition_point(|&end| end <= glyph.index as usize);
-            let at = offset + glyph.index as usize;
-            // Atoms are in text order.
-            if let Some((_, [_, height, baseline], align)) = atoms
-                .binary_search_by_key(&at, |(place, ..)| *place)
-                .ok()
-                .map(|atom| &atoms[atom])
-            {
-                if let Some(align @ (AlignItems::FlexStart | AlignItems::FlexEnd)) = align {
-                    edges.push((row, height * scale, *align == AlignItems::FlexEnd));
-                    continue;
-                }
-                // Do not shift the row for fractional-pixel differences between a full-line baseline box
-                // and the strut.
-                let [above, below] = [baseline * scale, (height - baseline) * scale];
-                rows[row] = [
-                    rows[row][0].max(if above - root[0] < 1. { 0. } else { above }),
-                    rows[row][1].max(if below - root[1] < 1. { 0. } else { below }),
-                ];
-                continue;
-            }
-            let kind = heights
-                .get(heights.partition_point(|(end, _)| *end <= at))
-                .map_or(style::LineHeight::Normal, |(_, kind)| *kind);
-            let source = (kind != style::LineHeight::Normal)
-                .then(|| run_ends.partition_point(|&end| end <= at));
-            if last == Some((glyph.font, glyph.size, row, kind, source)) {
-                continue;
-            }
-            last = Some((glyph.font, glyph.size, row, kind, source));
-            let size = f32::from(glyph.size);
-            let [above, below] = inline(
-                source
-                    .and_then(|index| runs.get(index))
-                    .map_or(glyph.font, |styled| system.face(&styled.font)),
-                glyph.size,
-                match kind {
-                    style::LineHeight::Normal => None,
-                    style::LineHeight::Scale(factor) => {
-                        Some((factor * size * scale * 64.).floor() / 64.)
-                    }
-                    style::LineHeight::Fixed(line) => Some((line * scale * 64.).round() / 64.),
-                },
-            );
-            rows[row] = [rows[row][0].max(above), rows[row][1].max(below)];
-        }
-        offset += line.len() + 1;
-    }
-    edges.sort_by(|a: &(usize, f32, bool), b| b.1.total_cmp(&a.1));
-    for (row, height, bottom) in edges {
-        let [above, below] = &mut rows[row];
-        if bottom {
-            *above = above.max(height - *below);
-        } else {
-            *below = below.max(height - *above);
-        }
-    }
-    rows.into_iter()
-        .map(|[above, below]| {
-            [above - root[0], below - root[1]].map(|extra| px(extra.max(0.) / scale))
-        })
-        .collect()
 }
 
 pub(crate) fn text_position(
@@ -844,7 +784,7 @@ impl From<InlineText> for renderer::Node {
                     }
                     let strut = (system.face(&style.font()), font_size, line_height);
                     let scale = window.scale_factor();
-                    let extents = row_extents(
+                    let extents = super::layout::line::row_extents(
                         lines.iter(),
                         &runs,
                         &data.line_heights,
@@ -1054,7 +994,7 @@ impl renderer::Hooks for InlineText {
             .unwrap_or(bounds.size.width);
         let indent = style.text_indent + px(style.text_indent_percent * f32::from(base));
         let strut = window.text_system().face(&style.font());
-        let extents = row_extents(
+        let extents = super::layout::line::row_extents(
             layout.lines().iter(),
             runs,
             &self.data.line_heights,
@@ -1838,7 +1778,7 @@ impl renderer::Hooks for InlineText {
                             .map_or(0x000000ff, |(color, alpha)| color << 8 | alpha as u32);
                         if let Some(position) = text_position(layout, &self.data.text, rows, start)
                         {
-                            super::input::paint_caret(
+                            paint_caret(
                                 view,
                                 [*id, start, range.len()],
                                 Rect::new(position, size(px(1.), layout.line_height())),

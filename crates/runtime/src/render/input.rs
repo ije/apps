@@ -5,48 +5,9 @@ use crate::css::properties::Prop;
 use crate::style;
 use anyhow::{Context as _, Result, ensure};
 use renderer::{App, Event, Pixels, Point, Rect, Utf16Selection, Window, point, px, size};
-use std::{
-    ops::Range,
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::{ops::Range, rc::Rc};
 
 pub(super) type Caret = (Option<[usize; 2]>, usize);
-
-pub(super) type Blink = ([usize; 3], Instant, Option<(u32, renderer::Timer)>);
-
-pub(super) fn paint_caret(
-    view: &ViewState,
-    key: [usize; 3],
-    bounds: Rect<Pixels>,
-    color: renderer::Color,
-    window: &mut Window,
-) {
-    const BLINK: Duration = renderer::CARET_BLINK;
-    if color.a == 0. || !window.is_active() {
-        return;
-    }
-    let now = Instant::now();
-    let mut caret = view.caret.borrow_mut();
-    if caret.as_ref().is_some_and(|(old, ..)| *old != key) {
-        *caret = None;
-    }
-    let (_, since, wake) = caret.get_or_insert((key, now, None));
-    // A timer can fire just before its time, so the phase rounds up within 8 ms.
-    let phase = ((now - *since + Duration::from_millis(8)).as_millis() / BLINK.as_millis()) as u32;
-    // The first phase draws, so typing and scrolling move the caret in the same frame as the text.
-    if phase > 0 && window.overlay_caret(bounds, color, *since, phase.is_multiple_of(2)) {
-        *wake = None;
-        return;
-    }
-    if wake.as_ref().is_none_or(|(old, _)| *old != phase) {
-        let due = *since + BLINK * (phase + 1);
-        *wake = Some((phase, window.timer(due - now, |window, _| window.refresh())));
-    }
-    if phase.is_multiple_of(2) {
-        window.draw_rect(bounds, color);
-    }
-}
 
 // The rows of `aligned_rows` with the lines, width and alignment they are for.
 type KeptRows = (
@@ -323,7 +284,7 @@ impl renderer::Hooks for FieldText {
             && start == end
             && let Some(at) = super::text::text_position(&layout, text, &rows, caret)
         {
-            paint_caret(
+            super::text::paint_caret(
                 &self.view,
                 [self.id, caret, text.len()],
                 Rect::new(at, size(px(1.), line_height)),

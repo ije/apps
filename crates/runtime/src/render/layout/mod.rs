@@ -1,3 +1,6 @@
+pub(crate) mod line;
+pub(crate) mod size;
+
 use crate::css;
 use std::{collections::HashMap, rc::Rc, sync::Arc};
 
