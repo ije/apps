@@ -445,7 +445,7 @@ impl Desktop {
                             .filter(|_| cfg!(target_os = "macos"));
                         let background = options["backgroundColor"]
                             .as_str()
-                            .and_then(crate::style::color)
+                            .and_then(crate::css::color)
                             .unwrap_or(if transparent || vibrancy.is_some() {
                                 (0, 0)
                             } else {
@@ -867,7 +867,7 @@ impl Desktop {
                         let key = args[2].as_str().unwrap_or_default();
                         if action == "insertCSS" {
                             let css = args[3].as_str().unwrap_or_default();
-                            let sheet = Rc::new(crate::style::Stylesheet::parse(css));
+                            let sheet = Rc::new(crate::css::Stylesheet::parse(css));
                             state
                                 .inserted
                                 .push((key.to_owned(), sheet, args[4] == true));
@@ -1102,7 +1102,7 @@ impl Desktop {
                     "background" => {
                         let color = args[2]
                             .as_str()
-                            .and_then(crate::style::color)
+                            .and_then(crate::css::color)
                             .unwrap_or((0xffffff, 255));
                         let mut host = self.host.borrow_mut();
                         host.backgrounds.insert(id, color);
@@ -1878,7 +1878,7 @@ pub(crate) fn validate(args: &serde_json::Value) -> Result<()> {
                     "titleBarStyle" => {
                         matches!(value.as_str(), Some("default" | "hidden" | "hiddenInset"))
                     }
-                    "backgroundColor" => value.as_str().and_then(crate::style::color).is_some(),
+                    "backgroundColor" => value.as_str().and_then(crate::css::color).is_some(),
                     "trafficLightPosition" => position(&value["x"]) && position(&value["y"]),
                     _ => bail!("Unsupported BrowserWindow option: {key}"),
                 };
@@ -1923,7 +1923,7 @@ pub(crate) fn validate(args: &serde_json::Value) -> Result<()> {
             "Invalid vibrancy"
         ),
         "background" => ensure!(
-            args[2].as_str().and_then(crate::style::color).is_some(),
+            args[2].as_str().and_then(crate::css::color).is_some(),
             "Invalid background color"
         ),
         "load" | "loadFile" => ensure!(

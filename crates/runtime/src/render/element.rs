@@ -6,7 +6,8 @@ use super::{
     scrollbar,
     text::InlineText,
 };
-use crate::style::Prop;
+use crate::css;
+use crate::css::Prop;
 use crate::{
     dom::Document,
     style::{self, ComputedStyles},
@@ -228,7 +229,7 @@ fn row_fill(doc: &Document, styles: &ComputedStyles, id: usize) -> Option<Color>
     let fill = |node: usize| {
         styles.values[node]
             .get(Prop::BACKGROUND_COLOR)
-            .and_then(style::paint)
+            .and_then(css::paint)
             .filter(|color| color.a > 0.)
     };
     let mut table = None;
@@ -319,7 +320,7 @@ fn box_parent(doc: &Document, styles: &ComputedStyles, id: usize) -> Option<usiz
 fn padding_start(styles: &ComputedStyles, parent: usize, width: f32) -> (f32, bool) {
     let style = &styles.values[parent];
     let rtl = style.get(Prop::DIRECTION) == Some("rtl");
-    let padding = styles.lengths[parent].edges(style, style::PADDING, width);
+    let padding = styles.lengths[parent].edges(style, css::PADDING, width);
     (padding[if rtl { 1 } else { 3 }].max(0.), rtl)
 }
 
@@ -358,13 +359,13 @@ fn insets(styles: &ComputedStyles, node: usize, padding: bool, width: f32) -> [f
     if !padding {
         return borders;
     }
-    let padding = units.edges(style, style::PADDING, width);
+    let padding = units.edges(style, css::PADDING, width);
     std::array::from_fn(|side| padding[side] + borders[side])
 }
 
 fn backdrop(doc: &Document, styles: &ComputedStyles, id: usize) -> Option<(usize, u32)> {
     std::iter::successors(Some(id), |&node| doc.nodes[node].parent).find_map(|node| {
-        let (ink, alpha) = style::color(styles.values[node].get(Prop::BACKGROUND_COLOR)?)?;
+        let (ink, alpha) = css::color(styles.values[node].get(Prop::BACKGROUND_COLOR)?)?;
         (alpha >= 128).then_some((node, ink))
     })
 }
@@ -689,7 +690,7 @@ impl<'a> Build<'a> {
 }
 
 // The axes, 1 for x and 2 for y, that the insets of an out-of-flow box set.
-fn inset_axes(style: &style::Style) -> u8 {
+fn inset_axes(style: &css::Style) -> u8 {
     [[Prop::LEFT, Prop::RIGHT], [Prop::TOP, Prop::BOTTOM]]
         .iter()
         .enumerate()
@@ -816,7 +817,7 @@ const SVG_SOURCE: [Prop; 13] = [
 ];
 
 // `text-indent` as pixels and a fraction of the width of the paragraph, which the renderer resolves at layout.
-fn text_indent(style: &style::Style, units: &style::Lengths) -> (f32, f32) {
+fn text_indent(style: &css::Style, units: &css::Lengths) -> (f32, f32) {
     let Some(value) = style.get(Prop::TEXT_INDENT) else {
         return (0., 0.);
     };
@@ -972,7 +973,7 @@ impl SvgSource<'_> {
                 | Prop::COLOR
                 | Prop::STOP_COLOR
                 | Prop::FLOOD_COLOR
-                | Prop::LIGHTING_COLOR => style::color(value)
+                | Prop::LIGHTING_COLOR => css::color(value)
                     .map_or(value.to_owned(), |(rgb, alpha)| {
                         format!("#{rgb:06x}{alpha:02x}")
                     }),
@@ -1040,7 +1041,7 @@ impl SvgSource<'_> {
         super::canvas::svg_shape(&source)
     }
 }
-pub(super) type Svg = (Vec<Rc<style::Style>>, ([f32; 2], u64));
+pub(super) type Svg = (Vec<Rc<css::Style>>, ([f32; 2], u64));
 
 type Used = Rc<rustc_hash::FxHashMap<usize, [f32; 2]>>;
 type Sets = ([f32; 2], [f32; 2], bool);
@@ -1382,7 +1383,7 @@ pub(super) fn repaint(build: &Build<'_>, id: usize) -> Option<renderer::Node> {
         Some(bounds) => {
             let mut units = build.styles.lengths[id];
             units.container = Some(container);
-            let margin = units.edges(&build.styles.values[id], style::MARGIN, containing[0]);
+            let margin = units.edges(&build.styles.values[id], css::MARGIN, containing[0]);
             self::place(child, margin, build.pixel_ratio, bounds)
         }
         None => child,
@@ -1745,7 +1746,7 @@ fn create(
     let overlapping = || {
         let shadows = |inset| {
             style.get(Prop::BOX_SHADOW).map_or(0, |value| {
-                (units.shadows(value, inset).iter())
+                (css::box_shadows(&units, value, inset).iter())
                     .filter(|shadow| !shadow.color.is_transparent())
                     .count()
             })
@@ -1753,7 +1754,7 @@ fn create(
         let images = style
             .get(Prop::BACKGROUND_IMAGE)
             .filter(|value| *value != "none")
-            .map_or(0, |value| style::components(value, ',').len());
+            .map_or(0, |value| css::components(value, ',').len());
         let border = (units.borders(style, 0.).into_iter())
             .zip(parsed.border_colors)
             .any(|(width, color)| width > 0. && color.a > 0.);
@@ -1937,8 +1938,8 @@ fn create(
         let painter = view.clone();
         let ink = [Prop::CARET_COLOR, Prop::COLOR]
             .into_iter()
-            .find_map(|prop| style::color(style.get(prop)?))
-            .map_or(Color::hex(0x000000ff), style::rgba);
+            .find_map(|prop| css::color(style.get(prop)?))
+            .map_or(Color::hex(0x000000ff), css::rgba);
         let view = view.clone();
         let above = above();
         // Like Chromium, the box of a `<br>` is the content area of its font, not the line.
@@ -2580,7 +2581,7 @@ fn create(
             if image.is_some() {
                 picture = Some(fit);
             } else {
-                let padding = units.edges(style, style::PADDING, containing[0]);
+                let padding = units.edges(style, css::PADDING, containing[0]);
                 content_layers.push(svg_layer(id, false, false, view.clone(), padding));
             }
         }
@@ -2673,8 +2674,8 @@ fn create(
     if node.tag == "svg" {
         // Padding and borders, which the drawing doesn't fill.
         let frame = {
-            let padding = units.edges(style, style::PADDING, containing[0]);
-            let borders = style::BORDERS.map(|[width, kind, _]| {
+            let padding = units.edges(style, css::PADDING, containing[0]);
+            let borders = css::BORDERS.map(|[width, kind, _]| {
                 style
                     .get(kind)
                     .filter(|kind| !matches!(*kind, "none" | "hidden"))
@@ -2716,7 +2717,7 @@ fn create(
         // Like browsers: an SVG with a ratio and no size fills the available width, and one with neither is
         // 300 by 150.
         let available = || {
-            let margins = units.edges(style, style::MARGIN, containing[0]);
+            let margins = units.edges(style, css::MARGIN, containing[0]);
             let insets = if matches!(position, "absolute" | "fixed") {
                 [Prop::LEFT, Prop::RIGHT].map(|prop| {
                     style
@@ -2748,7 +2749,7 @@ fn create(
                         .is_none_or(|value| matches!(value, "normal" | "stretch"))
                     && containing[1] > 0. =>
             {
-                let margins = units.edges(style, style::MARGIN, containing[0]);
+                let margins = units.edges(style, css::MARGIN, containing[0]);
                 let height = containing[1] - margins[0] - margins[2] - frame[1];
                 [height * ratio, height]
             }
@@ -2948,7 +2949,7 @@ fn create(
             true,
             spill,
             view.clone(),
-            units.edges(style, style::PADDING, containing[0]),
+            units.edges(style, css::PADDING, containing[0]),
         ));
     }
     let stretched = |axis: usize| {
@@ -3002,9 +3003,9 @@ fn create(
     {
         // The button takes its box from `::file-selector-button`, which the agent sheet always gives.
         let [padding, margin] =
-            [style::PADDING, style::MARGIN].map(|sides| units.edges(part, sides, 0.));
+            [css::PADDING, css::MARGIN].map(|sides| units.edges(part, sides, 0.));
         let borders = units.borders(part, 0.);
-        let color = |prop| part.get(prop).and_then(style::paint);
+        let color = |prop| part.get(prop).and_then(css::paint);
         let radius = part
             .get(Prop::BORDER_TOP_LEFT_RADIUS)
             .and_then(|value| units.resolve(value, 0.))
@@ -3126,24 +3127,24 @@ fn create(
         let font_size = units.font.em;
         let text_color = style
             .get(Prop::COLOR)
-            .and_then(style::paint)
+            .and_then(css::paint)
             .unwrap_or(renderer::Color::BLACK);
         let caret_color = style
             .get(Prop::CARET_COLOR)
-            .and_then(style::paint)
+            .and_then(css::paint)
             .unwrap_or(text_color);
         let pseudo = styles
             .text_pseudos
             .get(&id)
             .and_then(|pseudos| pseudos[3].as_ref());
         let mut placeholder_color = pseudo
-            .and_then(|pseudo| style::paint(pseudo.get(Prop::COLOR)?))
+            .and_then(|pseudo| css::paint(pseudo.get(Prop::COLOR)?))
             .unwrap_or(Color::hex(0x757575ff));
         placeholder_color.a *= pseudo
             .and_then(|pseudo| pseudo.get(Prop::OPACITY)?.parse::<f32>().ok())
             .map_or(1., |opacity| opacity.clamp(0., 1.));
         let single_line = node.tag != "textarea";
-        let padding = units.edges(style, style::PADDING, containing[0]);
+        let padding = units.edges(style, css::PADDING, containing[0]);
         let empty = text.is_empty();
         let face = match pseudo {
             Some(pseudo) if empty => style::font(pseudo),
@@ -3269,7 +3270,7 @@ fn create(
     if hit.is_none()
         && let Some(ink) = style
             .get(Prop::WEBKIT_TEXT_FILL_COLOR)
-            .and_then(style::paint)
+            .and_then(css::paint)
             .or(parsed.ink)
     {
         el = el.text_color(ink);
@@ -3318,10 +3319,10 @@ fn create(
         // The color fills the clip box of the bottom layer.
         let clip = style.get(Prop::BACKGROUND_CLIP).unwrap_or("");
         let clip = if clip.contains(',') {
-            let clips = style::components(clip, ',');
+            let clips = css::components(clip, ',');
             let layers = style
                 .get(Prop::BACKGROUND_IMAGE)
-                .map_or(1, |value| style::components(value, ',').len());
+                .map_or(1, |value| css::components(value, ',').len());
             clips
                 .get((layers.max(1) - 1) % clips.len().max(1))
                 .map_or("", |clip| clip.trim())
@@ -3426,7 +3427,7 @@ fn create(
     });
     let mut padding = parsed.padding.unwrap_or_else(|| {
         units
-            .edges(style, style::PADDING, containing[0])
+            .edges(style, css::PADDING, containing[0])
             .map(|value| value.max(0.))
     });
     padding[1] += reserved[1];
@@ -3472,11 +3473,11 @@ fn create(
         && legend == id
     {
         let left =
-            styles.lengths[fieldset].edges(&styles.values[fieldset], style::PADDING, containing[0])
+            styles.lengths[fieldset].edges(&styles.values[fieldset], css::PADDING, containing[0])
                 [3];
         el = el.absolute().top(px(-height)).left(px(left));
     }
-    for (side, prop) in style::MARGIN.iter().enumerate() {
+    for (side, prop) in css::MARGIN.iter().enumerate() {
         if hit.is_none() && style.get(*prop).is_some_and(|s| s == "auto") {
             el = match side {
                 0 => el.mt_auto(),
@@ -3517,7 +3518,7 @@ fn create(
     let mut borders = parsed
         .borders
         .unwrap_or_else(|| units.borders(style, containing[0]));
-    let sides = style::BORDERS.map(|[width, kind, color]| (width, kind, color));
+    let sides = css::BORDERS.map(|[width, kind, color]| (width, kind, color));
     let mut border_colors = parsed.border_colors;
     let mut border_kinds = sides.map(|(_, kind, _)| style.get(kind).unwrap_or("none"));
     if inline_box {
@@ -3708,10 +3709,10 @@ fn create(
                 }
                 super::control::Control::Color => node
                     .current_value()
-                    .and_then(style::color)
+                    .and_then(css::color)
                     .map_or(0, |(color, _)| color),
                 _ if node.attrs.contains_key("disabled") => 0x767676,
-                _ => match style.get(Prop::ACCENT_COLOR).and_then(style::color) {
+                _ => match style.get(Prop::ACCENT_COLOR).and_then(css::color) {
                     Some((color, _)) => {
                         dark = super::control::accent_dark(control, node.checked(), color, dark);
                         color
@@ -3732,7 +3733,7 @@ fn create(
                 accent,
                 ink: style
                     .get(Prop::COLOR)
-                    .and_then(style::color)
+                    .and_then(css::color)
                     .map_or(0, |(color, _)| color),
                 value: if value < min || max <= min && control != super::control::Control::Progress
                 {
@@ -3915,7 +3916,7 @@ fn create(
         && style
             .get(Prop::BACKGROUND_IMAGE)
             .is_some_and(|value| value != "none")
-        && style::components(
+        && css::components(
             style
                 .get(Prop::BACKGROUND_CLIP)
                 .filter(|clip| !clip.is_empty())
@@ -4049,7 +4050,7 @@ fn create(
     if hit.is_some()
         && let Some(value) = style.get(Prop::BOX_SHADOW)
     {
-        inner_shadows = units.shadows(value, true);
+        inner_shadows = css::box_shadows(&units, value, true);
     }
     // The left and right insets of a positioned box take room from its width.
     let inset_x = [Prop::LEFT, Prop::RIGHT].map(|prop| {
@@ -4235,8 +4236,8 @@ fn create(
                 };
             }
             Prop::BOX_SHADOW => {
-                el.style().box_shadow = units.shadows(value, false);
-                inner_shadows = units.shadows(value, true);
+                el.style().box_shadow = css::box_shadows(&units, value, false);
+                inner_shadows = css::box_shadows(&units, value, true);
             }
             Prop::ASPECT_RATIO => {
                 if !(value.contains("auto") && natural_ratio.is_some())
@@ -4703,7 +4704,7 @@ fn create(
             "bottom" => Some(renderer::AlignItems::FlexEnd),
             _ => None,
         };
-        let below = |style: &style::Style, font: style::FontUnits| {
+        let below = |style: &css::Style, font: css::FontUnits| {
             let face = text.face(&style::font(style));
             font.lh - f32::from(text.baseline(face, px(font.em), px(font.lh), pixel_ratio))
         };
@@ -5057,7 +5058,7 @@ fn create(
             };
         let color = style
             .get(Prop::OUTLINE_COLOR)
-            .and_then(style::paint)
+            .and_then(css::paint)
             .unwrap_or(ink);
         let under = renderer::Color::hex(if dark() { 0x101010ff } else { 0xffffffff });
         let mut ring = renderer::canvas(
@@ -5129,7 +5130,7 @@ fn create(
                 .unwrap_or(0.);
         let color = style
             .get(Prop::OUTLINE_COLOR)
-            .and_then(style::paint)
+            .and_then(css::paint)
             .unwrap_or(ink);
         let name = style.get(Prop::OUTLINE_STYLE).unwrap_or("solid");
         let kind = border_style(name);
@@ -5280,10 +5281,10 @@ fn create(
         el = el.child(if look.plain {
             let parts = styles.scrollbars.get(&id);
             let range = look.control == super::control::Control::Range;
-            let ink = style::rgba(
+            let ink = css::rgba(
                 style
                     .get(Prop::COLOR)
-                    .and_then(style::color)
+                    .and_then(css::color)
                     .unwrap_or((0, 255)),
             );
             // Size, margin-top, border width, radius, fill and border color of the track and thumb, or of the
@@ -5292,7 +5293,7 @@ fn create(
                 let part = parts.and_then(|parts| parts[slot].as_ref());
                 let get = |prop| part.and_then(|part| part.get(prop));
                 let length = |prop| get(prop).and_then(|value| units.resolve(value, f32::NAN));
-                let color = |prop| get(prop).and_then(style::paint);
+                let color = |prop| get(prop).and_then(css::paint);
                 let native = range
                     && slot == 2
                     && [Prop::APPEARANCE, Prop::WEBKIT_APPEARANCE]
@@ -5304,7 +5305,7 @@ fn create(
                     .flatten()
                     .unwrap_or(0.);
                 let fill = match (range, slot) {
-                    _ if native => Some(style::rgba((look.accent, 255))),
+                    _ if native => Some(css::rgba((look.accent, 255))),
                     (false, 1) => Some(renderer::Color::hex(0x808080ff)),
                     (false, _) => Some(renderer::Color::hex(0x008000ff)),
                     _ => None,
@@ -5498,7 +5499,7 @@ fn create(
             );
         let number = styles.list_items.get(&id).copied().unwrap_or(number);
         let marker = match kind {
-            "disc" | "circle" | "square" => style::counter_text(kind, number),
+            "disc" | "circle" | "square" => css::counter_text(kind, number),
             "disclosure-closed" => "▸".to_owned(),
             "disclosure-open" => "▾".to_owned(),
             other if other.starts_with(['"', '\'']) => other.trim_matches(['"', '\'']).to_owned(),
@@ -5507,12 +5508,12 @@ fn create(
             | "trad-chinese-informal"
             | "simp-chinese-informal"
             | "hiragana"
-            | "katakana" => format!("{}、", style::counter_text(kind, number)),
-            _ => format!("{}.", style::counter_text(kind, number)),
+            | "katakana" => format!("{}、", css::counter_text(kind, number)),
+            _ => format!("{}.", css::counter_text(kind, number)),
         };
         let marker = content.map_or(marker, |content| {
             let mut text = String::new();
-            for part in style::components(content, ' ') {
+            for part in css::components(content, ' ') {
                 if part.starts_with("counter(") || part.starts_with("counters(") {
                     text.push_str(&number.to_string());
                     continue;
@@ -5567,7 +5568,7 @@ fn create(
                 ink: marker_style
                     .unwrap_or(style)
                     .get(Prop::COLOR)
-                    .and_then(style::color)
+                    .and_then(css::color)
                     .map_or(0, |(ink, _)| ink),
                 ..Default::default()
             };
@@ -5612,7 +5613,7 @@ fn create(
             let color = marker_style
                 .unwrap_or(style)
                 .get(Prop::COLOR)
-                .and_then(style::paint)
+                .and_then(css::paint)
                 .unwrap_or(Color::hex(0x000000ff));
             let [ascent, descent, _] = metrics;
             let offset = (ascent * 2. / 3.).floor();
@@ -5674,8 +5675,8 @@ fn create(
                 .text_style()
                 .set_font_style(face.style)
                 .set_font_synthesis(face.synthesis);
-            if let Some(ink) = marker.get(Prop::COLOR).and_then(style::color) {
-                marker_box = marker_box.text_color(style::rgba(ink));
+            if let Some(ink) = marker.get(Prop::COLOR).and_then(css::color) {
+                marker_box = marker_box.text_color(css::rgba(ink));
             }
         }
         // Like Chrome's `::marker`, numbers take tabular widths.
@@ -5902,8 +5903,8 @@ fn create(
                 }
                 style::LineHeight::Normal => {}
             }
-            if let Some(ink) = pseudo.get(Prop::COLOR).and_then(style::color) {
-                decoration = decoration.text_color(style::rgba(ink));
+            if let Some(ink) = pseudo.get(Prop::COLOR).and_then(css::color) {
+                decoration = decoration.text_color(css::rgba(ink));
             }
             let absolute = pseudo
                 .get(Prop::POSITION)
@@ -5948,9 +5949,9 @@ fn create(
                     0.
                 };
             let pseudo_padding = pseudo_units
-                .edges(pseudo, style::PADDING, base)
+                .edges(pseudo, css::PADDING, base)
                 .map(|v| v.max(0.));
-            let pseudo_margin = pseudo_units.edges(pseudo, style::MARGIN, base);
+            let pseudo_margin = pseudo_units.edges(pseudo, css::MARGIN, base);
             let pseudo_borders = pseudo_units.borders(pseudo, base);
             decoration = decoration
                 .pt(px(pseudo_padding[0]))
@@ -5965,7 +5966,7 @@ fn create(
                 .border_r(px(pseudo_borders[1]))
                 .border_b(px(pseudo_borders[2]))
                 .border_l(px(pseudo_borders[3]));
-            for (side, prop) in style::MARGIN.iter().enumerate() {
+            for (side, prop) in css::MARGIN.iter().enumerate() {
                 if pseudo.get(*prop) == Some("auto") {
                     decoration = match side {
                         0 => decoration.mt_auto(),
@@ -5986,7 +5987,7 @@ fn create(
             let pseudo_radius = super::effects::radii(pseudo, &pseudo_units, || containing);
             decoration.style().corner_radii = pseudo_radius;
             let colors =
-                sides.map(|(_, _, color)| pseudo.get(color).and_then(style::paint).unwrap_or(ink));
+                sides.map(|(_, _, color)| pseudo.get(color).and_then(css::paint).unwrap_or(ink));
             let border_image = super::background::border_image(
                 pseudo,
                 pseudo_units,
@@ -6212,7 +6213,7 @@ fn create(
                         decoration.style().visibility = renderer::Visibility::Hidden;
                     }
                     Prop::BACKGROUND_COLOR => {
-                        if let Some(color) = style::paint(value) {
+                        if let Some(color) = css::paint(value) {
                             decoration = decoration.bg(color);
                         }
                     }
@@ -6220,8 +6221,9 @@ fn create(
                         decoration = decoration.opacity(super::effects::opacity(pseudo));
                     }
                     Prop::BOX_SHADOW => {
-                        decoration.style().box_shadow = pseudo_units.shadows(value, false);
-                        pseudo_shadows = pseudo_units.shadows(value, true);
+                        decoration.style().box_shadow =
+                            css::box_shadows(&pseudo_units, value, false);
+                        pseudo_shadows = css::box_shadows(&pseudo_units, value, true);
                     }
                     _ => {}
                 }
@@ -7385,11 +7387,11 @@ fn create(
                     let pseudo_units = pseudo_lengths(&units, style, pseudo, text, pixel_ratio);
                     let [padding, borders] = [
                         pseudo_units
-                            .edges(pseudo, style::PADDING, base)
+                            .edges(pseudo, css::PADDING, base)
                             .map(|v| v.max(0.)),
                         pseudo_units.borders(pseudo, base),
                     ];
-                    margin = pseudo_units.edges(pseudo, style::MARGIN, base);
+                    margin = pseudo_units.edges(pseudo, css::MARGIN, base);
                     let own = decoration.style();
                     own.padding = renderer::Edges {
                         top: px(padding[0]).into(),
@@ -7397,11 +7399,11 @@ fn create(
                         bottom: px(padding[2]).into(),
                         left: px(padding[3]).into(),
                     };
-                    let side =
-                        |at: usize, old: renderer::Length| match pseudo.get(style::MARGIN[at]) {
-                            Some("auto") => old,
-                            _ => px(margin[at]).into(),
-                        };
+                    let side = |at: usize, old: renderer::Length| match pseudo.get(css::MARGIN[at])
+                    {
+                        Some("auto") => old,
+                        _ => px(margin[at]).into(),
+                    };
                     own.margin = renderer::Edges {
                         top: side(0, own.margin.top),
                         right: side(1, own.margin.right),
@@ -7844,7 +7846,7 @@ fn create(
                 .is_none_or(|value| !value.contains("nowrap"));
         el.reserve(children.len());
         let mut item_margins =
-            rustc_hash::FxHashMap::<(*const style::Style, u32), [f32; 4]>::default();
+            rustc_hash::FxHashMap::<(*const css::Style, u32), [f32; 4]>::default();
         let (mut scanned, mut last_flow, mut seen, mut flowed) = (0, None, 0, false);
         if children.len() == flat.len() {
             for &(cut, from, to) in &cuts {
@@ -7878,7 +7880,7 @@ fn create(
                         2 * at + 1,
                         super::paint::Piece::Blocks(key(at), key(last), {
                             let last = children[last];
-                            styles.lengths[last].edges(&styles.values[last], style::MARGIN, 0.)[2]
+                            styles.lengths[last].edges(&styles.values[last], css::MARGIN, 0.)[2]
                         }),
                     ));
                     at = last + 1;
@@ -8263,7 +8265,7 @@ fn create(
                         let margin = *item_margins.entry(key).or_insert_with(|| {
                             let mut units = styles.lengths[child];
                             units.container = Some(container);
-                            units.edges(style, style::MARGIN, base)
+                            units.edges(style, css::MARGIN, base)
                         });
                         place(child_element, margin, pixel_ratio, bounds)
                     }
@@ -9416,12 +9418,12 @@ fn create(
 
 // Font units from the pseudo-element's own font, as the style pass gives them to an element.
 pub(super) fn pseudo_lengths(
-    units: &style::Lengths,
-    style: &style::Style,
-    pseudo: &style::Style,
+    units: &css::Lengths,
+    style: &css::Style,
+    pseudo: &css::Style,
     text: &renderer::TextSystem,
     pixel_ratio: f32,
-) -> style::Lengths {
+) -> css::Lengths {
     let mut lengths = *units;
     let size = pseudo
         .get(Prop::FONT_SIZE)
@@ -9443,7 +9445,7 @@ pub(super) fn pseudo_lengths(
     let metrics = text.metrics(face);
     let advance =
         |glyph, default: f32| text.advance(face, px(1.), glyph).map_or(default, f32::from) * size;
-    lengths.font = style::FontUnits {
+    lengths.font = css::FontUnits {
         em: size,
         ch: advance('0', 0.5),
         ex: metrics.x_height * size,
@@ -9467,7 +9469,7 @@ pub(super) fn pseudo_lengths(
 
 // Taffy applies min/max constraints through aspect ratio even with an explicit opposite size. Prevent
 // max-width from changing explicit image heights.
-fn only_auto_ratio(mut el: renderer::Node, style: &style::Style) -> renderer::Node {
+fn only_auto_ratio(mut el: renderer::Node, style: &css::Style) -> renderer::Node {
     let set = |prop| style.get(prop).is_some_and(|value| value != "auto");
     let limited = |prop| style.get(prop).is_some_and(|value| value != "none");
     if set(Prop::HEIGHT) {
@@ -9491,7 +9493,7 @@ fn only_auto_ratio(mut el: renderer::Node, style: &style::Style) -> renderer::No
 
 pub(super) fn aspect_ratio(value: &str) -> Option<f32> {
     let value = value.replace('/', " / ");
-    let parts = style::components(&value, ' ');
+    let parts = css::components(&value, ' ');
     let numbers: Vec<f32> = parts.iter().filter_map(|part| part.parse().ok()).collect();
     let ratio = match numbers.as_slice() {
         [a, b, ..] if parts.contains(&"/") => a / b,
@@ -9535,7 +9537,7 @@ pub(crate) fn dimension(value: &str, integer: bool) -> Option<f32> {
         .filter(|value| value.is_finite())
 }
 
-pub(super) fn text_field(node: &crate::dom::Node, style: &style::Style) -> bool {
+pub(super) fn text_field(node: &crate::dom::Node, style: &css::Style) -> bool {
     node.tag == "textarea"
         || node.tag == "input"
             && node.native_control(style).is_none()
@@ -9551,7 +9553,7 @@ pub(super) fn natural_size(
     doc: &Document,
     id: usize,
     decoded: Option<[f32; 2]>,
-    style: &style::Style,
+    style: &css::Style,
 ) -> Option<([f32; 2], Option<f32>)> {
     let node = &doc.nodes[id];
     let attr = |name: &str, default: f32| {
@@ -9649,8 +9651,8 @@ fn paint_broken_icon(origin: renderer::Point<renderer::Pixels>, window: &mut ren
 pub(super) fn field_size(
     doc: &Document,
     id: usize,
-    style: &style::Style,
-    units: &style::Lengths,
+    style: &css::Style,
+    units: &css::Lengths,
     text: &renderer::TextSystem,
     pixel_ratio: f32,
     width: bool,
@@ -9772,8 +9774,8 @@ pub(super) fn field_size(
 /// device pixels, takes the normal line height.
 pub(super) fn field_line(
     node: &crate::dom::Node,
-    style: &style::Style,
-    units: &style::Lengths,
+    style: &css::Style,
+    units: &css::Lengths,
     text: &renderer::TextSystem,
     pixel_ratio: f32,
 ) -> f32 {
@@ -9795,9 +9797,9 @@ pub(super) fn field_line(
 
 /// The natural content size of a file input with the box of its button: the button and label, or 34 digits.
 pub(super) fn file_size(
-    style: &style::Style,
-    button: &style::Style,
-    units: &style::Lengths,
+    style: &css::Style,
+    button: &css::Style,
+    units: &css::Lengths,
     text: &renderer::TextSystem,
     pixel_ratio: f32,
 ) -> [f32; 2] {
@@ -9812,8 +9814,7 @@ pub(super) fn file_size(
     let zero = text
         .advance(text.face(&style::font(style)), em, '0')
         .map_or(units.font.em / 2., f32::from);
-    let [padding, margin] =
-        [style::PADDING, style::MARGIN].map(|sides| units.edges(button, sides, 0.));
+    let [padding, margin] = [css::PADDING, css::MARGIN].map(|sides| units.edges(button, sides, 0.));
     let borders = units.borders(button, 0.);
     let edges = |side: usize| padding[side] + margin[side] + borders[side];
     // The button text takes the font size of `::file-selector-button`.
@@ -9866,8 +9867,8 @@ pub(super) fn place(
 /// Whether an inline box has padding, a border or a margin on a side.
 fn edge(build: &Build<'_>, id: usize, side: usize) -> bool {
     let (style, units) = (&build.styles.values[id], &build.styles.lengths[id]);
-    units.edges(style, style::PADDING, 0.)[side]
-        + units.edges(style, style::MARGIN, 0.)[side]
+    units.edges(style, css::PADDING, 0.)[side]
+        + units.edges(style, css::MARGIN, 0.)[side]
         + units.borders(style, 0.)[side]
         != 0.
 }
@@ -9926,12 +9927,12 @@ fn in_flow(doc: &Document, info: &[cull::Info], id: usize) -> bool {
 fn margins(
     build: &Build<'_>,
     id: usize,
-    units: &style::Lengths,
+    units: &css::Lengths,
     width: f32,
     flex_parent: bool,
     slot: bool,
 ) -> [f32; 4] {
-    let mut margin = units.edges(&build.styles.values[id], style::MARGIN, width);
+    let mut margin = units.edges(&build.styles.values[id], css::MARGIN, width);
     // The blocks of a spliced inline box are in the flow of its block.
     let parent = std::iter::successors(build.doc.nodes[id].parent, |&up| {
         style::spliced(build.doc, build.styles, up)
@@ -10308,7 +10309,7 @@ fn shrinks_around(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
         .unwrap_or(false)
 }
 
-fn percent_calc(units: &style::Lengths, value: &str) -> Option<(f32, f32)> {
+fn percent_calc(units: &css::Lengths, value: &str) -> Option<(f32, f32)> {
     // Bounds can look linear at the samples, so `percent_bound` takes them.
     if !value.starts_with("calc(")
         || !value.contains('%')
@@ -10330,7 +10331,7 @@ fn percent_calc(units: &style::Lengths, value: &str) -> Option<(f32, f32)> {
 // `min()`, `max()` and `clamp()` with percentages resolve at layout, against the real basis. The bound goes into
 // `style`, which can hold 256.
 fn percent_bound(
-    units: &style::Lengths,
+    units: &css::Lengths,
     value: &str,
     extra: f32,
     style: &mut renderer::Style,
@@ -10365,7 +10366,7 @@ fn percent_bound(
     struct Parser<'a> {
         text: &'a str,
         at: usize,
-        units: &'a style::Lengths,
+        units: &'a css::Lengths,
     }
     impl Parser<'_> {
         fn peek(&mut self) -> Option<u8> {
@@ -10584,7 +10585,7 @@ fn adjoining(build: &Build<'_>, id: usize, width: f32, around: Option<[f32; 2]>)
     (top, bottom, empty)
 }
 
-pub(super) fn overscroll(style: &style::Style) -> renderer::Point<renderer::Overscroll> {
+pub(super) fn overscroll(style: &css::Style) -> renderer::Point<renderer::Overscroll> {
     let axis = |prop| match style.get(prop) {
         Some("contain") => renderer::Overscroll::Contain,
         Some("none") => renderer::Overscroll::None,
@@ -10596,7 +10597,7 @@ pub(super) fn overscroll(style: &style::Style) -> renderer::Point<renderer::Over
     )
 }
 
-fn clear_bits(style: &style::Style) -> u8 {
+fn clear_bits(style: &css::Style) -> u8 {
     let rtl = style.get(Prop::DIRECTION) == Some("rtl");
     match style.get(Prop::CLEAR) {
         Some("left") => renderer::Flow::CLEAR_LEFT,
@@ -10610,7 +10611,7 @@ fn clear_bits(style: &style::Style) -> u8 {
     }
 }
 
-fn float_side(style: &style::Style) -> Option<bool> {
+fn float_side(style: &css::Style) -> Option<bool> {
     let rtl = style.get(Prop::DIRECTION) == Some("rtl");
     match style.get(Prop::FLOAT) {
         Some("left") => Some(false),
@@ -10624,8 +10625,8 @@ fn float_side(style: &style::Style) -> Option<bool> {
 type ColumnRule = (f32, renderer::Color, renderer::BorderStyle);
 
 fn columns(
-    style: &style::Style,
-    units: &style::Lengths,
+    style: &css::Style,
+    units: &css::Lengths,
     width: f32,
 ) -> Option<(usize, f32, Option<ColumnRule>)> {
     let count = style
@@ -10667,7 +10668,7 @@ fn columns(
                 .unwrap_or(0.);
             let color = rule_color
                 .or_else(|| style.get(Prop::COLOR))
-                .and_then(style::paint)
+                .and_then(css::paint)
                 .unwrap_or(renderer::Color::BLACK);
             (width, color, border_style(kind))
         })
@@ -10677,7 +10678,7 @@ fn columns(
 
 // A set of columns: its first child holds the flow of content, as wide as one column, which the renderer breaks.
 fn column_set(
-    style: &style::Style,
+    style: &css::Style,
     content: [f32; 2],
     count: usize,
     gap: f32,
@@ -10782,7 +10783,7 @@ pub(super) fn legend(
         return None;
     }
     let units = styles.lengths[legend];
-    let padding = units.edges(style, style::PADDING, 0.);
+    let padding = units.edges(style, css::PADDING, 0.);
     let border = |[width, kind, _]: [Prop; 3]| {
         if style
             .get(kind)
@@ -10796,12 +10797,9 @@ pub(super) fn legend(
                 .unwrap_or(3.)
         }
     };
-    let height = units.font.lh
-        + padding[0]
-        + padding[2]
-        + border(style::BORDERS[0])
-        + border(style::BORDERS[2]);
-    let margin = units.edges(style, style::MARGIN, 0.);
+    let height =
+        units.font.lh + padding[0] + padding[2] + border(css::BORDERS[0]) + border(css::BORDERS[2]);
+    let margin = units.edges(style, css::MARGIN, 0.);
     Some((
         legend,
         margin[0] + height + margin[2],

@@ -1,6 +1,11 @@
 use super::{ComputedStyles, FONT_NAMES, Lengths, Style, color, components};
+use crate::css::BORDERS;
+use crate::css::MARGIN;
+use crate::css::PADDING;
+use crate::css::Prop;
+use crate::css::paint;
+use crate::css::rgba;
 use crate::dom::Document;
-use crate::style::Prop;
 use std::rc::Rc;
 
 pub(crate) fn selection_colors(style: &Style, selection: Option<&Rc<Style>>) -> (Option<u32>, u32) {
@@ -353,12 +358,12 @@ fn styled_run(style: &Rc<Style>, units: &Lengths, len: usize) -> renderer::TextR
 }
 
 pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::TextRun {
-    let ink = (style.get(Prop::COLOR).and_then(super::paint)).unwrap_or(renderer::Color::BLACK);
+    let ink = (style.get(Prop::COLOR).and_then(paint)).unwrap_or(renderer::Color::BLACK);
     let lines = style.get(Prop::TEXT_DECORATION_LINE).unwrap_or("");
     let decoration = style
         .get(Prop::TEXT_DECORATION_COLOR)
         .filter(|value| !value.eq_ignore_ascii_case("currentcolor"))
-        .and_then(super::paint)
+        .and_then(paint)
         .unwrap_or(ink);
     let length = |prop: Prop| {
         style
@@ -382,7 +387,7 @@ pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::
         color: style
             .get(Prop::WEBKIT_TEXT_FILL_COLOR)
             .and_then(color)
-            .map_or(ink, super::rgba),
+            .map_or(ink, rgba),
         background_color: None,
         underline: lines.contains("underline").then(|| renderer::Decoration {
             thickness,
@@ -422,7 +427,7 @@ pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::
             .filter(|width| *width > 0.)
             .map(|width| {
                 let color = style.get(Prop::WEBKIT_TEXT_STROKE_COLOR).and_then(color);
-                (renderer::px(width), color.map_or(ink, super::rgba))
+                (renderer::px(width), color.map_or(ink, rgba))
             }),
     }
 }
@@ -580,22 +585,19 @@ pub(crate) fn makes_no_line(doc: &Document, styles: &ComputedStyles, id: usize) 
         .get(Prop::DISPLAY)
         .is_none_or(|value| value == "inline")
         && !styles.pseudos.contains_key(&id)
-        && [super::PADDING, super::MARGIN].into_iter().all(|edges| {
+        && [PADDING, MARGIN].into_iter().all(|edges| {
             let [_, right, _, left] = units.edges(style, edges, 0.);
             right == 0. && left == 0.
         })
-        && super::BORDERS
-            .iter()
-            .enumerate()
-            .all(|(side, [width, kind, _])| {
-                side % 2 == 0
-                    || style
-                        .get(*kind)
-                        .is_none_or(|kind| matches!(kind, "none" | "hidden"))
-                    || style
-                        .get(*width)
-                        .is_some_and(|width| units.resolve(width, 0.) == Some(0.))
-            })
+        && BORDERS.iter().enumerate().all(|(side, [width, kind, _])| {
+            side % 2 == 0
+                || style
+                    .get(*kind)
+                    .is_none_or(|kind| matches!(kind, "none" | "hidden"))
+                || style
+                    .get(*width)
+                    .is_some_and(|width| units.resolve(width, 0.) == Some(0.))
+        })
         && node
             .children
             .iter()
@@ -1191,13 +1193,13 @@ pub(crate) fn inline_text(
         }
         let units = &styles.lengths[id];
         let boxed = display != "inline"
-            || [super::PADDING, super::MARGIN]
+            || [PADDING, MARGIN]
                 .iter()
                 .any(|edges| units.edges(pseudo, *edges, 0.) != [0.; 4])
             || units.borders(pseudo, 0.) != [0.; 4]
             || pseudo
                 .get(Prop::BACKGROUND_COLOR)
-                .and_then(super::paint)
+                .and_then(paint)
                 .is_some_and(|color| color.a != 0.)
             || pseudo
                 .get(Prop::VERTICAL_ALIGN)
@@ -1254,7 +1256,7 @@ pub(crate) fn inline_text(
             let fill = |node: usize| {
                 styles.values[node]
                     .get(Prop::BACKGROUND_COLOR)
-                    .and_then(super::paint)
+                    .and_then(paint)
                     .filter(|color| color.a != 0.)
             };
             let chain = |node: usize| {
@@ -1358,7 +1360,7 @@ pub(crate) fn inline_text(
                 let inline = &boxes[at];
                 let right = inline.edges[1];
                 let margin = if last {
-                    styles.lengths[child].edges(&styles.values[child], super::MARGIN, 0.)[1]
+                    styles.lengths[child].edges(&styles.values[child], MARGIN, 0.)[1]
                 } else {
                     0.
                 };
@@ -1535,13 +1537,13 @@ pub(crate) fn inline_text(
             let inherited_background = background;
             let background = style
                 .get(Prop::BACKGROUND_COLOR)
-                .and_then(super::paint)
+                .and_then(paint)
                 .filter(|color| color.a != 0.)
                 .or(background);
             if node.tag != "#text" {
                 let units = &styles.lengths[child];
-                let mut padding = units.edges(style, super::PADDING, 0.);
-                let mut margin = units.edges(style, super::MARGIN, 0.);
+                let mut padding = units.edges(style, PADDING, 0.);
+                let mut margin = units.edges(style, MARGIN, 0.);
                 let mut borders = units.borders(style, 0.);
                 // A part of a spliced box is open at the sides where the box goes on.
                 for (flag, side) in [(CUT_FIRST, 3), (CUT_LAST, 1)] {
@@ -1573,11 +1575,11 @@ pub(crate) fn inline_text(
                         fill: fill.fade(faded),
                         edges,
                         borders,
-                        border: super::BORDERS
+                        border: BORDERS
                             .iter()
                             .enumerate()
                             .filter(|(side, _)| borders[*side] > 0.)
-                            .find_map(|(_, [_, _, color])| style.get(*color).and_then(super::paint))
+                            .find_map(|(_, [_, _, color])| style.get(*color).and_then(paint))
                             .unwrap_or_default()
                             .fade(faded),
                         lead: f32::NAN,
@@ -1815,7 +1817,7 @@ pub(crate) fn inline_text(
             .get(Prop::BACKGROUND_COLOR)
             .and_then(color)
             .filter(|(_, alpha)| *alpha != 0)
-            .map(super::rgba);
+            .map(rgba);
         run
     };
     let pseudos = styles.text_pseudos.get(&id).filter(|_| {
@@ -1851,7 +1853,7 @@ pub(crate) fn inline_text(
     }
     let ink = parent
         .get(Prop::COLOR)
-        .and_then(super::paint)
+        .and_then(paint)
         .unwrap_or(renderer::Color::BLACK);
     let shadows = parent
         .get(Prop::TEXT_SHADOW)
@@ -1863,7 +1865,7 @@ pub(crate) fn inline_text(
                 .filter_map(|shadow| {
                     let (mut ink, mut lengths) = (ink, Vec::new());
                     for part in components(shadow, ' ') {
-                        match super::paint(part) {
+                        match paint(part) {
                             Some(color) => ink = color,
                             None if part.eq_ignore_ascii_case("currentcolor") => {}
                             None => lengths.push(styles.lengths[id].resolve(part, 0.)?),

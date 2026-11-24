@@ -3009,17 +3009,17 @@ mod tests {
                 let style = &cached.values[id];
                 let position = shown.iter().position(|&shown| shown == index);
                 assert_eq!(
-                    style.get(crate::style::Prop::COLOR) == Some("red"),
+                    style.get(crate::css::Prop::COLOR) == Some("red"),
                     position.is_some_and(|position| position % 2 == 0),
                     "step {step}: item {index}"
                 );
                 assert_eq!(
-                    style.get(crate::style::Prop::WIDTH) == Some("1px"),
+                    style.get(crate::css::Prop::WIDTH) == Some("1px"),
                     shown.last() == Some(&index),
                     "step {step}: last {index}"
                 );
                 assert_eq!(
-                    style.get(crate::style::Prop::HEIGHT) == Some("2px"),
+                    style.get(crate::css::Prop::HEIGHT) == Some("2px"),
                     index == owners[1],
                     "step {step}: marked {index}"
                 );
@@ -3514,7 +3514,7 @@ mod tests {
             );
             assert_eq!(cached.values, fresh.values, "step {step}");
             let color = |id: usize| {
-                let color = cached.values[id].get(crate::style::Prop::new("color"));
+                let color = cached.values[id].get(crate::css::Prop::new("color"));
                 ["red", "blue"]
                     .into_iter()
                     .find(|&name| color.is_some_and(|value| value == name))
@@ -3613,7 +3613,7 @@ mod tests {
             for (index, (id, key, value)) in checks.into_iter().enumerate() {
                 assert_eq!(
                     cached.values[id]
-                        .get(crate::style::Prop::new(key))
+                        .get(crate::css::Prop::new(key))
                         .is_some_and(|v| v == value),
                     expected.contains(&index),
                     "step {step}: {key}:{value}"

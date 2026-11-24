@@ -1,6 +1,6 @@
 use crate::{
+    css::{Declarations, Stylesheet},
     dom::Document,
-    style::{Declarations, Stylesheet},
 };
 use anyhow::{Context, Result, ensure};
 use bbtree::unsync::BBTreeMap;

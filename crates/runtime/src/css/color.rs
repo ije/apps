@@ -1,4 +1,4 @@
-use super::parser::{Kind, Lengths};
+use super::{Kind, Lengths, components, number};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Space {
@@ -84,7 +84,7 @@ pub(crate) fn serialize(value: &str) -> Option<String> {
             if value.is_nan() {
                 "none".to_owned()
             } else {
-                super::value::number(value)
+                number(value)
             }
         };
         let name = match space {
@@ -452,7 +452,7 @@ fn parse(value: &str, depth: u8) -> Option<(Space, [f64; 3], f64)> {
             .map(|(_, space)| *space)
     };
     if name == "color-mix" {
-        let parts = super::components(body, ',');
+        let parts = components(body, ',');
         let (method, colors) = match parts.as_slice() {
             [method, first, second] => (*method, [*first, *second]),
             [first, second] => ("in oklab", [*first, *second]),
@@ -481,7 +481,7 @@ fn parse(value: &str, depth: u8) -> Option<(Space, [f64; 3], f64)> {
         };
         let mut mixed = [([0.; 3], 0., None); 2];
         for (index, part) in colors.into_iter().enumerate() {
-            let (color, weight) = match super::components(part, ' ').as_slice() {
+            let (color, weight) = match components(part, ' ').as_slice() {
                 [color] => (parse(color, depth + 1)?, None),
                 [first, second] => match parse(first, depth + 1) {
                     Some(color) => (color, Some(*second)),

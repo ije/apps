@@ -1,4 +1,5 @@
-use crate::style::{self, Prop};
+use crate::css;
+use crate::css::Prop;
 use renderer::Child;
 use std::{fmt::Write, rc::Rc};
 
@@ -24,7 +25,7 @@ pub(super) fn kind(
     tag: &str,
     input: Option<&str>,
     list: bool,
-    style: &style::Style,
+    style: &css::Style,
 ) -> Option<(Control, bool, bool)> {
     let plain = [Prop::APPEARANCE, Prop::WEBKIT_APPEARANCE]
         .into_iter()
@@ -67,11 +68,11 @@ pub(super) fn kind(
     } else {
         &[0x767676, 0x858585]
     };
-    let boxed = style::BORDERS.iter().all(|[_, kind, color]| {
+    let boxed = css::BORDERS.iter().all(|[_, kind, color]| {
         style.get(*kind) == Some(border)
             && style
                 .get(*color)
-                .and_then(style::color)
+                .and_then(css::color)
                 .is_some_and(|(ink, _)| edges.contains(&ink))
     }) && [
         Prop::BORDER_TOP_LEFT_RADIUS,
@@ -86,7 +87,7 @@ pub(super) fn kind(
             .is_none_or(|value| matches!(value, "0" | "0px"))
     }) && style
         .get(Prop::BACKGROUND_COLOR)
-        .and_then(style::color)
+        .and_then(css::color)
         .is_some_and(|(ink, _)| backgrounds.contains(&ink))
         && style
             .get(Prop::BACKGROUND_IMAGE)

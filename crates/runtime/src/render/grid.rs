@@ -1,7 +1,9 @@
-use crate::style::Prop;
+use crate::css;
+use crate::css::Prop;
 use crate::{
+    css::Lengths,
     dom::Document,
-    style::{self, ComputedStyles, Lengths},
+    style::{self, ComputedStyles},
 };
 use std::collections::HashMap;
 
@@ -27,7 +29,7 @@ pub(crate) struct Measurements {
     pub(crate) noted: rustc_hash::FxHashSet<usize>,
     // Use style-address keys only during grid layout, while styles outlive the map.
     #[allow(clippy::type_complexity)]
-    pub(crate) edges: Option<rustc_hash::FxHashMap<(*const style::Style, u32), [[f32; 4]; 3]>>,
+    pub(crate) edges: Option<rustc_hash::FxHashMap<(*const css::Style, u32), [[f32; 4]; 3]>>,
     // The boxes with `content-visibility: auto`, true while they are near the view and show their contents.
     pub(crate) shown: rustc_hash::FxHashMap<usize, bool>,
     // For `contain-intrinsic-size: auto`: the last content size of a box that showed its contents, and whether it
@@ -148,7 +150,7 @@ impl Grid {
 // The content size of a box that skips its contents: its `contain-intrinsic-size`, or the size it remembers for
 // `auto`.
 pub(crate) fn intrinsic_size(
-    style: &style::Style,
+    style: &css::Style,
     units: &Lengths,
     remembered: Option<[f32; 2]>,
 ) -> [f32; 2] {
@@ -212,12 +214,12 @@ fn tracks(
     let mut list = Vec::new();
     let mut names = Vec::new();
     let mut auto = None;
-    for part in style::components(value, ' ') {
+    for part in css::components(value, ' ') {
         let (function, arguments) = part
             .strip_suffix(')')
             .and_then(|v| v.split_once('('))
             .map_or((part, Vec::new()), |(name, body)| {
-                (name, style::components(body, ','))
+                (name, css::components(body, ','))
             });
         match (function, arguments.as_slice()) {
             _ if part.starts_with('[') => names.extend(
@@ -730,8 +732,8 @@ pub(crate) fn intrinsic(
     let base = width.unwrap_or(0.);
     let edges = || {
         [
-            units.edges(style, style::PADDING, base),
-            units.edges(style, style::MARGIN, base),
+            units.edges(style, css::PADDING, base),
+            units.edges(style, css::MARGIN, base),
             units.borders(style, base),
         ]
     };
@@ -1005,8 +1007,7 @@ pub(crate) fn intrinsic(
             {
                 // A flex or grid box sits on the baseline of its first item, or else on its bottom border edge.
                 let (own, lengths) = (&styles.values[atom.node], &styles.lengths[atom.node]);
-                let [above, _, below, _] =
-                    lengths.edges(own, style::MARGIN, available.unwrap_or(0.));
+                let [above, _, below, _] = lengths.edges(own, css::MARGIN, available.unwrap_or(0.));
                 above
                     + first_baseline(doc, atom.node, styles, available, text, measured)
                         .unwrap_or(height - above - below)
@@ -1256,7 +1257,7 @@ pub(crate) fn intrinsic(
                 // A length sizes the border box with `box-sizing: border-box`, which keeps only the margins outside.
                 let outer = |v: f32| {
                     if own.get(Prop::BOX_SIZING) == Some("border-box") {
-                        let margin = lengths.edges(own, style::MARGIN, space);
+                        let margin = lengths.edges(own, css::MARGIN, space);
                         (v + margin[1] + margin[3]).max(sides)
                     } else {
                         v + sides
@@ -1510,7 +1511,7 @@ pub(crate) fn intrinsic(
             };
             // How far the inline box of the child reaches past the strut, above and below.
             let reach = |raise: f32| {
-                let baseline = |style, units: &style::Lengths| {
+                let baseline = |style, units: &css::Lengths| {
                     f32::from(text.baseline(
                         text.face(&style::font(style)),
                         renderer::px(units.font.em),
@@ -1558,7 +1559,7 @@ pub(crate) fn intrinsic(
                             })
                     {
                         let [above, _, below, _] =
-                            child_units.edges(child_style, style::MARGIN, available.unwrap_or(0.));
+                            child_units.edges(child_style, css::MARGIN, available.unwrap_or(0.));
                         // An item without a baseline sits on its bottom border edge.
                         let above = above
                             + first_baseline(doc, child, styles, at, text, measured)
@@ -1833,7 +1834,7 @@ fn first_baseline(
     let (node, style, units) = (&doc.nodes[id], &styles.values[id], &styles.lengths[id]);
     let base = width.unwrap_or(0.);
     let [margin, padding] =
-        [style::MARGIN, style::PADDING].map(|sides| units.edges(style, sides, base));
+        [css::MARGIN, css::PADDING].map(|sides| units.edges(style, sides, base));
     let border = units.borders(style, base);
     let top = padding[0] + border[0];
     let strut = |measured: &Measurements| {
@@ -1892,7 +1893,7 @@ fn first_baseline(
     // The baseline of an item from the top of its margin box, or its bottom border edge without one.
     let item = |child: usize, width: Option<f32>, measured: &mut Measurements| {
         let (own, lengths) = (&styles.values[child], &styles.lengths[child]);
-        let [above, _, below, _] = lengths.edges(own, style::MARGIN, width.unwrap_or(inner));
+        let [above, _, below, _] = lengths.edges(own, css::MARGIN, width.unwrap_or(inner));
         let outer = intrinsic(doc, child, styles, width, None, text, measured)[3];
         let baseline = first_baseline(doc, child, styles, width, text, measured);
         (above + baseline.unwrap_or(outer - above - below), outer)
@@ -1976,7 +1977,7 @@ fn first_baseline(
         }
         if let Some(baseline) = first_baseline(doc, child, styles, Some(inner), text, measured) {
             let (own, lengths) = (&styles.values[child], &styles.lengths[child]);
-            return Some(y + lengths.edges(own, style::MARGIN, inner)[0] + baseline);
+            return Some(y + lengths.edges(own, css::MARGIN, inner)[0] + baseline);
         }
         y += intrinsic(doc, child, styles, Some(inner), None, text, measured)[3] + gap;
     }
@@ -2031,7 +2032,7 @@ fn pseudo_size(
     let units =
         super::element::pseudo_lengths(&styles.lengths[id], style, pseudo, text, pixel_ratio);
     let [padding, margin] =
-        [style::PADDING, style::MARGIN].map(|edges| units.edges(pseudo, edges, base));
+        [css::PADDING, css::MARGIN].map(|edges| units.edges(pseudo, edges, base));
     let border = units.borders(pseudo, base);
     // The frame of each axis as [outside the size, outside the content].
     let sides = |axis: usize| {
@@ -2164,11 +2165,11 @@ pub(super) fn pseudo_atom(
 }
 
 /// Margin, border and padding of each side: top, right, bottom, left.
-fn frame(style: &style::Style, units: &Lengths, base: f32) -> [f32; 4] {
+fn frame(style: &css::Style, units: &Lengths, base: f32) -> [f32; 4] {
     let [margin, padding] =
-        [style::MARGIN, style::PADDING].map(|sides| units.edges(style, sides, base));
+        [css::MARGIN, css::PADDING].map(|sides| units.edges(style, sides, base));
     std::array::from_fn(|side| {
-        let [size, kind, _] = style::BORDERS[side];
+        let [size, kind, _] = css::BORDERS[side];
         let border = if style
             .get(kind)
             .is_none_or(|v| matches!(v, "none" | "hidden"))
@@ -2257,7 +2258,7 @@ pub(crate) fn layout(
         .split(['"', '\''])
         .skip(1)
         .step_by(2)
-        .map(style::area_cells)
+        .map(css::area_cells)
         .collect();
     let mut regions: HashMap<&str, [usize; 4]> = HashMap::new();
     for (y, row) in area_rows.iter().enumerate() {
@@ -2325,7 +2326,7 @@ pub(crate) fn layout(
     let automatic = [0, 1].map(|axis| tracks(implicit[axis], units, available[axis], 0.).0);
     // The minimum contribution of an item without a preferred size: the outer size of its min size, or of 0 for a
     // scroll container. Other items contribute their min-content size.
-    let least = |style: &style::Style, units: &Lengths, axis: usize| -> Option<f32> {
+    let least = |style: &css::Style, units: &Lengths, axis: usize| -> Option<f32> {
         // A percentage depends on the track, so it counts as `auto` here.
         if style
             .get([Prop::WIDTH, Prop::HEIGHT][axis])
@@ -2348,7 +2349,7 @@ pub(crate) fn layout(
             _ => return None,
         };
         let frame = frame(style, units, base);
-        let margin = units.edges(style, style::MARGIN, base);
+        let margin = units.edges(style, css::MARGIN, base);
         let [start, end] = if axis == 0 { [3, 1] } else { [0, 2] };
         let (sides, margins) = (frame[start] + frame[end], margin[start] + margin[end]);
         Some(if style.get(Prop::BOX_SIZING) == Some("border-box") {
@@ -2357,7 +2358,7 @@ pub(crate) fn layout(
             size + sides
         })
     };
-    let alignment = |own: &style::Style, axis: usize, replaced: bool| {
+    let alignment = |own: &css::Style, axis: usize, replaced: bool| {
         let margins = [
             [Prop::MARGIN_LEFT, Prop::MARGIN_RIGHT],
             [Prop::MARGIN_TOP, Prop::MARGIN_BOTTOM],
@@ -2405,7 +2406,7 @@ pub(crate) fn layout(
         height: Option<&'a str>,
         subgrid: [bool; 2],
     }
-    let mut memo: rustc_hash::FxHashMap<(*const style::Style, bool), Item> = Default::default();
+    let mut memo: rustc_hash::FxHashMap<(*const css::Style, bool), Item> = Default::default();
     let table = style::table_box(style::role(styles, id));
     let legend = (doc.nodes[id].tag == "fieldset")
         .then(|| super::element::legend(doc, styles, id))
@@ -2900,7 +2901,7 @@ pub(crate) fn layout(
                     baselines.and_then(|baselines| baselines.get(&child)),
                 ) {
                     let [top, _, bottom, _] =
-                        styles.lengths[child].edges(&styles.values[child], style::MARGIN, area);
+                        styles.lengths[child].edges(&styles.values[child], css::MARGIN, area);
                     let border = height - top - bottom;
                     let offset = if last {
                         bottom + border - end.unwrap_or(border)
@@ -3061,7 +3062,7 @@ pub(crate) fn layout(
                 let base = available[0].unwrap_or(0.);
                 let [edges, margin] = [
                     frame(style, units, base),
-                    units.edges(style, style::MARGIN, base),
+                    units.edges(style, css::MARGIN, base),
                 ];
                 edges[0] + edges[2] - margin[0] - margin[2]
             } else {
@@ -3222,7 +3223,7 @@ pub(crate) fn layout(
             let area = grid.columns.iter().skip(cell[0]).take(cell[2]).sum::<f32>()
                 + cell[2].saturating_sub(1) as f32 * grid.gap[0];
             let [top, _, bottom, _] =
-                styles.lengths[child].edges(&styles.values[child], style::MARGIN, area);
+                styles.lengths[child].edges(&styles.values[child], css::MARGIN, area);
             grid.first_baseline = Some(y + top + first.unwrap_or(height - top - bottom));
         }
     }

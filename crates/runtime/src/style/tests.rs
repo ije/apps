@@ -1,4 +1,16 @@
 use super::*;
+use crate::css::Edit;
+use crate::css::Filter;
+use crate::css::MARGIN;
+use crate::css::PADDING;
+use crate::css::clip_path;
+use crate::css::declarations;
+use crate::css::declare;
+use crate::css::length;
+use crate::css::resolved;
+use crate::css::specified;
+use crate::css::supports;
+use crate::css::supports_condition;
 
 #[test]
 fn glass_variants_follow_native_support_and_cached_states() {
@@ -1516,7 +1528,7 @@ fn math_values_work_in_variables_shorthands_shadows_and_utilities() {
     assert_eq!(units.edges(style, PADDING, 800.), [22., 30., 22., 30.]);
     assert_eq!(units.resolve(&style["height"], 600.), Some(560.));
     assert_eq!(units.resolve(&style["width"], 800.), Some(400.));
-    let shadows = units.shadows(&style["box-shadow"], false);
+    let shadows = crate::css::box_shadows(&units, &style["box-shadow"], false);
     assert_eq!(shadows[0].offset.y, renderer::px(30.));
     assert_eq!(shadows[0].blur_radius, renderer::px(4.));
 }
@@ -1567,7 +1579,8 @@ fn theme_colors_and_apply_reach_native_paint() {
         8.
     );
     assert!(!style.contains_key("border-top-left-radius"));
-    let paint = Lengths::new(16., 800., 600.).shadows(&style["box-shadow"], false);
+    let paint =
+        crate::css::box_shadows(&Lengths::new(16., 800., 600.), &style["box-shadow"], false);
     let paint: Vec<_> = paint.iter().filter(|shadow| shadow.color.a > 0.).collect();
     assert_eq!(paint.len(), 2);
     assert_eq!(
@@ -1623,8 +1636,7 @@ fn theme_tokens_apply_order_and_scoped_overrides() {
     );
     assert_eq!(length(&style["width"], 799., 32., 799., 600.), 23.);
     assert_eq!(
-        Lengths::new(32., 799., 600.)
-            .shadows(&style["box-shadow"], false)
+        crate::css::box_shadows(&Lengths::new(32., 799., 600.), &style["box-shadow"], false)
             .iter()
             .filter(|shadow| shadow.color.a > 0.)
             .count(),
@@ -1658,8 +1670,8 @@ fn oklch_and_rgb_colors_have_expected_channels_and_alpha() {
 fn shadows_split_inset_and_outer_lists() {
     let units = Lengths::new(16., 800., 600.);
     let value = "inset 0 0 0 2px red, 0 4px 8px blue, inset 1px 2px 6px green";
-    let outer = units.shadows(value, false);
-    let inset = units.shadows(value, true);
+    let outer = crate::css::box_shadows(&units, value, false);
+    let inset = crate::css::box_shadows(&units, value, true);
     assert_eq!(outer.len(), 1);
     assert_eq!(outer[0].blur_radius, renderer::px(4.));
     assert_eq!(inset.len(), 2);
@@ -3713,24 +3725,6 @@ fn selectors_match_through_value_and_alternative_buckets() {
     assert_eq!(color("s"), ["navy"; 2]);
     assert_eq!(color("b"), ["teal", "teal", "#000000"]);
     assert_eq!(color("x-a"), ["gray"; 2]);
-}
-
-#[test]
-fn quoted_strings_split_like_the_tokenizer() {
-    for (value, separator) in [
-        ("url(\"data:a,b c\"), url( 'x)y' ), none", ','),
-        ("\"a b\" 'c,d' e", ' '),
-        ("url(\"a\")url(b)", ' '),
-        ("url(a b)", ' '),
-        ("\"a\\\"b\", c", ','),
-        ("\"open, x", ','),
-    ] {
-        assert_eq!(
-            value::components(value, separator),
-            value::tokenized(value, separator),
-            "{value}"
-        );
-    }
 }
 
 #[test]
@@ -5849,7 +5843,7 @@ fn review_cases_follow_chrome() {
         ("calc(2000) 12px serif", "calc(2000)", "12px"),
     ] {
         let mut out = Vec::new();
-        shorthand::expand("font", value, &mut out);
+        crate::css::expand("font", value, &mut out);
         let get = |name| {
             out.iter()
                 .find(|(key, _)| key == name)
@@ -5862,7 +5856,7 @@ fn review_cases_follow_chrome() {
         );
     }
     let mut out = Vec::new();
-    shorthand::expand("font", "bold calc(1px) a", &mut out);
+    crate::css::expand("font", "bold calc(1px) a", &mut out);
     assert!(
         out.iter()
             .any(|(key, value)| key == "font-size" && value == "calc(1px)")
@@ -5879,7 +5873,7 @@ fn review_cases_follow_chrome() {
     }
     for value in ["12px 1001", "bold 900 12px a", "900 bold 12px a"] {
         let mut out = Vec::new();
-        shorthand::expand("font", value, &mut out);
+        crate::css::expand("font", value, &mut out);
         assert!(out.is_empty(), "{value}");
     }
 }

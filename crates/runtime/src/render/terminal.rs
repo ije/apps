@@ -1,7 +1,9 @@
 //! Draws the grid of a `<terminal>` element.
 
 use super::PageState;
-use crate::style::{self, Prop};
+use crate::css;
+use crate::css::Prop;
+use crate::style;
 use crate::web::terminal::{
     BOLD, Cell, FAINT, FOCUS, Frame, INVERSE, INVISIBLE, ITALIC, OVERLINE, Placement, SCROLL_ROW,
     SELECTED, SPACER, STRIKETHROUGH, Terminals, UNDERLINE,
@@ -52,11 +54,11 @@ const PALETTE: [Prop; 16] = [
 ];
 
 pub(super) fn look(
-    style: &style::Style,
-    selection: Option<&Rc<style::Style>>,
-    units: &style::Lengths,
+    style: &css::Style,
+    selection: Option<&Rc<css::Style>>,
+    units: &css::Lengths,
 ) -> Look {
-    let pick = |prop: Prop| style.get(prop).and_then(style::color);
+    let pick = |prop: Prop| style.get(prop).and_then(css::color);
     let set = |(rgb, _): (u32, u8)| 1 << 24 | rgb;
     let foreground = pick(Prop::COLOR).unwrap_or((0, 255));
     let luminance = |rgb: u32| {

@@ -1,4 +1,5 @@
 use super::{Declaration, Declarations, Prop, Rule, Style, Stylesheet};
+use crate::css::color;
 use crate::dom::Document;
 use rustc_hash::FxHashMap;
 use std::{
@@ -5079,7 +5080,7 @@ fn is_color(value: &str) -> bool {
         .any(|prefix| value.starts_with(prefix))
         || value.eq_ignore_ascii_case("currentcolor")
         || value == "transparent"
-        || super::color(value).is_some()
+        || color(value).is_some()
 }
 
 fn is_type(kind: &str, value: &str) -> bool {

@@ -1,9 +1,9 @@
+use crate::css::{FONT_FORMATS, FONT_TECHS};
 use crate::dom::{Document, State};
-use crate::style::{FONT_FORMATS, FONT_TECHS};
 use std::{collections::HashMap, path::PathBuf};
 
 pub(crate) fn sources(src: &str) -> Vec<(&'static str, String)> {
-    crate::style::components(src, ',')
+    crate::css::components(src, ',')
         .into_iter()
         .filter_map(|part| {
             let (function, rest) = part.trim().split_once('(')?;
@@ -292,8 +292,8 @@ mod tests {
             );
         }
         crate::style::font_names(&system, &state.font_aliases);
-        let font = crate::style::font(&crate::style::Style::from_iter([(
-            crate::style::Prop::FONT_FAMILY,
+        let font = crate::style::font(&crate::css::Style::from_iter([(
+            crate::css::Prop::FONT_FAMILY,
             "Missing, Brand, sans-serif".into(),
         )]));
         // The later installed families stay for the glyphs that the first lacks.

@@ -1,6 +1,6 @@
 use super::background;
-use crate::style;
-use crate::style::Prop;
+use crate::css;
+use crate::css::Prop;
 use renderer::{Child, Hooks, NodeCx, Pixels, Point, Rect, Size, Window, point, px};
 use std::{cell::Cell, collections::HashMap, rc::Rc};
 
@@ -81,8 +81,8 @@ impl Hooks for Turned {
 }
 
 pub(super) struct Transformed {
-    pub(super) style: Rc<style::Style>,
-    pub(super) units: style::Lengths,
+    pub(super) style: Rc<css::Style>,
+    pub(super) units: css::Lengths,
     pub(super) matrix: Cell<Option<super::effects::Matrix>>,
     pub(super) local: super::effects::Local,
 }
@@ -183,8 +183,8 @@ impl Hooks for Effected {
 pub(super) struct Masked {
     pub(super) view: Rc<super::PageState>,
     pub(super) key: (usize, u8),
-    pub(super) style: Rc<style::Style>,
-    pub(super) units: style::Lengths,
+    pub(super) style: Rc<css::Style>,
+    pub(super) units: css::Lengths,
 }
 
 impl Hooks for Masked {
@@ -273,7 +273,7 @@ pub(super) struct Picture {
     pub(super) fit: renderer::ObjectFit,
     pub(super) cropped: Option<renderer::Radii<Pixels>>,
     /// `object-position` when it isn't centered.
-    pub(super) position: Option<(Rc<str>, style::Lengths)>,
+    pub(super) position: Option<(Rc<str>, css::Lengths)>,
     pub(super) pixelated: bool,
 }
 
@@ -680,12 +680,12 @@ pub(super) struct DomBox {
     pub(super) rtl: bool,
     pub(super) sized: Option<[f32; 2]>,
     pub(super) inset: [Option<f32>; 4],
-    pub(super) style: Rc<style::Style>,
+    pub(super) style: Rc<css::Style>,
     pub(super) effects: Option<f32>,
     pub(super) composited: bool,
     pub(super) transformed: bool,
     pub(super) perspective: Option<Box<((f32, String), usize)>>,
-    pub(super) units: style::Lengths,
+    pub(super) units: css::Lengths,
     pub(super) revision: u64,
     pub(super) sides: [f32; 2],
     pub(super) margin: [f32; 4],
@@ -1109,7 +1109,7 @@ impl Hooks for DomBox {
             let viewport = window.viewport_size();
             for axis in 0..2 {
                 let [start, end] = if axis == 0 { [3, 1] } else { [0, 2] };
-                let auto = |side: usize| self.style.get(style::MARGIN[side]) == Some("auto");
+                let auto = |side: usize| self.style.get(css::MARGIN[side]) == Some("auto");
                 let margin = |side: usize| {
                     if auto(side) {
                         px(0.)
@@ -1624,9 +1624,9 @@ impl DomBox {
                     corner_radius: radius,
                     tint: style
                         .get(Prop::MACOS_GLASS_TINT_COLOR)
-                        .and_then(style::color)
+                        .and_then(css::color)
                         .filter(|(_, alpha)| *alpha > 0)
-                        .map(crate::style::rgba),
+                        .map(crate::css::rgba),
                     clear: kind == "clear",
                     interactive: style.get(Prop::MACOS_GLASS_INTERACTIVE) == Some("true")
                         && style.get(Prop::POINTER_EVENTS) != Some("none")
@@ -1691,8 +1691,8 @@ pub(super) fn mask(
     dom: &mut crate::dom::State,
     assets: &HashMap<String, std::path::PathBuf>,
     key: (usize, u8),
-    style: &style::Style,
-    units: style::Lengths,
+    style: &css::Style,
+    units: css::Lengths,
     shapes: Option<&str>,
     bounds: Rect<Pixels>,
     window: &mut Window,
@@ -1824,8 +1824,8 @@ fn nest_effects(
 }
 
 pub(super) fn mask_svg<'a>(
-    style: &'a style::Style,
-    units: style::Lengths,
+    style: &'a css::Style,
+    units: css::Lengths,
     [width, height]: [f32; 2],
     base: Option<&url::Url>,
     assets: &HashMap<String, std::path::PathBuf>,
@@ -1838,7 +1838,7 @@ pub(super) fn mask_svg<'a>(
     if images.is_empty() || images == "none" {
         return None;
     }
-    let list = |props| style::components(get(props), ',');
+    let list = |props| css::components(get(props), ',');
     let (sizes, positions, repeats) = (
         list([Prop::MASK_SIZE, Prop::WEBKIT_MASK_SIZE]),
         list([Prop::MASK_POSITION, Prop::WEBKIT_MASK_POSITION]),
@@ -1850,13 +1850,13 @@ pub(super) fn mask_svg<'a>(
             .copied()
             .unwrap_or("")
     };
-    let composites = style::components(style.get(Prop::MASK_COMPOSITE).unwrap_or(""), ',');
+    let composites = css::components(style.get(Prop::MASK_COMPOSITE).unwrap_or(""), ',');
     // Layers go from the bottom up, and each one joins the layers below it by its `mask-composite`.
     let (mut defs, mut below) = (String::new(), None::<String>);
     let area = format!(
         "maskUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"{width}\" height=\"{height}\""
     );
-    for (index, image) in style::components(images, ',').into_iter().enumerate().rev() {
+    for (index, image) in css::components(images, ',').into_iter().enumerate().rev() {
         let image = image.trim();
         let [size, position, repeat] = [
             (pick(&sizes, index), "auto"),

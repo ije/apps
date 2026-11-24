@@ -1,4 +1,5 @@
-use super::super::{Prop, StyleCache, compute_styles, length};
+use super::super::{StyleCache, compute_styles};
+use crate::css::{Prop, length};
 use crate::dom::Document;
 use std::{collections::HashMap, fmt::Write, rc::Rc};
 

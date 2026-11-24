@@ -896,6 +896,103 @@ fn names_are_sorted() {
     assert!(NAMES.is_sorted());
 }
 
+pub(crate) type Registry = FxHashMap<Prop, (Rc<str>, bool, Option<Rc<str>>)>;
+
+pub(crate) const LOGICAL: [(Prop, Prop, Prop); 20] = [
+    (
+        Prop::MARGIN_INLINE_START,
+        Prop::MARGIN_LEFT,
+        Prop::MARGIN_RIGHT,
+    ),
+    (
+        Prop::MARGIN_INLINE_END,
+        Prop::MARGIN_RIGHT,
+        Prop::MARGIN_LEFT,
+    ),
+    (
+        Prop::PADDING_INLINE_START,
+        Prop::PADDING_LEFT,
+        Prop::PADDING_RIGHT,
+    ),
+    (
+        Prop::PADDING_INLINE_END,
+        Prop::PADDING_RIGHT,
+        Prop::PADDING_LEFT,
+    ),
+    (Prop::INSET_INLINE_START, Prop::LEFT, Prop::RIGHT),
+    (Prop::INSET_INLINE_END, Prop::RIGHT, Prop::LEFT),
+    (
+        Prop::BORDER_INLINE_START_WIDTH,
+        Prop::BORDER_LEFT_WIDTH,
+        Prop::BORDER_RIGHT_WIDTH,
+    ),
+    (
+        Prop::BORDER_INLINE_START_STYLE,
+        Prop::BORDER_LEFT_STYLE,
+        Prop::BORDER_RIGHT_STYLE,
+    ),
+    (
+        Prop::BORDER_INLINE_START_COLOR,
+        Prop::BORDER_LEFT_COLOR,
+        Prop::BORDER_RIGHT_COLOR,
+    ),
+    (
+        Prop::BORDER_INLINE_END_WIDTH,
+        Prop::BORDER_RIGHT_WIDTH,
+        Prop::BORDER_LEFT_WIDTH,
+    ),
+    (
+        Prop::BORDER_INLINE_END_STYLE,
+        Prop::BORDER_RIGHT_STYLE,
+        Prop::BORDER_LEFT_STYLE,
+    ),
+    (
+        Prop::BORDER_INLINE_END_COLOR,
+        Prop::BORDER_RIGHT_COLOR,
+        Prop::BORDER_LEFT_COLOR,
+    ),
+    (
+        Prop::BORDER_START_START_RADIUS,
+        Prop::BORDER_TOP_LEFT_RADIUS,
+        Prop::BORDER_TOP_RIGHT_RADIUS,
+    ),
+    (
+        Prop::CORNER_START_START_SHAPE,
+        Prop::CORNER_TOP_LEFT_SHAPE,
+        Prop::CORNER_TOP_RIGHT_SHAPE,
+    ),
+    (
+        Prop::CORNER_START_END_SHAPE,
+        Prop::CORNER_TOP_RIGHT_SHAPE,
+        Prop::CORNER_TOP_LEFT_SHAPE,
+    ),
+    (
+        Prop::CORNER_END_START_SHAPE,
+        Prop::CORNER_BOTTOM_LEFT_SHAPE,
+        Prop::CORNER_BOTTOM_RIGHT_SHAPE,
+    ),
+    (
+        Prop::CORNER_END_END_SHAPE,
+        Prop::CORNER_BOTTOM_RIGHT_SHAPE,
+        Prop::CORNER_BOTTOM_LEFT_SHAPE,
+    ),
+    (
+        Prop::BORDER_START_END_RADIUS,
+        Prop::BORDER_TOP_RIGHT_RADIUS,
+        Prop::BORDER_TOP_LEFT_RADIUS,
+    ),
+    (
+        Prop::BORDER_END_START_RADIUS,
+        Prop::BORDER_BOTTOM_LEFT_RADIUS,
+        Prop::BORDER_BOTTOM_RIGHT_RADIUS,
+    ),
+    (
+        Prop::BORDER_END_END_RADIUS,
+        Prop::BORDER_BOTTOM_RIGHT_RADIUS,
+        Prop::BORDER_BOTTOM_LEFT_RADIUS,
+    ),
+];
+
 #[cfg(test)]
 mod tests {
     use super::{Prop, PropSet, Style};

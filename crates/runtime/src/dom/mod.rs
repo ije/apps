@@ -8,8 +8,9 @@ pub(crate) use selector::{
     SelectorList, lowercase,
 };
 
+use crate::css;
+use crate::css::Prop;
 use crate::style;
-use crate::style::Prop;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -60,8 +61,8 @@ pub(crate) struct LayoutNode {
     pub shape: u64,
     pub attrs: u64,
     pub seen: u64,
-    pub style: Rc<style::Style>,
-    pub pseudos: Option<Rc<[style::Style; 2]>>,
+    pub style: Rc<css::Style>,
+    pub pseudos: Option<Rc<[css::Style; 2]>>,
     pub units: u64,
     pub list: u64,
     pub kids: u64,
@@ -803,8 +804,8 @@ pub struct State {
     pub(crate) layout_revision: u64,
     style_epoch: u64,
     layout_epoch: u64,
-    pub(crate) sheets: HashMap<Rc<str>, Rc<style::Stylesheet>>,
-    pub(crate) inserted: Vec<(String, Rc<style::Stylesheet>, bool)>,
+    pub(crate) sheets: HashMap<Rc<str>, Rc<css::Stylesheet>>,
+    pub(crate) inserted: Vec<(String, Rc<css::Stylesheet>, bool)>,
     pub(crate) style_cache: style::StyleCache,
     style_key: ([f32; 2], Option<f32>, bool, u32),
     pub(crate) focus: Option<usize>,
@@ -856,13 +857,13 @@ pub struct State {
     pub pixel_ratio: f32,
     pub(crate) linted: bool,
     pub(crate) warned: HashSet<String>,
-    pub(crate) checked: rustc_hash::FxHashSet<(u8, style::Prop, Rc<str>)>,
+    pub(crate) checked: rustc_hash::FxHashSet<(u8, css::Prop, Rc<str>)>,
     // The values in `checked` by address. Each holds its value, so no other value takes the address.
-    pub(crate) checked_values: rustc_hash::FxHashMap<(usize, u8, style::Prop), Rc<str>>,
+    pub(crate) checked_values: rustc_hash::FxHashMap<(usize, u8, css::Prop), Rc<str>>,
     pub(crate) motion: style::Motion,
-    pub(crate) animated: HashMap<usize, style::Style>,
-    pub(crate) animating: HashMap<usize, Rc<style::Style>>,
-    pub(crate) animating_pseudos: HashMap<usize, Rc<[style::Style; 2]>>,
+    pub(crate) animated: HashMap<usize, css::Style>,
+    pub(crate) animating: HashMap<usize, Rc<css::Style>>,
+    pub(crate) animating_pseudos: HashMap<usize, Rc<[css::Style; 2]>>,
     pub(crate) recolored: Vec<usize>,
     pub(crate) containers: rustc_hash::FxHashMap<usize, [f32; 2]>,
     pub(crate) atoms: rustc_hash::FxHashMap<usize, [f32; 3]>,
@@ -1577,7 +1578,7 @@ pub fn call(
     if op == "dom.easing" {
         let progress = args[1].as_f64().unwrap_or(0.);
         return Ok(json!(
-            style::Easing::parse(args[0].as_str().unwrap_or("linear"))
+            css::Easing::parse(args[0].as_str().unwrap_or("linear"))
                 .map_or(progress, |easing| easing.at(progress, args[2] == true))
         ));
     }
@@ -1666,19 +1667,19 @@ pub fn call(
         let sheet = state
             .sheets
             .entry(source.as_str().into())
-            .or_insert_with(|| Rc::new(style::Stylesheet::parse(&source)));
+            .or_insert_with(|| Rc::new(css::Stylesheet::parse(&source)));
         return Ok(sheet.matches_media(viewport[0], viewport[1], theme).into());
     }
     if op == "dom.properties" {
-        return Ok(json!(style::Prop::names()));
+        return Ok(json!(css::Prop::names()));
     }
     if op == "dom.aliases" {
-        let aliases = style::Prop::names()
+        let aliases = css::Prop::names()
             .iter()
             .map(|name| format!("-webkit-{name}"));
         return Ok(json!(
             aliases
-                .filter(|alias| style::Prop::unprefixed(alias).is_some())
+                .filter(|alias| css::Prop::unprefixed(alias).is_some())
                 .collect::<Vec<_>>()
         ));
     }
@@ -1688,14 +1689,14 @@ pub fn call(
         )));
     }
     if op == "dom.specified" {
-        return Ok(json!(style::specified(
+        return Ok(json!(css::specified(
             args[0].as_str().unwrap_or_default(),
             args[1].as_str().unwrap_or_default()
         )));
     }
     if op == "dom.declare" {
         return Ok(json!(
-            style::declare(args[0].as_str().unwrap_or_default()).concat()
+            css::declare(args[0].as_str().unwrap_or_default()).concat()
         ));
     }
     if matches!(
@@ -1707,8 +1708,8 @@ pub fn call(
             "dom.supports" => {
                 let name = args[0].as_str().context("Expected CSS text")?;
                 return Ok(json!(match args[1].as_str() {
-                    Some(value) => style::supports(&name.to_ascii_lowercase(), value) == Some(true),
-                    None => style::supports_condition(name),
+                    Some(value) => css::supports(&name.to_ascii_lowercase(), value) == Some(true),
+                    None => css::supports_condition(name),
                 }));
             }
             "dom.registerProperty" => {
@@ -1721,11 +1722,11 @@ pub fn call(
                     args[2].as_bool().unwrap_or(false),
                     initial.map_or(String::new(), |value| format!("initial-value:{value}"))
                 );
-                let registered = style::Stylesheet::parse(&rule).property();
+                let registered = css::Stylesheet::parse(&rule).property();
                 // `Prop::new` leaks the names it interns, so only a valid new registration interns one.
                 match registered {
                     _ if !name.starts_with("--") => Err("SyntaxError"),
-                    _ if style::Prop::find(name)
+                    _ if css::Prop::find(name)
                         .is_some_and(|prop| state.style_cache.scripted.contains_key(&prop)) =>
                     {
                         Err("InvalidModificationError")
@@ -1734,7 +1735,7 @@ pub fn call(
                         state
                             .style_cache
                             .scripted
-                            .insert(style::Prop::new(name), value);
+                            .insert(css::Prop::new(name), value);
                         Ok(Value::Null)
                     }
                     None => Err("SyntaxError"),
@@ -1758,9 +1759,9 @@ pub fn call(
             _ => {
                 let id = args[0].as_u64().context("Expected a sheet")? as u32;
                 match args[1].as_str().unwrap_or_default() {
-                    "parse" => return Ok(style::Stylesheet::parse(text).cssom()),
+                    "parse" => return Ok(css::Stylesheet::parse(text).cssom()),
                     kind @ ("replace" | "load") => {
-                        let sheet = style::Stylesheet::parse(text);
+                        let sheet = css::Stylesheet::parse(text);
                         let tree = if kind == "load" {
                             Value::Null
                         } else {
@@ -2436,9 +2437,9 @@ pub fn call(
                     && unsafe { *state.bounds.flags(node) } & MIRROR_HIDDEN == 0
             };
             // Padding, plus borders when `borders`, of each side, with percentages of `base`.
-            let edges = |style: &style::Style, units: &style::Lengths, base, borders| {
-                let mut edges = units.edges(style, style::PADDING, base);
-                for (edge, [width, kind, _]) in edges.iter_mut().zip(style::BORDERS) {
+            let edges = |style: &css::Style, units: &css::Lengths, base, borders| {
+                let mut edges = units.edges(style, css::PADDING, base);
+                for (edge, [width, kind, _]) in edges.iter_mut().zip(css::BORDERS) {
                     if borders
                         && style
                             .get(kind)
@@ -2574,8 +2575,8 @@ pub fn call(
                     })
                 });
             let value = |name: &str| -> String {
-                let name = style::physical_name(style, name);
-                let get = |name| style::resolved(style, &units, name, size, &container, &registry);
+                let name = css::physical_name(style, name);
+                let get = |name| css::resolved(style, &units, name, size, &container, &registry);
                 let value = get(&name);
                 match (&*name, value.as_str()) {
                     ("display", display_value) if pseudo.is_empty() => {
@@ -2627,7 +2628,7 @@ pub fn call(
                                 .map(|rect| rect[2 + axis])
                         });
                         match viewport.and_then(|base| units.resolve(given, base)) {
-                            Some(length) => format!("{}px", style::number(f64::from(length))),
+                            Some(length) => format!("{}px", css::number(f64::from(length))),
                             None => "0px".to_owned(),
                         }
                     }
@@ -2648,7 +2649,7 @@ pub fn call(
                                 .and_then(|px| px.parse::<f32>().ok())
                             {
                                 Some(px) if px != 0. => {
-                                    format!("{}px", style::number(f64::from(-px)))
+                                    format!("{}px", css::number(f64::from(-px)))
                                 }
                                 _ => "0px".to_owned(),
                             };
@@ -2686,7 +2687,7 @@ pub fn call(
                         let Some(size) = size else {
                             return value;
                         };
-                        let margin = units.edges(style, style::MARGIN, block[2]);
+                        let margin = units.edges(style, css::MARGIN, block[2]);
                         let start = corner[axis] - margin[3 - 3 * axis] - block[axis];
                         let used = if name == "top" || name == "left" {
                             start
@@ -2697,7 +2698,7 @@ pub fn call(
                                 - margin[3 - 3 * axis]
                                 - margin[1 + axis]
                         };
-                        format!("{}px", style::number(f64::from((used * 64.).round() / 64.)))
+                        format!("{}px", css::number(f64::from((used * 64.).round() / 64.)))
                     }
                     ("margin-left" | "margin-right", "auto") if size.is_some() => {
                         if !flow || position == "absolute" || position == "fixed" {
@@ -2724,7 +2725,7 @@ pub fn call(
                             Some(_) => free,
                             None => free / 2.,
                         };
-                        format!("{}px", style::number(f64::from((used * 64.).round() / 64.)))
+                        format!("{}px", css::number(f64::from((used * 64.).round() / 64.)))
                     }
                     ("margin-top" | "margin-bottom", "auto") if size.is_some() => "0px".to_owned(),
                     // Layout gives a pseudo-element box its padding, so its sizes are not resolved again.
@@ -2768,7 +2769,7 @@ pub fn call(
                         };
                         format!(
                             "{}px",
-                            style::number(f64::from((used.max(0.) * 64.).round() / 64.))
+                            css::number(f64::from((used.max(0.) * 64.).round() / 64.))
                         )
                     }
                     // The image layers set the number of layers of the other lists.
@@ -2794,8 +2795,8 @@ pub fn call(
                         } else {
                             "background-image"
                         };
-                        let count = style::components(&get(image), ',').len();
-                        let layers = style::components(&value, ',');
+                        let count = css::components(&get(image), ',').len();
+                        let layers = css::components(&value, ',');
                         if layers.len() == count {
                             return value;
                         }
@@ -2817,14 +2818,11 @@ pub fn call(
                         };
                         let used = &tracks[usize::from(name == "grid-template-rows")];
                         let mut used = used.iter().map(|&track| {
-                            format!(
-                                "{}px",
-                                style::number(f64::from((track * 64.).round() / 64.))
-                            )
+                            format!("{}px", css::number(f64::from((track * 64.).round() / 64.)))
                         });
                         // `repeat()` with a count gives its tracks and names that many times.
                         let mut parts = Vec::new();
-                        for part in style::components(&value, ' ') {
+                        for part in css::components(&value, ' ') {
                             let repeat = part
                                 .strip_prefix("repeat(")
                                 .and_then(|inner| inner.strip_suffix(')')?.split_once(','))
@@ -2834,7 +2832,7 @@ pub fn call(
                             match repeat {
                                 Some((count, body)) => {
                                     for _ in 0..count.min(1000) {
-                                        parts.extend(style::components(body, ' '));
+                                        parts.extend(css::components(body, ' '));
                                     }
                                 }
                                 None => parts.push(part),
@@ -2881,7 +2879,7 @@ pub fn call(
                         let quote = |text: String| {
                             format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
                         };
-                        for part in style::components(&value, ' ') {
+                        for part in css::components(&value, ' ') {
                             let mut input = cssparser::Parser::new(part);
                             let mut strings = None::<String>;
                             while let Ok(string) = input.expect_string() {
@@ -2913,11 +2911,11 @@ pub fn call(
                         ["margin-top", "margin-right", "margin-bottom", "margin-left"]
                     }
                     .map(value);
-                    json!(style::shortest(sides.each_ref().map(String::as_str)))
+                    json!(css::shortest(sides.each_ref().map(String::as_str)))
                 }
                 Some(name) => json!(value(name)),
                 None => json!(
-                    style::computed_names()
+                    css::computed_names()
                         .chain(style.vars().iter().map(|(prop, _)| prop.name()))
                         .collect::<Vec<_>>()
                 ),
@@ -3349,7 +3347,7 @@ pub fn call(
             args[1].as_str().unwrap_or("")
         ))),
         // As a canvas serializes a color: `#rrggbb`, or `rgba()` with the shortest alpha that rounds back.
-        "dom.canvasColor" => Ok(match crate::style::color(args[1].as_str().unwrap_or("")) {
+        "dom.canvasColor" => Ok(match crate::css::color(args[1].as_str().unwrap_or("")) {
             Some((rgb, 255)) => json!(format!("#{:06x}", rgb & 0xff_ffff)),
             Some((rgb, alpha)) => {
                 let [_, r, g, b] = rgb.to_be_bytes();
@@ -3600,7 +3598,7 @@ pub fn call(
                 .borders(now, base)
                 .map(|width| width / if shared { 2. } else { 1. });
             let padding = units
-                .edges(now, style::PADDING, base)
+                .edges(now, css::PADDING, base)
                 .map(|value| value.max(0.));
             let bars = state
                 .scroll
@@ -4506,7 +4504,7 @@ pub(crate) fn hit_test(
                         let (style, units) = (&computed.values[canvas], &computed.lengths[canvas]);
                         let (border, padding) = (
                             units.borders(style, wide),
-                            units.edges(style, style::PADDING, wide),
+                            units.edges(style, css::PADDING, wide),
                         );
                         let [x, y] = [
                             x + left + border[3] + padding[3],
@@ -5136,7 +5134,7 @@ pub(crate) fn styles(
 }
 
 // Like Chrome, a change of these properties of the scroll anchor or a box around it keeps the scroll offset.
-const ANCHORING_PROPS: style::PropSet = style::PropSet::new(&[
+const ANCHORING_PROPS: css::PropSet = css::PropSet::new(&[
     Prop::POSITION,
     Prop::TOP,
     Prop::RIGHT,
@@ -5196,14 +5194,14 @@ fn path(kind: &str, value: &Value) -> (Vec<usize>, Option<(usize, bool)>) {
     (path, top)
 }
 
-fn edit<'a>(kind: &str, text: &'a str) -> style::Edit<'a> {
+fn edit<'a>(kind: &str, text: &'a str) -> css::Edit<'a> {
     match kind {
-        "insert" => style::Edit::Insert(text),
-        "style" => style::Edit::Declarations(text),
-        "selector" => style::Edit::Selector(text),
-        "keyframe" => style::Edit::Keyframe(text),
-        "replace" => style::Edit::Replace(text),
-        _ => style::Edit::Delete,
+        "insert" => css::Edit::Insert(text),
+        "style" => css::Edit::Declarations(text),
+        "selector" => css::Edit::Selector(text),
+        "keyframe" => css::Edit::Keyframe(text),
+        "replace" => css::Edit::Replace(text),
+        _ => css::Edit::Delete,
     }
 }
 
@@ -6119,11 +6117,11 @@ mod tests {
         styles(&mut doc, &mut state, [800., 600.]);
         for (name, initial) in [("--w", "initial-value:7px"), ("--x", "")] {
             let rule = format!("@property {name}{{syntax:\"*\";inherits:false;{initial}}}");
-            let value = style::Stylesheet::parse(&rule).property().unwrap();
+            let value = css::Stylesheet::parse(&rule).property().unwrap();
             state
                 .style_cache
                 .scripted
-                .insert(style::Prop::new(name), value);
+                .insert(css::Prop::new(name), value);
         }
         state.invalidate();
         let computed = styles(&mut doc, &mut state, [800., 600.]);

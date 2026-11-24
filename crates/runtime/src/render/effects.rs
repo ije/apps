@@ -1,7 +1,8 @@
-use crate::style::Prop;
+use crate::css;
+use crate::css::Prop;
 use crate::{
+    css::{Lengths, Style, components},
     dom::Document,
-    style::{self, Lengths, Style, components, parser},
 };
 use renderer::{BlendMode, Color, Corners, Length, PaintEffect, Pixels, Radii, Rect, point, px};
 
@@ -154,9 +155,9 @@ pub(crate) fn transform(
             return percent.parse::<f32>().ok().map(|value| value / 100.);
         }
         match units.math(value, 100., &[])? {
-            (value, parser::Kind::Number) => Some(value as f32),
-            (percent, parser::Kind::Length)
-                if units.math(value, 0., &[]) == Some((0., parser::Kind::Length)) =>
+            (value, css::Kind::Number) => Some(value as f32),
+            (percent, css::Kind::Length)
+                if units.math(value, 0., &[]) == Some((0., css::Kind::Length)) =>
             {
                 Some(percent as f32 / 100.)
             }
@@ -166,7 +167,7 @@ pub(crate) fn transform(
     let angle = |value: &str| {
         units
             .math(value, 0., &[])
-            .filter(|(value, kind)| *kind == parser::Kind::Angle || *value == 0.)
+            .filter(|(value, kind)| *kind == css::Kind::Angle || *value == 0.)
             .map(|(value, _)| (value as f32).to_radians())
     };
     let length = |value: &str, base: f32| units.resolve(value, base);
@@ -390,7 +391,7 @@ pub(crate) fn backface(matrix: &Matrix, bounds: Rect<Pixels>) -> bool {
     (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) < 0.
 }
 
-fn color_matrix(filter: Option<style::Filter>, opacity: f32) -> Option<[f32; 20]> {
+fn color_matrix(filter: Option<css::Filter>, opacity: f32) -> Option<[f32; 20]> {
     if filter.is_none() && opacity >= 1. {
         return None;
     }
@@ -443,7 +444,7 @@ pub(crate) fn filters(value: &str, units: &Lengths, doc: &Document, ids: &Ids) -
             }
             "drop-shadow" => {
                 // Chrome uses the blur length as the standard deviation, not half of it as box-shadow does.
-                for shadow in units.shadows(args, false) {
+                for shadow in css::box_shadows(units, args, false) {
                     effects.push(PaintEffect {
                         shadow: Some((shadow.offset, shadow.blur_radius * 2., shadow.color)),
                         ..Default::default()
@@ -452,7 +453,7 @@ pub(crate) fn filters(value: &str, units: &Lengths, doc: &Document, ids: &Ids) -
             }
             "url" => effects.extend(svg_filter(args, units, doc, ids)),
             _ => {
-                let (filter, opacity) = style::Filter::parse(part, units);
+                let (filter, opacity) = css::Filter::parse(part, units);
                 let Some(matrix) = color_matrix(filter, opacity) else {
                     continue;
                 };
@@ -524,7 +525,7 @@ fn svg_filter(reference: &str, units: &Lengths, doc: &Document, ids: &Ids) -> Ve
                 let color = node
                     .attrs
                     .get("flood-color")
-                    .and_then(|value| style::color(value))
+                    .and_then(|value| css::color(value))
                     .unwrap_or((0, 255));
                 let opacity = numbers("flood-opacity").first().copied().unwrap_or(1.);
                 let mut ink: Color = renderer::Color::hex(color.0 << 8 | color.1 as u32);
@@ -558,7 +559,7 @@ fn svg_filter(reference: &str, units: &Lengths, doc: &Document, ids: &Ids) -> Ve
                     matrix[15..18].copy_from_slice(&[0.2125, 0.7154, 0.0721]);
                     Some(matrix)
                 } else {
-                    let (filter, opacity) = style::Filter::parse(&css, units);
+                    let (filter, opacity) = css::Filter::parse(&css, units);
                     color_matrix(filter, opacity)
                 };
                 if let Some(matrix) = matrix {
@@ -648,7 +649,7 @@ pub(crate) fn clip(
     let svg = Clip::Shape;
     match name.to_ascii_lowercase().as_str() {
         "inset" | "rect" | "xywh" => {
-            let (rect, radii) = style::clip_path(value, units, size)?;
+            let (rect, radii) = css::clip_path(value, units, size)?;
             let round = args.split_once(" round ").map(|(_, round)| round.trim());
             let Some(round) = round.filter(|round| round.contains(['%', '/'])) else {
                 return Some(Clip::Rounded(rect, radii));
@@ -711,7 +712,7 @@ pub(crate) fn clip(
             )))
         }
         "circle" | "ellipse" => {
-            let (rect, radii) = style::clip_path(value, units, size)?;
+            let (rect, radii) = css::clip_path(value, units, size)?;
             if (rect[2] - rect[3]).abs() <= rect[2].max(rect[3]) * 1e-4 {
                 return Some(Clip::Rounded(rect, radii));
             }
@@ -859,7 +860,7 @@ pub(crate) fn radii(style: &Style, units: &Lengths, basis: impl Fn() -> [f32; 2]
             None if first.contains('%') => length(first, 1),
             None => *x,
         };
-        match style.get(shape).and_then(style::corner_shape) {
+        match style.get(shape).and_then(css::corner_shape) {
             // Like Chrome, a corner of 16 or more is square, with no radius.
             Some(k) if k >= 16. => (*x, *y) = (Length::Px(px(0.)), Length::Px(px(0.))),
             Some(k) => *code = renderer::corner_shape(k as f32),
@@ -882,13 +883,13 @@ fn angle(value: &str, units: &Lengths) -> Option<f32> {
     units
         .math(value, 0., &[])
         .filter(|(value, kind)| {
-            *kind == parser::Kind::Angle || *kind == parser::Kind::Number && *value == 0.
+            *kind == css::Kind::Angle || *kind == css::Kind::Number && *value == 0.
         })
         .map(|(value, _)| value as f32)
 }
 
 fn first_argument(body: &str) -> (String, Option<String>) {
-    let parts = style::components(body, ',');
+    let parts = css::components(body, ',');
     let words: Vec<&str> = parts
         .first()
         .map_or("", |part| part.trim())
@@ -942,7 +943,7 @@ pub(crate) fn tile(
     height: f32,
     natural: Option<[f32; 2]>,
 ) -> [[f32; 2]; 2] {
-    let dims = style::components(size, ' ');
+    let dims = css::components(size, ' ');
     let [tw, th] = match (dims.as_slice(), natural) {
         ([fit @ ("cover" | "contain")], Some([nw, nh])) => {
             let [x, y] = [width / nw, height / nh];
@@ -966,7 +967,7 @@ pub(crate) fn tile(
         }
     }
     .map(|side| side.max(0.1));
-    let tokens = style::components(position, ' ');
+    let tokens = css::components(position, ' ');
     // Three and four values give each keyword an offset from its edge.
     let mut pairs: Vec<(&str, Option<&str>)> = Vec::with_capacity(2);
     for token in tokens.iter().copied() {
@@ -1006,7 +1007,7 @@ pub(crate) fn tile(
 
 /// The offset of a CSS `<position>` in `free`, the room left around the placed box.
 pub(crate) fn place(position: &str, free: [f32; 2], units: &Lengths) -> [f32; 2] {
-    let tokens = style::components(position, ' ');
+    let tokens = css::components(position, ' ');
     let keyword = |token: &str| matches!(token, "left" | "right" | "top" | "bottom" | "center");
     let offset = |token: &str, axis: usize| match token {
         "left" | "top" => 0.,
@@ -1052,11 +1053,11 @@ fn gradient_stops<S: AsRef<str>>(
     extent: f32,
     wide: bool,
 ) -> Option<Vec<(f32, (u32, u8))>> {
-    let color = if wide { style::wide_rgb } else { style::color };
+    let color = if wide { css::wide_rgb } else { css::color };
     let mut stops: Vec<(Option<f32>, (u32, u8))> = Vec::new();
     let mut hints = Vec::new();
     for stop in parts.iter().map(AsRef::as_ref).skip(usize::from(prelude)) {
-        let tokens = style::components(stop.trim(), ' ');
+        let tokens = css::components(stop.trim(), ' ');
         let Some(ink) = tokens.iter().find_map(|token| color(token)) else {
             // A lone position between two colors moves their midpoint.
             if let [token] = tokens.as_slice()
@@ -1070,7 +1071,7 @@ fn gradient_stops<S: AsRef<str>>(
         };
         let offsets: Vec<f32> = tokens
             .iter()
-            .filter(|token| style::color(token).is_none())
+            .filter(|token| css::color(token).is_none())
             .filter_map(|token| units.resolve(token, extent).or_else(|| angle(token, units)))
             .take(2)
             .collect();
@@ -1151,7 +1152,7 @@ fn gradient_stops<S: AsRef<str>>(
 }
 
 pub(super) fn axis_mask(
-    style: &style::Style,
+    style: &css::Style,
     units: &Lengths,
     [width, height]: [f32; 2],
     raster: [u32; 2],
@@ -1159,7 +1160,7 @@ pub(super) fn axis_mask(
     let get =
         |[prop, webkit]: [Prop; 2]| style.get(prop).or_else(|| style.get(webkit)).unwrap_or("");
     let plain = |value: &str, defaults: &[&str]| {
-        style::components(value, ',').iter().all(|part| {
+        css::components(value, ',').iter().all(|part| {
             let part = part.trim();
             part.is_empty() || defaults.contains(&part)
         })
@@ -1173,8 +1174,8 @@ pub(super) fn axis_mask(
     ) {
         return None;
     }
-    let images = style::components(get([Prop::MASK_IMAGE, Prop::WEBKIT_MASK_IMAGE]), ',');
-    let composites = style::components(style.get(Prop::MASK_COMPOSITE).unwrap_or(""), ',');
+    let images = css::components(get([Prop::MASK_IMAGE, Prop::WEBKIT_MASK_IMAGE]), ',');
+    let composites = css::components(style.get(Prop::MASK_COMPOSITE).unwrap_or(""), ',');
     let mut layers = Vec::with_capacity(images.len());
     for image in &images {
         let mut axes = [
@@ -1185,7 +1186,7 @@ pub(super) fn axis_mask(
             .trim()
             .strip_prefix("linear-gradient(")?
             .strip_suffix(')')?;
-        let parts = style::components(body, ',');
+        let parts = css::components(body, ',');
         let (first, space) = first_argument(body);
         if space.is_some() {
             return None;
@@ -1197,9 +1198,9 @@ pub(super) fn axis_mask(
             "to left" | "270deg" => (0, true, true),
             other
                 if other.is_empty()
-                    || style::components(other, ' ')
+                    || css::components(other, ' ')
                         .first()
-                        .is_some_and(|part| style::color(part).is_some()) =>
+                        .is_some_and(|part| css::color(part).is_some()) =>
             {
                 (1, false, false)
             }
@@ -1297,7 +1298,7 @@ impl Gradient<'_> {
     // The sRGB color of a stop, or its Display P3 color when the gradient is wide.
     fn output(&self, ink: u32, alpha: u8) -> u32 {
         match self.wide {
-            true => style::p3(&stop_css(true, ink, alpha)).map_or(ink, |(ink, _)| ink),
+            true => css::p3(&stop_css(true, ink, alpha)).map_or(ink, |(ink, _)| ink),
             false => ink,
         }
     }
@@ -1629,7 +1630,7 @@ fn gradient<'a>(
     let ([[tw, th], [x, y]], steps) =
         tile_repeat(size, position, repeat, &units, area[2], area[3], None);
     let [x, y] = [x + area[0], y + area[1]];
-    let parts = style::components(body, ',');
+    let parts = css::components(body, ',');
     let (first, space) = first_argument(body);
     let first = first.as_str();
     let repeating = kind.starts_with("repeating-");
@@ -1671,7 +1672,7 @@ fn gradient<'a>(
                     .any(|word| first.contains(word))
                 || first.starts_with("at")
                 || !first.is_empty()
-                    && style::color(first).is_none()
+                    && css::color(first).is_none()
                     && first
                         .split_whitespace()
                         .all(|part| units.resolve(part, tw).is_some());
@@ -1746,17 +1747,17 @@ fn gradient<'a>(
         }
         _ => return None,
     };
-    // Like Chrome on a wide-gamut screen, colors outside sRGB keep their gamut. Then stops are `style::wide_rgb`, and
+    // Like Chrome on a wide-gamut screen, colors outside sRGB keep their gamut. Then stops are `css::wide_rgb`, and
     // the image is Display P3.
     let wide = cfg!(target_os = "macos")
         && (parts.iter()).any(|part| {
-            style::components(part, ' ')
+            css::components(part, ' ')
                 .iter()
-                .any(|token| style::wide(token))
+                .any(|token| css::wide(token))
         });
     let color = match wide {
-        true => style::wide_rgb as fn(&str) -> _,
-        false => style::color as fn(&str) -> _,
+        true => css::wide_rgb as fn(&str) -> _,
+        false => css::color as fn(&str) -> _,
     };
     let css = |ink, alpha| stop_css(wide, ink, alpha);
     let stops = gradient_stops(&parts, prelude, &units, extent, wide)?;
@@ -1937,7 +1938,7 @@ pub(super) fn push_bits(key: &mut String, size: [f32; 2], units: &Lengths) {
     }
 }
 
-pub(super) fn opacity(style: &style::Style) -> f32 {
+pub(super) fn opacity(style: &css::Style) -> f32 {
     style
         .get(Prop::OPACITY)
         .and_then(|value| {
@@ -2074,7 +2075,7 @@ mod tests {
     fn style(pairs: &[(&str, &str)]) -> Style {
         pairs
             .iter()
-            .map(|(key, value)| (crate::style::Prop::new(key), (*value).into()))
+            .map(|(key, value)| (crate::css::Prop::new(key), (*value).into()))
             .collect()
     }
 
