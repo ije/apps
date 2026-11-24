@@ -9,6 +9,7 @@ use crate::css::value::units::Lengths;
 use crate::dom::Node;
 use crate::render::inline::InlineText;
 use crate::render::paint::text::AtomSlot;
+use crate::style;
 use renderer::{point, px, relative};
 use std::{cell::RefCell, rc::Rc};
 
@@ -37,6 +38,7 @@ pub(super) struct Cx<'a> {
     pub(super) flexbox: bool,
     pub(super) editable: bool,
     pub(super) stacking: bool,
+    pub(super) selection_colors: (Option<u32>, u32),
     pub(super) broken: bool,
     pub(super) alt: Option<&'a String>,
     pub(super) sizeless: bool,
@@ -624,5 +626,46 @@ impl Cx<'_> {
             );
         }
         wrapper
+    }
+
+    pub(super) fn stretched(&self, axis: usize) -> bool {
+        let Self {
+            reader,
+            id,
+            position,
+            style,
+            ..
+        } = *self;
+        let flex_parent = reader.flex_parent;
+        let [size, start, end] = [
+            [Prop::WIDTH, Prop::MARGIN_LEFT, Prop::MARGIN_RIGHT],
+            [Prop::HEIGHT, Prop::MARGIN_TOP, Prop::MARGIN_BOTTOM],
+        ][axis];
+        flex_parent
+            && reader
+                .parent(id, Prop::FLEX_DIRECTION)
+                .is_some_and(|value| value.starts_with("column"))
+                == (axis == 0)
+            && !matches!(position, "absolute" | "fixed")
+            && style.get(size).is_none_or(|value| value == "auto")
+            && [start, end]
+                .iter()
+                .all(|&prop| style.get(prop) != Some("auto"))
+            && style
+                .get(Prop::ALIGN_SELF)
+                .filter(|value| *value != "auto")
+                .or_else(|| reader.parent(id, Prop::ALIGN_ITEMS))
+                .is_none_or(|value| matches!(value, "normal" | "stretch"))
+    }
+
+    pub(super) fn dark(&self) -> bool {
+        let Self { reader, style, .. } = *self;
+        if style
+            .get(Prop::COLOR_SCHEME)
+            .is_some_and(|value| value.contains("dark") && value.contains("light"))
+        {
+            reader.log(Query::Theme, 0, hashed(crate::native::theme_state() & 1));
+        }
+        style::dark(style, crate::native::theme_state())
     }
 }

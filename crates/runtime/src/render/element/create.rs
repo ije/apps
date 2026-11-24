@@ -1,6 +1,6 @@
 use super::super::layout::size::{
-    aspect_ratio, broken_image, dimension, field_line, field_size, file_size, layout_ceil, legend,
-    natural_size, text_field,
+    aspect_ratio, broken_image, dimension, field_size, layout_ceil, legend, natural_size,
+    text_field,
 };
 use super::super::{
     layout::cull,
@@ -9,16 +9,18 @@ use super::super::{
 use super::border::{border_canvas, fieldset_border, inset_shadows, shade_border};
 use super::children::children;
 use super::columns::columns;
+use super::controls::controls;
 use super::cx::{Carry, Cx, Frame, above, percentage, viewport};
 use super::kept::{Query, Read, Replay, Shared, hashed};
 use super::margin::{
     body_overflow_moves, clear_bits, definite_line, float_side, in_flow, margins, overscroll,
     percent_bound, percent_calc, shrinks_around,
 };
+use super::native::native_control;
 use super::paragraph::paragraph;
 use super::pseudos::pseudo_elements;
 use super::query::{
-    LOOK, backdrop, box_parent, boxless, collapses, content_editable, inset_axes, insets,
+    backdrop, box_parent, boxless, collapses, content_editable, inset_axes, insets,
     only_auto_ratio, padding_start, parent_font, positioner, row_fill, scrolled, scroller,
     starts_line, text_indent,
 };
@@ -28,7 +30,7 @@ use super::{Build, element};
 use crate::css;
 use crate::css::properties::Prop;
 use crate::style::{self};
-use renderer::{Child, Color, Rect, SharedString, point, px, relative, size};
+use renderer::{Child, Color, Rect, point, px, relative, size};
 use std::{cell::RefCell, ops::ControlFlow, rc::Rc};
 
 /// Builds the box of `id`, or with `pseudo` only that block pseudo-element of a spliced inline box.
@@ -483,6 +485,7 @@ pub(super) fn create(
         flexbox: matches!(display, "flex" | "inline-flex"),
         editable: text_field(node, style),
         stacking,
+        selection_colors,
         broken,
         alt,
         sizeless,
@@ -777,27 +780,6 @@ pub(super) fn create(
     if node.tag == "svg" {
         el = svg_box(&cx, el, &mut content_layers);
     }
-    let stretched = |axis: usize| {
-        let [size, start, end] = [
-            [Prop::WIDTH, Prop::MARGIN_LEFT, Prop::MARGIN_RIGHT],
-            [Prop::HEIGHT, Prop::MARGIN_TOP, Prop::MARGIN_BOTTOM],
-        ][axis];
-        flex_parent
-            && reader
-                .parent(id, Prop::FLEX_DIRECTION)
-                .is_some_and(|value| value.starts_with("column"))
-                == (axis == 0)
-            && !matches!(position, "absolute" | "fixed")
-            && style.get(size).is_none_or(|value| value == "auto")
-            && [start, end]
-                .iter()
-                .all(|&prop| style.get(prop) != Some("auto"))
-            && style
-                .get(Prop::ALIGN_SELF)
-                .filter(|value| *value != "auto")
-                .or_else(|| reader.parent(id, Prop::ALIGN_ITEMS))
-                .is_none_or(|value| matches!(value, "normal" | "stretch"))
-    };
     let input = (node.tag == "input").then(|| node.input_type());
     let appkit = node.native_control(style);
     if appkit.is_some() {
@@ -807,286 +789,9 @@ pub(super) fn create(
         kind.eq_ignore_ascii_case("checkbox") || kind.eq_ignore_ascii_case("radio")
     });
     let editable = cx.editable;
-    let dark = || {
-        if style
-            .get(Prop::COLOR_SCHEME)
-            .is_some_and(|value| value.contains("dark") && value.contains("light"))
-        {
-            reader.log(Query::Theme, 0, hashed(crate::native::theme_state() & 1));
-        }
-        style::dark(style, crate::native::theme_state())
-    };
-    if input.is_some_and(|kind| kind.eq_ignore_ascii_case("file"))
-        && let Some(part) = styles
-            .scrollbars
-            .get(&id)
-            .and_then(|parts| parts[1].as_ref())
-    {
-        // The button takes its box from `::file-selector-button`, which the agent sheet always gives.
-        let [padding, margin] = [css::properties::PADDING, css::properties::MARGIN]
-            .map(|sides| units.edges(part, sides, 0.));
-        let borders = units.borders(part, 0.);
-        let color = |prop| part.get(prop).and_then(css::value::color::paint);
-        let radius = part
-            .get(Prop::BORDER_TOP_LEFT_RADIUS)
-            .and_then(|value| units.resolve(value, 0.))
-            .unwrap_or(0.);
-        let mut button = renderer::node()
-            .flex_shrink_0()
-            .mt(px(margin[0]))
-            .mr(px(margin[1]))
-            .mb(px(margin[2]))
-            .ml(px(margin[3]))
-            .pt(px(padding[0]))
-            .pr(px(padding[1]))
-            .pb(px(padding[2]))
-            .pl(px(padding[3]))
-            .border_t(px(borders[0]))
-            .border_r(px(borders[1]))
-            .border_b(px(borders[2]))
-            .border_l(px(borders[3]))
-            .border_color(color(Prop::BORDER_TOP_COLOR).unwrap_or(renderer::Color::TRANSPARENT))
-            .bg(color(Prop::BACKGROUND_COLOR).unwrap_or(renderer::Color::TRANSPARENT))
-            .child("Choose File");
-        if let Some(ink) = color(Prop::COLOR) {
-            button = button.text_color(ink);
-        }
-        if let Some(size) = part
-            .get(Prop::FONT_SIZE)
-            .and_then(|value| units.resolve(value, units.font.em))
-            .filter(|size| *size != units.font.em)
-        {
-            let text = button.text_style();
-            text.set_font_size(px(size));
-            text.set_line_height(px(units.font.lh * size / units.font.em));
-        }
-        if let Some(weight) = part
-            .get(Prop::FONT_WEIGHT)
-            .filter(|weight| Some(*weight) != style.get(Prop::FONT_WEIGHT))
-            .and_then(|weight| match weight {
-                "bold" => Some(700.),
-                "normal" => Some(400.),
-                weight => weight.parse().ok(),
-            })
-        {
-            button.text_style().set_font_weight(weight);
-        }
-        button.style().corner_radii = renderer::Corners::all(px(radius).into()).into();
-        el = el
-            .flex_row()
-            .items_center()
-            .overflow_hidden()
-            .child(button)
-            .child(renderer::node().whitespace_nowrap().child("No file chosen"));
-        if style.get(Prop::WIDTH).is_none_or(|value| value == "auto") {
-            el = el.w(px(file_size(style, part, &units, text, pixel_ratio)[0]));
-        }
-    }
-    if appkit == Some(renderer::ControlKind::Button) {
-        let [padding, height] =
-            super::super::layout::size::native_size(renderer::ControlKind::Button);
-        if style.get(Prop::WIDTH).is_none_or(|value| value == "auto") {
-            let label = node.button_label();
-            let run = style::text_run(style, &units, label.len());
-            let width = text.shape_line(label, px(units.font.em), &run).line.width;
-            el = el.w(px(layout_ceil(f32::from(width) + padding, pixel_ratio)));
-        }
-        if style.get(Prop::HEIGHT).is_none_or(|value| value == "auto") {
-            el = el.h(px(height));
-        }
-    }
-    if appkit.is_none()
-        && input.is_some_and(|kind| {
-            ["button", "submit", "reset"]
-                .iter()
-                .any(|other| kind.eq_ignore_ascii_case(other))
-        })
-    {
-        el = el.items_center().justify_center().child(SharedString::from(
-            node.attrs.get("value").cloned().unwrap_or_else(|| {
-                if input.is_some_and(|kind| kind.eq_ignore_ascii_case("reset")) {
-                    "Reset".into()
-                } else if input.is_some_and(|kind| kind.eq_ignore_ascii_case("submit")) {
-                    "Submit".into()
-                } else {
-                    String::new()
-                }
-            }),
-        ));
-    }
-    let field_line_height = if editable {
-        field_line(node, style, &units, text, pixel_ratio)
-    } else {
-        0.
-    };
-    if editable && node.tag != "textarea" {
-        let above = f32::from(text.baseline(
-            text.face(&parsed.face),
-            px(units.font.em),
-            px(field_line_height),
-            pixel_ratio,
-        ));
-        el.style().justify_content = Some(renderer::AlignContent::Center);
-        el = el.child(
-            renderer::node()
-                .w(px(0.))
-                .h(px(above))
-                .mb(px(field_line_height - above))
-                .flex_shrink_0()
-                .baseline(renderer::Baseline::Bottom),
-        );
-    }
     let mut field_layer = None;
-    if editable {
-        if style.get(Prop::FIELD_SIZING) == Some("content") {
-            reader.log(Query::Value(id as u32), 0, hashed(&node.value));
-        }
-        let text = node.shown_text(
-            node.current_value()
-                .map_or_else(|| doc.text(id), str::to_owned),
-        );
-        let placeholder = node.attrs.get("placeholder").cloned().unwrap_or_default();
-        let font_size = units.font.em;
-        let text_color = style
-            .get(Prop::COLOR)
-            .and_then(css::value::color::paint)
-            .unwrap_or(renderer::Color::BLACK);
-        let caret_color = style
-            .get(Prop::CARET_COLOR)
-            .and_then(css::value::color::paint)
-            .unwrap_or(text_color);
-        let pseudo = styles
-            .text_pseudos
-            .get(&id)
-            .and_then(|pseudos| pseudos[3].as_ref());
-        let mut placeholder_color = pseudo
-            .and_then(|pseudo| css::value::color::paint(pseudo.get(Prop::COLOR)?))
-            .unwrap_or(Color::hex(0x757575ff));
-        placeholder_color.a *= pseudo
-            .and_then(|pseudo| pseudo.get(Prop::OPACITY)?.parse::<f32>().ok())
-            .map_or(1., |opacity| opacity.clamp(0., 1.));
-        let single_line = node.tag != "textarea";
-        let padding = units.edges(style, css::properties::PADDING, containing[0]);
-        let empty = text.is_empty();
-        let face = match pseudo {
-            Some(pseudo) if empty => style::font(pseudo),
-            _ => parsed.face.clone(),
-        };
-        let mut shown = if empty { placeholder } else { text };
-        if let Some(mode) = pseudo
-            .filter(|_| empty)
-            .unwrap_or(style)
-            .get(Prop::TEXT_TRANSFORM)
-            .filter(|mode| *mode != "none")
-        {
-            let len = shown.len();
-            style::text_transform(&mut shown, 0..len, mode);
-        }
-        let shown: Rc<str> = shown.into();
-        let run = renderer::TextRun {
-            len: shown.len(),
-            font: face,
-            color: if empty { placeholder_color } else { text_color },
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-            overline: None,
-            letter_spacing: style::spacing(style, &units, Prop::LETTER_SPACING),
-            word_spacing: px(0.),
-            font_size: None,
-            inset: Default::default(),
-            nowrap: false,
-            tab_size: 8.,
-            stroke: None,
-        };
-        if !single_line && style.get(Prop::FIELD_SIZING) == Some("content") {
-            // The full width of the content box, so the text wraps as in the field.
-            let mut sizer = renderer::text(shown.clone(), Some(vec![run.clone()]))
-                .w(relative(1.))
-                .min_h(px(field_line_height))
-                .flex_shrink_0();
-            sizer.style().visibility = renderer::Visibility::Hidden;
-            el = el.child(sizer);
-        }
-        let handle = view
-            .host
-            .borrow_mut()
-            .state(view.id)
-            .geometry
-            .scroll
-            .entry(id)
-            .or_default()
-            .clone();
-        let field = super::super::paint::field::FieldText {
-            selected: Default::default(),
-            id,
-            view: view.clone(),
-            placeholder: empty,
-            password: (node.password() && !empty)
-                .then(|| node.current_value().unwrap_or("").to_owned()),
-            text: shown,
-            run,
-            single_line,
-            rtl: rtl && line_justify == Some(renderer::AlignContent::End),
-            rows: Default::default(),
-            caret: caret_color,
-            selection: selection_colors,
-            handle: handle.clone(),
-        };
-        let mut clip = renderer::node()
-            .absolute()
-            .track_scroll(&handle)
-            .text_size(px(font_size))
-            .line_height(px(field_line_height));
-        clip.style().restrict_scroll_to_axis = true;
-        clip.style().overscroll = overscroll(style);
-        el = el.cursor(renderer::Cursor::Text);
-        // Added after the background layers, which are absolute too and would paint over the text.
-        field_layer = Some(if single_line {
-            let line = renderer::node().flex_shrink_0().child(field);
-            // A right-to-left row starts at the right, so text that overflows goes to the left and scrolls from there.
-            let line = match (line_justify, rtl) {
-                (Some(renderer::AlignContent::Center), _) => line.ml_auto().mr_auto(),
-                (Some(renderer::AlignContent::End), false) => line.ml_auto(),
-                (None, true) => line.mr_auto(),
-                _ => line,
-            };
-            let mut clip = clip
-                .top(px(padding[0]))
-                .right(px(padding[1]))
-                .bottom(px(padding[2]))
-                .left(px(padding[3]))
-                .overflow_hidden()
-                .flex()
-                .flex_row()
-                .items_center()
-                .whitespace_nowrap();
-            if rtl {
-                clip.style().flex_direction = renderer::FlexDirection::RowReverse;
-            }
-            clip.child(line)
-        } else {
-            if rtl && line_justify == Some(renderer::AlignContent::End) {
-                clip.style().flow |= renderer::Flow::RTL_BLOCK;
-            }
-            clip.style().overflow.x = renderer::Overflow::Scroll;
-            clip.top_0()
-                .right(px(0.))
-                .bottom(px(0.))
-                .left_0()
-                .pt(px(padding[0]))
-                .pb(px(padding[2]))
-                .overflow_y_scroll()
-                .flex()
-                .flex_col()
-                // The text takes the side padding, so like the inner editor of Chrome, the end padding doesn't
-                // follow text that overflows.
-                .child(
-                    renderer::Node::from(field)
-                        .pl(px(padding[3]))
-                        .pr(px(padding[1])),
-                )
-        });
+    if input.is_some() || appkit.is_some() || editable {
+        (el, field_layer) = controls(&cx, el, input, appkit);
     }
     if hit.is_none()
         && let Some(ink) = style
@@ -1442,267 +1147,16 @@ pub(super) fn create(
             }
         }
     }
-    let list = (node.tag == "select")
-        .then(|| {
-            match node
-                .attrs
-                .get("size")
-                .and_then(|size| size.trim().parse::<usize>().ok())
-            {
-                Some(rows) if rows > 1 => Some(rows),
-                _ => node.attrs.contains_key("multiple").then_some(4),
-            }
-        })
-        .flatten();
-    let native = super::super::paint::control::kind(&node.tag, input, list.is_some(), style).map(
-        |(control, boxed, plain)| {
-            let number = |name: &str| {
-                node.attrs
-                    .get(name)
-                    .and_then(|value| value.trim().parse::<f32>().ok())
-                    .filter(|value| value.is_finite())
-            };
-            let [min, max] = match control {
-                super::super::paint::control::Control::Range => {
-                    [number("min").unwrap_or(0.), number("max").unwrap_or(100.)]
-                }
-                super::super::paint::control::Control::Meter => {
-                    [number("min").unwrap_or(0.), number("max").unwrap_or(1.)]
-                }
-                _ => [0., number("max").filter(|&max| max > 0.).unwrap_or(1.)],
-            };
-            let max = max.max(min);
-            let value = match control {
-                super::super::paint::control::Control::Range => {
-                    let value = node
-                        .current_value()
-                        .and_then(|value| value.trim().parse::<f32>().ok())
-                        .map_or((min + max) / 2., |value| value.clamp(min, max));
-                    // Like the value property, the thumb snaps to a step from `min`.
-                    match node.attrs.get("step").map(|step| step.trim()) {
-                        Some(step) if step.eq_ignore_ascii_case("any") => value,
-                        step => {
-                            let step = step
-                                .and_then(|step| step.parse::<f32>().ok())
-                                .filter(|step| *step > 0.)
-                                .unwrap_or(1.);
-                            let steps = ((value - min) / step).round();
-                            min + if min + steps * step > max {
-                                steps - 1.
-                            } else {
-                                steps
-                            } * step
-                        }
-                    }
-                }
-                _ => number("value").unwrap_or(
-                    if control == super::super::paint::control::Control::Progress {
-                        -1.
-                    } else {
-                        0.
-                    },
-                ),
-            };
-            let mut dark = dark();
-            let accent = match control {
-                super::super::paint::control::Control::Meter => {
-                    let low = number("low").unwrap_or(min).clamp(min, max);
-                    let high = number("high").unwrap_or(max).clamp(low, max);
-                    let region = |value: f32| u8::from(value >= low) + u8::from(value > high);
-                    let optimum = region(
-                        number("optimum")
-                            .unwrap_or((min + max) / 2.)
-                            .clamp(min, max),
-                    );
-                    let current = region(value.clamp(min, max));
-                    let colors = if dark {
-                        [0x74b374, 0xf2c812, 0xe98f6d]
-                    } else {
-                        [0x107c10, 0xffb900, 0xd83b01]
-                    };
-                    if optimum == current {
-                        colors[0]
-                    } else if optimum == 1 || current == 1 {
-                        colors[1]
-                    } else {
-                        colors[2]
-                    }
-                }
-                super::super::paint::control::Control::Color => node
-                    .current_value()
-                    .and_then(css::value::color::color)
-                    .map_or(0, |(color, _)| color),
-                _ if node.attrs.contains_key("disabled") => 0x767676,
-                _ => match style
-                    .get(Prop::ACCENT_COLOR)
-                    .and_then(css::value::color::color)
-                {
-                    Some((color, _)) => {
-                        dark = super::super::paint::control::accent_dark(
-                            control,
-                            node.checked(),
-                            color,
-                            dark,
-                        );
-                        color
-                    }
-                    None if dark => 0x99c8ff,
-                    None => 0x0075ff,
-                },
-            };
-            super::super::paint::control::Look {
-                control,
-                boxed,
-                plain,
-                checked: node.checked(),
-                disabled: node.attrs.contains_key("disabled"),
-                hover: node.state & crate::css::selector::HOVER != 0,
-                active: node.state & crate::css::selector::ACTIVE != 0,
-                dark,
-                accent,
-                ink: style
-                    .get(Prop::COLOR)
-                    .and_then(css::value::color::color)
-                    .map_or(0, |(color, _)| color),
-                value: if value < min
-                    || max <= min && control != super::super::paint::control::Control::Progress
-                {
-                    if control == super::super::paint::control::Control::Progress {
-                        -1.
-                    } else {
-                        0.
-                    }
-                } else {
-                    ((value - min) / (max - min).max(f32::EPSILON)).clamp(0., 1.)
-                },
-            }
-        },
+    let (mut el, native) = native_control(
+        &cx,
+        el,
+        input,
+        appkit,
+        &mut padding,
+        &mut borders,
+        &mut border_kinds,
+        &mut border_colors,
     );
-    let native = native.filter(|_| appkit.is_none());
-    if native.is_some() {
-        reader.log(Query::Look(id as u32), 0, hashed(node.state & LOOK));
-    }
-    #[cfg(debug_assertions)]
-    if let Some(look) = &native {
-        reader.extra.set(hashed((
-            reader.extra.get(),
-            [
-                look.hover,
-                look.active,
-                look.checked,
-                look.disabled,
-                look.dark,
-            ],
-            [look.accent, look.ink, look.value.to_bits()],
-        )));
-    }
-    if let Some(look) = &native {
-        if look.boxed {
-            let (edge, fill) = super::super::paint::control::box_colors(look);
-            for side in 0..4 {
-                padding[side] += (borders[side] - 1.).max(0.);
-                borders[side] = borders[side].min(1.);
-                border_kinds[side] = "solid";
-                if let Some(edge) = edge {
-                    border_colors[side] = Color::hex(edge << 8 | 0xff);
-                }
-            }
-            if let Some(fill) = fill {
-                el = el.bg(Color::hex(fill << 8 | 0xff));
-            }
-        }
-        if let Some(rows) = list
-            && style.get(Prop::HEIGHT).is_none_or(|value| value == "auto")
-        {
-            // Options have `line-height: normal` and `min-height: 1.2em`.
-            let normal = text
-                .line_metrics(text.face(&parsed.face), px(units.font.em * pixel_ratio))
-                .map(f32::from)
-                .iter()
-                .sum::<f32>()
-                / pixel_ratio;
-            let row = (normal.max(1.2 * units.font.em) * 64.).round() / 64. + 1.;
-            el = el.h(px(rows as f32 * row
-                + padding[0]
-                + padding[2]
-                + borders[0]
-                + borders[2]));
-        }
-        if look.control == super::super::paint::control::Control::Menu {
-            padding[1] += 16.;
-            padding[3] += 4.;
-            if style.get(Prop::WIDTH).is_none_or(|value| value == "auto") {
-                let (font, size) = (parsed.face.clone(), px(units.font.em));
-                let mut widest = 0f32;
-                let mut stack = node.children.clone();
-                while let Some(child) = stack.pop() {
-                    match doc.nodes[child].tag.as_str() {
-                        "optgroup" => stack.extend(&doc.nodes[child].children),
-                        "option" => {
-                            let label = doc
-                                .text(child)
-                                .split_ascii_whitespace()
-                                .collect::<Vec<_>>()
-                                .join(" ");
-                            let run = renderer::TextRun {
-                                len: label.len(),
-                                font: font.clone(),
-                                color: renderer::Color::BLACK,
-                                background_color: None,
-                                underline: None,
-                                strikethrough: None,
-                                overline: None,
-                                letter_spacing: px(0.),
-                                word_spacing: px(0.),
-                                font_size: None,
-                                inset: Default::default(),
-                                nowrap: false,
-                                tab_size: 8.,
-                                stroke: None,
-                            };
-                            widest = widest
-                                .max(f32::from(text.shape_line(&label, size, &run).line.width));
-                        }
-                        _ => {}
-                    }
-                }
-                el = el.min_w(px((widest * pixel_ratio).ceil() / pixel_ratio
-                    + padding[1]
-                    + padding[3]
-                    + borders[1]
-                    + borders[3]));
-            }
-            if !node.attrs.contains_key("multiple")
-                && node
-                    .attrs
-                    .get("size")
-                    .is_none_or(|size| size.trim().parse::<u32>().is_ok_and(|size| size <= 1))
-                && style.get(Prop::HEIGHT).is_none_or(|value| value == "auto")
-            {
-                let face = text.face(&parsed.face);
-                let [ascent, descent, _] = text
-                    .line_metrics(face, px(units.font.em * pixel_ratio))
-                    .map(f32::from);
-                let height = px((ascent + descent) / pixel_ratio
-                    + 2.
-                    + padding[0]
-                    + padding[2]
-                    + borders[0]
-                    + borders[2]);
-                el = if stretched(1) {
-                    el.min_h(height)
-                } else {
-                    el.h(height)
-                }
-                .justify_center();
-            }
-        }
-        el = el
-            .pt(px(padding[0]))
-            .pr(px(padding[1]))
-            .pb(px(padding[2]))
-            .pl(px(padding[3]));
-    }
     let legend = (node.tag == "fieldset")
         .then(|| legend(doc, styles, id))
         .flatten()
@@ -1821,7 +1275,7 @@ pub(super) fn create(
             None,
         );
         if auto[0] {
-            if !stretched(0)
+            if !cx.stretched(0)
                 && !(matches!(position, "absolute" | "fixed")
                     && [Prop::LEFT, Prop::RIGHT]
                         .iter()
@@ -2327,7 +1781,7 @@ pub(super) fn create(
                 (percent.max(0.) / 100. * containing[0] + extra[0]).min(natural[0] + chrome[0])
             ));
         }
-        let stretch = [stretched(0), stretched(1)];
+        let stretch = [cx.stretched(0), cx.stretched(1)];
         let css = el.style().aspect_ratio.is_some();
         let line = (stretch[1]
             && reader
@@ -2885,7 +2339,7 @@ pub(super) fn create(
             .get(Prop::OUTLINE_COLOR)
             .and_then(css::value::color::paint)
             .unwrap_or(ink);
-        let under = renderer::Color::hex(if dark() { 0x101010ff } else { 0xffffffff });
+        let under = renderer::Color::hex(if cx.dark() { 0x101010ff } else { 0xffffffff });
         let mut ring = renderer::canvas(
             |_, _| (),
             move |bounds, _, window| {
