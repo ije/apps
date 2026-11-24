@@ -45,6 +45,10 @@ impl Context {
         })
     }
 
+    pub(crate) fn api(&self) -> &Rc<JavaScriptCore> {
+        &self.api
+    }
+
     pub(crate) fn ptr(&self) -> Ptr {
         self.ctx
     }
@@ -348,6 +352,71 @@ impl JavaScriptCore {
 
     pub(crate) fn array(&self, ctx: Ptr, items: &[Ptr]) -> Ptr {
         unsafe { (self.make_array)(ctx, items.len(), items.as_ptr(), ptr::null_mut()) }
+    }
+
+    // The JSC type of a value: 2 boolean, 3 number, 4 string, 5 object, 7 BigInt.
+    pub(crate) fn kind(&self, ctx: Ptr, value: Ptr) -> u32 {
+        unsafe { (self.value_type)(ctx, value) }
+    }
+
+    pub(crate) fn to_f64(&self, ctx: Ptr, value: Ptr) -> f64 {
+        unsafe { (self.to_number)(ctx, value, ptr::null_mut()) }
+    }
+
+    pub(crate) fn to_bool(&self, ctx: Ptr, value: Ptr) -> bool {
+        unsafe { (self.to_boolean)(ctx, value) }
+    }
+
+    pub(crate) fn is_callable(&self, ctx: Ptr, value: Ptr) -> bool {
+        unsafe { (self.is_function)(ctx, value) }
+    }
+
+    pub(crate) fn make_number(&self, ctx: Ptr, value: f64) -> Ptr {
+        unsafe { (self.number)(ctx, value) }
+    }
+
+    pub(crate) fn make_undefined(&self, ctx: Ptr) -> Ptr {
+        unsafe { (self.undefined)(ctx) }
+    }
+
+    pub(crate) fn make_null(&self, ctx: Ptr) -> Ptr {
+        unsafe { (self.null)(ctx) }
+    }
+
+    pub(crate) fn make_text(&self, ctx: Ptr, text: &str) -> Ptr {
+        let string = self.string(text);
+        unsafe {
+            let value = (self.make_string)(ctx, string);
+            (self.string_release)(string);
+            value
+        }
+    }
+
+    // An `ArrayBuffer` over memory that `release` frees with `owner`.
+    pub(crate) fn external_buffer(
+        &self,
+        ctx: Ptr,
+        bytes: Ptr,
+        size: usize,
+        release: unsafe extern "C" fn(Ptr, Ptr),
+        owner: Ptr,
+    ) -> Ptr {
+        unsafe { (self.make_buffer)(ctx, bytes, size, Some(release), owner, ptr::null_mut()) }
+    }
+
+    // Native memory that wrappers of the context hold, so GC starts sooner.
+    pub(crate) fn add_memory(&self, ctx: Ptr, bytes: usize) {
+        unsafe { (self.extra_memory)(ctx, bytes) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn global_value(&self, ctx: Ptr, name: &str) -> Ptr {
+        let name = self.string(name);
+        unsafe {
+            let value = (self.get)(ctx, (self.global)(ctx), name, ptr::null_mut());
+            (self.string_release)(name);
+            value
+        }
     }
 
     pub(crate) fn is_proxy(&self, ctx: Ptr, value: Ptr) -> bool {

@@ -139,17 +139,11 @@ impl Job {
 
 pub(crate) type Run = fn(Job) -> Result<()>;
 
-// The host gives the function that runs workers. Without one, as in the tests of this module, workers fail.
-fn no_run(_: Job) -> Result<()> {
-    bail!("Workers are unavailable here")
-}
-
-#[derive(Default)]
 pub(crate) struct State {
     workers: HashMap<u64, Worker>,
     app: crate::bundle::AppInfo,
     channels: Vec<u64>,
-    run: Option<Run>,
+    run: Run,
 }
 
 // A preload context ends without its thread ending, so its subscribers leave with its state.
@@ -170,7 +164,7 @@ impl State {
             workers: HashMap::new(),
             app: crate::bundle::AppInfo::default(),
             channels: Vec::new(),
-            run: Some(run),
+            run,
         }
     }
 
@@ -347,7 +341,7 @@ impl State {
                 let started = running.clone();
                 let wake = crate::jsc::Waker::current();
                 let own = input.clone();
-                let run = self.run.unwrap_or(no_run);
+                let run = self.run;
                 let job = Job { app, source, native, ends, stop: cancelled.clone(), inbox, running: started };
                 std::thread::Builder::new().name(format!("apps-worker-{id}")).spawn(move || {
                     crate::jsc::Waker::install(move || { let _ = own.send(Value::Null.into()); });
@@ -449,7 +443,7 @@ impl State {
 mod tests {
     #[test]
     fn dropped_contexts_remove_their_channel_subscribers() {
-        let mut state = super::State::default();
+        let mut state = super::State::new(|_| Ok(()));
         let id = state
             .call("channel.open", &mut serde_json::Value::Null)
             .unwrap()

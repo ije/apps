@@ -66,6 +66,8 @@ pub struct Desktop {
     quit: bool,
     wake: Option<(Instant, renderer::Timer)>,
     scheduled: bool,
+    // A shrink of the engine waits for a quiet second.
+    shrinking: Rc<std::cell::Cell<bool>>,
 }
 
 // The page views reach their desktop through this.
@@ -98,9 +100,7 @@ impl crate::render::Pages for Pages {
 }
 
 thread_local! {
-    // The page side of this thread waits to shrink its engine. Main keeps its own flag.
-    static SHRINKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    // Skip destruction: this needs HOSTS, which exits first.
+    // Skip destruction: this needs the context table of jsc, which exits first.
     static PAGE_SIDE: std::mem::ManuallyDrop<RefCell<Option<Rc<RefCell<Desktop>>>>> = const { std::mem::ManuallyDrop::new(RefCell::new(None)) };
 }
 
@@ -320,6 +320,7 @@ impl Desktop {
             quit: false,
             wake: None,
             scheduled: false,
+            shrinking: Rc::default(),
         })
     }
 
@@ -366,8 +367,7 @@ impl Desktop {
                         } else if command["op"] == "reload" {
                             let host = self.host.borrow();
                             for &id in self.views.keys() {
-                                if let Some(url) =
-                                    host.dom.get(&id).and_then(|dom| dom.base.as_ref())
+                                if let Some(url) = host.page_url(id)
                                     && url.as_str().starts_with("apps:///")
                                 {
                                     self.link.page(ToPage::Window(
@@ -893,8 +893,11 @@ impl Desktop {
                 cx.end_thread();
             });
         }
-        let api = runtime.borrow().api.clone();
-        if api.shrink_pending() && !SHRINKING.replace(true) {
+        let (api, shrinking) = {
+            let app = runtime.borrow();
+            (app.api.clone(), app.shrinking.clone())
+        };
+        if api.shrink_pending() && !shrinking.replace(true) {
             shrink_when_quiet(runtime.clone(), cx);
         }
         match result {
@@ -1147,6 +1150,7 @@ impl Desktop {
             quit: false,
             wake: None,
             scheduled: false,
+            shrinking: Rc::default(),
         }));
         let woken = Rc::downgrade(&runtime);
         cx.on_wake(move |cx| {
@@ -1167,7 +1171,10 @@ fn scripted<R>(cx: Option<&mut App>, f: impl FnOnce() -> R) -> R {
 }
 
 fn shrink_when_quiet(runtime: Rc<RefCell<Desktop>>, cx: &mut App) {
-    let api = runtime.borrow().api.clone();
+    let (api, shrinking) = {
+        let app = runtime.borrow();
+        (app.api.clone(), app.shrinking.clone())
+    };
     let frames = |runtime: &Rc<RefCell<Desktop>>, cx: &mut App| -> u64 {
         let Ok(app) = runtime.try_borrow() else {
             return 0;
@@ -1186,7 +1193,7 @@ fn shrink_when_quiet(runtime: Rc<RefCell<Desktop>>, cx: &mut App) {
         if drawing || !api.shrink_due() {
             return shrink_when_quiet(runtime, cx);
         }
-        SHRINKING.set(false);
+        shrinking.set(false);
         api.shrink();
         if let Ok(app) = runtime.try_borrow() {
             for view in app.views.values() {

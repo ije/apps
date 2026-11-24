@@ -186,7 +186,7 @@ impl Desktop {
             list.push(json!({
                 "id": id,
                 "title": view.title,
-                "url": host.dom.get(&id).and_then(|dom| dom.base.as_ref()).map(url::Url::as_str),
+                "url": host.page_url(id).map(url::Url::as_str),
                 "state": state,
                 "preload": view.preload.is_some(),
             }));

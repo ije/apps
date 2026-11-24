@@ -148,8 +148,8 @@ unsafe extern "C" fn ffi_call(
         || -> Result<crate::node::ffi::Output> {
             anyhow::ensure!(count > 0, "Missing FFI request");
             let values = unsafe { std::slice::from_raw_parts(args, count) };
-            if unsafe { (api.value_type)(ctx, values[0]) } == 3 {
-                let id = unsafe { (api.to_number)(ctx, values[0], ptr::null_mut()) } as u64;
+            if api.kind(ctx, values[0]) == 3 {
+                let id = api.to_f64(ctx, values[0]) as u64;
                 return ffi
                     .invoke(api, ctx, role, id, &values[1..])
                     .map(crate::node::ffi::Output::Object);
@@ -164,15 +164,10 @@ unsafe extern "C" fn ffi_call(
         Ok(Err(error)) => serde_json::json!({"error":error.to_string()}),
         Err(_) => serde_json::json!({"error":"FFI call failed"}),
     };
-    let string = api.string(&value.to_string());
-    unsafe {
-        let result = (api.make_string)(ctx, string);
-        (api.string_release)(string);
-        if !exception.is_null() {
-            *exception = ptr::null_mut();
-        }
-        result
+    if !exception.is_null() {
+        unsafe { *exception = ptr::null_mut() };
     }
+    api.make_text(ctx, &value.to_string())
 }
 
 unsafe extern "C" fn page_limit(ctx: Ptr, _: Ptr) -> bool {
@@ -239,8 +234,6 @@ pub(crate) const NEXT: &str = "this.__appsNext?.()";
 
 pub struct JsContext {
     engine: Engine,
-    api: Rc<JavaScriptCore>,
-    ctx: Ptr,
     napi: Option<Rc<crate::node::napi::Root>>,
     // Kept for the limit callback, which reads it.
     _interrupt: Option<Box<Interrupt>>,
@@ -361,8 +354,6 @@ impl JsContext {
         engine.install(false, &[("__appsChunk", chunk)]);
         let engine = Self {
             engine,
-            api,
-            ctx,
             napi,
             _interrupt: interrupt,
         };
@@ -381,7 +372,7 @@ impl JsContext {
             ),
             "apps:role",
         )?;
-        engine.api.attach_aot(ctx);
+        engine.engine.api().attach_aot(ctx);
         if !matches!(role, Role::Renderer(_)) {
             for (url, source) in runtime_sources(Runtime::Node) {
                 engine.run(source(), url)?;
@@ -422,7 +413,7 @@ impl JsContext {
 
     fn checked(&self, url: &str, result: Ptr, exception: Ptr) -> Result<Ptr> {
         if !exception.is_null() {
-            let message = self.api.text(self.ctx, exception);
+            let message = self.engine.api().text(self.engine.ptr(), exception);
             self.log(url, &message);
             bail!("{message}");
         }
@@ -437,7 +428,7 @@ impl JsContext {
                 ARMED.set(self.0);
             }
         }
-        let _armed = Armed(ARMED.replace(self.ctx as usize));
+        let _armed = Armed(ARMED.replace(self.engine.ptr() as usize));
         self.evaluate(source, url, self.engine.has_scope())
     }
 
@@ -446,28 +437,32 @@ impl JsContext {
     }
 
     pub fn call(&self, name: &str, arguments: &[&str]) -> Result<String> {
-        self.api.call_json(self.ctx, name, arguments, |value| {
-            self.api.text(self.ctx, value)
-        })
+        self.engine
+            .api()
+            .call_json(self.engine.ptr(), name, arguments, |value| {
+                self.engine.api().text(self.engine.ptr(), value)
+            })
     }
 
     fn evaluate(&self, source: &str, url: &str, scoped: bool) -> Result<String> {
         let mut exception = ptr::null_mut();
         let result = self.engine.evaluate(source, url, scoped, &mut exception)?;
         Ok(self
-            .api
-            .text(self.ctx, self.checked(url, result, exception)?))
+            .engine
+            .api()
+            .text(self.engine.ptr(), self.checked(url, result, exception)?))
     }
 
     // Calls a global function with JSON arguments. Unlike a script of new text, it compiles nothing.
     pub fn call_logged(&self, name: &str, arguments: &[&str], url: &str) -> Result<()> {
-        self.api
-            .call_json(self.ctx, name, arguments, drop)
+        self.engine
+            .api()
+            .call_json(self.engine.ptr(), name, arguments, drop)
             .inspect_err(|error| self.log(url, &error.to_string()))
     }
 
     fn log(&self, url: &str, message: &str) {
-        if let Some(binding) = binding(self.ctx)
+        if let Some(binding) = binding(self.engine.ptr())
             && let Ok(mut host) = binding.host.try_borrow_mut()
             && !host.app.packaged
         {
@@ -476,11 +471,17 @@ impl JsContext {
     }
 
     pub(crate) fn receive(&self, payload: payload::Payload) -> Result<payload::Payload> {
-        payload::receive(&self.api, self.ctx, payload)
+        payload::receive(self.engine.api(), self.engine.ptr(), payload)
     }
 
     pub(crate) fn deliver(&self, payload: payload::Payload) -> Result<()> {
-        payload::bridge(&self.api, self.ctx, "__appsBridgeDeliver", payload).map(|_| ())
+        payload::bridge(
+            self.engine.api(),
+            self.engine.ptr(),
+            "__appsBridgeDeliver",
+            payload,
+        )
+        .map(|_| ())
     }
 
     pub(crate) fn heap(&self) -> Result<serde_json::Value> {
@@ -500,9 +501,10 @@ impl JsContext {
         // macrotask.
         loop {
             let delay = self
-                .api
-                .call_json(self.ctx, "__appsTick", &[], |value| unsafe {
-                    (self.api.to_number)(self.ctx, value, ptr::null_mut())
+                .engine
+                .api()
+                .call_json(self.engine.ptr(), "__appsTick", &[], |value| {
+                    self.engine.api().to_f64(self.engine.ptr(), value)
                 })
                 .inspect_err(|error| self.log("apps:tick", &error.to_string()))?;
             if delay != -2. {
@@ -542,7 +544,7 @@ impl JsContext {
 
     fn install(&self, files: &BBTreeMap<String, String>) -> Result<()> {
         {
-            let binding = binding(self.ctx).context("The JavaScript context is closed")?;
+            let binding = binding(self.engine.ptr()).context("The JavaScript context is closed")?;
             let mut host = binding.host.borrow_mut();
             host.app.install(files)?;
             if !host.app.scripts.is_empty() {
@@ -565,7 +567,8 @@ impl Drop for JsContext {
         if let Some(napi) = &self.napi {
             napi.close();
         }
-        let binding = jsc::forget(self.ctx).and_then(|data| data.downcast::<Binding>().ok());
+        let binding =
+            jsc::forget(self.engine.ptr()).and_then(|data| data.downcast::<Binding>().ok());
         if let Some(binding) = &binding {
             if let Role::Preload(id) = binding.role
                 && let Ok(mut host) = binding.host.try_borrow_mut()
@@ -587,7 +590,7 @@ impl Drop for JsContext {
             .filter(|connection| !connection.is_null())
         {
             // A connected inspector keeps the global object alive.
-            inspector_disconnect(self.ctx, connection);
+            inspector_disconnect(self.engine.ptr(), connection);
         }
     }
 }
@@ -969,13 +972,8 @@ mod tests {
             "test",
         )
         .unwrap();
-        let items = unsafe {
-            let name = api.string("items");
-            let items = (api.get)(page.ctx, (api.global)(page.ctx), name, ptr::null_mut());
-            (api.string_release)(name);
-            items
-        };
-        let (buffers, roots) = payload::input(&api, page.ctx, items).unwrap();
+        let items = api.global_value(page.engine.ptr(), "items");
+        let (buffers, roots) = payload::input(&api, page.engine.ptr(), items).unwrap();
         page.eval("delete globalThis.items", "test").unwrap();
         page.collect_garbage();
         page.eval(
@@ -1121,9 +1119,9 @@ mod tests {
             ""
         );
         let page = JsContext::new(api, host, Role::Renderer(1)).unwrap();
-        let binding = binding(page.ctx).unwrap();
+        let binding = binding(page.engine.ptr()).unwrap();
         let open = |args| {
-            dispatch(&binding, page.ctx, "dom.open", args)
+            dispatch(&binding, page.engine.ptr(), "dom.open", args)
                 .unwrap_err()
                 .to_string()
         };
@@ -1142,7 +1140,7 @@ mod tests {
         let picker = |picker| {
             dispatch(
                 &binding,
-                page.ctx,
+                page.engine.ptr(),
                 "dom.filePicker",
                 serde_json::json!([picker]),
             )
@@ -1157,7 +1155,7 @@ mod tests {
         let popup = |items| {
             dispatch(
                 &binding,
-                page.ctx,
+                page.engine.ptr(),
                 "dom.selectPopup",
                 serde_json::json!([{"id":1,"x":0,"y":0,"width":9,"selected":-1,"items":items}]),
             )
@@ -1166,7 +1164,8 @@ mod tests {
         assert!(!popup(serde_json::json!([["a", "0);evil("]])));
         assert!(popup(serde_json::json!([["a", 1], null])));
         for op in ["node.poll", "child.spawn", "pty.spawn"] {
-            let error = dispatch(&binding, page.ctx, op, serde_json::json!([])).unwrap_err();
+            let error =
+                dispatch(&binding, page.engine.ptr(), op, serde_json::json!([])).unwrap_err();
             assert!(
                 error.to_string().contains("unavailable in page scripts"),
                 "{op}"

@@ -1,8 +1,9 @@
-use anyhow::{Context, Result, ensure};
+use super::{JavaScriptCore, Ptr, well_formed};
+use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use serde_json::{Value, json};
-use std::cell::RefCell;
+use std::{cell::RefCell, ptr};
 
 // Only read and snapshot can export borrowed bytes by copying them. A slice expires on call return or another
 // read of that argument.
@@ -18,11 +19,10 @@ static TAKEN_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 // The functions of scripts/jsc.patch that give an object of one VM to another VM.
 #[derive(Clone, Copy)]
 pub(crate) struct Contents {
-    pub(crate) take: unsafe extern "C" fn(crate::jsc::Ptr, crate::jsc::Ptr) -> crate::jsc::Ptr,
-    pub(crate) bytes:
-        unsafe extern "C" fn(crate::jsc::Ptr, *mut usize, *mut i32) -> crate::jsc::Ptr,
-    pub(crate) make: unsafe extern "C" fn(crate::jsc::Ptr, crate::jsc::Ptr) -> crate::jsc::Ptr,
-    pub(crate) release: unsafe extern "C" fn(crate::jsc::Ptr),
+    pub(crate) take: unsafe extern "C" fn(Ptr, Ptr) -> Ptr,
+    pub(crate) bytes: unsafe extern "C" fn(Ptr, *mut usize, *mut i32) -> Ptr,
+    pub(crate) make: unsafe extern "C" fn(Ptr, Ptr) -> Ptr,
+    pub(crate) release: unsafe extern "C" fn(Ptr),
 }
 
 // The memory of an ArrayBuffer has one owner. The others are made again in each VM that gets them.
@@ -33,7 +33,7 @@ struct Taken {
     contents: usize,
     data: usize,
     size: usize,
-    release: unsafe extern "C" fn(crate::jsc::Ptr),
+    release: unsafe extern "C" fn(Ptr),
 }
 
 impl AsRef<[u8]> for Taken {
@@ -52,17 +52,13 @@ impl Drop for Taken {
             TAKEN_COUNT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         }
         drop(taken);
-        unsafe { (self.release)(self.contents as crate::jsc::Ptr) };
+        unsafe { (self.release)(self.contents as Ptr) };
     }
 }
 
 // Moves the memory of an ArrayBuffer out of its VM, or shares a SharedArrayBuffer, a shared WebAssembly.Memory
 // or a WebAssembly.Module. Returns the ID that the next operation passes to `held`.
-pub(crate) fn take(
-    api: &crate::jsc::JavaScriptCore,
-    ctx: crate::jsc::Ptr,
-    buffer: crate::jsc::Ptr,
-) -> Option<u64> {
+pub(crate) fn take(api: &JavaScriptCore, ctx: Ptr, buffer: Ptr) -> Option<u64> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let functions = api.contents?;
     let contents = unsafe { (functions.take)(ctx, buffer) };
@@ -99,7 +95,7 @@ pub(crate) fn held(id: u64) -> Option<Bytes> {
 }
 
 // Tells if these bytes come from `take`, and gives their contents record and kind.
-pub(crate) fn taken(bytes: &Bytes) -> Option<(crate::jsc::Ptr, i32)> {
+pub(crate) fn taken(bytes: &Bytes) -> Option<(Ptr, i32)> {
     if TAKEN_COUNT.load(std::sync::atomic::Ordering::Acquire) == 0 {
         return None;
     }
@@ -109,7 +105,7 @@ pub(crate) fn taken(bytes: &Bytes) -> Option<(crate::jsc::Ptr, i32)> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
         .find(|&&(data, ..)| data == address)
-        .map(|&(_, contents, kind)| (contents as crate::jsc::Ptr, kind))
+        .map(|&(_, contents, kind)| (contents as Ptr, kind))
 }
 
 #[derive(Clone, Default)]
@@ -252,20 +248,16 @@ pub(crate) fn write(bytes: impl Into<Bytes>) -> Value {
 }
 
 // The slice has an unbounded lifetime, but stays valid only while the value lives and no JavaScript runs.
-pub(crate) fn view<'a>(
-    api: &crate::jsc::JavaScriptCore,
-    ctx: crate::jsc::Ptr,
-    value: crate::jsc::Ptr,
-) -> Result<&'a [u8]> {
+pub(crate) fn view<'a>(api: &JavaScriptCore, ctx: Ptr, value: Ptr) -> Result<&'a [u8]> {
     let bytes = api.bytes(ctx, value).context("Expected typed bytes")?;
     ensure!(bytes.len() <= 1 << 31, "Binary arguments are too large");
     Ok(bytes)
 }
 
 pub(crate) struct Roots<'a> {
-    api: &'a crate::jsc::JavaScriptCore,
-    ctx: crate::jsc::Ptr,
-    values: Vec<crate::jsc::Ptr>,
+    api: &'a JavaScriptCore,
+    ctx: Ptr,
+    values: Vec<Ptr>,
 }
 
 impl Drop for Roots<'_> {
@@ -278,15 +270,15 @@ impl Drop for Roots<'_> {
 
 // These bytes remain valid only while the returned Roots live.
 pub(crate) fn input<'a>(
-    api: &'a crate::jsc::JavaScriptCore,
-    ctx: crate::jsc::Ptr,
-    values: crate::jsc::Ptr,
+    api: &'a JavaScriptCore,
+    ctx: Ptr,
+    values: Ptr,
 ) -> Result<(Vec<Bytes>, Roots<'a>)> {
     ensure!(
         unsafe { (api.value_type)(ctx, values) } == 5,
         "Invalid binary arguments"
     );
-    let mut error = std::ptr::null_mut();
+    let mut error = ptr::null_mut();
     let key = api.string("length");
     let count = unsafe { (api.get)(ctx, values, key, &mut error) };
     unsafe {
@@ -325,25 +317,21 @@ pub(crate) fn input<'a>(
     Ok((buffers, roots))
 }
 
-pub(crate) unsafe extern "C" fn release(_pointer: crate::jsc::Ptr, owner: crate::jsc::Ptr) {
+pub(crate) unsafe extern "C" fn release(_pointer: Ptr, owner: Ptr) {
     drop(unsafe { Box::from_raw(owner.cast::<Vec<u8>>()) });
 }
 
-pub(crate) unsafe extern "C" fn release_bytes(_pointer: crate::jsc::Ptr, owner: crate::jsc::Ptr) {
+pub(crate) unsafe extern "C" fn release_bytes(_pointer: Ptr, owner: Ptr) {
     drop(unsafe { Box::from_raw(owner.cast::<Bytes>()) });
 }
 
-// A call result that is JSON text already. crate::jsc::JavaScriptCore parses it as it is, so a large message is not parsed and
+// A call result that is JSON text already. JavaScriptCore parses it as it is, so a large message is not parsed and
 // serialized again here. `buffers` has the shape of the result, but only down to its `$appsBytes` markers.
 pub(crate) fn raw(json: String, buffers: Value) -> Value {
     json!({"$appsRaw": json, "$appsBuffers": buffers})
 }
 
-pub(crate) fn output(
-    api: &crate::jsc::JavaScriptCore,
-    ctx: crate::jsc::Ptr,
-    mut payload: Payload,
-) -> crate::jsc::Ptr {
+pub(crate) fn output(api: &JavaScriptCore, ctx: Ptr, mut payload: Payload) -> Ptr {
     let mut buffers = Vec::new();
     if !payload.buffers.is_empty() {
         let mut used = std::collections::HashMap::new();
@@ -374,13 +362,13 @@ pub(crate) fn output(
     if buffers.is_empty() {
         return text;
     }
-    let object = unsafe { (api.object_make)(ctx, std::ptr::null_mut(), std::ptr::null_mut()) };
+    let object = unsafe { (api.object_make)(ctx, ptr::null_mut(), ptr::null_mut()) };
     unsafe {
         (api.protect)(ctx, object);
     }
     let key = api.string("json");
     unsafe {
-        (api.set)(ctx, object, key, text, 0, std::ptr::null_mut());
+        (api.set)(ctx, object, key, text, 0, ptr::null_mut());
         (api.string_release)(key);
     }
     for (index, bytes) in buffers.into_iter().enumerate() {
@@ -392,12 +380,12 @@ pub(crate) fn output(
                 bytes.len(),
                 Some(release),
                 Box::into_raw(bytes).cast(),
-                std::ptr::null_mut(),
+                ptr::null_mut(),
             )
         };
         let key = api.string(&index.to_string());
         unsafe {
-            (api.set)(ctx, object, key, buffer, 0, std::ptr::null_mut());
+            (api.set)(ctx, object, key, buffer, 0, ptr::null_mut());
             (api.string_release)(key);
         }
     }
@@ -407,11 +395,7 @@ pub(crate) fn output(
     object
 }
 
-fn buffer_object(
-    api: &crate::jsc::JavaScriptCore,
-    ctx: crate::jsc::Ptr,
-    bytes: bytes::Bytes,
-) -> (crate::jsc::Ptr, bool) {
+fn buffer_object(api: &JavaScriptCore, ctx: Ptr, bytes: bytes::Bytes) -> (Ptr, bool) {
     let taken = taken(&bytes);
     unsafe {
         if let (Some((contents, kind)), Some(functions)) = (taken, api.contents)
@@ -431,7 +415,7 @@ fn buffer_object(
                 bytes.len(),
                 Some(release_bytes),
                 Box::into_raw(bytes).cast(),
-                std::ptr::null_mut(),
+                ptr::null_mut(),
             );
             return (buffer, true);
         }
@@ -442,17 +426,13 @@ fn buffer_object(
             bytes.len(),
             Some(release),
             Box::into_raw(bytes).cast(),
-            std::ptr::null_mut(),
+            ptr::null_mut(),
         );
         (buffer, true)
     }
 }
 
-pub(crate) fn buffer(
-    api: &crate::jsc::JavaScriptCore,
-    ctx: crate::jsc::Ptr,
-    bytes: bytes::Bytes,
-) -> crate::jsc::Ptr {
+pub(crate) fn buffer(api: &JavaScriptCore, ctx: Ptr, bytes: bytes::Bytes) -> Ptr {
     // Copy small results into JSC memory. External buffers cost more and escape GC accounting.
     if bytes.len() <= 16384
         && taken(&bytes).is_none_or(|(_, kind)| kind == MOVED)
@@ -462,16 +442,12 @@ pub(crate) fn buffer(
         return array;
     }
     match buffer_object(api, ctx, bytes) {
-        (buffer, true) => unsafe { (api.typed_from_buffer)(ctx, 3, buffer, std::ptr::null_mut()) },
+        (buffer, true) => unsafe { (api.typed_from_buffer)(ctx, 3, buffer, ptr::null_mut()) },
         (object, false) => object,
     }
 }
 
-pub(crate) fn result(
-    api: &crate::jsc::JavaScriptCore,
-    ctx: crate::jsc::Ptr,
-    payload: Payload,
-) -> crate::jsc::Ptr {
+pub(crate) fn result(api: &JavaScriptCore, ctx: Ptr, payload: Payload) -> Ptr {
     use serde_json::Value;
     let Payload { value, mut buffers } = payload;
     unsafe {
@@ -489,12 +465,12 @@ pub(crate) fn result(
                         .all(|value| !value.is_array() && !value.is_object()) =>
             {
                 // The items stay on the stack, where JSC's conservative scan keeps them alive.
-                let mut items = [std::ptr::null_mut(); 32];
+                let mut items = [ptr::null_mut(); 32];
                 let count = values.len();
                 for (item, value) in items.iter_mut().zip(values) {
                     *item = result(api, ctx, value.into());
                 }
-                (api.make_array)(ctx, count, items.as_ptr(), std::ptr::null_mut())
+                (api.make_array)(ctx, count, items.as_ptr(), ptr::null_mut())
             }
             value => {
                 if let Some(bytes) = value
@@ -522,15 +498,14 @@ pub(crate) fn result(
                     return root;
                 }
                 (api.protect)(ctx, root);
-                let mut arrays: Vec<(crate::jsc::Ptr, bool)> =
-                    vec![(std::ptr::null_mut(), true); buffers.len()];
+                let mut arrays: Vec<(Ptr, bool)> = vec![(ptr::null_mut(), true); buffers.len()];
                 let mut pending = vec![(&value, root)];
                 while let Some((value, object)) = pending.pop() {
-                    let children: Vec<(crate::jsc::Ptr, Option<u32>, &Value)> = match value {
+                    let children: Vec<(Ptr, Option<u32>, &Value)> = match value {
                         Value::Array(values) => values
                             .iter()
                             .enumerate()
-                            .map(|(index, value)| (std::ptr::null_mut(), Some(index as u32), value))
+                            .map(|(index, value)| (ptr::null_mut(), Some(index as u32), value))
                             .collect(),
                         Value::Object(values) => values
                             .iter()
@@ -548,22 +523,20 @@ pub(crate) fn result(
                                 (api.protect)(ctx, array.0);
                             }
                             let view = if array.1 {
-                                (api.typed_from_buffer)(ctx, 3, array.0, std::ptr::null_mut())
+                                (api.typed_from_buffer)(ctx, 3, array.0, ptr::null_mut())
                             } else {
                                 array.0
                             };
                             match index {
                                 Some(index) => {
-                                    (api.set_index)(ctx, object, index, view, std::ptr::null_mut())
+                                    (api.set_index)(ctx, object, index, view, ptr::null_mut())
                                 }
-                                None => (api.set)(ctx, object, key, view, 0, std::ptr::null_mut()),
+                                None => (api.set)(ctx, object, key, view, 0, ptr::null_mut()),
                             }
                         } else if child.is_array() || child.is_object() {
                             let inner = match index {
-                                Some(index) => {
-                                    (api.get_index)(ctx, object, index, std::ptr::null_mut())
-                                }
-                                None => (api.get)(ctx, object, key, std::ptr::null_mut()),
+                                Some(index) => (api.get_index)(ctx, object, index, ptr::null_mut()),
+                                None => (api.get)(ctx, object, key, ptr::null_mut()),
                             };
                             if !inner.is_null() && (api.value_type)(ctx, inner) == 5 {
                                 pending.push((child, inner));
@@ -586,13 +559,13 @@ pub(crate) fn result(
 
 // Calls the global function `function` of a context with a payload.
 pub(crate) fn bridge(
-    api: &crate::jsc::JavaScriptCore,
-    context: crate::jsc::Ptr,
+    api: &JavaScriptCore,
+    context: Ptr,
     function: &str,
     payload: Payload,
-) -> Result<crate::jsc::Ptr> {
+) -> Result<Ptr> {
     let name = api.string(function);
-    let mut error = std::ptr::null_mut();
+    let mut error = ptr::null_mut();
     let receiver = unsafe { (api.get)(context, (api.global)(context), name, &mut error) };
     unsafe {
         (api.string_release)(name);
@@ -608,30 +581,18 @@ pub(crate) fn bridge(
     unsafe {
         (api.protect)(context, argument);
     }
-    let result = unsafe {
-        (api.invoke)(
-            context,
-            receiver,
-            std::ptr::null_mut(),
-            1,
-            &argument,
-            &mut error,
-        )
-    };
+    let result =
+        unsafe { (api.invoke)(context, receiver, ptr::null_mut(), 1, &argument, &mut error) };
     unsafe {
         (api.unprotect)(context, argument);
     }
     if !error.is_null() {
-        anyhow::bail!("{}", api.text(context, error));
+        bail!("{}", api.text(context, error));
     }
     Ok(result)
 }
 
-pub(crate) fn receive(
-    api: &crate::jsc::JavaScriptCore,
-    context: crate::jsc::Ptr,
-    payload: Payload,
-) -> Result<Payload> {
+pub(crate) fn receive(api: &JavaScriptCore, context: Ptr, payload: Payload) -> Result<Payload> {
     let result = bridge(api, context, "__appsBridgeReceiveBytes", payload)?;
     anyhow::ensure!(
         !result.is_null() && unsafe { (api.value_type)(context, result) } == 5,
@@ -640,7 +601,7 @@ pub(crate) fn receive(
     unsafe {
         (api.protect)(context, result);
     }
-    let mut error = std::ptr::null_mut();
+    let mut error = ptr::null_mut();
     let decoded = (|| -> Result<_> {
         let name = api.string("json");
         let json = unsafe { (api.get)(context, result, name, &mut error) };
@@ -648,7 +609,7 @@ pub(crate) fn receive(
             (api.string_release)(name);
         }
         let mut json = api.text(context, json);
-        crate::jsc::well_formed(&mut json);
+        well_formed(&mut json);
         let value = serde_json::from_str(&json)?;
         let name = api.string("buffers");
         let buffers = unsafe { (api.get)(context, result, name, &mut error) };

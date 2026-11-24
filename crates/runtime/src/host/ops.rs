@@ -89,7 +89,7 @@ pub(super) unsafe extern "C" fn call(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Ptr> {
         let generic = values
             .first()
-            .is_some_and(|&value| unsafe { (api.value_type)(ctx, value) } == 3);
+            .is_some_and(|&value| api.kind(ctx, value) == 3);
         let mut name = [0u8; 64];
         let op = {
             let value = *values
@@ -111,17 +111,17 @@ pub(super) unsafe extern "C" fn call(
         // This one needs the buffer itself, not its bytes. A number gives back memory that was never sent.
         if op == "web.buffer.take" {
             let value = *values.get(1).context("Expected a buffer")?;
-            let id = match unsafe { (api.value_type)(ctx, value) } {
+            let id = match api.kind(ctx, value) {
                 3 => {
-                    payload::held(unsafe { (api.to_number)(ctx, value, ptr::null_mut()) } as u64);
+                    payload::held(api.to_f64(ctx, value) as u64);
                     None
                 }
                 5 => payload::take(&api, ctx, value),
                 _ => None,
             };
             return Ok(match id {
-                Some(id) => unsafe { (api.number)(ctx, id as f64) },
-                None => unsafe { (api.undefined)(ctx) },
+                Some(id) => api.make_number(ctx, id as f64),
+                None => api.make_undefined(ctx),
             });
         }
         let run = |buffers, action: &mut dyn FnMut() -> Result<Value>| -> Result<Ptr> {
@@ -176,14 +176,14 @@ pub(super) unsafe extern "C" fn call(
             if let Some(reflow) = REFLOW.get() {
                 reflow(id);
             }
-            return Ok(unsafe { (api.undefined)(ctx) });
+            return Ok(api.make_undefined(ctx));
         }
         if let Role::Renderer(id) = role
             && op == "dom.batch"
         {
             ensure!(values.len() == 4, "Expected DOM operations");
             let text = api.text(ctx, values[1]);
-            let size = unsafe { (api.to_number)(ctx, values[3], ptr::null_mut()) } * 4.;
+            let size = api.to_f64(ctx, values[3]) * 4.;
             let codes = payload::view(&api, ctx, values[2])?;
             let codes = (size >= 0. && size.fract() == 0.)
                 .then(|| codes.get(..size as usize))
@@ -205,36 +205,27 @@ pub(super) unsafe extern "C" fn call(
             let page = host.pages.get_mut(&id).context("Window is closed")?;
             let state = host.dom.entry(id).or_default();
             let viewport = *host.viewports.get(&id).unwrap_or(&[800., 600.]);
-            if values
-                .get(2)
-                .is_some_and(|&value| unsafe { (api.to_boolean)(ctx, value) })
-            {
+            if values.get(2).is_some_and(|&value| api.to_bool(ctx, value)) {
                 crate::dom::layout_flags(&mut page.doc, state, viewport);
             }
             state.sync_scroll();
-            if !values
-                .get(1)
-                .is_some_and(|&value| unsafe { (api.to_boolean)(ctx, value) })
-            {
-                return Ok(unsafe { (api.null)(ctx) });
+            if !values.get(1).is_some_and(|&value| api.to_bool(ctx, value)) {
+                return Ok(api.make_null(ctx));
             }
             let (pointer, size, owner) = state.bounds.share();
-            return Ok(unsafe {
-                (api.make_buffer)(
-                    ctx,
-                    pointer,
-                    size,
-                    Some(crate::dom::LayoutMirror::release),
-                    owner,
-                    ptr::null_mut(),
-                )
-            });
+            return Ok(api.external_buffer(
+                ctx,
+                pointer,
+                size,
+                crate::dom::LayoutMirror::release,
+                owner,
+            ));
         }
         // fs.readSync reads straight into the caller's buffer. No JavaScript runs during the read.
         if op == "node.readInto" {
             ensure!(values.len() == 6, "Expected read arguments");
-            let arg = |index: usize| match unsafe { (api.value_type)(ctx, values[index]) } {
-                3 => number_value(unsafe { (api.to_number)(ctx, values[index], ptr::null_mut()) }),
+            let arg = |index: usize| match api.kind(ctx, values[index]) {
+                3 => number_value(api.to_f64(ctx, values[index])),
                 _ => Value::Null,
             };
             let out = api.bytes(ctx, values[2]).context("Expected a buffer")?;
@@ -249,16 +240,16 @@ pub(super) unsafe extern "C" fn call(
                 .context("Node is busy")?
                 .files
                 .read_into(&arg(1), out, arg(5).as_u64())?;
-            return Ok(unsafe { (api.number)(ctx, count as f64) });
+            return Ok(api.make_number(ctx, count as f64));
         }
         let mut buffers = Vec::new();
         let mut args = Vec::with_capacity(values.len() - 1);
         for &value in &values[1..] {
-            args.push(match unsafe { (api.value_type)(ctx, value) } {
-                2 => Value::Bool(unsafe { (api.to_boolean)(ctx, value) }),
-                3 => number_value(unsafe { (api.to_number)(ctx, value, ptr::null_mut()) }),
+            args.push(match api.kind(ctx, value) {
+                2 => Value::Bool(api.to_bool(ctx, value)),
+                3 => number_value(api.to_f64(ctx, value)),
                 4 => Value::String(api.text(ctx, value)),
-                5 if unsafe { (api.is_function)(ctx, value) } => Value::Null,
+                5 if api.is_callable(ctx, value) => Value::Null,
                 5 => {
                     // These bytes are not static: they borrow the arguments, which live only until the call
                     // returns.
@@ -289,7 +280,7 @@ pub(super) unsafe extern "C" fn call(
         Err(_) => ("Host call failed".into(), None),
     };
     api.throw_error(ctx, exception, &message, code);
-    unsafe { (api.undefined)(ctx) }
+    api.make_undefined(ctx)
 }
 
 pub(super) fn dispatch(
@@ -468,9 +459,9 @@ pub(super) fn dispatch(
                 _ => {}
             }
         }
-        let destination = jsc::contexts::<Binding>()
-            .into_iter()
-            .find(|(_, binding)| Rc::ptr_eq(host, &binding.host) && target == Some(binding.role));
+        let destination = jsc::find::<Binding>(|binding| {
+            Rc::ptr_eq(host, &binding.host) && target == Some(binding.role)
+        });
         if destination.is_none() && matches!(role, Role::Main) && values[1]["kind"] == "event" {
             return Ok(serde_json::Value::Null);
         }
@@ -647,7 +638,7 @@ fn report_nodes(binding: &Binding, ctx: Ptr, id: u64) {
         .and_then(|mut host| Some(std::mem::take(&mut host.dom.get_mut(&id)?.created)));
     if let Some(created) = created.filter(|&created| created > 0) {
         // Count only wrapped nodes: JSC resets this cost only after a full GC.
-        unsafe { (binding.api.extra_memory)(ctx, created * 65536) };
+        binding.api.add_memory(ctx, created * 65536);
     }
 }
 
@@ -660,7 +651,7 @@ fn gpu(binding: &Binding, ctx: Ptr, id: u64, op: &str, args: &[u8]) -> Result<se
         && bytes > 0
     {
         drop(host);
-        unsafe { (binding.api.extra_memory)(ctx, bytes as usize) };
+        binding.api.add_memory(ctx, bytes as usize);
     }
     result
 }
