@@ -249,35 +249,6 @@ impl Drop for DevTools {
     }
 }
 
-pub(crate) enum Tool {
-    Hud,
-    DevTools,
-    Console,
-    Pick,
-}
-
-pub(crate) fn tool(key: &str, modifiers: renderer::Modifiers) -> Option<Tool> {
-    let primary = if cfg!(target_os = "macos") {
-        modifiers.command()
-    } else {
-        modifiers.ctrl()
-    };
-    // The modifiers of the developer tools shortcuts in Chrome.
-    let chrome =
-        (modifiers.command() && modifiers.alt()) || (modifiers.ctrl() && modifiers.shift());
-    if key == "f" && modifiers.alt() && primary {
-        Some(Tool::Hud)
-    } else if key == "f12" || (key == "i" && chrome) {
-        Some(Tool::DevTools)
-    } else if key == "j" && chrome {
-        Some(Tool::Console)
-    } else if key == "c" && (chrome || (modifiers.shift() && primary)) {
-        Some(Tool::Pick)
-    } else {
-        None
-    }
-}
-
 // Calls the script that inspects a context from inside it. A new context gets the script on its first call.
 pub(crate) fn agent(engine: &JsContext, method: &str, params: &Value) -> Result<Value> {
     if engine.eval_page("typeof this.__appsAgent", "apps:devtools")? != "function" {

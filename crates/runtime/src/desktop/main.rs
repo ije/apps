@@ -1,4 +1,4 @@
-use super::panel::tool;
+use crate::render::inspect::tool;
 use crate::{
     host::JsContext,
     host::{

@@ -86,3 +86,33 @@ pub(super) fn paint(view: &PageState, window: &mut Window) {
         );
     }
 }
+
+// The shortcuts of the developer tools.
+pub(crate) enum Tool {
+    Hud,
+    DevTools,
+    Console,
+    Pick,
+}
+
+pub(crate) fn tool(key: &str, modifiers: renderer::Modifiers) -> Option<Tool> {
+    let primary = if cfg!(target_os = "macos") {
+        modifiers.command()
+    } else {
+        modifiers.ctrl()
+    };
+    // The modifiers of the developer tools shortcuts in Chrome.
+    let chrome =
+        (modifiers.command() && modifiers.alt()) || (modifiers.ctrl() && modifiers.shift());
+    if key == "f" && modifiers.alt() && primary {
+        Some(Tool::Hud)
+    } else if key == "f12" || (key == "i" && chrome) {
+        Some(Tool::DevTools)
+    } else if key == "j" && chrome {
+        Some(Tool::Console)
+    } else if key == "c" && (chrome || (modifiers.shift() && primary)) {
+        Some(Tool::Pick)
+    } else {
+        None
+    }
+}

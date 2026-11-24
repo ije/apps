@@ -66,6 +66,32 @@ pub struct Desktop {
     scheduled: bool,
 }
 
+// The page views reach their desktop through this.
+struct Pages(Rc<RefCell<Desktop>>);
+
+impl crate::render::Pages for Pages {
+    fn renderer(&self, id: u64) -> Option<Rc<JsContext>> {
+        let desktop = self.0.try_borrow().ok()?;
+        desktop.views.get(&id)?.renderer.clone()
+    }
+
+    fn dispatch(
+        &self,
+        id: u64,
+        name: &str,
+        path: &[usize],
+        data: serde_json::Value,
+        window: Option<&mut renderer::Window>,
+        cx: &mut App,
+    ) -> bool {
+        Desktop::dispatch(self.0.clone(), id, name, path, data, window, cx)
+    }
+
+    fn drive(&self, cx: &mut App) {
+        Desktop::drive(self.0.clone(), cx);
+    }
+}
+
 type Reloaded = (
     Arc<HashMap<String, String>>,
     Arc<HashMap<String, bytes::Bytes>>,
@@ -429,7 +455,8 @@ impl Desktop {
                                 movable: options["movable"] != false,
                             };
                             let handle = cx.open_window(window_options, |window, _| {
-                                let view = PageView::new(id, runtime, host, window.id());
+                                let view =
+                                    PageView::new(id, Rc::new(Pages(runtime)), host, window.id());
                                 data = Rc::downgrade(&view.0);
                                 Box::new(view)
                             })?;
