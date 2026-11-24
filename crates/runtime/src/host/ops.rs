@@ -477,10 +477,12 @@ pub(super) fn dispatch(
         let (destination, target) = destination.context("Bridge target is unavailable")?;
         let mut message = args[1].take();
         message["sender"] = serde_json::to_value(role)?;
-        return Ok(target
-            .api
-            .receive(destination, payload::Payload::snapshot(message))?
-            .into_value());
+        return Ok(payload::receive(
+            &target.api,
+            destination,
+            payload::Payload::snapshot(message),
+        )?
+        .into_value());
     }
     if let Some(op) = op.strip_prefix("web.") {
         anyhow::ensure!(

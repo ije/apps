@@ -476,13 +476,11 @@ impl JsContext {
     }
 
     pub(crate) fn receive(&self, payload: payload::Payload) -> Result<payload::Payload> {
-        self.api.receive(self.ctx, payload)
+        payload::receive(&self.api, self.ctx, payload)
     }
 
     pub(crate) fn deliver(&self, payload: payload::Payload) -> Result<()> {
-        self.api
-            .bridge(self.ctx, "__appsBridgeDeliver", payload)
-            .map(|_| ())
+        payload::bridge(&self.api, self.ctx, "__appsBridgeDeliver", payload).map(|_| ())
     }
 
     pub(crate) fn heap(&self) -> Result<serde_json::Value> {

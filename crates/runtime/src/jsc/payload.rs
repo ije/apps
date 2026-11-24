@@ -333,7 +333,7 @@ pub(crate) unsafe extern "C" fn release_bytes(_pointer: crate::jsc::Ptr, owner: 
     drop(unsafe { Box::from_raw(owner.cast::<Bytes>()) });
 }
 
-// A call result that is JSON text already. JavaScriptCore parses it as it is, so a large message is not parsed and
+// A call result that is JSON text already. crate::jsc::JavaScriptCore parses it as it is, so a large message is not parsed and
 // serialized again here. `buffers` has the shape of the result, but only down to its `$appsBytes` markers.
 pub(crate) fn raw(json: String, buffers: Value) -> Value {
     json!({"$appsRaw": json, "$appsBuffers": buffers})
@@ -582,4 +582,88 @@ pub(crate) fn result(
             }
         }
     }
+}
+
+// Calls the global function `function` of a context with a payload.
+pub(crate) fn bridge(
+    api: &crate::jsc::JavaScriptCore,
+    context: crate::jsc::Ptr,
+    function: &str,
+    payload: Payload,
+) -> Result<crate::jsc::Ptr> {
+    let name = api.string(function);
+    let mut error = std::ptr::null_mut();
+    let receiver = unsafe { (api.get)(context, (api.global)(context), name, &mut error) };
+    unsafe {
+        (api.string_release)(name);
+    }
+    // JSC casts call targets to objects without checking, so a primitive would crash.
+    anyhow::ensure!(
+        error.is_null()
+            && unsafe { (api.value_type)(context, receiver) } == 5
+            && unsafe { (api.is_function)(context, receiver) },
+        "Bridge target is unavailable"
+    );
+    let argument = output(api, context, payload);
+    unsafe {
+        (api.protect)(context, argument);
+    }
+    let result = unsafe {
+        (api.invoke)(
+            context,
+            receiver,
+            std::ptr::null_mut(),
+            1,
+            &argument,
+            &mut error,
+        )
+    };
+    unsafe {
+        (api.unprotect)(context, argument);
+    }
+    if !error.is_null() {
+        anyhow::bail!("{}", api.text(context, error));
+    }
+    Ok(result)
+}
+
+pub(crate) fn receive(
+    api: &crate::jsc::JavaScriptCore,
+    context: crate::jsc::Ptr,
+    payload: Payload,
+) -> Result<Payload> {
+    let result = bridge(api, context, "__appsBridgeReceiveBytes", payload)?;
+    anyhow::ensure!(
+        !result.is_null() && unsafe { (api.value_type)(context, result) } == 5,
+        "Invalid bridge reply"
+    );
+    unsafe {
+        (api.protect)(context, result);
+    }
+    let mut error = std::ptr::null_mut();
+    let decoded = (|| -> Result<_> {
+        let name = api.string("json");
+        let json = unsafe { (api.get)(context, result, name, &mut error) };
+        unsafe {
+            (api.string_release)(name);
+        }
+        let mut json = api.text(context, json);
+        crate::jsc::well_formed(&mut json);
+        let value = serde_json::from_str(&json)?;
+        let name = api.string("buffers");
+        let buffers = unsafe { (api.get)(context, result, name, &mut error) };
+        unsafe {
+            (api.string_release)(name);
+        }
+        let buffers = input(api, context, buffers)?
+            .0
+            .iter()
+            .map(|bytes| bytes::Bytes::copy_from_slice(bytes))
+            .collect();
+        Ok(Payload { value, buffers })
+    })();
+    unsafe {
+        (api.unprotect)(context, result);
+    }
+    decoded
 }
