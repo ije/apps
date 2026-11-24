@@ -307,6 +307,7 @@ fn queue(at: Callbacks, job: impl FnOnce(&mut Window, &mut App) + Send + 'static
 }
 
 // Frames stop when this returns `Some(false)`, so an idle window gets no calls.
+#[cfg(not(target_os = "macos"))]
 fn frame(at: Callbacks) -> Option<bool> {
     with(at, |window, app| window.frame(app))?;
     let home = home()?;
@@ -360,22 +361,12 @@ impl WindowEvents for Events {
 
     #[cfg(target_os = "macos")]
     fn tick(&self, at: Callbacks, time: Option<std::time::Instant>) {
-        // A tick without a frame takes one frame out of a queue that is too long.
-        if let Some(time) = time
-            && with(at, move |window, _| window.start_tick(time)) != Some(true)
-        {
-            return;
-        }
-        if frame(at) == Some(false) {
-            with(at, |window, _| window.rest());
-        }
+        with(at, move |window, app| window.tick(time, app));
     }
 
     #[cfg(target_os = "macos")]
     fn present_live(&self, at: Callbacks, visible: bool) -> Option<platform::Present> {
-        with(at, move |window, _| window.live_resize(visible));
-        self.tick(at, None);
-        with(at, |window, _| window.end_live_resize()).flatten()
+        with(at, move |window, app| window.present_live(visible, app)).flatten()
     }
 
     fn resized(&self, at: Callbacks, size: Size<Pixels>, scale_factor: f32) {

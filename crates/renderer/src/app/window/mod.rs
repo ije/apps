@@ -938,35 +938,37 @@ impl Window {
         self.dispatch_native(key, app, false) && !ime
     }
 
+    // Gives back the GPU memory that the window does not need while it is idle.
     pub(crate) fn release_gpu(&mut self) {
-        #[cfg(target_os = "macos")]
         self.platform.release(&self.scene);
-        #[cfg(not(target_os = "macos"))]
-        self.platform.release();
     }
 
-    // A display tick at `at`. False when the GPU queue is full, and the tick draws no frame.
+    // A display tick at `at`, or a forced frame with `None`. A tick while the GPU queue is full draws no frame,
+    // which takes one frame out of the queue. A window that wants no more frames rests.
     #[cfg(target_os = "macos")]
-    pub(crate) fn start_tick(&mut self, at: Instant) -> bool {
-        let free = !self.platform.take_congested();
-        self.frame_at = free.then_some(at);
-        free
+    pub(crate) fn tick(&mut self, at: Option<Instant>, app: &mut App) {
+        if let Some(at) = at {
+            if !self.platform.tick() {
+                return;
+            }
+            self.frame_at = Some(at);
+        }
+        self.frame(app);
+        if !self.wants_frame() {
+            self.platform.rest();
+        }
     }
 
+    // A frame of a live resize, which presents inside the transaction of AppKit when `visible`. Returns its present.
     #[cfg(target_os = "macos")]
-    pub(crate) fn rest(&mut self) {
-        self.platform.rest();
-    }
-
-    // A live resize presents the next frame inside the transaction of AppKit when `visible`.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn live_resize(&mut self, visible: bool) {
-        self.platform.live_resize(visible);
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(crate) fn end_live_resize(&mut self) -> Option<platform::Present> {
-        self.platform.end_live_resize()
+    pub(crate) fn present_live(
+        &mut self,
+        visible: bool,
+        app: &mut App,
+    ) -> Option<platform::Present> {
+        self.platform.begin_live(visible);
+        self.tick(None, app);
+        self.platform.end_live()
     }
 
     pub(crate) fn wants_frame(&self) -> bool {

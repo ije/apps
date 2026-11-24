@@ -386,7 +386,7 @@ impl Window {
         crate::platform::timer(QUIET, move || events().release(calls)).detach();
     }
 
-    pub fn release(&self) {
+    pub fn release(&self, _: &Scene) {
         // Frames came since the timer started, so the quiet second starts again.
         if self.quiet.replace(Some(false)) == Some(true) {
             return self.wait();

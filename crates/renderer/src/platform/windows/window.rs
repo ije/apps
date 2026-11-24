@@ -260,7 +260,7 @@ impl Window {
         }
     }
 
-    pub fn release(&self) {
+    pub fn release(&self, _: &Scene) {
         if let Ok(mut renderer) = self.shared.drawing.try_borrow_mut() {
             renderer.release();
         }

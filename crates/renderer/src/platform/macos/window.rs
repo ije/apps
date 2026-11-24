@@ -283,16 +283,17 @@ impl Window {
         self.renderer.set_caret(caret);
     }
 
-    pub(crate) fn take_congested(&mut self) -> bool {
-        self.renderer.take_congested()
+    // False when the drawable queue is too long, and this display tick should draw no frame.
+    pub(crate) fn tick(&mut self) -> bool {
+        !self.renderer.take_congested()
     }
 
-    // The frames drawn until `end_live_resize` present inside the transaction of a live resize when `visible`.
-    pub(crate) fn live_resize(&mut self, visible: bool) {
+    // The frames drawn until `end_live` present inside the transaction of a live resize when `visible`.
+    pub(crate) fn begin_live(&mut self, visible: bool) {
         self.renderer.set_presents_with_transaction(visible);
     }
 
-    pub(crate) fn end_live_resize(&mut self) -> Option<Present> {
+    pub(crate) fn end_live(&mut self) -> Option<Present> {
         self.renderer.set_presents_with_transaction(false);
         self.renderer.take_present()
     }
