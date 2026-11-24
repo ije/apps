@@ -1,5 +1,6 @@
 use crate::css::{Lengths, Prop, Registry, Style, Vars};
-use crate::style::cascade::{Container, Passed};
+use crate::style::cascade::Container;
+use crate::style::cascade::shadow::Shadowed;
 use crate::style::chunked::Chunked;
 use crate::style::keyframes::Animation;
 use rustc_hash::FxHashMap;
@@ -196,8 +197,6 @@ pub(crate) struct ComputedStyles {
     // The native theme bits that this pass styled with.
     pub(crate) theme: u32,
 }
-
-pub(crate) type Shadowed = Rc<Vec<Passed>>;
 
 #[derive(Clone, Copy, Default, PartialEq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]

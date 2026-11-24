@@ -5,8 +5,7 @@ use crate::css::{
 use crate::dom::{Document, SelectorCache};
 use crate::style::cascade::computed::{
     AGENT_DISPLAY, CAPTION, CELL, COUNTED, ComputedStyles, DISPLAY_CONTENTS, DISPLAY_NONE, FOOTER,
-    HEADER, INVISIBLE, ROW, SELECT_ALL, SELECT_NONE, SELECT_TEXT, Shadowed, TABLE_DISPLAYS, empty,
-    table_box,
+    HEADER, INVISIBLE, ROW, SELECT_ALL, SELECT_NONE, SELECT_TEXT, TABLE_DISPLAYS, empty, table_box,
 };
 use crate::style::cascade::container::{ContainerQuery, QueryCache, query_containers};
 use crate::style::cascade::memo::{
@@ -18,7 +17,9 @@ use crate::style::cascade::rank::{
 use crate::style::cascade::scope::{
     Collect, MatchedRules, MediaBlock, MediaStack, PSEUDO, SELECTOR, StyleScope, intern,
 };
-use crate::style::cascade::shadow::{ELEMENT, PART, SLOTTED, STARTING, ShadowRule, exported_parts};
+use crate::style::cascade::shadow::{
+    ELEMENT, PART, SLOTTED, STARTING, ShadowRule, Shadowed, exported_parts,
+};
 use crate::style::cascade::sheets::{Cssom, Derived, Sheet};
 use crate::style::cascade::table::CollapsedTable;
 use crate::style::font;

@@ -1,7 +1,6 @@
 use crate::css::{FontUnits, Lengths, Prop, Style, Vars};
 use crate::style::cascade::Container;
-use crate::style::cascade::computed::Shadowed;
-use crate::style::cascade::shadow::ShadowRule;
+use crate::style::cascade::shadow::{ShadowRule, Shadowed};
 use crate::style::keyframes::Animation;
 use std::rc::Rc;
 pub(crate) struct StyleRef<T: ?Sized = Style>(pub(crate) Rc<T>);

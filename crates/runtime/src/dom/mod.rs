@@ -541,6 +541,7 @@ impl LayoutMirror {
         }
     }
 
+    #[cfg(debug_assertions)]
     pub(crate) fn inert(&self, id: usize) -> bool {
         unsafe { *self.flags(id) & MIRROR_INERT != 0 }
     }
