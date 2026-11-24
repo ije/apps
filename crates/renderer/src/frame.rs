@@ -253,82 +253,6 @@ impl<T> Pool<T> {
     }
 }
 
-// The window regions to draw again, or `None` for the whole window. A layer that reads the pixels
-// below it draws whole when a region reaches it, since it reads only what the frame drew again.
-#[cfg(any(target_os = "macos", test))]
-pub fn damage_regions(
-    scene: &Scene,
-    window: [u32; 2],
-    extra: &[[i32; 4]],
-) -> Option<Vec<[i32; 4]>> {
-    regions_of(
-        &scene.damage,
-        scene.reads.iter().map(|read| read.0),
-        window,
-        extra,
-    )
-}
-
-fn regions_of(
-    damage: &crate::scene::Damage,
-    reads: impl Iterator<Item = Rect<f32>>,
-    window: [u32; 2],
-    extra: &[[i32; 4]],
-) -> Option<Vec<[i32; 4]>> {
-    if damage.whole {
-        return None;
-    }
-    let bounds = Rect::new(
-        Point::default(),
-        Size::new(window[0] as f32, window[1] as f32),
-    );
-    let meets = |a: [i32; 4], b: [i32; 4]| {
-        a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]
-    };
-    let join = |a: [i32; 4], b: [i32; 4]| {
-        let [x, y] = [a[0].min(b[0]), a[1].min(b[1])];
-        let [right, bottom] = [
-            (a[0] + a[2]).max(b[0] + b[2]),
-            (a[1] + a[3]).max(b[1] + b[3]),
-        ];
-        [x, y, right - x, bottom - y]
-    };
-    let mut regions: Vec<[i32; 4]> = Vec::new();
-    let add = |regions: &mut Vec<[i32; 4]>, mut region: [i32; 4]| {
-        while let Some(at) = regions.iter().position(|other| meets(*other, region)) {
-            region = join(regions.swap_remove(at), region);
-        }
-        regions.push(region);
-    };
-    // Edges blend into the pixel next to them.
-    for rect in &damage.rects {
-        let rect = rect.outset(1.).intersect(bounds);
-        if !rect.is_empty() {
-            add(&mut regions, region(rect));
-        }
-    }
-    for &region in extra {
-        add(&mut regions, region);
-    }
-    let reads: Vec<[i32; 4]> = reads
-        .map(|read| read.intersect(bounds))
-        .filter(|read| !read.is_empty())
-        .map(region)
-        .collect();
-    while let Some(&read) = reads.iter().find(|read| {
-        regions.iter().any(|region| meets(*region, **read))
-            && !regions
-                .iter()
-                .any(|region| join(*region, **read) == *region)
-    }) {
-        add(&mut regions, read);
-    }
-    let area: i64 = (regions.iter())
-        .map(|region| i64::from(region[2]) * i64::from(region[3]))
-        .sum();
-    (area * 2 <= i64::from(window[0]) * i64::from(window[1])).then_some(regions)
-}
-
 impl RenderFrame {
     pub fn record(&mut self, scene: &Scene, window: [u32; 2], max_texture: u32, copy: bool) {
         self.instances.clear();
@@ -477,7 +401,7 @@ impl RenderFrame {
                 let reads = (scene.reads.iter())
                     .filter(|read| !Under::after(split, read.1))
                     .map(|read| read.0);
-                regions_of(&info.damage, reads, window, &[])
+                info.damage.regions(reads, window, &[])
             })
             .flatten();
         let kept = self.under.as_mut()?;
@@ -2229,7 +2153,7 @@ mod tests {
         scene.drawn();
         let regions = |scene: &mut Scene, rect: [f32; 4]| {
             scene.damage.add(bounds(rect));
-            let regions = super::damage_regions(scene, [400, 300], &[]);
+            let regions = scene.damage_regions([400, 300], &[]);
             scene.damage = Default::default();
             regions
         };

@@ -1,7 +1,7 @@
 use crate::{
     Color, Rect, Size,
     atlas::{self, PageKind, PageList, PageStore, Tile},
-    frame::{self, Command, Mask, Pool, RenderFrame, Target},
+    frame::{Command, Mask, Pool, RenderFrame, Target},
     gpu::{ATTRIBUTES, Globals, Instance, bytes},
     scene::Scene,
 };
@@ -767,40 +767,8 @@ impl Renderer {
         let mut glass: Vec<NativeGlass> = Vec::new();
         if super::glass::available() {
             // Later glass draws above earlier glass, so it is checked first.
-            for nested in scene.layers[0].nested.iter().rev() {
-                let index = nested.layer;
-                let layer = &scene.layers[index];
-                let Some(effect) = &layer.effect else {
-                    continue;
-                };
-                let (Some(config), Some(bounds)) = (&effect.glass, layer.bounds) else {
-                    continue;
-                };
-                let mask = &effect.content_mask;
-                if effect.transform.is_some()
-                    || effect.opacity != 1.
-                    || effect.color_matrix.is_some()
-                    || effect.blur != 0.
-                    || effect.shadow.is_some()
-                    || effect.blend_mode != crate::BlendMode::Normal
-                    || effect.clip.is_some()
-                    || effect.mask.is_some()
-                    || effect.backdrop.is_some()
-                    || bounds != config.bounds
-                    || bounds.intersect(mask.bounds) != bounds
-                    || mask.radii != Default::default()
-                    || scene.paints_over(index, bounds, |layer| {
-                        glass.iter().any(|native| native.index == layer)
-                    })
-                    || bounds.size.width > 4096.
-                    || bounds.size.height > 4096.
-                {
-                    continue;
-                }
+            scene.native_glass(|index, bounds, config| {
                 let region = crate::geometry::region(bounds);
-                if region[2] <= 0 || region[3] <= 0 {
-                    continue;
-                }
                 let sublayer = match self
                     .glass
                     .iter()
@@ -831,7 +799,7 @@ impl Renderer {
                         interactive: config.interactive,
                     },
                 });
-            }
+            });
         }
         glass.reverse();
         self.glass = glass;
@@ -850,7 +818,7 @@ impl Renderer {
                 && self.glass.is_empty()
                 && [last.width() as u32, last.height() as u32] == window
         });
-        let damage = (last.as_ref()).and_then(|_| frame::damage_regions(scene, window, &[]));
+        let damage = (last.as_ref()).and_then(|_| scene.damage_regions(window, &[]));
         // Nothing changed, so the window keeps its last frame.
         if damage.as_ref().is_some_and(Vec::is_empty)
             && self.promoted.iter().all(|promoted| promoted.drawn)
@@ -908,7 +876,7 @@ impl Renderer {
                 .collect::<Option<Vec<_>>>()
         {
             let extra: Vec<_> = extra.into_iter().flatten().copied().collect();
-            if let Some(regions) = frame::damage_regions(scene, window, &extra) {
+            if let Some(regions) = scene.damage_regions(window, &extra) {
                 (damage, last) = (regions, None);
             }
         }

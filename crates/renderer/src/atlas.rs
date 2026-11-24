@@ -110,13 +110,10 @@ impl<B: PageStore> Atlas<B> {
         self.evicted.get()
     }
 
-    pub fn take_evicted(&self) -> bool {
-        self.evicted.replace(false)
-    }
-
     // The tiles removed since the last call. Canvases and videos remove one each frame, so only the copies
-    // that read them paint again. Many removals stop all copies.
-    pub(crate) fn take_removed(&self, into: &mut Vec<(bool, u32, Rect<i32>)>) {
+    // that read them paint again. Many removals stop all copies. Returns true when tiles that copies read were
+    // freed.
+    pub(crate) fn take_removed(&self, into: &mut Vec<(bool, u32, Rect<i32>)>) -> bool {
         into.clear();
         let mut removed = self.removed.borrow_mut();
         if removed.len() > 64 {
@@ -125,6 +122,7 @@ impl<B: PageStore> Atlas<B> {
             into.extend_from_slice(&removed);
         }
         removed.clear();
+        self.evicted.replace(false)
     }
 
     // Instances that read new pixels in the place of old ones look the same, so they must draw again.
@@ -643,7 +641,7 @@ mod tests {
         let (shown, gone) = (insert(&glyph(1)), insert(&glyph(2)));
         let (photo, hidden) = (insert(&TileKey::Image(1)), insert(&TileKey::Image(2)));
         let mut scene = Scene::default();
-        scene.begin_paint(0);
+        scene.begin_paint(0, |_| false);
         let mark = scene.mark();
         scene.push(sprite(GLYPH, shown));
         let mut cropped = sprite(IMAGE, photo);
@@ -657,7 +655,7 @@ mod tests {
         let mut retired_at = None;
         for pass in 1..=MAX_AGE * 2 {
             scene.clear();
-            scene.begin_paint(pass);
+            scene.begin_paint(pass, |_| false);
             span = scene.replay(&span).unwrap();
             atlas.glyph_pixels.set(MAX_GLYPH_PIXELS + 1);
             atlas.finish_frame(scene.texels());
@@ -673,7 +671,7 @@ mod tests {
         }
         assert!(retired_at.is_some());
         assert!(atlas.tiles.borrow().get(&glyph(1)).is_some());
-        assert!(!atlas.take_evicted(), "copies never read the swept glyph");
+        assert!(!atlas.evicted(), "copies never read the swept glyph");
         #[cfg(target_os = "macos")]
         {
             atlas.release_images(scene.texels());
@@ -681,19 +679,18 @@ mod tests {
             let tiles = atlas.tiles.borrow();
             assert!(tiles.get(&TileKey::Image(1)).is_some());
             assert!(tiles.get(&TileKey::Image(2)).is_none());
-            assert!(!atlas.take_evicted());
+            assert!(!atlas.evicted());
         }
         // A removed tile stops only the copies that read it.
         scene.clear();
-        scene.begin_paint(MAX_AGE * 2 + 1);
+        scene.begin_paint(MAX_AGE * 2 + 1, |_| false);
         let photo_span = scene.replay(&span).unwrap();
         let mark = scene.mark();
         scene.push(sprite(GLYPH, shown));
         let glyph_span = scene.span(mark).unwrap();
         scene.clear();
         atlas.remove(&TileKey::Image(1));
-        atlas.take_removed(&mut scene.removed);
-        assert!(!atlas.take_evicted());
+        assert!(!scene.begin_paint(MAX_AGE * 2 + 2, |removed| atlas.take_removed(removed)));
         assert!(
             scene.replay(&glyph_span).is_some(),
             "the glyph copy reads no removed tile"

@@ -1,7 +1,7 @@
 use crate::{
     Clip, Color, Pixels, Point, Radii, Rect, Size,
     atlas::Tile,
-    geometry::transform_bounds,
+    geometry::{region, transform_bounds},
     gpu::{Instance, SHADOW, bytes, rect},
     point,
 };
@@ -33,7 +33,7 @@ pub struct Scene {
     pub(crate) reads: Vec<(Rect<f32>, u32)>,
     // Atlas tiles removed since the last paint: (color page, page, texels). A span of `last` that reads one
     // can't be copied, but its box can paint again while other boxes copy theirs.
-    pub(crate) removed: Vec<(bool, u32, Rect<i32>)>,
+    removed: Vec<(bool, u32, Rect<i32>)>,
     entries: Vec<Entry>,
     maps: Vec<Map>,
     // Layers that patches changed since the last diff, so `maps` doesn't place what they hold.
@@ -45,7 +45,7 @@ pub struct Scene {
     // `Some` after `clear`, and true after `diff`.
     diffed: Option<bool>,
     // Paint that the content mask cut away: instances outside their clip, or content that paint skipped.
-    pub(crate) culled: u32,
+    culled: u32,
     // Patched regions since the last diff, which the prior entries don't know.
     patched: Damage,
     salt: u64,
@@ -142,6 +142,68 @@ const DAMAGE_RECTS: usize = 16;
 const DAMAGE_SLACK: f32 = 64. * 64.;
 
 impl Damage {
+    // The window regions to draw again, or `None` for the whole window. A layer in `reads` draws whole when a region
+    // reaches it, since it reads only what the frame drew again.
+    pub(crate) fn regions(
+        &self,
+        reads: impl Iterator<Item = Rect<f32>>,
+        window: [u32; 2],
+        extra: &[[i32; 4]],
+    ) -> Option<Vec<[i32; 4]>> {
+        if self.whole {
+            return None;
+        }
+        let bounds = Rect::new(
+            Point::default(),
+            Size::new(window[0] as f32, window[1] as f32),
+        );
+        let meets = |a: [i32; 4], b: [i32; 4]| {
+            a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]
+        };
+        let join = |a: [i32; 4], b: [i32; 4]| {
+            let [x, y] = [a[0].min(b[0]), a[1].min(b[1])];
+            let [right, bottom] = [
+                (a[0] + a[2]).max(b[0] + b[2]),
+                (a[1] + a[3]).max(b[1] + b[3]),
+            ];
+            [x, y, right - x, bottom - y]
+        };
+        let mut regions: Vec<[i32; 4]> = Vec::new();
+        let add = |regions: &mut Vec<[i32; 4]>, mut region: [i32; 4]| {
+            while let Some(at) = regions.iter().position(|other| meets(*other, region)) {
+                region = join(regions.swap_remove(at), region);
+            }
+            regions.push(region);
+        };
+        // Edges blend into the pixel next to them.
+        for rect in &self.rects {
+            let rect = rect.outset(1.).intersect(bounds);
+            if !rect.is_empty() {
+                add(&mut regions, region(rect));
+            }
+        }
+        for &region in extra {
+            add(&mut regions, region);
+        }
+        let reads: Vec<[i32; 4]> = reads
+            .map(|read| read.intersect(bounds))
+            .filter(|read| !read.is_empty())
+            .map(region)
+            .collect();
+        while let Some(&read) = reads.iter().find(|read| {
+            regions.iter().any(|region| meets(*region, **read))
+                && !regions
+                    .iter()
+                    .any(|region| join(*region, **read) == *region)
+        }) {
+            add(&mut regions, read);
+        }
+        let area: i64 = (regions.iter())
+            .map(|region| i64::from(region[2]) * i64::from(region[3]))
+            .sum();
+        (area * 2 <= i64::from(window[0]) * i64::from(window[1])).then_some(regions)
+    }
+
     pub fn add(&mut self, rect: Rect<f32>) {
         if self.whole || rect.is_empty() {
             return;
@@ -421,6 +483,7 @@ pub(crate) struct Mark {
     shots: u32,
     scrolls: u32,
     cuts: u32,
+    culled: u32,
 }
 
 // What a paint span added to the scene: instances and nested layers of its layer, and the layers it made.
@@ -780,8 +843,23 @@ impl Scene {
         }
     }
 
-    pub(crate) fn begin_paint(&mut self, pass: u32) {
+    // `removed` lists the atlas tiles removed since the last paint, and returns true when all copies must stop.
+    pub(crate) fn begin_paint(
+        &mut self,
+        pass: u32,
+        removed: impl FnOnce(&mut Vec<(bool, u32, Rect<i32>)>) -> bool,
+    ) -> bool {
         self.pass = Some(pass);
+        removed(&mut self.removed)
+    }
+
+    /// Paint left out content, so a copy of it can't move.
+    pub(crate) fn cull(&mut self) {
+        self.culled += 1;
+    }
+
+    pub(crate) fn culled_since(&self, mark: Mark) -> bool {
+        self.culled != mark.culled
     }
 
     // This paint stops, so the last one stays the source of copies.
@@ -806,6 +884,7 @@ impl Scene {
             shots: self.shots.len() as u32,
             scrolls: self.scrolls.len() as u32,
             cuts: self.cuts.len() as u32,
+            culled: self.culled,
         }
     }
 
@@ -1324,6 +1403,46 @@ impl Scene {
         }
     }
 
+    // A snapshot layer is read only when it draws otherwise than in the last frame: `last` holds the digest and
+    // the size of each snapshot layer of the last frame.
+    pub(crate) fn read_shots(&mut self, last: &mut FxHashMap<u64, (u64, [i32; 2])>) {
+        let mut shots = FxHashMap::default();
+        for at in 0..self.shots.len() {
+            let (key, layer) = (self.shots[at].key, self.shots[at].layer);
+            let [x, y, width, height] = self.shots[at].region;
+            let mut hasher = rustc_hash::FxHasher::default();
+            let region = crate::rect(x as f32, y as f32, width as f32, height as f32);
+            self.digest(layer, region, &mut hasher);
+            let now = (hasher.finish(), [width, height]);
+            self.shots[at].read = last.get(&key) != Some(&now);
+            shots.insert(key, now);
+        }
+        *last = shots;
+    }
+
+    // A layer that the backend could not read is read with the next frame.
+    pub(crate) fn keep_unread(
+        &mut self,
+        read: &[crate::Snapshot],
+        last: &mut FxHashMap<u64, (u64, [i32; 2])>,
+    ) {
+        for shot in &mut self.shots {
+            if mem::take(&mut shot.read) && !read.iter().any(|read| read.key == shot.key) {
+                last.remove(&shot.key);
+            }
+        }
+    }
+
+    // The window regions to draw again, or `None` for the whole window.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn damage_regions(
+        &self,
+        window: [u32; 2],
+        extra: &[[i32; 4]],
+    ) -> Option<Vec<[i32; 4]>> {
+        (self.damage).regions(self.reads.iter().map(|read| read.0), window, extra)
+    }
+
     pub(crate) fn keyed(&self, key: u64) -> Option<usize> {
         let &(_, index) = self.keyed.iter().find(|(keyed, _)| *keyed == key)?;
         Some(index)
@@ -1834,6 +1953,48 @@ impl Scene {
             mem::swap(&mut self.prior, &mut self.entries);
             self.prior_maps.clone_from(&self.maps);
             self.prior_scrolls.clone_from(&self.scrolls);
+        }
+    }
+
+    // The glass layers that Core Animation can draw: plain glass in the window layer that nothing paints over.
+    // Later glass draws above earlier glass, so it comes first.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn native_glass(&self, mut take: impl FnMut(usize, Rect<f32>, &GlassState)) {
+        let mut taken = Vec::new();
+        for nested in self.layers[0].nested.iter().rev() {
+            let index = nested.layer;
+            let layer = &self.layers[index];
+            let Some(effect) = &layer.effect else {
+                continue;
+            };
+            let (Some(config), Some(bounds)) = (&effect.glass, layer.bounds) else {
+                continue;
+            };
+            let mask = &effect.content_mask;
+            if effect.transform.is_some()
+                || effect.opacity != 1.
+                || effect.color_matrix.is_some()
+                || effect.blur != 0.
+                || effect.shadow.is_some()
+                || effect.blend_mode != BlendMode::Normal
+                || effect.clip.is_some()
+                || effect.mask.is_some()
+                || effect.backdrop.is_some()
+                || bounds != config.bounds
+                || bounds.intersect(mask.bounds) != bounds
+                || mask.radii != Default::default()
+                || self.paints_over(index, bounds, |layer| taken.contains(&layer))
+                || bounds.size.width > 4096.
+                || bounds.size.height > 4096.
+            {
+                continue;
+            }
+            let region = region(bounds);
+            if region[2] <= 0 || region[3] <= 0 {
+                continue;
+            }
+            taken.push(index);
+            take(index, bounds, config);
         }
     }
 
@@ -2401,14 +2562,14 @@ mod tests {
             scene.push(at(x + 3.));
         };
         let mut scene = Scene::default();
-        scene.begin_paint(1);
+        scene.begin_paint(1, |_| false);
         scene.push(at(90.));
         let mark = scene.mark();
         paint(&mut scene, 20.);
         let span = scene.span(mark).unwrap();
         let painted = scene.records(&span, false, None);
         scene.clear();
-        scene.begin_paint(2);
+        scene.begin_paint(2, |_| false);
         // The copy lands after other content, in a nested layer.
         scene.push(at(50.));
         scene.push_effect(effect(mask), None);
@@ -2427,7 +2588,7 @@ mod tests {
         let mask = Clip::from(bounds([0., 0., 100., 100.]));
         let open = Clip::from(bounds([-1e6, -1e6, 2e6, 2e6]));
         let mut scene = Scene::default();
-        scene.begin_paint(1);
+        scene.begin_paint(1, |_| false);
         for (x, culled) in [(10., 0), (300., 1)] {
             scene.push_effect(effect(mask), None);
             scene.push(Instance::new(BOX, bounds([x, x, 10., 10.]), open));
@@ -2444,7 +2605,7 @@ mod tests {
         let mut spans: Vec<Span> = Vec::new();
         let mut scene = Scene::default();
         for pass in 1..6 {
-            scene.begin_paint(pass);
+            scene.begin_paint(pass, |_| false);
             let last = mem::take(&mut spans);
             // A scroll with content, an empty scroll, and a box next to them, each in its own span.
             let paint = |scene: &mut Scene, index: usize, y: f32| match index {
@@ -2486,7 +2647,7 @@ mod tests {
         let open = Clip::from(bounds([0., -100., 100., 300.]));
         let at = |y: f32| Instance::new(BOX, bounds([0., y, 10., 10.]), open);
         let mut scene = Scene::default();
-        scene.begin_paint(1);
+        scene.begin_paint(1, |_| false);
         scene.begin_scroll(1, viewport, point(0., 0.), true);
         scene.push(at(150.));
         scene.pause_cuts(0);
@@ -2513,7 +2674,7 @@ mod tests {
         let mut scene = Scene::default();
         let mut capacities = Vec::new();
         for pass in 1..5 {
-            scene.begin_paint(pass);
+            scene.begin_paint(pass, |_| false);
             for _ in 0..1000 {
                 scene.push(at);
             }
@@ -2547,7 +2708,7 @@ mod tests {
             scene.push(Instance::new(BOX, bounds([30., y + 20., 10., 10.]), mask));
         };
         let mut scene = Scene::default();
-        scene.begin_paint(1);
+        scene.begin_paint(1, |_| false);
         let mark = scene.mark();
         paint(&mut scene, 60., mask);
         let span = scene.span(mark).unwrap();
@@ -2556,12 +2717,12 @@ mod tests {
         // A box that the clip cuts can't move.
         assert_eq!(scene.plain(&span, &cut), None);
         scene.clear();
-        scene.begin_paint(2);
+        scene.begin_paint(2, |_| false);
         let moved = scene
             .replay_moved(&span, point(0., -8.), &mask, &cut)
             .unwrap();
         let mut fresh = Scene::default();
-        fresh.begin_paint(3);
+        fresh.begin_paint(3, |_| false);
         let mark = fresh.mark();
         paint(&mut fresh, 52., cut);
         let painted = fresh.records(&fresh.span(mark).unwrap(), false, None);
@@ -2608,7 +2769,7 @@ mod tests {
             scene.pop_effect();
         };
         let mut scene = Scene::default();
-        scene.begin_paint(1);
+        scene.begin_paint(1, |_| false);
         let mark = scene.mark();
         paint(&mut scene, 60.);
         let span = scene.span(mark).unwrap();
@@ -2620,12 +2781,12 @@ mod tests {
         let cut = Clip::from(bounds([0., 65., 200., 100.]));
         assert_eq!(scene.plain(&span, &cut), None);
         scene.clear();
-        scene.begin_paint(2);
+        scene.begin_paint(2, |_| false);
         let moved = scene
             .replay_moved(&span, point(0., -8.), &mask, &mask)
             .unwrap();
         let mut fresh = Scene::default();
-        fresh.begin_paint(3);
+        fresh.begin_paint(3, |_| false);
         let mark = fresh.mark();
         paint(&mut fresh, 52.);
         let painted = fresh.records(&fresh.span(mark).unwrap(), false, None);

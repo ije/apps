@@ -270,7 +270,6 @@ pub(crate) struct PaintMark {
     scene: scene::Mark,
     input: [u32; 4],
     volatile: u32,
-    culled: u32,
 }
 
 // The output of a paint span, which a later paint can copy while it paints under the same `PaintKey`.
@@ -1102,30 +1101,13 @@ impl Window {
         #[cfg(target_os = "macos")]
         self.platform
             .set_drawable_size(self.native.0, self.native.1);
-        // A snapshot layer is read only when it draws otherwise than in the last frame.
-        let mut shots = FxHashMap::default();
-        for at in 0..self.scene.shots.len() {
-            let (key, layer) = (self.scene.shots[at].key, self.scene.shots[at].layer);
-            let [x, y, width, height] = self.scene.shots[at].region;
-            let mut hasher = rustc_hash::FxHasher::default();
-            let region = crate::rect(x as f32, y as f32, width as f32, height as f32);
-            self.scene.digest(layer, region, &mut hasher);
-            let now = (std::hash::Hasher::finish(&hasher), [width, height]);
-            self.scene.shots[at].read = self.shots.get(&key) != Some(&now);
-            shots.insert(key, now);
-        }
-        self.shots = shots;
+        self.scene.read_shots(&mut self.shots);
         let fresh = self.platform.atlas().take_fresh();
         self.scene.diff(fresh.as_deref());
         let mut frame = self.platform.draw(&self.scene, !captures.is_empty());
         self.scene.drawn();
         let snapshots = self.platform.take_snapshots();
-        // A layer that the backend could not read is read with the next frame.
-        for shot in &mut self.scene.shots {
-            if mem::take(&mut shot.read) && !snapshots.iter().any(|read| read.key == shot.key) {
-                self.shots.remove(&shot.key);
-            }
-        }
+        self.scene.keep_unread(&snapshots, &mut self.shots);
         if let Some(tree) = &mut self.tree {
             tree.bury();
         }
@@ -1445,7 +1427,7 @@ impl Window {
 
     /// Paint left out or placed content by the content mask, so a copy can't move with its box.
     pub fn cull(&mut self) {
-        self.scene.culled += 1;
+        self.scene.cull();
     }
 
     // The frame starts again after this paint, which the next paint doesn't copy.
@@ -1479,11 +1461,9 @@ impl Window {
         self.paints = self.paints.wrapping_add(1);
         let generation = self.text_system.generation();
         let atlas = self.platform.atlas();
-        atlas.take_removed(&mut self.scene.removed);
-        let evicted = atlas.take_evicted();
+        let evicted = (self.scene).begin_paint(self.paints, |removed| atlas.take_removed(removed));
         let fresh = mem::take(&mut self.repaint) || evicted || generation != self.generation;
         self.generation = generation;
-        self.scene.begin_paint(self.paints);
         self.pending.pass = Some(self.paints);
         let last = self
             .live
@@ -1507,7 +1487,6 @@ impl Window {
             scene: self.scene.mark(),
             input: self.pending.lens(),
             volatile: self.volatile,
-            culled: self.scene.culled,
         }
     }
 
@@ -1519,7 +1498,7 @@ impl Window {
         mark: PaintMark,
         mask: Clip<Pixels>,
     ) -> Option<Rect<f32>> {
-        (self.scene.culled == mark.culled)
+        (!self.scene.culled_since(mark.scene))
             .then(|| self.scene.plain(&span.scene, &self.snap_mask(mask)))
             .flatten()
     }
