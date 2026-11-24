@@ -831,9 +831,11 @@ impl Host {
                 return Ok(json!([
                     viewport[0].round(),
                     viewport[1].round(),
-                    Some(page.state.pixel_ratio)
-                        .filter(|&ratio| ratio > 0.)
-                        .unwrap_or(1.),
+                    if page.state.pixel_ratio > 0. {
+                        page.state.pixel_ratio
+                    } else {
+                        1.
+                    },
                     crate::native::theme_state()
                 ]));
             }

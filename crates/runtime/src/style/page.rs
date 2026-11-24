@@ -557,5 +557,3 @@ const ANCHORING_PROPS: crate::css::properties::PropSet = crate::css::properties:
     Prop::PADDING_INLINE_START,
     Prop::PADDING_INLINE_END,
 ]);
-
-// A path with a bad item is empty, so the edit fails with IndexSizeError instead of reaching another rule.

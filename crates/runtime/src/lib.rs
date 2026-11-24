@@ -34,8 +34,10 @@ pub mod node;
 pub mod render;
 pub mod script;
 pub mod style;
-pub mod web;
+mod web;
 pub use web::download;
+// The DOM operations of page scripts, which tests drive directly.
+pub use web::dom::call as dom_call;
 pub use web::{gpu, media, terminal};
 
 pub use anyhow::Result;

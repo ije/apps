@@ -61,12 +61,8 @@ impl Attrs {
         self.0.iter().map(|(key, value)| (key, value))
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.0.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 
     // Adds an attribute that the caller knows is new.

@@ -197,7 +197,6 @@ impl SelectorCache {
         }
     }
 
-    // `dependencies` must be sorted, as `chunk_by` groups them by node.
     // Starts the record of what the matches of a node read.
     pub(crate) fn begin(&mut self) {
         self.dependencies.clear();
@@ -265,6 +264,7 @@ impl SelectorCache {
             })
     }
 
+    // `dependencies` must be sorted, as `chunk_by` groups them by node.
     pub(crate) fn register(&mut self, id: usize) {
         for group in self
             .dependencies

@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::rc::Rc;
 
+// A path with a bad item is empty, so the edit fails with IndexSizeError instead of reaching another rule.
 fn path(kind: &str, value: &Value) -> (Vec<usize>, Option<(usize, bool)>) {
     let path: Vec<usize> = value
         .as_array()

@@ -5,8 +5,7 @@ fn decoded(doc: &mut Document, state: &mut apps_runtime::render::PageState) -> V
     let started = std::time::Instant::now();
     loop {
         let results =
-            apps_runtime::web::dom::call("dom.decoded", &json!([]), doc, state, [640., 480.])
-                .unwrap();
+            apps_runtime::dom_call("dom.decoded", &json!([]), doc, state, [640., 480.]).unwrap();
         if let Some(result) = results.get(0) {
             return result[1].clone();
         }
@@ -31,7 +30,7 @@ fn web_images_decode_in_the_dom() {
         (include_bytes!("../images/gray.jpg"), [4, 3]),
         (include_bytes!("../images/cmyk.jpg"), [4, 3]),
     ] {
-        apps_runtime::web::dom::call(
+        apps_runtime::dom_call(
             "dom.image",
             &json!([1, bytes]),
             &mut doc,
@@ -155,7 +154,7 @@ fn svg_and_bundled_images_load_through_the_host() {
     gzip.write_all(svg).unwrap();
     let svgz = gzip.finish().unwrap();
     for bytes in [svg.as_slice(), svgz.as_slice()] {
-        apps_runtime::web::dom::call(
+        apps_runtime::dom_call(
             "dom.image",
             &json!([1, bytes]),
             &mut doc,
@@ -166,7 +165,7 @@ fn svg_and_bundled_images_load_through_the_host() {
         assert_eq!(decoded(&mut doc, &mut state), json!([30., 12.]));
         assert!(!state.media.images.contains_key(&1));
     }
-    apps_runtime::web::dom::call(
+    apps_runtime::dom_call(
         "dom.image",
         &json!([1, b"not an image".as_slice()]),
         &mut doc,
