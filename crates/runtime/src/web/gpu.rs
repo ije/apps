@@ -118,7 +118,7 @@ fn load() -> Result<Library> {
 fn load() -> Result<Library> {
     let name =
         library_name(std::env::consts::OS).context("WebGPU is unavailable on this platform")?;
-    let library = crate::native::library::load(name, "WebGPU", b"apps_webgpu_abi\0", ABI)?;
+    let library = crate::native::library::load(name, "WebGPU", b"apps_webgpu_abi\0", ABI, "")?;
     unsafe {
         Ok(Library {
             new: *library.get(b"apps_webgpu_new\0")?,

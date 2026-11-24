@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use serde_json::Value;
 use std::{
     ffi::{CStr, c_char, c_void},
@@ -21,8 +21,8 @@ pub(crate) fn load() -> Result<&'static libloading::Library> {
         "developer tools",
         b"apps_devtools_abi\0",
         ABI,
-    )
-    .context("Build the workspace with cargo build --workspace")?;
+        ". Build the workspace with cargo build --workspace.",
+    )?;
     Ok(LOADED.get_or_init(|| library))
 }
 

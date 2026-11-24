@@ -69,21 +69,32 @@ pub(crate) fn set_dev_path(path: std::path::PathBuf) {
 
 // Like JavaScriptCore, the library only loads from the app, never from the environment. It is never unloaded,
 // because its threads may outlive every page and device.
+// `missing` ends the error text when the file is not there.
 pub(crate) fn load(
     name: &str,
     what: &str,
     abi_symbol: &[u8],
     abi: u32,
+    missing: &str,
 ) -> Result<&'static libloading::Library> {
     let executable = exe(name)?;
     let directory = executable
         .parent()
         .context("Missing executable directory")?;
-    let path = ["../Frameworks", ".", "deps"]
-        .iter()
+    // A macOS app keeps its libraries in Contents/Frameworks, and Cargo puts some of a debug build in deps.
+    let folders = [
+        cfg!(target_os = "macos").then_some("../Frameworks"),
+        Some("."),
+        cfg!(debug_assertions).then_some("deps"),
+    ];
+    let path = folders
+        .into_iter()
+        .flatten()
         .map(|folder| directory.join(folder).join(name))
         .find(|path| path.is_file())
-        .with_context(|| format!("The {what} library {name} is missing next to the runtime"))?;
+        .with_context(|| {
+            format!("The {what} library {name} is missing next to the runtime{missing}")
+        })?;
     let library = unsafe { libloading::Library::new(&path) }
         .with_context(|| format!("Cannot load the {what} library from {}", path.display()))?;
     let version: libloading::Symbol<extern "C" fn() -> u32> = unsafe { library.get(abi_symbol)? };

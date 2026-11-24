@@ -198,6 +198,7 @@ fn load() -> Result<Library> {
         "terminal",
         b"apps_terminal_abi\0",
         ABI,
+        "",
     )
     .context("The terminal library needs libghostty-vt: run bash scripts/build-ghostty.sh")?;
     unsafe {

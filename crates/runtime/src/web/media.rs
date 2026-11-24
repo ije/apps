@@ -80,6 +80,7 @@ fn load() -> Result<Library> {
         "media",
         b"apps_media_abi\0",
         ABI,
+        "",
     )?;
     unsafe {
         Ok(Library {
