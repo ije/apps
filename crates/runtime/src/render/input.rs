@@ -817,9 +817,9 @@ impl renderer::View for PageView {
         // A terminal composes text at its cursor.
         let caret = dom
             .terminals
-            .borrow_mut()
-            .shown(id)
-            .map(|terminal| terminal.drawn.caret);
+            .borrow()
+            .session(id)
+            .and_then(|session| Some(self.terminals.borrow().get(&session)?.caret));
         let bounds = caret.as_ref().or_else(|| dom.bounds.get(&id))?;
         Some(Rect::new(
             point(px(bounds[0]), px(bounds[1])),

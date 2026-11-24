@@ -3,7 +3,7 @@
 use super::PageState;
 use crate::style::{self, Prop};
 use crate::web::terminal::{
-    BOLD, Cell, FAINT, FOCUS, Frame, INVERSE, INVISIBLE, ITALIC, OVERLINE, Placement, SCROLL_ROW,
+    BOLD, Cell, FAINT, Frame, INVERSE, INVISIBLE, ITALIC, OVERLINE, Placement, SCROLL_ROW,
     SELECTED, SPACER, STRIKETHROUGH, Terminals, UNDERLINE,
 };
 use renderer::{
@@ -117,7 +117,6 @@ struct Row {
 #[derive(Default)]
 pub(crate) struct Drawn {
     look: Option<Rc<Look>>,
-    scale: f32,
     rows: Vec<Row>,
     /// Kind, column, row, and whether it blinks.
     cursor: (u8, u16, u16, bool),
@@ -290,16 +289,19 @@ impl Grid {
             return;
         }
         let mut terminals = self.terminals.borrow_mut();
+        let mut drawings = self.view.terminals.borrow_mut();
+        drawings.retain(|session, _| terminals.contains(*session));
         // Without a session, the element is an empty box.
-        let Some((terminal, bar)) = terminals.drawn(self.id) else {
+        let Some((session, terminal, bar)) = terminals.drawn(self.id) else {
             return;
         };
+        let drawn = drawings.entry(session).or_default();
         // The knob of the bar was dragged, or its track was pressed.
         let asked = bar.0.target().y;
         if asked != bar.1 {
             terminal.control(SCROLL_ROW, f64::from((-f32::from(asked) / cell_h).round()));
         }
-        let scrolled = terminal.drawn.scroll;
+        let scrolled = drawn.scroll;
         // The focus is read here, because it doesn't build the element again.
         let focused = self.view.host.try_borrow().is_ok_and(|host| {
             host.pages
@@ -308,38 +310,32 @@ impl Grid {
                 .is_some_and(|node| node.state & crate::dom::FOCUS != 0)
         });
         let scale = cx.window.scale_factor();
-        if terminal
-            .drawn
+        if drawn
             .look
             .as_ref()
             .is_none_or(|old| !Rc::ptr_eq(old, &self.look) && **old != *look)
         {
             terminal.theme(&look.colors, look.dark);
         }
-        terminal.drawn.look = Some(self.look.clone());
+        drawn.look = Some(self.look.clone());
         // Layout rounds the box to device pixels, so a box of `80ch` can be a little narrower than 80 cells.
         let grid =
             [width / cell_w, height / cell_h].map(|count| (count + 0.1).clamp(1., 2000.) as u16);
-        if grid != terminal.size || look.cell != terminal.cell || scale != terminal.drawn.scale {
-            terminal.drawn.scale = scale;
-            terminal.resize(grid, look.cell, scale);
+        let focused = focused && cx.window.is_active();
+        let origin = [bounds.origin.x, bounds.origin.y].map(f32::from);
+        if terminal.place(origin, grid, look.cell, scale, focused) {
             // The page reads the new size in its next task.
             crate::host::Waker::current().wake();
         }
-        let focused = focused && cx.window.is_active();
-        if focused != terminal.focused {
-            terminal.focused = focused;
-            terminal.control(FOCUS, f64::from(u8::from(focused)));
-        }
         let mut frame: Frame = unsafe { std::mem::zeroed() };
         if terminal.frame(&mut frame) {
-            terminal.drawn.scroll = frame.scroll;
+            drawn.scroll = frame.scroll;
             // SAFETY: the frame holds `placed` placements until the next frame.
             let placements = match frame.placed {
                 0 => &[][..],
                 count => unsafe { std::slice::from_raw_parts(frame.placements, count as usize) },
             };
-            let mut images = std::mem::take(&mut terminal.drawn.images);
+            let mut images = std::mem::take(&mut drawn.images);
             for (_, old) in images.extract_if(.., |image| {
                 !placements
                     .iter()
@@ -354,7 +350,6 @@ impl Grid {
                     images.push((placement.image, Arc::new(image)));
                 }
             }
-            let drawn = &mut terminal.drawn;
             drawn.images = images;
             drawn.placements.clear();
             drawn.placements.extend_from_slice(placements);
@@ -402,7 +397,7 @@ impl Grid {
             }
         } else if frame.wait > 0 {
             // The program holds the screen: draw again when the hold ends.
-            terminal.drawn.animation = Some(
+            drawn.animation = Some(
                 cx.window
                     .timer(Duration::from_millis(frame.wait.into()), |window, _| {
                         window.refresh()
@@ -411,8 +406,7 @@ impl Grid {
         }
         let window = &mut *cx.window;
         let origin = bounds.origin;
-        terminal.origin = [origin.x, origin.y].map(f32::from);
-        let [all, top, shown] = terminal.drawn.scroll;
+        let [all, top, shown] = drawn.scroll;
         let [top_edge, right_edge, bottom_edge, left_edge] = self.edges.map(px);
         bar.0.set_range(
             Rect::between(
@@ -423,14 +417,14 @@ impl Grid {
         );
         bar.1 = px(-(top as f32) * cell_h);
         bar.0.set_offset(point(px(0.), bar.1));
-        if scrolled != terminal.drawn.scroll {
+        if scrolled != drawn.scroll {
             let bars = window
                 .keyed::<Rc<RefCell<super::scrollbar::State>>>(("scrollbar", self.id).into())
                 .clone();
             let mut bars = bars.borrow_mut();
             // Output scrolls the screen without the bar. The bar shows when the user scrolls.
             let pinned = |[all, top, shown]: [u32; 3]| top + shown >= all;
-            if scrolled[1] != top && !(pinned(scrolled) && pinned(terminal.drawn.scroll)) {
+            if scrolled[1] != top && !(pinned(scrolled) && pinned(drawn.scroll)) {
                 bars.show();
             }
             // The bar took its place before this frame had the new rows.
@@ -439,15 +433,12 @@ impl Grid {
             }
         }
         // The program sees cells of whole pixels, and places its images in these pixels.
-        let unit = [0, 1].map(|axis| look.cell[axis] / terminal.cell_pixels[axis] as f32);
+        let (cells, cell_pixels) = terminal.grid();
+        let unit = [0, 1].map(|axis| look.cell[axis] / cell_pixels[axis] as f32);
         let grid = Rect::new(
             origin,
-            size(
-                px(terminal.size[0] as f32 * cell_w),
-                px(terminal.size[1] as f32 * cell_h),
-            ),
+            size(px(cells[0] as f32 * cell_w), px(cells[1] as f32 * cell_h)),
         );
-        let drawn = &mut terminal.drawn;
         let [fore, back] = [drawn.colors[0], drawn.colors[1]].map(rgb);
         let face = window.text_system().face(&look.font);
         let baseline = window
@@ -625,16 +616,17 @@ impl Grid {
             }
         }
         // The text of an input method is on top of the grid, at the cursor.
-        if !terminal.preedit.is_empty() {
+        let preedit = terminal.preedit();
+        if !preedit.is_empty() {
             let run = TextRun {
-                len: terminal.preedit.len(),
+                len: preedit.len(),
                 font: look.font.clone(),
                 color: fore,
                 ..Default::default()
             };
             let line = window
                 .text_system()
-                .shape_line(&terminal.preedit, px(look.font_size), &run);
+                .shape_line(preedit, px(look.font_size), &run);
             let wide = line.line.width;
             let start = at.origin.x.min(origin.x + px(width) - wide).max(origin.x);
             window.draw_rect(

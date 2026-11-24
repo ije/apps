@@ -64,6 +64,8 @@ pub(crate) struct PageState {
     reach: RefCell<Vec<[f32; 2]>>,
     reaching: RefCell<Vec<([f32; 2], u8)>>,
     caret: RefCell<Option<input::Blink>>,
+    /// The drawing of each terminal session, kept from frame to frame.
+    terminals: RefCell<rustc_hash::FxHashMap<u32, terminal::Drawn>>,
     pub(crate) hud: RefCell<Option<hud::Hud>>,
     pub(crate) inspect: Cell<inspect::Inspect>,
     kept: RefCell<rustc_hash::FxHashMap<usize, element::Kept>>,
@@ -404,6 +406,7 @@ impl PageView {
             reaching: RefCell::default(),
             promote: Cell::new(None),
             caret: RefCell::default(),
+            terminals: RefCell::default(),
             hud: RefCell::default(),
             inspect: Cell::default(),
             kept: RefCell::default(),

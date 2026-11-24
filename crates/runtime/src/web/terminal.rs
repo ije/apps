@@ -229,15 +229,17 @@ pub(crate) struct Terminal {
     raw: NonNull<c_void>,
     library: &'static Library,
     /// Columns and rows.
-    pub size: [u16; 2],
+    size: [u16; 2],
     /// The size of a cell in CSS pixels, and in the pixels that the program sees.
-    pub cell: [f32; 2],
-    pub cell_pixels: [u32; 2],
+    cell: [f32; 2],
+    cell_pixels: [u32; 2],
+    /// The scale of the window, as of the last frame.
+    scale: f32,
     /// The top left of the grid in the page, as of the last frame.
-    pub origin: [f32; 2],
-    pub focused: bool,
+    origin: [f32; 2],
+    focused: bool,
     /// The text that an input method composes.
-    pub preedit: String,
+    preedit: String,
     /// Events from this side for the scripts.
     events: Vec<Value>,
     /// The contexts that have an object for the session: bit 0 is the page, and bit 1 is its preload script.
@@ -245,7 +247,6 @@ pub(crate) struct Terminal {
     title: Value,
     status: Value,
     wheel: f32,
-    pub drawn: crate::render::terminal::Drawn,
 }
 
 impl Drop for Terminal {
@@ -269,6 +270,7 @@ impl Terminal {
             size: [80, 24],
             cell: [8., 16.],
             cell_pixels: [8, 16],
+            scale: 0.,
             origin: [0.; 2],
             focused: false,
             preedit: String::new(),
@@ -277,7 +279,6 @@ impl Terminal {
             title: json!(""),
             status: json!([]),
             wheel: 0.,
-            drawn: Default::default(),
         })
     }
 
@@ -324,13 +325,111 @@ impl Terminal {
         unsafe { (self.library.control)(self.raw.as_ptr(), op, value) };
     }
 
-    pub fn resize(&mut self, size: [u16; 2], cell: [f32; 2], scale: f32) {
-        self.size = size;
-        self.cell = cell;
-        self.cell_pixels = cell.map(|side| (side * scale).round().max(1.) as u32);
-        let [width, height] = self.cell_pixels;
-        unsafe { (self.library.resize)(self.raw.as_ptr(), size[0], size[1], width, height) };
-        self.events.push(json!(["resize"]));
+    /// Places the grid of a frame: its top left in the page, its columns and rows, the size of a cell in CSS
+    /// pixels, the scale and the focus. Returns whether the grid has a new size.
+    pub fn place(
+        &mut self,
+        origin: [f32; 2],
+        size: [u16; 2],
+        cell: [f32; 2],
+        scale: f32,
+        focused: bool,
+    ) -> bool {
+        self.origin = origin;
+        let resized = size != self.size || cell != self.cell || scale != self.scale;
+        if resized {
+            self.size = size;
+            self.cell = cell;
+            self.scale = scale;
+            self.cell_pixels = cell.map(|side| (side * scale).round().max(1.) as u32);
+            let [width, height] = self.cell_pixels;
+            unsafe { (self.library.resize)(self.raw.as_ptr(), size[0], size[1], width, height) };
+            self.events.push(json!(["resize"]));
+        }
+        if focused != self.focused {
+            self.focused = focused;
+            self.control(FOCUS, f64::from(u8::from(focused)));
+        }
+        resized
+    }
+
+    /// Columns and rows, and the size of a cell in the pixels that the program sees.
+    pub fn grid(&self) -> ([u16; 2], [u32; 2]) {
+        (self.size, self.cell_pixels)
+    }
+
+    pub fn preedit(&self) -> &str {
+        &self.preedit
+    }
+
+    fn set_preedit(&mut self, text: &str) {
+        text.clone_into(&mut self.preedit);
+    }
+
+    /// A context of `world` got an object for the session.
+    fn open_in(&mut self, world: usize) {
+        self.worlds |= 1 << world;
+    }
+
+    fn opened_in(&self, world: usize) -> bool {
+        self.worlds >> world & 1 != 0
+    }
+
+    fn key(&mut self, action: u32, name: &str, mods: u32, text: &str) -> bool {
+        unsafe {
+            (self.library.key)(
+                self.raw.as_ptr(),
+                action,
+                name.as_ptr(),
+                name.len(),
+                mods,
+                text.as_ptr(),
+                text.len(),
+            )
+        }
+    }
+
+    fn mouse(&mut self, action: u32, button: u32, mods: u32, x: f64, y: f64, any: bool) -> bool {
+        let [x, y] = self.at(x, y);
+        unsafe { (self.library.mouse)(self.raw.as_ptr(), action, button, mods, x, y, any) }
+    }
+
+    /// The state for `info`: the library's fields, with the size, title and status.
+    fn info(&mut self) -> Result<Value> {
+        let (_, json) = self.json(|library, raw, output| unsafe {
+            (library.info)(raw, output, alloc);
+            true
+        });
+        let mut info: Value = serde_json::from_slice(&json)?;
+        info["cols"] = json!(self.size[0]);
+        info["rows"] = json!(self.size[1]);
+        info["title"] = self.title.clone();
+        info["status"] = self.status.clone();
+        Ok(info)
+    }
+
+    /// The text of the screen and the scrollback, or of the selection.
+    fn text(&mut self, selected: bool) -> Option<String> {
+        let (found, text) = self
+            .json(|library, raw, output| unsafe { (library.text)(raw, selected, output, alloc) });
+        found.then(|| String::from_utf8_lossy(&text).into_owned())
+    }
+
+    /// Events for the scripts, from this side and from the library. Returns whether the screen changed.
+    fn poll(&mut self) -> Result<(bool, Vec<Value>)> {
+        let (changed, json) =
+            self.json(|library, raw, output| unsafe { (library.poll)(raw, output, alloc) });
+        let polled: Vec<Value> = serde_json::from_slice(&json)?;
+        let mut events = std::mem::take(&mut self.events);
+        for mut event in polled {
+            match event[0].as_str() {
+                Some("title") => self.title = event[1].take(),
+                Some("status") => self.status = event[1].take(),
+                _ => {}
+            }
+            events.push(event);
+        }
+        Ok((changed, events))
     }
 
     /// Sets the default colors: foreground, background, cursor and the 16 palette colors.
@@ -401,27 +500,105 @@ pub(crate) struct Terminals {
 }
 
 impl Terminals {
+    /// The session that an element shows.
+    pub fn session(&self, node: usize) -> Option<u32> {
+        self.views.get(&node).map(|view| view.0)
+    }
+
     /// The terminal that an element shows.
     pub fn shown(&mut self, node: usize) -> Option<&mut Terminal> {
         self.sessions.get_mut(&self.views.get(&node)?.0)
     }
 
-    /// The terminal that an element shows, with the bar of the element. Without a session, the bar has no range.
+    /// The session that an element shows, with its terminal and the bar of the element. Without a session, the
+    /// bar has no range.
     pub fn drawn(
         &mut self,
         node: usize,
-    ) -> Option<(&mut Terminal, &mut (renderer::ScrollRef, renderer::Pixels))> {
+    ) -> Option<(
+        u32,
+        &mut Terminal,
+        &mut (renderer::ScrollRef, renderer::Pixels),
+    )> {
         let bar = self.bars.get_mut(&node)?;
-        let terminal = self
-            .views
-            .get(&node)
-            .and_then(|view| self.sessions.get_mut(&view.0));
+        let session = self.views.get(&node).map(|view| view.0);
+        let terminal = session.and_then(|session| self.sessions.get_mut(&session));
         if terminal.is_none() {
             bar.0.set_range(Default::default(), Default::default());
             bar.0.set_offset(Default::default());
             bar.1 = Default::default();
         }
-        Some((terminal?, bar))
+        Some((session?, terminal?, bar))
+    }
+
+    fn get(&mut self, session: u32) -> Option<&mut Terminal> {
+        self.sessions.get_mut(&session)
+    }
+
+    pub fn contains(&self, session: u32) -> bool {
+        self.sessions.contains_key(&session)
+    }
+
+    fn create(&mut self, mut terminal: Terminal) -> u32 {
+        // Only a preload script creates sessions.
+        terminal.open_in(1);
+        self.last += 1;
+        self.sessions.insert(self.last, terminal);
+        self.last
+    }
+
+    // Shows a session in an element, or nothing. A session shows in one element.
+    fn attach(&mut self, node: usize, session: Option<u32>) -> Result<()> {
+        self.views.remove(&node);
+        if let Some(session) = session {
+            ensure!(
+                self.sessions.contains_key(&session),
+                "The terminal session is closed"
+            );
+            self.views.retain(|_, view| view.0 != session);
+            self.views.insert(node, (session, false));
+            self.revision = 0;
+        }
+        Ok(())
+    }
+
+    /// The events of all sessions for one world. At a new document `revision`, the sessions of elements that
+    /// left the document end. One that moved in a task is still there.
+    fn poll(
+        &mut self,
+        revision: u64,
+        world: usize,
+        attached: impl Fn(usize) -> bool,
+    ) -> Result<(bool, Vec<Value>)> {
+        if std::mem::replace(&mut self.revision, revision) != revision {
+            let mut gone = Vec::new();
+            for (&node, view) in &mut self.views {
+                if attached(node) {
+                    view.1 = true;
+                } else if view.1 {
+                    gone.push(node);
+                }
+            }
+            for node in gone {
+                self.release(node);
+            }
+        }
+        let mut dirty = false;
+        for (session, terminal) in &mut self.sessions {
+            let (changed, events) = terminal.poll()?;
+            dirty |= changed;
+            for mut event in events {
+                if let Some(event) = event.as_array_mut() {
+                    event.insert(0, json!(session));
+                }
+                for (world, events) in self.events.iter_mut().enumerate() {
+                    if terminal.opened_in(world) {
+                        events.push(event.clone());
+                    }
+                }
+            }
+        }
+        Ok((dirty, std::mem::take(&mut self.events[world])))
     }
 
     /// Ends the session of an element that is gone.
@@ -438,7 +615,7 @@ impl Terminals {
         };
         self.views.retain(|_, view| view.0 != session);
         for (world, events) in self.events.iter_mut().enumerate() {
-            if terminal.worlds >> world & 1 != 0 {
+            if terminal.opened_in(world) {
                 events.push(json!([session, "close"]));
             }
         }
@@ -476,46 +653,11 @@ impl crate::host::Host {
         let terminals = &mut *terminals;
         let world = usize::from(preload);
         if op == "poll" {
-            // An element that left the document ends its session. One that moved in a task is still there.
-            let revision = page.doc.nodes.latest();
-            if std::mem::replace(&mut terminals.revision, revision) != revision {
-                let mut gone = Vec::new();
-                for (&node, view) in &mut terminals.views {
-                    if crate::host::reaches(&page.doc, &state.hosts, node, 0) {
-                        view.1 = true;
-                    } else if view.1 {
-                        gone.push(node);
-                    }
-                }
-                for node in gone {
-                    terminals.release(node);
-                }
-            }
-            for (session, terminal) in &mut terminals.sessions {
-                let (changed, json) = terminal
-                    .json(|library, raw, output| unsafe { (library.poll)(raw, output, alloc) });
-                page.dirty |= changed;
-                let polled: Vec<Value> = serde_json::from_slice(&json)?;
-                for mut event in std::mem::take(&mut terminal.events)
-                    .into_iter()
-                    .chain(polled)
-                {
-                    match event[0].as_str() {
-                        Some("title") => terminal.title = event[1].take(),
-                        Some("status") => terminal.status = event[1].take(),
-                        _ => {}
-                    }
-                    if let Some(event) = event.as_array_mut() {
-                        event.insert(0, json!(session));
-                    }
-                    for (world, events) in terminals.events.iter_mut().enumerate() {
-                        if terminal.worlds >> world & 1 != 0 {
-                            events.push(event.clone());
-                        }
-                    }
-                }
-            }
-            return Ok(json!(std::mem::take(&mut terminals.events[world])));
+            let (changed, events) = terminals.poll(page.doc.nodes.latest(), world, |node| {
+                crate::host::reaches(&page.doc, &state.hosts, node, 0)
+            })?;
+            page.dirty |= changed;
+            return Ok(json!(events));
         }
         let number = |index: usize| args[index].as_f64().unwrap_or(0.);
         // A string is a command line for the login shell of the user.
@@ -546,14 +688,11 @@ impl crate::host::Host {
         match op {
             "create" => {
                 let mut terminal = Terminal::new()?;
-                terminal.worlds = 2;
                 if args[0] != true {
                     let (argv, env, cwd) = program()?;
                     terminal.spawn(&argv, &env, cwd)?;
                 }
-                terminals.last += 1;
-                terminals.sessions.insert(terminals.last, terminal);
-                return Ok(json!(terminals.last));
+                return Ok(json!(terminals.create(terminal)));
             }
             "attach" => {
                 let node = args[0].as_u64().context("Invalid node")? as usize;
@@ -564,18 +703,7 @@ impl crate::host::Host {
                         .is_some_and(|node| node.tag == "terminal"),
                     "Expected a terminal element"
                 );
-                terminals.views.remove(&node);
-                if let Some(session) = args[1].as_u64() {
-                    let session = session as u32;
-                    ensure!(
-                        terminals.sessions.contains_key(&session),
-                        "The terminal session is closed"
-                    );
-                    // A session shows in one element.
-                    terminals.views.retain(|_, view| view.0 != session);
-                    terminals.views.insert(node, (session, false));
-                    terminals.revision = 0;
-                }
+                terminals.attach(node, args[1].as_u64().map(|session| session as u32))?;
                 page.dirty = true;
                 return Ok(Value::Null);
             }
@@ -587,16 +715,13 @@ impl crate::host::Host {
             page.dirty = true;
             return Ok(Value::Null);
         }
-        let terminal = terminals.sessions.get_mut(&session);
+        let terminal = terminals.get(session);
         if op == "open" {
             return Ok(json!(
-                terminal
-                    .map(|terminal| terminal.worlds |= 1 << world)
-                    .is_some()
+                terminal.map(|terminal| terminal.open_in(world)).is_some()
             ));
         }
         let terminal = terminal.context("The terminal session is closed")?;
-        let raw = terminal.raw.as_ptr();
         // Reads draw no frame, and neither does a pointer that only moves above the terminal.
         page.dirty |=
             !matches!(op, "info" | "text") && !(op == "mouse" && args[1] == 2 && args[6] != true);
@@ -609,31 +734,22 @@ impl crate::host::Host {
             "key" => {
                 let name = args[2].as_str().unwrap_or("");
                 let text = args[3].as_str().unwrap_or("");
-                return Ok(json!(unsafe {
-                    (terminal.library.key)(
-                        raw,
-                        number(1) as u32,
-                        name.as_ptr(),
-                        name.len(),
-                        number(4) as u32,
-                        text.as_ptr(),
-                        text.len(),
-                    )
-                }));
+                return Ok(json!(terminal.key(
+                    number(1) as u32,
+                    name,
+                    number(4) as u32,
+                    text
+                )));
             }
             "mouse" => {
-                let [x, y] = terminal.at(number(4), number(5));
-                return Ok(json!(unsafe {
-                    (terminal.library.mouse)(
-                        raw,
-                        number(1) as u32,
-                        number(2) as u32,
-                        number(3) as u32,
-                        x,
-                        y,
-                        args[6].as_bool().unwrap_or(false),
-                    )
-                }));
+                return Ok(json!(terminal.mouse(
+                    number(1) as u32,
+                    number(2) as u32,
+                    number(3) as u32,
+                    number(4),
+                    number(5),
+                    args[6].as_bool().unwrap_or(false),
+                )));
             }
             "control" => {
                 let op = number(1) as u32;
@@ -649,29 +765,9 @@ impl crate::host::Host {
                 };
                 terminal.control(op, value);
             }
-            "info" => {
-                let (_, json) = terminal.json(|library, raw, output| unsafe {
-                    (library.info)(raw, output, alloc);
-                    true
-                });
-                let mut info: Value = serde_json::from_slice(&json)?;
-                info["cols"] = json!(terminal.size[0]);
-                info["rows"] = json!(terminal.size[1]);
-                info["title"] = terminal.title.clone();
-                info["status"] = terminal.status.clone();
-                return Ok(info);
-            }
-            "text" => {
-                let (found, text) = terminal.json(|library, raw, output| unsafe {
-                    (library.text)(raw, args[1].as_bool().unwrap_or(false), output, alloc)
-                });
-                return Ok(if found {
-                    json!(String::from_utf8_lossy(&text))
-                } else {
-                    Value::Null
-                });
-            }
-            "preedit" => terminal.preedit = args[1].as_str().unwrap_or("").to_owned(),
+            "info" => return terminal.info(),
+            "text" => return Ok(json!(terminal.text(args[1].as_bool().unwrap_or(false)))),
+            "preedit" => terminal.set_preedit(args[1].as_str().unwrap_or("")),
             _ => bail!("Unknown terminal operation: {op}"),
         }
         Ok(Value::Null)
