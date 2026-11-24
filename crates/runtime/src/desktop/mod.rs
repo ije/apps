@@ -367,8 +367,7 @@ impl Desktop {
                         } else if command["op"] == "reload" {
                             let host = self.host.borrow();
                             for &id in self.views.keys() {
-                                if let Some(url) =
-                                    host.dom.get(&id).and_then(|dom| dom.base.as_ref())
+                                if let Some(url) = host.page_url(id)
                                     && url.as_str().starts_with("apps:///")
                                 {
                                     self.link.page(ToPage::Window(

@@ -80,6 +80,11 @@ impl Host {
         }
     }
 
+    // The URL of the page in window `id`.
+    pub(crate) fn page_url(&self, id: u64) -> Option<&url::Url> {
+        self.dom.get(&id)?.base.as_ref()
+    }
+
     // The nodes of each page: in its tree, allocated, and free for reuse.
     pub(crate) fn memory(&self) -> Value {
         Value::Object(
