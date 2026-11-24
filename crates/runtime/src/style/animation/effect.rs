@@ -672,7 +672,7 @@ pub(super) fn show(
     let mut pending = vec![id];
     while let Some(id) = pending.pop() {
         painted[id] = true;
-        for &child in styles.children.get(&id).unwrap_or(&doc.nodes[id].children) {
+        for &child in styles.flat_children(doc, id) {
             if painted.get(child) == Some(&false)
                 && (styles.values[child].get(Prop::DISPLAY) != Some("none") || shows(child))
             {

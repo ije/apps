@@ -58,6 +58,30 @@ pub(crate) fn table_part(doc: &crate::dom::Document, styles: &ComputedStyles, id
 }
 
 impl ComputedStyles {
+    // Gives a new detached node the styles of an unstyled node, as a full pass does, and grows every list.
+    pub(crate) fn place(&mut self, id: usize, len: usize) {
+        let (style, vars) = empty();
+        self.values.resize(len, style.clone());
+        self.values[id] = style;
+        self.vars.resize(len, vars.clone());
+        self.vars[id] = vars;
+        self.flags.resize(len, 0);
+        self.flags[id] = 0;
+        self.lengths.grow(len);
+        self.lengths.unset(id);
+        self.user_select.resize(len, (UserSelect::None, 0));
+        self.user_select[id] = (UserSelect::None, 0);
+    }
+
+    // The children of a node in the flat tree: a shadow host shows its shadow tree, and a slot its assigned nodes.
+    pub(crate) fn flat_children<'a>(
+        &'a self,
+        doc: &'a crate::dom::Document,
+        id: usize,
+    ) -> &'a [usize] {
+        self.children.get(&id).unwrap_or(&doc.nodes[id].children)
+    }
+
     pub(crate) fn blended(&self) -> bool {
         self.blended.get().unwrap_or_else(|| {
             let blended = self.values.iter().any(|style| {

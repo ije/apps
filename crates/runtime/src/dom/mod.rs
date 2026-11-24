@@ -1179,19 +1179,7 @@ impl State {
         if let Some(cached) = &mut self.styles.computed {
             // Grow every per-node list here. Initialize detached nodes as a full style pass does.
             if let Some(computed) = Rc::get_mut(cached) {
-                let (style, vars) = style::empty();
-                computed.values.resize(doc.nodes.len(), style.clone());
-                computed.values[id] = style;
-                computed.vars.resize(doc.nodes.len(), vars.clone());
-                computed.vars[id] = vars;
-                computed.flags.resize(doc.nodes.len(), 0);
-                computed.flags[id] = 0;
-                computed.lengths.grow(doc.nodes.len());
-                computed.lengths.unset(id);
-                computed
-                    .user_select
-                    .resize(doc.nodes.len(), (style::UserSelect::None, 0));
-                computed.user_select[id] = (style::UserSelect::None, 0);
+                computed.place(id, doc.nodes.len());
             } else if id >= cached.values.len() {
                 self.invalidate();
             }
@@ -4620,9 +4608,7 @@ pub(crate) fn hit_test(
         path.push((id, clip, 0, round));
         pending.extend(
             computed
-                .children
-                .get(&id)
-                .unwrap_or(&doc.nodes[id].children)
+                .flat_children(doc, id)
                 .iter()
                 .filter(|child| !top.contains(child))
                 .map(|&child| (child, clip, false, depth + 1, drawn, round)),

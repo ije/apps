@@ -975,7 +975,7 @@ impl Motion {
                 while let Some(id) = pending.pop() {
                     if painted.get(id) == Some(&true) {
                         painted[id] = false;
-                        pending.extend(styles.children.get(&id).unwrap_or(&doc.nodes[id].children));
+                        pending.extend(styles.flat_children(doc, id));
                     }
                 }
             }
@@ -1002,11 +1002,7 @@ impl Motion {
                 let base = styles.values[id].value(key);
                 let mut pending = vec![id];
                 while let Some(parent) = pending.pop() {
-                    for &child in styles
-                        .children
-                        .get(&parent)
-                        .unwrap_or(&doc.nodes[parent].children)
-                    {
+                    for &child in styles.flat_children(doc, parent) {
                         let own = styles.values[child].value(key);
                         if own.map(Rc::as_ptr) == base.map(Rc::as_ptr)
                             && animated
@@ -1066,12 +1062,7 @@ impl Motion {
                             && styles.values[node]
                                 .get(Prop::VISIBILITY)
                                 .is_some_and(|value| matches!(value, "hidden" | "collapse"));
-                        pending.extend(
-                            styles
-                                .children
-                                .get(&node)
-                                .unwrap_or(&doc.nodes[node].children),
-                        );
+                        pending.extend(styles.flat_children(doc, node));
                     }
                     faded || hidden
                 };
