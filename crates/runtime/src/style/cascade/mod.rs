@@ -1,6 +1,6 @@
 use crate::css::{
-    BORDERS, Declarations, FontUnits, Lengths, Prop, Registry, Selector, Style, Stylesheet, Vars,
-    color, components, counter_text, number,
+    Declarations, FontUnits, Lengths, Prop, Registry, Selector, Style, Stylesheet, Vars, color,
+    number,
 };
 use crate::dom::{Document, SelectorCache};
 use crate::style::animation::Animation;
@@ -17,10 +17,9 @@ use crate::style::cascade::scope::{
 };
 use crate::style::cascade::shadow::{ELEMENT, PART, SLOTTED, STARTING, ShadowRule, exported_parts};
 use crate::style::cascade::sheets::{Cssom, Derived, Sheet, derive};
-use crate::style::cascade::table::{CollapsedTable, Line};
+use crate::style::cascade::table::CollapsedTable;
 use crate::style::cascade::used::{blockify, border_spacing, pixels};
 use crate::style::cascade::vars::{references, var};
-use crate::style::chunked::Chunked;
 use crate::style::computed::{HEADER, INVISIBLE};
 use crate::style::fonts::font_names;
 use crate::style::ua::{FULLSCREEN_SHEET, GLASS_SHEET, UA_SHEET, presentation, svg_transform};
@@ -29,11 +28,14 @@ use crate::style::{
     ROW, SELECT_ALL, SELECT_NONE, SELECT_TEXT, Shadowed, TABLE_DISPLAYS, empty, font, table_box,
 };
 use bbtree::unsync::BBTreeMap;
+use counters::{list_item, listed, number_lists};
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::rc::Rc;
+use table::anonymous_tables;
 mod container;
+mod counters;
 mod memo;
 pub(super) mod rank;
 pub(super) mod scope;
@@ -1384,12 +1386,12 @@ pub(crate) fn compute_styles(
         parts,
         exported,
         starting: starts,
-        list_items,
+        list_items: _,
         counting,
-        authored,
-        anonymous,
+        authored: _,
+        anonymous: _,
         containers,
-        counted,
+        counted: _,
         revision,
         ..
     } = &mut out;
@@ -1427,8 +1429,6 @@ pub(crate) fn compute_styles(
     let mut counters = false;
     // A fast pass numbers the counters again only when one of their inputs changed.
     let mut recount = false;
-    let item = |style: &Style| style.get(Prop::DISPLAY) == Some("list-item");
-    let listed = |id: usize| matches!(doc.nodes[id].tag.as_str(), "ol" | "ul" | "menu" | "li");
     let html: Vec<usize> = walk.special[0]
         .iter()
         .copied()
@@ -1592,9 +1592,9 @@ pub(crate) fn compute_styles(
                     let before = previous.authored.get(&id).or(previous.values.get(id));
                     recount = (old | style_flags[id]) & COUNTED != 0
                         || (old ^ style_flags[id]) & DISPLAY_NONE != 0
-                        || listed(id)
-                        || item(&styles[id])
-                        || before.is_some_and(|before| item(before));
+                        || listed(doc, id)
+                        || list_item(&styles[id])
+                        || before.is_some_and(|before| list_item(before));
                 }
             }
             counters |= style_flags[id] & COUNTED != 0;
@@ -3855,739 +3855,92 @@ pub(crate) fn compute_styles(
             scopes: used,
         });
     }
-    let reused = previous
-        .filter(|previous| fast && previous.counted)
-        .filter(|previous| {
-            // Attributes like `start`, `reversed` and `value` can change without a new style.
-            !recount
-                && !doc.nodes.changed_since(previous.revision).any(|id| {
-                    listed(id)
-                        || item(&styles[id])
-                        || previous.values.get(id).is_some_and(|old| item(old))
-                        || doc.nodes[id]
-                            .children
-                            .iter()
-                            .any(|&child| item(&styles[child]))
-                })
-        });
-    if let Some(previous) = reused {
-        *counted = true;
-        list_items.clone_from(&previous.list_items);
-    } else if counters || previous.is_some_and(|previous| fast && previous.counted) {
-        *counted = true;
-        let list = |value: Option<&str>, default: i64| -> Vec<(String, i64)> {
-            let parts = value.map_or_else(Vec::new, |value| components(value, ' '));
-            let mut list: Vec<(String, i64)> = Vec::new();
-            for part in parts {
-                match (part.parse::<i64>(), list.last_mut()) {
-                    (Ok(number), Some(last)) => last.1 = number,
-                    (Ok(_), None) => {}
-                    (Err(_), _) if part == "none" => {}
-                    (Err(_), _) => list.push((part.to_owned(), default)),
-                }
-            }
-            list
-        };
-        let mut counters: Vec<(String, i64, usize)> = Vec::new();
-        let apply = |counters: &mut Vec<(String, i64, usize)>,
-                     style: &Style,
-                     parent: usize,
-                     implicit: Option<i64>| {
-            for (name, value) in list(style.get(Prop::COUNTER_RESET), 0) {
-                // A reset replaces the counter of a preceding sibling.
-                if let Some(at) = counters
-                    .iter()
-                    .rposition(|counter| counter.0 == name && counter.2 == parent)
-                {
-                    counters.remove(at);
-                }
-                counters.push((name, value, parent));
-            }
-            for (name, value) in list(style.get(Prop::COUNTER_SET), 0) {
-                match counters.iter_mut().rfind(|counter| counter.0 == name) {
-                    Some(counter) => counter.1 = value,
-                    None => counters.push((name, value, parent)),
-                }
-            }
-            let mut increments = list(style.get(Prop::COUNTER_INCREMENT), 1);
-            if let Some(step) =
-                implicit.filter(|_| !increments.iter().any(|(name, _)| name == "list-item"))
-            {
-                increments.push(("list-item".into(), step));
-            }
-            for (name, step) in increments {
-                match counters.iter_mut().rfind(|counter| counter.0 == name) {
-                    Some(counter) => counter.1 = counter.1.saturating_add(step),
-                    None => counters.push((name, step, parent)),
-                }
-            }
-        };
-        let content = |counters: &[(String, i64, usize)], content: &str| -> Option<String> {
-            if !content.contains("counter") {
-                return None;
-            }
-            let parts: Vec<String> = components(content, ' ')
-                .into_iter()
-                .map(|part| {
-                    let Some((function, arguments)) = part
-                        .strip_suffix(')')
-                        .and_then(|part| part.split_once('('))
-                        .filter(|(function, _)| matches!(*function, "counter" | "counters"))
-                    else {
-                        return part.to_owned();
-                    };
-                    let arguments: Vec<&str> = components(arguments, ',')
-                        .into_iter()
-                        .map(str::trim)
-                        .collect();
-                    let name = arguments.first().copied().unwrap_or_default();
-                    let (separator, kind) = if function == "counters" {
-                        (
-                            arguments
-                                .get(1)
-                                .map(|value| value.trim_matches(['"', '\'']))
-                                .unwrap_or(""),
-                            arguments.get(2),
-                        )
-                    } else {
-                        ("", arguments.get(1))
-                    };
-                    let kind = kind.copied().unwrap_or("decimal");
-                    let values: Vec<i64> = counters
-                        .iter()
-                        .filter(|counter| counter.0 == name)
-                        .map(|counter| counter.1)
-                        .collect();
-                    let values = match (function, values.last()) {
-                        ("counter", Some(&last)) => vec![last],
-                        ("counter", None) => vec![0],
-                        _ if values.is_empty() => vec![0],
-                        _ => values,
-                    };
-                    serde_json::to_string(
-                        &values
-                            .into_iter()
-                            .map(|value| counter_text(kind, value))
-                            .collect::<Vec<_>>()
-                            .join(separator),
-                    )
-                    .unwrap_or_default()
-                })
-                .collect();
-            Some(parts.join(" "))
-        };
-        // A node that got no new style in a fast pass still holds the text, so its declared value is in
-        // `counting`. A new style drops that entry.
-        let number = |pseudos: &mut FxHashMap<usize, Rc<[Style; 2]>>,
-                      counting: &mut FxHashMap<usize, [Option<Rc<str>>; 2]>,
-                      counters: &[(String, i64, usize)],
-                      id: usize,
-                      side: usize| {
-            let declared = counting.get(&id).and_then(|kept| kept[side].clone());
-            let own = &pseudos[&id][side];
-            let declared = declared.or_else(|| own.value(Prop::CONTENT).cloned());
-            if let Some(text) = declared
-                .as_deref()
-                .and_then(|value| content(counters, value))
-            {
-                counting.entry(id).or_default()[side] = declared;
-                if own.get(Prop::CONTENT) != Some(&text) {
-                    Rc::make_mut(pseudos.get_mut(&id).unwrap())[side].insert(Prop::CONTENT, text);
-                }
-            }
-        };
-        for &(root, _) in walk.trees.iter() {
-            counters.clear();
-            let mut pending = vec![(root, false)];
-            while let Some((id, exit)) = pending.pop() {
-                let node = &doc.nodes[id];
-                let parent = node.parent.unwrap_or(usize::MAX);
-                if exit {
-                    if let Some(own) = pseudos.get(&id).cloned() {
-                        apply(&mut counters, &own[1], id, None);
-                        number(pseudos, counting, &counters, id, 1);
-                    }
-                    counters.retain(|counter| counter.2 != id);
-                    continue;
-                }
-                if style_flags[id] & DISPLAY_NONE != 0 || node.tag.starts_with('#') && id != root {
-                    continue;
-                }
-                let style = styles[id].clone();
-                // Like Chrome, lists reset `list-item` unless their `counter-reset` names it.
-                if matches!(node.tag.as_str(), "ol" | "ul" | "menu")
-                    && style
-                        .get(Prop::COUNTER_RESET)
-                        .is_none_or(|reset| !components(reset, ' ').contains(&"list-item"))
-                {
-                    let items = node
-                        .children
-                        .iter()
-                        .filter(|&&child| styles[child].get(Prop::DISPLAY) == Some("list-item"))
-                        .count() as i64;
-                    let reversed = node.attrs.contains_key("reversed");
-                    let start = node
-                        .attrs
-                        .get("start")
-                        .and_then(|value| value.parse::<i64>().ok());
-                    let first = if reversed {
-                        start.unwrap_or(items).saturating_add(1)
-                    } else {
-                        start.unwrap_or(1).saturating_sub(1)
-                    };
-                    counters.push(("list-item".into(), first, parent));
-                }
-                let item = style.get(Prop::DISPLAY) == Some("list-item");
-                let reversed = item
-                    && node
-                        .parent
-                        .is_some_and(|parent| doc.nodes[parent].attrs.contains_key("reversed"));
-                apply(
-                    &mut counters,
-                    &style,
-                    parent,
-                    item.then_some(if reversed { -1 } else { 1 }),
-                );
-                if item {
-                    if let Some(value) = node
-                        .attrs
-                        .get("value")
-                        .and_then(|value| value.parse::<i64>().ok())
-                    {
-                        match counters
-                            .iter_mut()
-                            .rfind(|counter| counter.0 == "list-item")
-                        {
-                            Some(counter) => counter.1 = value,
-                            None => counters.push(("list-item".into(), value, parent)),
-                        }
-                    }
-                    if let Some(counter) = counters.iter().rfind(|counter| counter.0 == "list-item")
-                    {
-                        list_items.insert(id, counter.1);
-                    }
-                }
-                if let Some(own) = pseudos.get(&id).cloned() {
-                    apply(&mut counters, &own[0], id, None);
-                    number(pseudos, counting, &counters, id, 0);
-                }
-                pending.push((id, true));
-                pending.extend(node.children.iter().rev().map(|&child| (child, false)));
-            }
-        }
-    }
-    // This adjusts styles after caching, so cached styles stay unadjusted.
-    const SIDES: [[Prop; 4]; 4] = [
-        [
-            Prop::BORDER_TOP_STYLE,
-            Prop::BORDER_TOP_WIDTH,
-            Prop::MARGIN_TOP,
-            Prop::PADDING_TOP,
-        ],
-        [
-            Prop::BORDER_RIGHT_STYLE,
-            Prop::BORDER_RIGHT_WIDTH,
-            Prop::MARGIN_RIGHT,
-            Prop::PADDING_RIGHT,
-        ],
-        [
-            Prop::BORDER_BOTTOM_STYLE,
-            Prop::BORDER_BOTTOM_WIDTH,
-            Prop::MARGIN_BOTTOM,
-            Prop::PADDING_BOTTOM,
-        ],
-        [
-            Prop::BORDER_LEFT_STYLE,
-            Prop::BORDER_LEFT_WIDTH,
-            Prop::MARGIN_LEFT,
-            Prop::PADDING_LEFT,
-        ],
-    ];
-    let mut edges = FxHashMap::<*const Style, (Rc<Style>, [(f32, u8); 4])>::default();
-    let own_style = |styles: &Chunked<Rc<Style>>, id: usize| {
-        let style = &styles[id];
-        previous
-            .filter(|_| fast)
-            .filter(|previous| {
-                previous
-                    .values
-                    .get(id)
-                    .is_some_and(|old| Rc::ptr_eq(old, style))
-            })
-            .and_then(|previous| previous.authored.get(&id))
-            .unwrap_or(style)
-            .clone()
-    };
-    for &table in &walk.tables {
-        let table_style = own_style(styles, table);
-        if table_style
-            .get(Prop::BORDER_COLLAPSE)
-            .is_none_or(|value| value != "collapse")
-            || table_style
-                .get(Prop::DISPLAY)
-                .is_none_or(|value| value != "grid")
-        {
-            continue;
-        }
-        let lines: Vec<Line> = doc.nodes[table]
-            .children
-            .iter()
-            .flat_map(|child| {
-                let group = matches!(doc.nodes[*child].tag.as_str(), "thead" | "tbody" | "tfoot");
-                let rows = if group {
-                    &doc.nodes[*child].children[..]
-                } else {
-                    std::slice::from_ref(child)
-                };
-                rows.iter().map(move |&row| (row, group.then_some(*child)))
-            })
-            .filter(|&(row, _)| doc.nodes[row].tag == "tr")
-            .map(|(row, group)| Line {
-                row: (row, StyleRef(own_style(styles, row))),
-                group: group.map(|group| (group, StyleRef(own_style(styles, group)))),
-                cells: doc.nodes[row]
-                    .children
-                    .iter()
-                    .filter(|&&cell| matches!(doc.nodes[cell].tag.as_str(), "td" | "th"))
-                    .map(|&cell| {
-                        let span = doc.nodes[cell]
-                            .attrs
-                            .get("colspan")
-                            .and_then(|value| value.parse::<usize>().ok())
-                            .unwrap_or(1)
-                            .clamp(1, 1000);
-                        (cell, StyleRef(own_style(styles, cell)), span)
-                    })
-                    .collect(),
-            })
-            .filter(|line| !line.cells.is_empty())
-            .collect();
-        type Edge = (f32, u8, usize, usize);
-        let wins = |a: Edge, b: Edge| if (b.0, b.1) > (a.0, a.1) { b } else { a };
-        let mut edge = |style: &Rc<Style>, id: usize, side: usize| -> Edge {
-            let sides = match edges.get(&Rc::as_ptr(style)) {
-                Some((_, sides)) => *sides,
-                None => {
-                    let sides =
-                        SIDES.map(
-                            |[kind, width, ..]| match style.get(kind).unwrap_or("none") {
-                                "none" | "hidden" => (0., 0),
-                                kind => (
-                                    style
-                                        .get(width)
-                                        .map_or(Some(3.), |value| lengths[id].resolve(value, 0.))
-                                        .unwrap_or(0.)
-                                        .max(0.),
-                                    match kind {
-                                        "double" => 8,
-                                        "solid" => 7,
-                                        "dashed" => 6,
-                                        "dotted" => 5,
-                                        "ridge" => 4,
-                                        "outset" => 3,
-                                        "groove" => 2,
-                                        "inset" => 1,
-                                        _ => 0,
-                                    },
-                                ),
-                            },
-                        );
-                    edges.insert(Rc::as_ptr(style), (style.clone(), sides));
-                    sides
-                }
-            };
-            (sides[side].0, sides[side].1, id, side)
-        };
-        let frame = [0, 1, 2, 3].map(|side| edge(&table_style, table, side));
-        let mut own = |index: usize| -> Vec<[Edge; 4]> {
-            let line = &lines[index];
-            let group = line.group.as_ref().map(|group| group.0);
-            let first = index == 0 || lines[index - 1].group.as_ref().map(|group| group.0) != group;
-            let last = lines
-                .get(index + 1)
-                .is_none_or(|next| next.group.as_ref().map(|group| group.0) != group);
-            line.cells
-                .iter()
-                .enumerate()
-                .map(|(column, (cell, style, _))| {
-                    let mut sides = [0, 1, 2, 3].map(|side| edge(&style.0, *cell, side));
-                    for (position, (owner, style)) in [Some(&line.row), line.group.as_ref()]
-                        .into_iter()
-                        .flatten()
-                        .enumerate()
-                    {
-                        let whole = position == 0;
-                        for (side, applies) in [
-                            (0, whole || first),
-                            (1, column + 1 == line.cells.len()),
-                            (2, whole || last),
-                            (3, column == 0),
-                        ] {
-                            if applies {
-                                sides[side] = wins(sides[side], edge(&style.0, *owner, side));
-                            }
-                        }
-                    }
-                    sides
-                })
-                .collect()
-        };
-        let share = |above: &mut [[Edge; 4]], a: &Line, below: &mut [[Edge; 4]], b: &Line| {
-            let ends = |line: &Line| {
-                line.cells
-                    .iter()
-                    .scan(0, |end, cell| {
-                        *end += cell.2;
-                        Some(*end)
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let (top, bottom) = (ends(a), ends(b));
-            let (mut i, mut j) = (0, 0);
-            while i < above.len() && j < below.len() {
-                if top[i] - a.cells[i].2 < bottom[j] && bottom[j] - b.cells[j].2 < top[i] {
-                    let shared = wins(above[i][2], below[j][0]);
-                    (above[i][2], below[j][0]) = (shared, shared);
-                }
-                if top[i] <= bottom[j] {
-                    i += 1;
-                } else {
-                    j += 1;
-                }
-            }
-        };
-        let mut old = style_cache.tables.remove(&table).unwrap_or_default();
-        let whole = old.size != [width, height]
-            || old
-                .table
-                .as_ref()
-                .is_none_or(|(style, ..)| !Rc::ptr_eq(&style.0, &table_style));
-        let mut moved: Option<FxHashMap<usize, usize>> = None;
-        let mut shared = std::mem::take(&mut old.styles);
-        let mut adjusted: Vec<(Vec<Rc<Style>>, [f32; 4])> = Vec::with_capacity(lines.len());
-        let mut widest = [0f32; 4];
-        for index in 0..lines.len() {
-            let row = lines[index].row.0;
-            let before = match old.lines.get(index) {
-                Some(line) if line.row.0 == row => Some(index),
-                _ => moved
-                    .get_or_insert_with(|| {
-                        old.lines
-                            .iter()
-                            .enumerate()
-                            .map(|(index, line)| (line.row.0, index))
-                            .collect()
-                    })
-                    .get(&row)
-                    .copied(),
-            };
-            let same = before.filter(|&before| {
-                !whole
-                    && (0..3).all(|step| {
-                        lines.get((index + step).wrapping_sub(1))
-                            == old.lines.get((before + step).wrapping_sub(1))
-                    })
-            });
-            let line = match same {
-                Some(before) => std::mem::take(&mut old.adjusted[before]),
-                None => {
-                    let mut cells = own(index);
-                    if index > 0 {
-                        share(
-                            &mut own(index - 1),
-                            &lines[index - 1],
-                            &mut cells,
-                            &lines[index],
-                        );
-                    }
-                    if index + 1 < lines.len() {
-                        share(
-                            &mut cells,
-                            &lines[index],
-                            &mut own(index + 1),
-                            &lines[index + 1],
-                        );
-                    }
-                    for column in 1..cells.len() {
-                        let shared = wins(cells[column - 1][1], cells[column][3]);
-                        (cells[column - 1][1], cells[column][3]) = (shared, shared);
-                    }
-                    let mut outer = [0f32; 4];
-                    let count = cells.len();
-                    for (column, sides) in cells.iter_mut().enumerate() {
-                        for (side, outer) in outer.iter_mut().enumerate() {
-                            let at = match side {
-                                0 => index == 0,
-                                1 => column + 1 == count,
-                                2 => index + 1 == lines.len(),
-                                _ => column == 0,
-                            };
-                            if at {
-                                sides[side] = wins(sides[side], frame[side]);
-                                *outer = outer.max(sides[side].0);
-                            }
-                        }
-                    }
-                    let cells = lines[index]
-                        .cells
-                        .iter()
-                        .zip(cells)
-                        .map(|((cell, own, _), sides)| {
-                            let side = |side: usize| {
-                                let (width, _, owner, from) = sides[side];
-                                let [_, kind, color] = BORDERS[from];
-                                (
-                                    width,
-                                    (owner != *cell || from != side).then(|| {
-                                        let owner = own_style(styles, owner);
-                                        [
-                                            if width > 0. {
-                                                owner.value(kind).cloned()
-                                            } else {
-                                                Some("none".into())
-                                            },
-                                            owner.value(color).cloned(),
-                                        ]
-                                    }),
-                                )
-                            };
-                            let sides = [side(0), side(1), side(2), side(3)];
-                            let key = (
-                                own.clone(),
-                                sides.clone().map(|(width, taken)| (width.to_bits(), taken)),
-                            );
-                            shared
-                                .entry(key)
-                                .or_insert_with(|| {
-                                    let mut style = (*own.0).clone();
-                                    for (side, ([_, _, margin, _], (width, taken))) in
-                                        SIDES.into_iter().zip(sides).enumerate()
-                                    {
-                                        if let Some([kind, color]) = taken {
-                                            for (prop, value) in BORDERS[side].into_iter().zip([
-                                                Some(format!("{width}px").into()),
-                                                kind,
-                                                color,
-                                            ]) {
-                                                if let Some(value) = value {
-                                                    style.insert(prop, value);
-                                                }
-                                            }
-                                        }
-                                        style.insert(margin, format!("{}px", -width / 2.));
-                                    }
-                                    Rc::new(style)
-                                })
-                                .clone()
-                        })
-                        .collect();
-                    (cells, outer)
-                }
-            };
-            for (widest, outer) in widest.iter_mut().zip(line.1) {
-                *widest = widest.max(outer);
-            }
-            adjusted.push(line);
-        }
-        let count: usize = lines.iter().map(|line| line.cells.len()).sum();
-        if shared.len() > 2 * count + 64 {
-            shared.retain(|_, style| Rc::strong_count(style) > 1);
-        }
-        let key = (StyleRef(table_style.clone()), widest.map(f32::to_bits));
-        let style = match old.table.take() {
-            Some((style, bits, adjusted)) if (style.clone(), bits) == key => adjusted,
-            _ => {
-                let mut style = (*table_style).clone();
-                for ([_, width, _, padding], widest) in SIDES.into_iter().zip(widest) {
-                    style.insert(width, "0");
-                    style.insert(padding, format!("{}px", widest / 2.));
-                }
-                Rc::new(style)
-            }
-        };
-        // Writes only where the style changed, as each write copies a shared chunk of the styles.
-        authored.reserve(adjusted.iter().map(|line| line.0.len()).sum::<usize>() + 1);
-        for (id, own, style) in lines
-            .iter()
-            .zip(&adjusted)
-            .flat_map(|(line, (cells, _))| {
-                line.cells
-                    .iter()
-                    .zip(cells)
-                    .map(|((cell, own, _), style)| (*cell, &own.0, style))
-            })
-            .chain(std::iter::once((table, &table_style, &style)))
-        {
-            if !Rc::ptr_eq(&styles[id], style) {
-                styles[id] = style.clone();
-            }
-            authored.insert(id, own.clone());
-        }
-        style_cache.tables.insert(
-            table,
-            CollapsedTable {
-                pass: style_cache.pass,
-                size: [width, height],
-                table: Some((key.0, key.1, style)),
-                lines,
-                adjusted,
-                styles: shared,
-            },
-        );
-    }
-    for (&table, old) in style_cache
-        .tables
-        .iter()
-        .filter(|(_, old)| old.pass != style_cache.pass)
-    {
-        for id in old
-            .lines
-            .iter()
-            .flat_map(|line| line.cells.iter().map(|cell| cell.0))
-            .chain([table])
-        {
-            let own = own_style(styles, id);
-            if !Rc::ptr_eq(&styles[id], &own) {
-                styles[id] = own;
-            }
-        }
-    }
-    // A block whose children are all table parts outside a table lays out as their anonymous table, and its rows
-    // and row groups pass their cells on to it. Blocks with other content keep their parts as they are.
-    orphans.sort_unstable();
-    orphans.dedup();
-    orphans.retain(|&host| {
-        let part = |child: usize| matches!(style_flags[child] >> 8, CELL | CAPTION | 10..=12);
-        if host >= count
-            || walk.walk.place(host).is_none()
-            || !doc.nodes[host].children.iter().any(|&child| part(child))
-        {
-            return false;
-        }
-        let role = match styles[host].get(Prop::DISPLAY) {
-            Some("block") => 13,
-            Some("inline-block") => 14,
-            _ => return true,
-        };
-        if style_flags[host] >> 8 != 0
-            || shadows.roots.contains_key(&host)
-            || !doc.nodes[host].children.iter().all(|&child| {
-                let (node, style) = (&doc.nodes[child], &styles[child]);
-                match node.tag.as_str() {
-                    "#text" => node.text.trim_ascii().is_empty(),
-                    "#comment" => true,
-                    _ => {
-                        part(child)
-                            || style_flags[child] & DISPLAY_NONE != 0
-                            || style
-                                .get(Prop::DISPLAY)
-                                .is_some_and(|value| value.starts_with("table-column"))
-                            || style
-                                .get(Prop::POSITION)
-                                .is_some_and(|value| matches!(value, "absolute" | "fixed"))
-                    }
-                }
-            })
-        {
-            return true;
-        }
-        let rows = doc.nodes[host]
-            .children
-            .iter()
-            .copied()
-            .filter(|&child| matches!(style_flags[child] >> 8, 10..=12))
-            .collect::<Vec<_>>();
-        for id in std::iter::once(host).chain(rows) {
-            let (own, flags) = (styles[id].clone(), style_flags[id]);
-            let (role, display) = match flags >> 8 {
-                10 => (ROW, "contents"),
-                11 => (5, "contents"),
-                12 => (HEADER, "contents"),
-                _ => (role, ["grid", "inline-grid"][usize::from(role == 14)]),
-            };
-            let kept = previous
-                .filter(|previous| fast && previous.anonymous.contains_key(&id))
-                .filter(|previous| {
-                    previous
-                        .authored
-                        .get(&id)
-                        .is_some_and(|old| Rc::ptr_eq(old, &own))
-                })
-                .and_then(|previous| previous.values.get(id).cloned());
-            styles[id] = kept.unwrap_or_else(|| {
-                let mut style = (*own).clone();
-                style.insert(Prop::DISPLAY, display);
-                if id == host {
-                    style.insert(Prop::JUSTIFY_CONTENT, "start");
-                    style.insert(Prop::ALIGN_CONTENT, "start");
-                    border_spacing(&mut style);
-                }
-                Rc::new(style)
-            });
-            style_flags[id] =
-                (flags & 0xff) | role << 8 | (u16::from(display == "contents") * DISPLAY_CONTENTS);
-            authored.insert(id, own);
-            anonymous.insert(id, flags);
-        }
-        true
-    });
+    number_lists(
+        doc, &walk, &mut out, previous, last, fast, recount, counters,
+    );
+    style_cache.collapse_tables(doc, &walk, &mut out, [width, height], previous, fast);
+    anonymous_tables(doc, &walk, &shadows, &mut out, previous, fast, &mut orphans);
     style_cache.orphans = orphans;
     #[cfg(debug_assertions)]
     if fast {
-        style_cache.incremental += 1;
-        let mut fresh = StyleCache {
-            cssom: style_cache.cssom.clone(),
-            constructed: style_cache.constructed.clone(),
-            adopted: style_cache.adopted.clone(),
-            containers: style_cache.containers.clone(),
-            scripted: style_cache.scripted.clone(),
-            tailwind: std::mem::take(&mut style_cache.tailwind),
-            unshared: true,
-            ..Default::default()
-        };
-        let full = compute_styles(doc, width, height, text_system, cache, &mut fresh, context);
-        style_cache.tailwind = fresh.tailwind;
-        let groups = |a: Option<&Shadowed>, b: Option<&Shadowed>| match (a, b) {
-            (Some(a), Some(b)) => {
-                a.len() == b.len()
-                    && a.iter().zip(b.iter()).all(|(a, b)| {
-                        a.name == b.name
-                            && a.compound.len() == b.compound.len()
-                            && a.conditions.is_some() == b.conditions.is_some()
-                            && (a.rule.kind, a.rule.context, a.rule.specificity)
-                                == (b.rule.kind, b.rule.context, b.rule.specificity)
-                            && a.rule.declarations == b.rule.declarations
-                    })
-            }
-            (a, b) => a.is_none() && b.is_none(),
-        };
-        for id in 0..doc.nodes.len() {
-            let same = [
-                groups(full.slotted.get(&id), out.slotted.get(&id)),
-                groups(full.parts.get(&id), out.parts.get(&id)),
-                groups(full.exported.get(&id), out.exported.get(&id)),
-                *full.values[id] == *out.values[id],
-                full.vars[id] == out.vars[id],
-                full.flags[id] == out.flags[id],
-                full.lengths[id] == out.lengths[id],
-                full.pseudos.get(&id) == out.pseudos.get(&id),
-                full.text_pseudos.get(&id) == out.text_pseudos.get(&id),
-                full.backdrops.get(&id) == out.backdrops.get(&id),
-                full.backdrop_starts.get(&id) == out.backdrop_starts.get(&id),
-                full.scrollbars.get(&id) == out.scrollbars.get(&id),
-                full.selections.get(&id) == out.selections.get(&id),
-                format!("{:?}", full.animations.get(&id))
-                    == format!("{:?}", out.animations.get(&id)),
-                full.important.get(&id) == out.important.get(&id),
-                full.starting.get(&id) == out.starting.get(&id),
-                full.containers[id] == out.containers[id],
-            ];
-            assert!(
-                same.iter().all(|same| *same),
-                "incremental style of node {id} <{}> differs from a full pass: {same:?}",
-                doc.nodes[id].tag
-            );
-        }
+        check_incremental(
+            doc,
+            width,
+            height,
+            text_system,
+            cache,
+            style_cache,
+            context,
+            &out,
+        );
     }
     out
+}
+
+// Checks that an incremental pass gives what a full pass gives.
+#[cfg(debug_assertions)]
+#[allow(clippy::too_many_arguments)]
+fn check_incremental(
+    doc: &Document,
+    width: f32,
+    height: f32,
+    text_system: Option<&renderer::TextSystem>,
+    cache: &mut HashMap<Rc<str>, Rc<Stylesheet>>,
+    style_cache: &mut StyleCache,
+    context: Option<&StyleContext>,
+    out: &ComputedStyles,
+) {
+    style_cache.incremental += 1;
+    let mut fresh = StyleCache {
+        cssom: style_cache.cssom.clone(),
+        constructed: style_cache.constructed.clone(),
+        adopted: style_cache.adopted.clone(),
+        containers: style_cache.containers.clone(),
+        scripted: style_cache.scripted.clone(),
+        tailwind: std::mem::take(&mut style_cache.tailwind),
+        unshared: true,
+        ..Default::default()
+    };
+    let full = compute_styles(doc, width, height, text_system, cache, &mut fresh, context);
+    style_cache.tailwind = fresh.tailwind;
+    let groups = |a: Option<&Shadowed>, b: Option<&Shadowed>| match (a, b) {
+        (Some(a), Some(b)) => {
+            a.len() == b.len()
+                && a.iter().zip(b.iter()).all(|(a, b)| {
+                    a.name == b.name
+                        && a.compound.len() == b.compound.len()
+                        && a.conditions.is_some() == b.conditions.is_some()
+                        && (a.rule.kind, a.rule.context, a.rule.specificity)
+                            == (b.rule.kind, b.rule.context, b.rule.specificity)
+                        && a.rule.declarations == b.rule.declarations
+                })
+        }
+        (a, b) => a.is_none() && b.is_none(),
+    };
+    for id in 0..doc.nodes.len() {
+        let same = [
+            groups(full.slotted.get(&id), out.slotted.get(&id)),
+            groups(full.parts.get(&id), out.parts.get(&id)),
+            groups(full.exported.get(&id), out.exported.get(&id)),
+            *full.values[id] == *out.values[id],
+            full.vars[id] == out.vars[id],
+            full.flags[id] == out.flags[id],
+            full.lengths[id] == out.lengths[id],
+            full.pseudos.get(&id) == out.pseudos.get(&id),
+            full.text_pseudos.get(&id) == out.text_pseudos.get(&id),
+            full.backdrops.get(&id) == out.backdrops.get(&id),
+            full.backdrop_starts.get(&id) == out.backdrop_starts.get(&id),
+            full.scrollbars.get(&id) == out.scrollbars.get(&id),
+            full.selections.get(&id) == out.selections.get(&id),
+            format!("{:?}", full.animations.get(&id)) == format!("{:?}", out.animations.get(&id)),
+            full.important.get(&id) == out.important.get(&id),
+            full.starting.get(&id) == out.starting.get(&id),
+            full.containers[id] == out.containers[id],
+        ];
+        assert!(
+            same.iter().all(|same| *same),
+            "incremental style of node {id} <{}> differs from a full pass: {same:?}",
+            doc.nodes[id].tag
+        );
+    }
 }
