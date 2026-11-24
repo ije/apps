@@ -121,7 +121,7 @@ fn limits() -> WebSocketConfig {
 
 #[derive(Default)]
 pub(crate) struct State {
-    pub(crate) sockets: HashMap<u64, Socket>,
+    sockets: HashMap<u64, Socket>,
     next_id: u64,
 }
 
@@ -163,6 +163,16 @@ impl State {
             },
         );
         Ok(self.next_id)
+    }
+
+    pub(crate) fn is_open(&self, id: u64) -> bool {
+        self.sockets.contains_key(&id)
+    }
+
+    pub(crate) fn close(&mut self, ids: &[u64]) {
+        for id in ids {
+            self.sockets.remove(id);
+        }
     }
 
     pub(crate) fn accept(

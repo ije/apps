@@ -32,6 +32,11 @@ struct Checked(
     bool,
     Mutex<Option<(&'static str, String)>>,
 );
+impl Checked {
+    fn take_failure(&self) -> Option<(&'static str, String)> {
+        self.2.lock().unwrap().take()
+    }
+}
 impl ServerCertVerifier for Checked {
     fn verify_server_cert(
         &self,
@@ -297,7 +302,7 @@ async fn run(
             .connect(name, plain)
             .await
             .map_err(|error| {
-                let found = checked.2.lock().unwrap().take();
+                let found = checked.take_failure();
                 let inner = error.get_ref().and_then(|inner| inner.downcast_ref());
                 let details = match (found, inner) {
                     (Some((code, message)), _) => json!({"code":code,"message":message}),
@@ -329,7 +334,7 @@ async fn run(
             "protocol": if modern { "TLSv1.3" } else { "TLSv1.2" },
             "cipher": session.negotiated_cipher_suite().map(|suite| u16::from(suite.suite())),
             "alpn": session.alpn_protocol().map(String::from_utf8_lossy),
-            "error": checked.2.lock().unwrap().take().map(|(code, _)| code),
+            "error": checked.take_failure().map(|(code, _)| code),
         });
         let cert = session
             .peer_certificates()

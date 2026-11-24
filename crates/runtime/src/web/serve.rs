@@ -403,7 +403,7 @@ impl State {
                     upgrade.context("Request is not a WebSocket upgrade")?,
                     protocol.to_owned(),
                 )?;
-                server.sockets.retain(|id| sockets.sockets.contains_key(id));
+                server.sockets.retain(|id| sockets.is_open(*id));
                 server.sockets.push(socket);
                 let _ = reply.send(response);
                 Ok(json!(socket))
@@ -418,9 +418,7 @@ impl State {
                         server.stop.send_replace(true);
                     }
                 } else if let Some(server) = self.servers.remove(&id) {
-                    for id in &server.sockets {
-                        sockets.sockets.remove(id);
-                    }
+                    sockets.close(&server.sockets);
                 }
                 Ok(Value::Null)
             }
