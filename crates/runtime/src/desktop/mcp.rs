@@ -1,5 +1,10 @@
 use super::{Desktop, main::state_json, png};
-use crate::{host::link::Link, jsc, jsc::Role};
+use crate::{
+    host::link::Link,
+    jsc,
+    jsc::Role,
+    native::devtools::{Done, Host},
+};
 use anyhow::{Context as _, Result, anyhow, bail};
 use renderer::{App, Button, Event, Key, Modifiers, WheelPhase, WindowId, point, px};
 use serde_json::{Value, json};
@@ -8,19 +13,6 @@ use std::{
     sync::{Arc, Mutex, OnceLock, PoisonError},
     time::Instant,
 };
-
-// The reply, ok, JSON value or error text, and an optional PNG.
-type Done = extern "C" fn(*mut c_void, bool, *const u8, usize, *const u8, usize);
-
-#[repr(C)]
-struct Host {
-    connect: extern "C" fn(usize) -> i32,
-    inspect: extern "C" fn(usize, *const u8, usize) -> bool,
-    messages: extern "C" fn(*mut c_void, extern "C" fn(*mut c_void, usize, *const u8, usize)),
-    contexts: extern "C" fn(*mut c_void, extern "C" fn(*mut c_void, usize, u32, u64)),
-    wake: extern "C" fn(u64),
-    call: extern "C" fn(*mut c_void, *const u8, usize, *const u8, usize, *mut c_void, Done),
-}
 
 static LINK: OnceLock<Link> = OnceLock::new();
 static HOST: Host = Host {

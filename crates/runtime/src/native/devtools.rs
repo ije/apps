@@ -37,6 +37,22 @@ pub(crate) fn text(agent: bool) -> Result<&'static str> {
     })?)
 }
 
+// The reply, ok, JSON value or error text, and an optional PNG.
+pub(crate) type Done = extern "C" fn(*mut c_void, bool, *const u8, usize, *const u8, usize);
+
+// The functions that the MCP server of the library calls. Match `apps_devtools::mcp::Host`.
+#[repr(C)]
+pub(crate) struct Host {
+    pub(crate) connect: extern "C" fn(usize) -> i32,
+    pub(crate) inspect: extern "C" fn(usize, *const u8, usize) -> bool,
+    pub(crate) messages:
+        extern "C" fn(*mut c_void, extern "C" fn(*mut c_void, usize, *const u8, usize)),
+    pub(crate) contexts: extern "C" fn(*mut c_void, extern "C" fn(*mut c_void, usize, u32, u64)),
+    pub(crate) wake: extern "C" fn(u64),
+    pub(crate) call:
+        extern "C" fn(*mut c_void, *const u8, usize, *const u8, usize, *mut c_void, Done),
+}
+
 struct Library {
     install: extern "C" fn(u64),
     uninstall: extern "C" fn(),
@@ -49,10 +65,10 @@ struct Library {
 static LIBRARY: OnceLock<Library> = OnceLock::new();
 
 // Starts the MCP server of the library with the functions of `host`, which the library calls.
-pub(crate) fn start<H>(port: u16, host: &'static H) -> Result<()> {
+pub(crate) fn start(port: u16, host: &'static Host) -> Result<()> {
     let library = load()?;
     let (start, paused, functions) = unsafe {
-        let start: extern "C" fn(u16, &'static H) -> *const c_char =
+        let start: extern "C" fn(u16, &'static Host) -> *const c_char =
             *library.get(b"apps_devtools_mcp_start\0")?;
         let paused: unsafe extern "C" fn(usize, *mut bool) =
             *library.get(b"apps_devtools_mcp_paused\0")?;
