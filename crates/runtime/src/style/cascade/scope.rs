@@ -1047,3 +1047,72 @@ impl StyleCache {
             .collect()
     }
 }
+
+impl StyleCache {
+    pub(crate) fn set_containers(
+        &mut self,
+        sizes: &FxHashMap<usize, [f32; 2]>,
+        doc: &Document,
+    ) -> bool {
+        self.units.clear();
+        if *sizes == self.containers {
+            return false;
+        }
+        // Styles with container units are not shared, so only the nodes in a resized container need a new style.
+        let mut flipped: rustc_hash::FxHashSet<usize> = self
+            .sized
+            .iter()
+            .copied()
+            .filter(|id| sizes.get(id) != self.containers.get(id))
+            .collect();
+        self.units.extend(&flipped);
+        for (&(scope, order, index, container), &(inline, matched, lengths)) in &self.queries {
+            let query = self
+                .scopes
+                .iter()
+                .find(|cached| cached.id == scope)
+                .and_then(|scope| scope.containers.get(order)?.as_ref()?.get(index));
+            if query.is_none_or(|(_, _, query)| {
+                sizes.get(&container).is_some_and(|size| {
+                    query.matches(
+                        size[0],
+                        if inline { f32::NAN } else { size[1] },
+                        false,
+                        0,
+                        lengths,
+                    ) == Some(true)
+                }) != matched
+            }) {
+                flipped.insert(container);
+            }
+        }
+        self.containers = sizes.clone();
+        if flipped.is_empty() {
+            return false;
+        }
+        self.queries
+            .retain(|&(_, _, _, container), _| !flipped.contains(&container));
+        let mut pending: Vec<_> = flipped.iter().map(|&id| (id, true)).collect();
+        while let Some((id, root)) = pending.pop() {
+            // A flipped container inside another one is walked once, as its own root.
+            let Some(node) = doc.nodes.get(id).filter(|_| root || !flipped.contains(&id)) else {
+                continue;
+            };
+            pending.extend(
+                self.shadows
+                    .composed
+                    .get(&id)
+                    .unwrap_or(&node.children)
+                    .iter()
+                    .map(|&child| (child, false)),
+            );
+            for scope in &mut self.scopes {
+                if let Some(Some(node)) = scope.nodes.get_mut(id) {
+                    node.cached = None;
+                }
+            }
+            self.matches.mark(id, false);
+        }
+        true
+    }
+}
