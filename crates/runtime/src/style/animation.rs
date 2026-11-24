@@ -110,6 +110,7 @@ impl Animation {
         style: &Style,
         keyframes: &HashMap<String, Vec<(f32, Declarations)>>,
         registry: &Registry,
+        theme: u32,
     ) -> Vec<Self> {
         let shorthand = components(style.get(Prop::ANIMATION).unwrap_or("none"), ',');
         if shorthand.is_empty() {
@@ -205,7 +206,7 @@ impl Animation {
                         })
                         .unwrap_or(0),
                     pseudo: 0,
-                    tracks: tracks(style, &rules, registry, true),
+                    tracks: tracks(style, &rules, registry, theme, true),
                 })
             })
             .collect()
@@ -216,6 +217,7 @@ fn tracks(
     style: &Style,
     rules: &[(f64, Style, Option<Easing>)],
     registry: &Registry,
+    theme: u32,
     merge: bool,
 ) -> Vec<(Prop, Vec<Keyframe>)> {
     let mut tracks: Vec<(Prop, Vec<Keyframe>)> = Vec::new();
@@ -234,7 +236,7 @@ fn tracks(
                     Some((key, value.clone()))
                 }),
         );
-        resolve_style(&mut frame, Some(style), None, &custom, registry);
+        resolve_style(&mut frame, Some(style), None, &custom, registry, theme);
         resolve_keywords(&mut frame, Some(style), None);
         for (key, value) in declarations.iter() {
             if value.ends_with("!important")
@@ -963,7 +965,7 @@ impl Scripted {
             .as_ref()
             .is_none_or(|(old, vars)| !Rc::ptr_eq(old, &owner) || !Rc::ptr_eq(vars, base.vars()))
         {
-            self.effect.tracks = tracks(&base, &self.rules, &styles.registry, false);
+            self.effect.tracks = tracks(&base, &self.rules, &styles.registry, styles.theme, false);
             self.base = Some((owner, base.vars().clone()));
         }
         let (local, paused) = (self.playback.at(now), self.playback.rate == 0.);
@@ -3940,7 +3942,8 @@ mod tests {
         let new = |frames: &[(f64, &str, &str)], timing, direction, fill, easing| {
             let mut animation =
                 Scripted::new(1, frames, timing, [direction, fill, easing, "replace"], 0);
-            animation.effect.tracks = tracks(&base, &animation.rules, &Default::default(), false);
+            animation.effect.tracks =
+                tracks(&base, &animation.rules, &Default::default(), 0, false);
             animation
         };
         let frames = [(0., "opacity:0", "linear"), (1., "opacity:1", "linear")];
@@ -4174,7 +4177,8 @@ mod tests {
                     (Prop::new("animation-name"), "pulse".into())
                 ]),
                 &frames,
-                &Default::default()
+                &Default::default(),
+                0
             )
             .is_empty()
         );
@@ -4185,7 +4189,8 @@ mod tests {
                     (Prop::new("animation-iteration-count"), "NaN".into())
                 ]),
                 &frames,
-                &Default::default()
+                &Default::default(),
+                0
             )
             .is_empty()
         );
@@ -4894,7 +4899,7 @@ mod tests {
             ["normal", "both", "steps(2, jump-start)", "replace"],
             0,
         );
-        animation.effect.tracks = tracks(&base, &animation.rules, &Default::default(), false);
+        animation.effect.tracks = tracks(&base, &animation.rules, &Default::default(), 0, false);
         let opacity = |local: f64| {
             let mut out = Style::new();
             animation

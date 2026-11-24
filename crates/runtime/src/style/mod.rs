@@ -1683,10 +1683,6 @@ impl ComputedStyles {
     }
 }
 
-pub(crate) fn reduced_motion() -> bool {
-    crate::desktop::native::theme_state() & 32 != 0
-}
-
 struct Collect<'a> {
     width: f32,
     height: f32,
@@ -2022,6 +2018,8 @@ pub(crate) struct ComputedStyles {
     counted: bool,
     // The node revision of the document that this pass styled.
     revision: u64,
+    // The native theme bits that this pass styled with.
+    theme: u32,
 }
 
 pub(crate) type Shadowed = Rc<Vec<Passed>>;
@@ -2127,7 +2125,7 @@ pub(crate) fn compute_styles(
     // The generation and revision of each dependency key in the list of the current node.
     let (mut unique, mut generation) = (Vec::<(u32, u32)>::new(), 0u32);
     let (reduced_motion, native_theme) = context.map_or_else(
-        || (reduced_motion(), crate::desktop::native::theme_state()),
+        || (false, 0),
         |context| (context.reduced_motion, context.theme),
     );
     if let Some(text) = text_system {
@@ -2846,6 +2844,7 @@ pub(crate) fn compute_styles(
             })
     });
     out.registry = registry.clone();
+    out.theme = native_theme;
     let count = doc.nodes.len();
     match previous.filter(|_| fast) {
         Some(previous) => {
@@ -4513,6 +4512,7 @@ pub(crate) fn compute_styles(
             parent_vars,
             &declared,
             &registry,
+            native_theme,
         );
         let parent_units = up.map(|up| lengths[up]);
         let mut keyword = resolve_keywords(
@@ -4999,6 +4999,7 @@ pub(crate) fn compute_styles(
                 parent_vars,
                 &declared,
                 &registry,
+                native_theme,
             );
             keyword |= resolve_keywords(
                 &mut values,
@@ -5031,7 +5032,14 @@ pub(crate) fn compute_styles(
                     }
                     Some((prop, value.clone()))
                 }));
-                resolve_style(&mut values, Some(&style), None, &declared, &registry);
+                resolve_style(
+                    &mut values,
+                    Some(&style),
+                    None,
+                    &declared,
+                    &registry,
+                    native_theme,
+                );
                 resolve_keywords(&mut values, Some(&style), Some(&units));
                 if !keep && declared.is_empty() {
                     values.set_vars(empty.clone());
@@ -5133,6 +5141,7 @@ pub(crate) fn compute_styles(
                 None,
                 &[],
                 &registry,
+                native_theme,
             );
             if !keep {
                 values.set_vars(empty.clone());
@@ -5219,7 +5228,7 @@ pub(crate) fn compute_styles(
         } else {
             let mut effects =
                 if style.contains(Prop::ANIMATION) || style.contains(Prop::ANIMATION_NAME) {
-                    Animation::parse(&style, &scoped.keyframes, &registry)
+                    Animation::parse(&style, &scoped.keyframes, &registry, native_theme)
                 } else {
                     Vec::new()
                 };
@@ -5230,7 +5239,7 @@ pub(crate) fn compute_styles(
             {
                 if pseudo.contains(Prop::ANIMATION) || pseudo.contains(Prop::ANIMATION_NAME) {
                     effects.extend(
-                        Animation::parse(pseudo, &scoped.keyframes, &registry)
+                        Animation::parse(pseudo, &scoped.keyframes, &registry, native_theme)
                             .into_iter()
                             .map(|mut effect| {
                                 effect.pseudo = slot as u8 + 1;
@@ -6358,6 +6367,7 @@ fn resolve_style(
     parent_vars: Option<&Vars>,
     declared: &[(Prop, Rc<str>)],
     registry: &Registry,
+    theme: u32,
 ) {
     if !declared.is_empty() {
         // Only custom properties are declared or referenced here.
@@ -6465,7 +6475,7 @@ fn resolve_style(
             }
         }
     }
-    let dark = dark(style);
+    let dark = dark(style, theme);
     style.retain(|prop, slot| {
         if prop.is_custom() || !slot.contains("light-dark(") {
             return true;
@@ -6582,11 +6592,10 @@ fn resolve_style(
     });
 }
 
-pub(crate) fn dark(style: &Style) -> bool {
-    style.get(Prop::COLOR_SCHEME).is_some_and(|v| {
-        v.contains("dark")
-            && (!v.contains("light") || crate::desktop::native::theme_state() & 1 != 0)
-    })
+pub(crate) fn dark(style: &Style, theme: u32) -> bool {
+    style
+        .get(Prop::COLOR_SCHEME)
+        .is_some_and(|v| v.contains("dark") && (!v.contains("light") || theme & 1 != 0))
 }
 
 // A table's border spacing is the gap of its grid and padding at its edges.

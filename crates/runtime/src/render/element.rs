@@ -2993,7 +2993,7 @@ fn create(
                 hashed(crate::desktop::native::theme_state() & 1),
             );
         }
-        style::dark(style)
+        style::dark(style, crate::desktop::native::theme_state())
     };
     if input.is_some_and(|kind| kind.eq_ignore_ascii_case("file"))
         && let Some(part) = styles

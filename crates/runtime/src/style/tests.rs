@@ -1083,10 +1083,7 @@ fn editor_media_caret_and_selection_styles() {
         .parent
         .and_then(|parent| doc.nodes[parent].parent)
         .unwrap();
-    assert_eq!(
-        wide.values[div].contains(Prop::ANIMATION),
-        !reduced_motion()
-    );
+    assert!(wide.values[div].contains(Prop::ANIMATION));
     let motion = |value: &str| {
         MediaQuery::Feature("prefers-reduced-motion".into(), ":".into(), value.into()).matches(
             800.,

@@ -1749,11 +1749,13 @@ impl renderer::Hooks for InlineText {
                             } else {
                                 0.
                             };
-                        let under = Color::hex(if style::dark(style) {
-                            0x101010ff
-                        } else {
-                            0xffffffff
-                        });
+                        let under = Color::hex(
+                            if style::dark(style, crate::desktop::native::theme_state()) {
+                                0x101010ff
+                            } else {
+                                0xffffffff
+                            },
+                        );
                         let rings =
                             vec![(at + 2., 2., under, "solid"), (at + 1., 2., color, "solid")];
                         (rings, (at, 1., 4.))

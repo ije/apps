@@ -4746,8 +4746,8 @@ pub(crate) fn styles(
         text_system.as_deref(),
         text_system.is_some().then_some(state.pixel_ratio),
     );
-    let reduced_motion = style::reduced_motion();
     let theme = state.theme();
+    let reduced_motion = theme & 32 != 0;
     let key = (viewport, scale, reduced_motion, theme);
     let animated = std::mem::take(&mut state.animated);
     let animating = !animated.is_empty();
