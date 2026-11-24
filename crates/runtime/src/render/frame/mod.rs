@@ -60,7 +60,8 @@ impl Cx<'_> {
         bounds: &LayoutMirror,
         id: usize,
     ) -> Result<(), usize> {
-        (self.view).place(self.doc, styles, texts, bounds, self.tree, self.near, id)
+        self.view
+            .place(self.doc, styles, texts, bounds, self.tree, self.near, id)
     }
 }
 
