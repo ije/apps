@@ -705,7 +705,7 @@ pub(super) fn text_rect(
     };
     let start = shown(args[1].as_u64().unwrap_or(0) as usize);
     let end = args[2].as_u64().map_or(start, |end| shown(end as usize));
-    if let Some((layout, text, range, rows, font)) = state.layout.text_layouts.get(&id) {
+    if let Some((layout, text, range, rows, font)) = state.layout.text_layout(id) {
         let content = &text[range.clone()];
         let source = doc.nodes[id].text.as_str();
         let [dx, dy] = state.geometry.scroll_shift(&state.styles.walk, id);
@@ -735,10 +735,7 @@ pub(super) fn text_rect(
     }
     // Text that this frame did not lay out, like the text of a block far from the view, lays out with its
     // block on the next reflow: `null` asks the script for one, as `dom.skipped` does.
-    let forced = &mut state.layout.measurements.forced;
-    if doc.nodes[id].parent.is_some() && forced.insert(id) {
-        state.layout.measurements.waking.push(id);
-        state.layout.cull.reskipped = true;
+    if doc.nodes[id].parent.is_some() && state.layout.force_layout(id) {
         return Ok(Value::Null);
     }
     Ok(if op == "dom.textRect" {

@@ -436,13 +436,13 @@ pub(super) fn computed(
     // Container units: the width of the nearest container, the height of the nearest size container.
     let mut sizes = [None, None];
     let queried =
-        !state.layout.containers.is_empty() && style.own().any(|(_, value)| value.contains("cq"));
+        !state.layout.containers().is_empty() && style.own().any(|(_, value)| value.contains("cq"));
     for node in std::iter::successors(doc.nodes[id].parent, |&node| doc.nodes[node].parent)
         .take_while(|_| queried)
     {
         let kind = styles.values[node].get(Prop::CONTAINER_TYPE);
         if let (Some(kind @ ("size" | "inline-size")), Some(size)) =
-            (kind, state.layout.containers.get(&node))
+            (kind, state.layout.containers().get(&node))
         {
             sizes[0] = sizes[0].or(Some(size[0]));
             if kind == "size" {
@@ -504,10 +504,7 @@ pub(super) fn computed(
         let outer = edges(style, units, rect[2], true);
         let inner = state
             .layout
-            .cull
-            .widths
-            .get(&node)
-            .copied()
+            .content_size(node)
             .unwrap_or([rect[2] - outer[1] - outer[3], rect[3] - outer[0] - outer[2]]);
         let padding = if position == "absolute" {
             edges(style, units, inner[0], false)
@@ -535,8 +532,7 @@ pub(super) fn computed(
         .find(|&parent| styles.values[parent].get(Prop::DISPLAY) != Some("contents"))
     })
     .flatten()
-    .filter(|parent| state.layout.tracks.contains_key(parent))
-    .and_then(|_| state.layout.areas.get(&id).copied());
+    .and_then(|grid| state.layout.grid_area(grid, id));
     let block = area.map_or(block, |[width, height]| [block[0], block[1], width, height]);
     let container = || [block[2], block[3]];
     let inline = !doc.nodes[id].tag.starts_with('#')
@@ -568,14 +564,11 @@ pub(super) fn computed(
         && style
             .get(Prop::CONTENT)
             .is_some_and(|content| !matches!(content, "none" | "normal")))
-    .then(|| {
-        let key = crate::render::inline::atom_key(id, if pseudo == "after" { 2 } else { 1 });
-        state.layout.pseudo_boxes.get(&key).copied()
-    })
+    .then(|| state.layout.pseudo_box(id, pseudo == "after"))
     .flatten();
     let size = (pseudo.is_empty() && !inline && shown(id))
         .then(|| {
-            let inner = state.layout.cull.widths.get(&id)?;
+            let inner = state.layout.content_size(id)?;
             let sides = edges(style, &units, block[2], true);
             Some([
                 inner[0] + sides[1] + sides[3],
@@ -841,7 +834,7 @@ pub(super) fn computed(
                         .get(Prop::DISPLAY)
                         .is_some_and(|display| display.ends_with("grid")) =>
             {
-                let Some(tracks) = state.layout.tracks.get(&id) else {
+                let Some(tracks) = state.layout.tracks(id) else {
                     return value;
                 };
                 let used = &tracks[usize::from(name == "grid-template-rows")];

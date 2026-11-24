@@ -5,7 +5,7 @@ pub(crate) mod measure;
 pub(crate) mod size;
 
 use crate::css;
-use std::{collections::HashMap, rc::Rc, sync::Arc};
+use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Row {
@@ -27,19 +27,6 @@ pub(crate) type TextLayout = (
     [renderer::Pixels; 2],
 );
 
-pub(crate) type SvgBoxes = (
-    Rc<str>,
-    Vec<(String, usize)>,
-    [f32; 2],
-    Vec<(usize, [f32; 4], [f32; 4])>,
-    [f32; 4],
-    [f32; 4],
-    [f32; 4],
-);
-
-// The mask of a box, 0, or of its `::before` or `::after`, 1 and 2: its inputs and its image.
-pub(crate) type Mask = (String, Option<Arc<renderer::RenderImage>>);
-
 pub(crate) struct LayoutNode {
     pub shape: u64,
     pub attrs: u64,
@@ -60,8 +47,8 @@ pub(crate) struct LayoutNode {
 
 #[derive(Default)]
 pub struct Layout {
-    pub(crate) text_layouts: rustc_hash::FxHashMap<usize, TextLayout>,
-    pub(crate) grids: rustc_hash::FxHashMap<
+    pub(in crate::render) text_layouts: rustc_hash::FxHashMap<usize, TextLayout>,
+    pub(in crate::render) grids: rustc_hash::FxHashMap<
         usize,
         (
             f32,
@@ -70,57 +57,106 @@ pub struct Layout {
             crate::render::layout::grid::Grid,
         ),
     >,
-    pub(crate) flexed_grids: rustc_hash::FxHashMap<usize, [Option<(f32, f32)>; 2]>,
-    pub(crate) grid_widest: rustc_hash::FxHashMap<usize, f32>,
+    pub(in crate::render) flexed_grids: rustc_hash::FxHashMap<usize, [Option<(f32, f32)>; 2]>,
+    pub(in crate::render) grid_widest: rustc_hash::FxHashMap<usize, f32>,
     // The used columns and rows of the last layout of each grid, for `getComputedStyle()`.
-    pub(crate) tracks: rustc_hash::FxHashMap<usize, [Box<[f32]>; 2]>,
+    pub(in crate::render) tracks: rustc_hash::FxHashMap<usize, [Box<[f32]>; 2]>,
     // The grid area of each grid item at its last build, for `getComputedStyle()`.
-    pub(crate) areas: rustc_hash::FxHashMap<usize, [f32; 2]>,
-    pub(crate) baselines: crate::render::layout::grid::Baselines,
-    pub(crate) layout_nodes: Vec<Option<LayoutNode>>,
-    pub(crate) measurements: crate::render::layout::measure::Measurements,
+    pub(in crate::render) areas: rustc_hash::FxHashMap<usize, [f32; 2]>,
+    pub(in crate::render) baselines: grid::Baselines,
+    pub(in crate::render) layout_nodes: Vec<Option<LayoutNode>>,
+    pub(in crate::render) measurements: measure::Measurements,
     pub painted: Vec<u64>,
     // A hash of the state that paint reads outside the boxes: images and the selection.
-    pub(crate) paint_inputs: u64,
-    pub(crate) layout_revision: u64,
-    pub(crate) containers: rustc_hash::FxHashMap<usize, [f32; 2]>,
-    pub(crate) atoms: rustc_hash::FxHashMap<usize, [f32; 3]>,
+    pub(in crate::render) paint_inputs: u64,
+    pub(in crate::render) layout_revision: u64,
+    pub(in crate::render) containers: rustc_hash::FxHashMap<usize, [f32; 2]>,
+    pub(in crate::render) atoms: rustc_hash::FxHashMap<usize, [f32; 3]>,
     // The rendered `::before` and `::after` boxes that scripts can read, by their atom key: the place of the border
     // box from the border box of the element in layout, its size, then the padding plus border of each side.
     pub pseudo_boxes: rustc_hash::FxHashMap<usize, [f32; 8]>,
-    pub(crate) container_pass: bool,
-    pub(crate) anchors: rustc_hash::FxHashMap<usize, renderer::Rect<renderer::Pixels>>,
-    pub(crate) blocks: rustc_hash::FxHashMap<usize, renderer::Rect<renderer::Pixels>>,
-    pub(crate) cull: crate::render::layout::cull::Cull,
+    pub(in crate::render) container_pass: bool,
+    pub(in crate::render) anchors: rustc_hash::FxHashMap<usize, renderer::Rect<renderer::Pixels>>,
+    pub(in crate::render) blocks: rustc_hash::FxHashMap<usize, renderer::Rect<renderer::Pixels>>,
+    pub(in crate::render) cull: cull::Cull,
     // The `content-visibility: auto` boxes, each with the boxes on its path, the boxes that clip it, and the view
     // and its top and bottom at its last change.
     #[allow(clippy::type_complexity)]
-    pub(crate) autos: rustc_hash::FxHashMap<usize, (Rc<[usize]>, Rc<[usize]>, (u64, [f32; 2]))>,
+    pub(in crate::render) autos:
+        rustc_hash::FxHashMap<usize, (Rc<[usize]>, Rc<[usize]>, (u64, [f32; 2]))>,
     // `contentvisibilityautostatechange` events: the box and whether it skips its contents now.
-    pub(crate) skip_events: Vec<(usize, bool)>,
-}
-
-#[derive(Default)]
-pub struct Rasters {
-    pub(crate) svg_boxes: rustc_hash::FxHashMap<usize, SvgBoxes>,
-    pub(crate) svg_trees: rustc_hash::FxHashMap<usize, usvg::Tree>,
-    pub(crate) masks: rustc_hash::FxHashMap<(usize, u8), Mask>,
-    pub(crate) svgs: rustc_hash::FxHashMap<usize, (Rc<str>, Arc<renderer::RenderImage>)>,
-    pub(crate) svg_cache: HashMap<
-        Rc<str>,
-        (
-            crate::render::raster::svg::SvgGeometry,
-            Vec<Arc<renderer::RenderImage>>,
-        ),
-    >,
-    pub(crate) backgrounds: HashMap<(usize, usize), (String, Arc<renderer::RenderImage>)>,
-    pub(crate) bitmaps: HashMap<String, Arc<renderer::RenderImage>>,
-    // The decoded source of each background layer, kept while the layer keeps its raster, so `retire` keeps it.
-    pub(crate) layer_sources: HashMap<(usize, usize), Arc<renderer::RenderImage>>,
-    pub(crate) gradients: Vec<(String, Arc<renderer::RenderImage>)>,
+    pub(in crate::render) skip_events: Vec<(usize, bool)>,
 }
 
 impl Layout {
+    // What scripts read of the last layout.
+
+    pub(crate) fn containers(&self) -> &rustc_hash::FxHashMap<usize, [f32; 2]> {
+        &self.containers
+    }
+
+    // The content box size of a box, as its last layout gave it.
+    pub(crate) fn content_size(&self, id: usize) -> Option<[f32; 2]> {
+        self.cull.widths.get(&id).copied()
+    }
+
+    // The used columns and rows of a grid.
+    pub(crate) fn tracks(&self, grid: usize) -> Option<&[Box<[f32]>; 2]> {
+        self.tracks.get(&grid)
+    }
+
+    // The size of the grid area of `item` when `grid` laid it out.
+    pub(crate) fn grid_area(&self, grid: usize, item: usize) -> Option<[f32; 2]> {
+        self.tracks
+            .contains_key(&grid)
+            .then(|| self.areas.get(&item).copied())?
+    }
+
+    // The `::before` or `::after` box of `id`.
+    pub(crate) fn pseudo_box(&self, id: usize, after: bool) -> Option<[f32; 8]> {
+        let key = crate::render::inline::atom_key(id, if after { 2 } else { 1 });
+        self.pseudo_boxes.get(&key).copied()
+    }
+
+    pub(crate) fn text_layout(&self, id: usize) -> Option<&TextLayout> {
+        self.text_layouts.get(&id)
+    }
+
+    // `contentvisibilityautostatechange` events since the last call.
+    pub(crate) fn take_skip_events(&mut self) -> Vec<(usize, bool)> {
+        std::mem::take(&mut self.skip_events)
+    }
+
+    // Whether the last frame culled `id` as hidden, and whether `id` is a `content-visibility: auto` box.
+    pub(crate) fn culled(&self, id: usize) -> bool {
+        self.cull.visible.get(id) == Some(&false)
+    }
+
+    pub(crate) fn auto_box(&self, id: usize) -> bool {
+        self.measurements.shown.contains_key(&id)
+    }
+
+    // A script reads the geometry of `id`: the boxes that skip it show their contents until the next frame. False
+    // when it already does.
+    pub(crate) fn force_layout(&mut self, id: usize) -> bool {
+        let forced = self.measurements.forced.insert(id);
+        if forced {
+            self.measurements.waking.push(id);
+            self.cull.reskipped = true;
+        }
+        forced
+    }
+
+    // The natural size of a decoded image.
+    pub(crate) fn set_natural(&mut self, id: usize, size: [f32; 2]) {
+        self.measurements.naturals.insert(id, size);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_container(&mut self, id: usize, size: [f32; 2]) {
+        self.containers.insert(id, size);
+    }
+
     // The content of node `id` changed, so it lays out again.
     pub(crate) fn relayout(&mut self, id: usize) {
         if let Some(node) = self.layout_nodes.get_mut(id) {
@@ -190,35 +226,5 @@ impl Layout {
         self.painted.truncate(len);
         self.painted.shrink_to_fit();
         self.cull.trim(len);
-    }
-}
-
-impl Rasters {
-    pub(crate) fn forget(&mut self, id: usize, retired: &mut Vec<Arc<renderer::RenderImage>>) {
-        retired.extend(
-            self.svgs
-                .remove(&id)
-                .map(|(_, image)| image)
-                .filter(|image| Arc::strong_count(image) == 1),
-        );
-        for slot in 0..3 {
-            retired.extend(self.masks.remove(&(id, slot)).and_then(|(_, image)| image));
-        }
-        self.svg_boxes.remove(&id);
-        self.svg_trees.remove(&id);
-    }
-
-    pub(crate) fn forget_all(
-        &mut self,
-        gone: &rustc_hash::FxHashSet<usize>,
-        retired: &mut Vec<Arc<renderer::RenderImage>>,
-    ) {
-        self.backgrounds.retain(|(node, _), (_, image)| {
-            let keep = !gone.contains(node);
-            if !keep {
-                retired.push(image.clone());
-            }
-            keep
-        });
     }
 }

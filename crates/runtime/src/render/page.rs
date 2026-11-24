@@ -13,7 +13,7 @@ pub struct PageState {
     pub interaction: crate::dom::Interaction,
     pub(crate) styles: style::Styles,
     pub layout: super::layout::Layout,
-    pub rasters: super::layout::Rasters,
+    pub rasters: super::raster::Rasters,
     pub media: super::media::Media,
     pub fonts: super::fonts::Fonts,
     pub base: Option<url::Url>,

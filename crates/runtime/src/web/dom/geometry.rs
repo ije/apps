@@ -27,11 +27,12 @@ pub(crate) fn layout_flags(doc: &mut Document, state: &mut PageState, viewport: 
 pub(super) fn scroll_events(state: &mut PageState) -> Result<Value> {
     let changed = state.geometry.scroll_events();
     let mut changed = json!(changed);
-    if !state.layout.skip_events.is_empty()
+    let skips = state.layout.take_skip_events();
+    if !skips.is_empty()
         && let Some(list) = changed.as_array_mut()
     {
         list.push(json!(
-            std::mem::take(&mut state.layout.skip_events)
+            skips
                 .into_iter()
                 .flat_map(|(id, skipped)| [id, usize::from(skipped)])
                 .collect::<Vec<_>>()
@@ -242,9 +243,7 @@ pub(super) fn client(
     let transformed = state.geometry.mirror.is_transformed(id);
     let size = state
         .layout
-        .cull
-        .widths
-        .get(&id)
+        .content_size(id)
         .filter(|_| transformed)
         .map_or([rect[2], rect[3]], |inner| {
             [
@@ -300,7 +299,7 @@ pub(super) fn skipped(
     let computed = state.restyle(doc, viewport);
     let (mut kind, mut roots) = (0, Vec::new());
     // An `auto` box that shows its contents from the next frame on still skips them.
-    let hidden = state.layout.cull.visible.get(id) == Some(&false);
+    let hidden = state.layout.culled(id);
     let mut node = Some(id);
     while let Some(at) = node {
         let style = &computed.values[at];
@@ -311,7 +310,7 @@ pub(super) fn skipped(
             && (crate::render::skipping(doc, state, &computed, at, false)
                 || hidden
                     && style.get(Prop::CONTENT_VISIBILITY) == Some("auto")
-                    && state.layout.measurements.shown.contains_key(&at))
+                    && state.layout.auto_box(at))
         {
             roots.push(at);
             kind = kind.max(if style.get(Prop::CONTENT_VISIBILITY) == Some("hidden") {
@@ -323,12 +322,8 @@ pub(super) fn skipped(
         node = state.tree.flat_parent(doc, &computed.children, at);
     }
     if args[1].as_bool() == Some(true) {
-        let measured = &mut state.layout.measurements;
         for root in roots {
-            if measured.forced.insert(root) {
-                measured.waking.push(root);
-                state.layout.cull.reskipped = true;
-            }
+            state.layout.force_layout(root);
         }
     }
     Ok(json!(kind))

@@ -30,9 +30,9 @@ fn engine(html: &str) -> (Rc<RefCell<Host>>, JsContext) {
 #[test]
 fn kept_containers_keep_their_sizes_between_frames() {
     let mut state = crate::render::PageState::default();
-    state.layout.containers.insert(1, [150., 20.]);
+    state.layout.set_container(1, [150., 20.]);
     state.update_containers(&Document::default());
-    assert_eq!(state.layout.containers.get(&1), Some(&[150., 20.]));
+    assert_eq!(state.layout.containers().get(&1), Some(&[150., 20.]));
 }
 
 #[test]

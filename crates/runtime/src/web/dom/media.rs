@@ -54,9 +54,7 @@ pub(super) fn decoded(state: &mut PageState) -> Result<Value> {
                     let size = image.size();
                     state
                         .layout
-                        .measurements
-                        .naturals
-                        .insert(id, [size.width as u32 as f32, size.height as u32 as f32]);
+                        .set_natural(id, [size.width as u32 as f32, size.height as u32 as f32]);
                     state.media.svg_images.remove(&id);
                     state
                         .media
@@ -65,7 +63,7 @@ pub(super) fn decoded(state: &mut PageState) -> Result<Value> {
                     json!([size.width as u32, size.height as u32])
                 }
                 Ok(Err((text, size))) => {
-                    state.layout.measurements.naturals.insert(id, size);
+                    state.layout.set_natural(id, size);
                     state.media.retired.extend(state.media.images.remove(&id));
                     state.media.svg_images.insert(id, (text.into(), size));
                     json!(size)
@@ -409,13 +407,8 @@ pub(super) fn canvas_color(args: &Value) -> Result<Value> {
 }
 
 pub(super) fn svg_box(id: usize, doc: &mut Document, state: &mut PageState) -> Result<Value> {
-    let boxes = std::iter::successors(Some(id), |&node| doc.nodes[node].parent).find_map(|node| {
-        state
-            .rasters
-            .svg_boxes
-            .get(&node)
-            .map(|boxes| (node, boxes))
-    });
+    let boxes = std::iter::successors(Some(id), |&node| doc.nodes[node].parent)
+        .find_map(|node| state.rasters.svg_boxes(node).map(|boxes| (node, boxes)));
     Ok(json!(
         boxes
             .and_then(|(root, (_, _, _, boxes, content, ..))| if root == id {

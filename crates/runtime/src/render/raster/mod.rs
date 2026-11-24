@@ -3,7 +3,7 @@ pub mod image;
 pub mod resvg;
 pub mod svg;
 
-use std::sync::Arc;
+use std::{collections::HashMap, rc::Rc, sync::Arc};
 use tiny_skia as skia;
 
 pub const RASTER_MAX: u32 = 4096;
@@ -48,4 +48,68 @@ pub(crate) fn pixmap(image: &renderer::RenderImage) -> Option<skia::Pixmap> {
         }
     }
     Some(pixels)
+}
+
+pub(crate) type SvgBoxes = (
+    Rc<str>,
+    Vec<(String, usize)>,
+    [f32; 2],
+    Vec<(usize, [f32; 4], [f32; 4])>,
+    [f32; 4],
+    [f32; 4],
+    [f32; 4],
+);
+
+// The mask of a box, 0, or of its `::before` or `::after`, 1 and 2: its inputs and its image.
+pub(crate) type Mask = (String, Option<Arc<renderer::RenderImage>>);
+
+#[derive(Default)]
+pub struct Rasters {
+    pub(in crate::render) svg_boxes: rustc_hash::FxHashMap<usize, SvgBoxes>,
+    pub(in crate::render) svg_trees: rustc_hash::FxHashMap<usize, usvg::Tree>,
+    pub(in crate::render) masks: rustc_hash::FxHashMap<(usize, u8), Mask>,
+    pub(in crate::render) svgs: rustc_hash::FxHashMap<usize, (Rc<str>, Arc<renderer::RenderImage>)>,
+    pub(in crate::render) svg_cache:
+        HashMap<Rc<str>, (svg::SvgGeometry, Vec<Arc<renderer::RenderImage>>)>,
+    pub(in crate::render) backgrounds:
+        HashMap<(usize, usize), (String, Arc<renderer::RenderImage>)>,
+    pub(in crate::render) bitmaps: HashMap<String, Arc<renderer::RenderImage>>,
+    // The decoded source of each background layer, kept while the layer keeps its raster, so `retire` keeps it.
+    pub(in crate::render) layer_sources: HashMap<(usize, usize), Arc<renderer::RenderImage>>,
+    pub(in crate::render) gradients: Vec<(String, Arc<renderer::RenderImage>)>,
+}
+
+impl Rasters {
+    // The boxes of the elements of an inline `<svg>`.
+    pub(crate) fn svg_boxes(&self, id: usize) -> Option<&SvgBoxes> {
+        self.svg_boxes.get(&id)
+    }
+
+    pub(crate) fn forget(&mut self, id: usize, retired: &mut Vec<Arc<renderer::RenderImage>>) {
+        retired.extend(
+            self.svgs
+                .remove(&id)
+                .map(|(_, image)| image)
+                .filter(|image| Arc::strong_count(image) == 1),
+        );
+        for slot in 0..3 {
+            retired.extend(self.masks.remove(&(id, slot)).and_then(|(_, image)| image));
+        }
+        self.svg_boxes.remove(&id);
+        self.svg_trees.remove(&id);
+    }
+
+    pub(crate) fn forget_all(
+        &mut self,
+        gone: &rustc_hash::FxHashSet<usize>,
+        retired: &mut Vec<Arc<renderer::RenderImage>>,
+    ) {
+        self.backgrounds.retain(|(node, _), (_, image)| {
+            let keep = !gone.contains(node);
+            if !keep {
+                retired.push(image.clone());
+            }
+            keep
+        });
+    }
 }
