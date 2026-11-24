@@ -425,25 +425,6 @@ impl Sound {
         }
     }
 
-    fn open(&self, length: usize, channels: usize) {
-        self.ring.get_or_init(|| {
-            let ring = (0..length.next_power_of_two()).map(|_| AtomicU32::new(0));
-            (ring.collect(), channels)
-        });
-    }
-
-    fn set_gain(&self, gain: f32) {
-        self.gain.store(gain.to_bits(), Relaxed);
-    }
-
-    // A sound that once found no free slot never takes one, because only one side may read its ring.
-    fn mixable(&self, free: bool) -> bool {
-        if !free {
-            self.unmixed.store(true, Relaxed);
-        }
-        free && !self.unmixed.load(Relaxed)
-    }
-
     // Starts or stops the clock. Returns whether it changed.
     fn run(&self, running: bool) -> bool {
         let mut clock = lock(&self.clock);
@@ -561,11 +542,8 @@ impl Sound {
         count
     }
 
-    // With audio output, the audio callback owns `read` of a mixed sound, so this does nothing then.
-    fn drop_played(&self, output: bool) {
-        if output && !self.unmixed.load(Relaxed) {
-            return;
-        }
+    // Call only without audio output or for an unmixed sound. Otherwise, the audio callback owns `read`.
+    fn drop_played(&self) {
         let Some((_, channels)) = self.ring.get() else {
             return;
         };
@@ -603,14 +581,14 @@ impl Mixer {
             }
             // Without a slot the sound plays silently and still ends. It never takes a slot later, because
             // only one side may read its ring.
-            None if on => {
-                let slot = PLAYING.iter().find(|slot| slot.load(Relaxed).is_null());
-                if sound.mixable(slot.is_some())
-                    && let Some(slot) = slot
-                {
-                    slot.store(Arc::into_raw(sound.clone()).cast_mut(), SeqCst);
-                }
-            }
+            None if on => match PLAYING
+                .iter()
+                .find(|slot| slot.load(Relaxed).is_null())
+                .filter(|_| !sound.unmixed.load(Relaxed))
+            {
+                Some(slot) => slot.store(Arc::into_raw(sound.clone()).cast_mut(), SeqCst),
+                None => sound.unmixed.store(true, Relaxed),
+            },
             _ => {}
         }
         let mixing = MIXING.load(SeqCst);
@@ -895,7 +873,8 @@ fn open(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
     let (has_video, has_audio) = (info.width > 0, info.audio != 0);
     if has_audio {
         let length = ((rate as usize * channels) as f64 * AHEAD) as usize;
-        shared.sound.open(length, channels);
+        let ring = (0..length.next_power_of_two()).map(|_| AtomicU32::new(0));
+        shared.sound.ring.get_or_init(|| (ring.collect(), channels));
     }
     let decoder = Decoder {
         media,
@@ -977,7 +956,9 @@ fn run(shared: Arc<Shared>, decoder: Decoder) {
             speed = value;
             unsafe { apps_ffmpeg_speed(media, value) };
         }
-        sound.drop_played(output.is_some());
+        if output.is_none() || sound.unmixed.load(Relaxed) {
+            sound.drop_played();
+        }
         if !pending.is_empty() && state.generation == generation {
             let taken = sound.push(&pending, pending_time, pending_step);
             pending.drain(..taken);
@@ -1314,7 +1295,7 @@ pub unsafe extern "C" fn apps_media_control(media: *mut c_void, id: u64, op: u32
                 player.muted = value != 0.;
             }
             let gain = if player.muted { 0. } else { player.volume };
-            shared.sound.set_gain(gain);
+            shared.sound.gain.store(gain.to_bits(), Relaxed);
         }
         // Keep speed within 1/16 to 16 so the integer resampler rate stays valid.
         SPEED if value > 0. && value.is_finite() => {

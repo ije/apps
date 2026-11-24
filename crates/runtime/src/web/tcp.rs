@@ -27,15 +27,11 @@ enum Command {
     Tls(Box<(Arc<ClientConfig>, ServerName<'static>, Arc<Checked>)>),
 }
 #[derive(Debug)]
-struct Checked(
-    Arc<dyn ServerCertVerifier>,
-    bool,
-    Mutex<Option<(&'static str, String)>>,
-);
-impl Checked {
-    fn take_failure(&self) -> Option<(&'static str, String)> {
-        self.2.lock().unwrap().take()
-    }
+struct Checked {
+    verifier: Arc<dyn ServerCertVerifier>,
+    reject: bool,
+    // The Node.js code and message of the last failed check.
+    failure: Mutex<Option<(&'static str, String)>>,
 }
 impl ServerCertVerifier for Checked {
     fn verify_server_cert(
@@ -46,7 +42,7 @@ impl ServerCertVerifier for Checked {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let error = match self.0.verify_server_cert(
+        let error = match self.verifier.verify_server_cert(
             end_entity,
             intermediates,
             server_name,
@@ -119,8 +115,8 @@ impl ServerCertVerifier for Checked {
             ),
             _ => ("CERT_UNTRUSTED", "certificate not trusted".into()),
         };
-        *self.2.lock().unwrap() = Some((code, message));
-        if self.1 {
+        *self.failure.lock().unwrap() = Some((code, message));
+        if self.reject {
             Err(rustls::Error::InvalidCertificate(error))
         } else {
             Ok(ServerCertVerified::assertion())
@@ -132,7 +128,7 @@ impl ServerCertVerifier for Checked {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.0.verify_tls12_signature(message, cert, dss)
+        self.verifier.verify_tls12_signature(message, cert, dss)
     }
     fn verify_tls13_signature(
         &self,
@@ -140,10 +136,10 @@ impl ServerCertVerifier for Checked {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.0.verify_tls13_signature(message, cert, dss)
+        self.verifier.verify_tls13_signature(message, cert, dss)
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.supported_verify_schemes()
+        self.verifier.supported_verify_schemes()
     }
 }
 trait Transport: AsyncRead + AsyncWrite + Send + Unpin + 'static {
@@ -302,7 +298,7 @@ async fn run(
             .connect(name, plain)
             .await
             .map_err(|error| {
-                let found = checked.take_failure();
+                let found = checked.failure.lock().unwrap().take();
                 let inner = error.get_ref().and_then(|inner| inner.downcast_ref());
                 let details = match (found, inner) {
                     (Some((code, message)), _) => json!({"code":code,"message":message}),
@@ -334,7 +330,7 @@ async fn run(
             "protocol": if modern { "TLSv1.3" } else { "TLSv1.2" },
             "cipher": session.negotiated_cipher_suite().map(|suite| u16::from(suite.suite())),
             "alpn": session.alpn_protocol().map(String::from_utf8_lossy),
-            "error": checked.take_failure().map(|(code, _)| code),
+            "error": checked.failure.lock().unwrap().take().map(|(code, _)| code),
         });
         let cert = session
             .peer_certificates()
@@ -621,11 +617,11 @@ impl State {
                             }
                             None => crate::web::roots(),
                         };
-                        let checked = Arc::new(Checked(
+                        let checked = Arc::new(Checked {
                             verifier,
-                            options["reject"] != false,
-                            Mutex::default(),
-                        ));
+                            reject: options["reject"] != false,
+                            failure: Mutex::default(),
+                        });
                         let mut config = ClientConfig::builder()
                             .dangerous()
                             .with_custom_certificate_verifier(checked.clone())

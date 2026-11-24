@@ -74,10 +74,6 @@ impl Process {
         self.inputs.clear();
     }
 
-    fn signal(&self) -> Option<&str> {
-        self.signal.as_deref()
-    }
-
     fn code(&self) -> Option<i32> {
         self.status
             .filter(|_| self.signal.is_none())
@@ -451,7 +447,7 @@ impl Process {
     }
 
     // Writes to an input stream, or ends it without bytes.
-    fn send(&mut self, name: &str, bytes: Option<Vec<u8>>) -> Result<()> {
+    fn send(&mut self, name: &str, bytes: Option<&Value>) -> Result<()> {
         let index = self
             .inputs
             .iter()
@@ -463,7 +459,9 @@ impl Process {
             })?;
         match bytes {
             None => self.inputs.remove(index).1.send(None)?,
-            bytes => self.inputs[index].1.send(bytes)?,
+            Some(bytes) => self.inputs[index]
+                .1
+                .send(Some(crate::node::bytes(bytes)?.to_vec()))?,
         }
         Ok(())
     }
@@ -486,11 +484,10 @@ impl Process {
         Ok(())
     }
 
-    fn kill(&mut self, signal: &Value) -> Result<bool> {
+    fn kill(&mut self, signal: &str) -> Result<bool> {
         let (Some(child), None) = (&mut self.child, self.status) else {
             return Ok(false);
         };
-        let signal = signal.as_str().context("Expected signal")?;
         #[cfg(unix)]
         {
             let number = crate::node::SIGNALS
@@ -612,7 +609,7 @@ impl Process {
             }
         };
         if error.is_some() && self.status.is_none() {
-            let _ = self.kill(&json!(kill_signal));
+            let _ = self.kill(kill_signal);
             self.reap()?;
         }
         Ok((stdout, stderr, error))
@@ -639,8 +636,6 @@ impl State {
     }
 
     pub(crate) fn call(&mut self, op: &str, args: &Value) -> Result<Value> {
-        // A child that failed to spawn has no ID.
-        let found = args[0].as_u64().and_then(|id| self.children.get_mut(&id));
         match op {
             "sync" => {
                 let mut state = State::default();
@@ -671,14 +666,15 @@ impl State {
                         Value::Null
                     }
                 };
-                let mut result = json!({"pid":spawned["pid"],"stdout":output(stdout, 1),"stderr":output(stderr, 2),"status":process.code(),"signal":process.signal()});
+                let mut result = json!({"pid":spawned["pid"],"stdout":output(stdout, 1),"stderr":output(stderr, 2),"status":process.code(),"signal":process.signal});
                 if let Some((code, errno)) = error {
                     result["error"] = json!({"code":code,"errno":cfg!(unix).then_some(-errno)});
                 }
                 Ok(result)
             }
             "unref" => {
-                if let Some(process) = found {
+                // A child that failed to spawn has no ID.
+                if let Some(process) = args[0].as_u64().and_then(|id| self.children.get_mut(&id)) {
                     process.unref(args[1] == true);
                 }
                 Ok(Value::Null)
@@ -688,7 +684,7 @@ impl State {
                 Err(error) => json!({"error": error_value(&error)}),
             }),
             "pause" | "destroy" => {
-                if let Some(process) = found {
+                if let Some(process) = args[0].as_u64().and_then(|id| self.children.get(&id)) {
                     let next = if op == "destroy" {
                         CLOSED
                     } else {
@@ -714,20 +710,19 @@ impl State {
             "write" | "end" => {
                 let process = self.child(&args[0])?;
                 let name = if op == "end" { &args[1] } else { &args[2] };
-                let bytes = if op == "end" {
-                    None
-                } else {
-                    Some(crate::node::bytes(&args[1])?.to_vec())
-                };
+                let bytes = (op == "write").then_some(&args[1]);
                 process.send(name.as_str().unwrap_or("stdin"), bytes)?;
                 Ok(Value::Null)
             }
             "kill" => {
-                args[0].as_u64().context("Expected child ID")?;
-                let Some(process) = found else {
+                let Some(process) = self
+                    .children
+                    .get_mut(&args[0].as_u64().context("Expected child ID")?)
+                else {
                     return Ok(json!(false));
                 };
-                Ok(json!(process.kill(&args[1])?))
+                let signal = args[1].as_str().context("Expected signal")?;
+                Ok(json!(process.kill(signal)?))
             }
             "channel" => {
                 #[cfg(unix)]
@@ -741,7 +736,7 @@ impl State {
             }
             #[cfg(unix)]
             "flush" => {
-                if let Some(process) = found {
+                if let Some(process) = args[0].as_u64().and_then(|id| self.children.get_mut(&id)) {
                     process.flush(&args[1])?;
                 }
                 Ok(Value::Null)

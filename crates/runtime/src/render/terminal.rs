@@ -318,14 +318,14 @@ impl Grid {
         }
         drawn.look = Some(self.look.clone());
         // Layout rounds the box to device pixels, so a box of `80ch` can be a little narrower than 80 cells.
-        let grid =
+        let cells =
             [width / cell_w, height / cell_h].map(|count| (count + 0.1).clamp(1., 2000.) as u16);
-        let focused = focused && cx.window.is_active();
         let origin = [bounds.origin.x, bounds.origin.y].map(f32::from);
-        if terminal.place(origin, grid, look.cell, scale, focused) {
+        if terminal.fit(origin, cells, look.cell, scale) {
             // The page reads the new size in its next task.
             crate::host::Waker::current().wake();
         }
+        terminal.focus(focused && cx.window.is_active());
         let mut frame: Frame = unsafe { std::mem::zeroed() };
         if terminal.frame(&mut frame) {
             drawn.scroll = frame.scroll;
@@ -432,8 +432,7 @@ impl Grid {
             }
         }
         // The program sees cells of whole pixels, and places its images in these pixels.
-        let (cells, cell_pixels) = terminal.grid();
-        let unit = [0, 1].map(|axis| look.cell[axis] / cell_pixels[axis] as f32);
+        let unit = look.cell.map(|side| side / (side * scale).round().max(1.));
         let grid = Rect::new(
             origin,
             size(px(cells[0] as f32 * cell_w), px(cells[1] as f32 * cell_h)),

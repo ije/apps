@@ -325,37 +325,29 @@ impl Terminal {
         unsafe { (self.library.control)(self.raw.as_ptr(), op, value) };
     }
 
-    /// Places the grid of a frame: its top left in the page, its columns and rows, the size of a cell in CSS
-    /// pixels, the scale and the focus. Returns whether the grid has a new size.
-    pub fn place(
-        &mut self,
-        origin: [f32; 2],
-        size: [u16; 2],
-        cell: [f32; 2],
-        scale: f32,
-        focused: bool,
-    ) -> bool {
+    /// Fits the grid to a frame: its top left in the page, its columns and rows, and the size of a cell in CSS
+    /// pixels at a scale. Returns whether the grid has a new size.
+    pub fn fit(&mut self, origin: [f32; 2], size: [u16; 2], cell: [f32; 2], scale: f32) -> bool {
         self.origin = origin;
-        let resized = size != self.size || cell != self.cell || scale != self.scale;
-        if resized {
-            self.size = size;
-            self.cell = cell;
-            self.scale = scale;
-            self.cell_pixels = cell.map(|side| (side * scale).round().max(1.) as u32);
-            let [width, height] = self.cell_pixels;
-            unsafe { (self.library.resize)(self.raw.as_ptr(), size[0], size[1], width, height) };
-            self.events.push(json!(["resize"]));
+        if size == self.size && cell == self.cell && scale == self.scale {
+            return false;
         }
+        self.size = size;
+        self.cell = cell;
+        self.scale = scale;
+        // The program sees cells of whole pixels.
+        self.cell_pixels = cell.map(|side| (side * scale).round().max(1.) as u32);
+        let [width, height] = self.cell_pixels;
+        unsafe { (self.library.resize)(self.raw.as_ptr(), size[0], size[1], width, height) };
+        self.events.push(json!(["resize"]));
+        true
+    }
+
+    pub fn focus(&mut self, focused: bool) {
         if focused != self.focused {
             self.focused = focused;
             self.control(FOCUS, f64::from(u8::from(focused)));
         }
-        resized
-    }
-
-    /// Columns and rows, and the size of a cell in the pixels that the program sees.
-    pub fn grid(&self) -> ([u16; 2], [u32; 2]) {
-        (self.size, self.cell_pixels)
     }
 
     pub fn preedit(&self) -> &str {
