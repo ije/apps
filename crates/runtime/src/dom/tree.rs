@@ -1,4 +1,5 @@
 use super::{Document, Node};
+use crate::style;
 
 #[derive(Default)]
 pub struct Tree {
@@ -164,4 +165,55 @@ impl Tree {
         self.free = free.into();
         len
     }
+
+    // The parent in the flat tree: the slot of a slotted node, or the host of a shadow root.
+    pub(crate) fn flat_parent(
+        &self,
+        doc: &Document,
+        styles: &style::ComputedStyles,
+        id: usize,
+    ) -> Option<usize> {
+        match doc.nodes[id].parent {
+            Some(parent) if self.shadows.contains_key(&parent) => styles
+                .children
+                .iter()
+                .find_map(|(&slot, kids)| (slot != parent && kids.contains(&id)).then_some(slot)),
+            Some(parent) => Some(parent),
+            None => self.hosts.get(&id).copied(),
+        }
+    }
+}
+
+pub(crate) fn slots(
+    doc: &Document,
+    roots: impl IntoIterator<Item = (usize, usize)>,
+) -> rustc_hash::FxHashMap<usize, Vec<usize>> {
+    let mut slots = rustc_hash::FxHashMap::default();
+    let (mut names, mut pending) = (rustc_hash::FxHashMap::default(), Vec::new());
+    for (host, root) in roots {
+        names.clear();
+        pending.push(root);
+        while let Some(id) = pending.pop() {
+            let node = &doc.nodes[id];
+            if node.tag == "slot" {
+                slots.insert(id, Vec::new());
+                names
+                    .entry(node.attrs.get("name").map_or("", String::as_str))
+                    .or_insert(id);
+            }
+            if node.tag != "template" {
+                pending.extend(node.children.iter().rev());
+            }
+        }
+        for &child in &doc.nodes[host].children {
+            let node = &doc.nodes[child];
+            if (node.tag == "#text" || !node.tag.starts_with('#'))
+                && let Some(slot) = names.get(node.attrs.get("slot").map_or("", String::as_str))
+                && let Some(assigned) = slots.get_mut(slot)
+            {
+                assigned.push(child);
+            }
+        }
+    }
+    slots
 }

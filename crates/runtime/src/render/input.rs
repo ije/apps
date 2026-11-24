@@ -188,7 +188,7 @@ impl renderer::Hooks for FieldText {
             .filter(|_| dom.interaction.focus == Some(self.id))
             .map(|&selected| match &self.password {
                 _ if self.placeholder => [0; 2],
-                Some(value) => selected.map(|offset| crate::dom::bullets(value, offset)),
+                Some(value) => selected.map(|offset| crate::dom::text::bullets(value, offset)),
                 None => selected,
             });
         if !self.placeholder {
@@ -210,7 +210,7 @@ impl renderer::Hooks for FieldText {
             let mut offset = old;
             match selected {
                 Some([_, end]) => {
-                    let index = crate::dom::utf16_index(&self.text, end);
+                    let index = crate::dom::text::utf16_index(&self.text, end);
                     if let Some(caret) =
                         super::text::text_position(&layout, &self.text, &rows, index)
                     {
@@ -274,7 +274,7 @@ impl renderer::Hooks for FieldText {
         let text = &*self.text;
         let line_height = layout.line_height();
         let selected = selected.map(|[a, b]| {
-            [a.min(b), a.max(b), b].map(|index| crate::dom::utf16_index(text, index))
+            [a.min(b), a.max(b), b].map(|index| crate::dom::text::utf16_index(text, index))
         });
         let highlights: Vec<_> = selected
             .filter(|[start, end, _]| start < end)
@@ -788,8 +788,8 @@ impl renderer::View for PageView {
         if let Some((layout, text, span, rows, _)) = dom.layout.text_layouts.get(&node) {
             let content = &text[span.clone()];
             let [start, end] = [range.start, range.end].map(|index| {
-                let index = password.map_or(index, |value| crate::dom::bullets(value, index));
-                span.start + crate::dom::utf16_index(content, index)
+                let index = password.map_or(index, |value| crate::dom::text::bullets(value, index));
+                span.start + crate::dom::text::utf16_index(content, index)
             });
             let at = super::text::text_position(layout, text, rows, start)?;
             let to = super::text::text_position(layout, text, rows, end)
@@ -834,7 +834,7 @@ impl renderer::View for PageView {
             let index = text[span.start..index].encode_utf16().count();
             return Some(
                 password(&host, self.id, id, &state)
-                    .map_or(index, |value| crate::dom::unbullet(value, index)),
+                    .map_or(index, |value| crate::dom::text::unbullet(value, index)),
             );
         }
         let bounds = dom.geometry.mirror.get(&id)?;

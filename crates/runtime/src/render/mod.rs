@@ -6,6 +6,7 @@ pub(crate) mod effects;
 mod element;
 pub mod fonts;
 pub(crate) mod grid;
+pub(crate) mod hit;
 mod hud;
 pub mod image;
 pub(crate) mod inline;
@@ -472,9 +473,7 @@ impl PageView {
         {
             let mut host = self.host.borrow_mut();
             let state = host.state(self.id);
-            state.fonts.system = Some(window.text_system().clone());
-            state.pixel_ratio = window.scale_factor();
-            state.window = window.window_state();
+            state.attach_window(window);
             state.geometry.unshift();
             state.geometry.sync_scroll();
             state.geometry.mirror.touch();
@@ -622,7 +621,7 @@ impl PageView {
                         let seen = state.layout.cull.seen.as_ref().map(|seen| seen.2.clone()).or_else(|| state.styles.computed.clone());
                         target = seen.as_ref().and_then(|computed| {
                             let at = [position.x, position.y].map(f32::from);
-                            crate::dom::hit_test(&page.doc, state, computed, viewport, at, true, false).as_u64()
+                            crate::render::hit::hit_test(&page.doc, state, computed, viewport, at, true, false).as_u64()
                         })
                         .map(|id| id as usize);
                         if let Some(target) = target {
@@ -633,7 +632,7 @@ impl PageView {
                                     terminal = Some((id, state.media.terminals.clone()));
                                 }
                                 chain.extend(state.geometry.scroll.get(&id).cloned());
-                                node = seen.as_ref().and_then(|computed| crate::dom::flat_parent(&page.doc, state, computed, id));
+                                node = seen.as_ref().and_then(|computed| state.tree.flat_parent(&page.doc, computed, id));
                             }
                             window.scroll_only(chain);
                         }
@@ -733,11 +732,11 @@ impl PageView {
             self.paint.set(true);
         }
         let cached = dom.styles.computed.clone();
-        let mut styles = crate::dom::styles(&mut doc, dom, [width, height]);
+        let mut styles = dom.restyle(&mut doc, [width, height]);
         if cached.is_none_or(|cached| !std::rc::Rc::ptr_eq(&cached, &styles))
             && fonts::load(&doc, dom, &state.app.assets).0
         {
-            styles = crate::dom::styles(&mut doc, dom, [width, height]);
+            styles = dom.restyle(&mut doc, [width, height]);
         }
         // Boxes forced to show their contents for a script skip them again in the next frame.
         let mut waking = std::mem::take(&mut dom.layout.measurements.waking);
@@ -748,7 +747,7 @@ impl PageView {
             let mut nodes = rustc_hash::FxHashSet::default();
             for id in waking {
                 let path: Vec<_> = std::iter::successors(Some(id), |&node| {
-                    crate::dom::flat_parent(&doc, dom, &styles, node)
+                    dom.tree.flat_parent(&doc, &styles, node)
                 })
                 .collect();
                 for node in path {
@@ -956,7 +955,7 @@ impl PageView {
             for (node, light) in children.iter_mut().rev() {
                 *light = doc.nodes.compose_children(*node, std::mem::take(light));
             }
-            let restyled = crate::dom::styles(&mut doc, dom, [width, height]);
+            let restyled = dom.restyle(&mut doc, [width, height]);
             for (node, composed) in children.iter_mut() {
                 *composed = doc.nodes.compose_children(*node, std::mem::take(composed));
             }
@@ -1128,7 +1127,7 @@ impl PageView {
             let mut node = Some(id).filter(|&id| id < doc.nodes.len());
             while let Some(id) = node {
                 kept.remove(&id);
-                node = crate::dom::flat_parent(&doc, dom, &styles, id);
+                node = dom.tree.flat_parent(&doc, &styles, id);
             }
         }
         if self.focused.replace(dom.interaction.focus) != dom.interaction.focus
@@ -1138,7 +1137,7 @@ impl PageView {
             let mut node = Some(focus);
             while let Some(id) = node {
                 kept.remove(&id);
-                node = crate::dom::flat_parent(&doc, dom, &styles, id);
+                node = dom.tree.flat_parent(&doc, &styles, id);
             }
         }
         if !same {
@@ -1901,9 +1900,9 @@ impl PageView {
             // Container units change the boxes in the resized containers, and the sizes of the boxes around them.
             let mut nodes = rustc_hash::FxHashSet::default();
             for &container in &dom.styles.cache.units {
-                let mut node = crate::dom::flat_parent(&doc, dom, &styles, container);
+                let mut node = dom.tree.flat_parent(&doc, &styles, container);
                 while let Some(id) = node.filter(|&id| nodes.insert(id)) {
-                    node = crate::dom::flat_parent(&doc, dom, &styles, id);
+                    node = dom.tree.flat_parent(&doc, &styles, id);
                 }
                 let mut pending = vec![container];
                 while let Some(id) = pending.pop() {
@@ -1936,14 +1935,14 @@ impl PageView {
                 while let Some(id) = node.filter(|&id| around.insert(id)) {
                     info[id].flags |= cull::GEOMETRY_CHANGED;
                     fresh.iter_mut().for_each(|fresh| fresh.push(id));
-                    node = crate::dom::flat_parent(&doc, dom, &styles, id);
+                    node = dom.tree.flat_parent(&doc, &styles, id);
                 }
                 // Grid tracks leave out absolutely positioned items, so the grids above one keep their layout.
                 let mut node = Some(id);
                 while let Some(id) = node.filter(|&id| regridded.insert(id)) {
                     dom.layout.grids.remove(&id);
                     node = (info[id].flags & cull::OUT_OF_FLOW == 0)
-                        .then(|| crate::dom::flat_parent(&doc, dom, &styles, id))
+                        .then(|| dom.tree.flat_parent(&doc, &styles, id))
                         .flatten();
                 }
                 stale = true;
@@ -2186,7 +2185,7 @@ impl PageView {
                 if let Some(info) = info.get_mut(id) {
                     info.flags |= cull::SHOWN;
                 }
-                node = crate::dom::flat_parent(&doc, dom, &styles, id);
+                node = dom.tree.flat_parent(&doc, &styles, id);
             }
         }
         let autos = !dom.layout.autos.is_empty();
@@ -3537,7 +3536,7 @@ mod tests {
         let mut doc = crate::dom::Document::parse(
             "<div id=panel style='height:0;overflow:hidden'><i id=a></i><i id=b style='position:absolute'></i></div><b id=c></b><span style='overflow:hidden'><b id=d></b></span>",
         );
-        let styles = crate::dom::styles(&mut doc, &mut Default::default(), [800., 600.]);
+        let styles = crate::render::PageState::default().restyle(&mut doc, [800., 600.]);
         let id = |name: &str| {
             (0..doc.nodes.len())
                 .find(|&id| {
@@ -3588,7 +3587,7 @@ mod tests {
             .filter(|&id| doc.nodes[id].tag == "p")
             .collect();
         let [first, second] = [paragraphs[0], paragraphs[1]];
-        let styles = crate::dom::styles(&mut doc, &mut dom, [800., 600.]);
+        let styles = dom.restyle(&mut doc, [800., 600.]);
         let mut drawn = canvas::Canvas::new(2, 2).unwrap();
         drawn
             .draw(
@@ -3651,7 +3650,7 @@ mod tests {
             "<i style='mask-image:url(m.png)'></i><b style='clip-path:circle()'></b><u></u>",
         );
         let mut dom = crate::render::PageState::default();
-        let styles = crate::dom::styles(&mut doc.clone(), &mut dom, [800., 600.]);
+        let styles = dom.restyle(&mut doc.clone(), [800., 600.]);
         let ids =
             ["i", "b", "u"].map(|tag| doc.nodes.iter().position(|node| node.tag == tag).unwrap());
         for id in ids {
@@ -3767,7 +3766,7 @@ mod tests {
         let mut released = Vec::new();
         let mut frame =
             |doc: &mut crate::dom::Document, dom: &mut crate::render::PageState, seconds: f64| {
-                let styles = crate::dom::styles(doc, dom, [800., 600.]);
+                let styles = dom.restyle(doc, [800., 600.]);
                 let mut visible = vec![false; doc.nodes.len()];
                 for id in 0..doc.nodes.len() {
                     visible[id] = doc.nodes[id].parent.is_none_or(|parent| visible[parent])

@@ -835,7 +835,8 @@ impl Canvas {
             layer
         };
         let mut string = |units: f64| {
-            let (part, rest) = strings.split_at(crate::dom::utf16_index(strings, units as usize));
+            let (part, rest) =
+                strings.split_at(crate::dom::text::utf16_index(strings, units as usize));
             strings = rest;
             part
         };

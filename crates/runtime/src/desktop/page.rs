@@ -308,9 +308,7 @@ impl Desktop {
             cx.update_window(handle, |window, _| {
                 let mut host = self.host.borrow_mut();
                 let state = host.state(id);
-                state.fonts.system = Some(window.text_system().clone());
-                state.pixel_ratio = window.scale_factor();
-                state.window = window.window_state();
+                state.attach_window(window);
                 // Like Playwright, pages count as focused while the devtools MCP server runs, so tests in hidden windows get focus events.
                 view.focused = window.is_active() || crate::native::devtools::enabled();
             });

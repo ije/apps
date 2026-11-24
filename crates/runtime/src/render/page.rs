@@ -1,6 +1,7 @@
 use crate::css::properties::Prop;
 use crate::dom::{ABSENT, Document, Node};
 use crate::style;
+use std::sync::Arc;
 
 // What a page keeps besides its document: its nodes, geometry, focus and selection, styles, layout, media and
 // fonts, and what its next frame must do.
@@ -24,6 +25,13 @@ pub struct PageState {
 }
 
 impl PageState {
+    // The page shows in this window: its fonts, pixel ratio and frame.
+    pub(crate) fn attach_window(&mut self, window: &renderer::Window) {
+        self.fonts.system = Some(window.text_system().clone());
+        self.pixel_ratio = window.scale_factor();
+        self.window = window.window_state();
+    }
+
     pub(crate) fn theme(&self) -> u32 {
         crate::native::theme_state()
             | ((self.pixel_ratio.clamp(0., 600.) * 100.).round() as u32) << 16
@@ -164,5 +172,76 @@ impl PageState {
     pub(crate) fn place(&mut self, doc: &mut Document, id: usize, node: Node) {
         self.tree.place(doc, id, node);
         self.styles.place(id, doc.nodes.len());
+    }
+
+    // The styles of the page now: the last pass when it still holds, or a new pass.
+    pub(crate) fn restyle(
+        &mut self,
+        doc: &mut Document,
+        viewport: [f32; 2],
+    ) -> std::rc::Rc<style::ComputedStyles> {
+        let scale = self.fonts.system.is_some().then_some(self.pixel_ratio);
+        let pending = match self.styles.begin(
+            doc,
+            viewport,
+            self.theme(),
+            scale,
+            &mut self.geometry.mirror,
+        ) {
+            Ok(kept) => return kept,
+            Err(pending) => pending,
+        };
+        self.drop_removed(doc);
+        self.styles.update(
+            doc,
+            pending,
+            style::Page {
+                shadows: &self.tree.shadows,
+                hosts: &self.tree.hosts,
+                top_layer: &self.interaction.top_layer,
+                font_aliases: &self.fonts.aliases,
+                text_system: self.fonts.system.as_deref(),
+                bounds: &mut self.geometry.mirror,
+            },
+        )
+    }
+
+    // Shows a new frame or image of node `id`, and returns the old one when it can be freed now.
+    pub(crate) fn show_frame(
+        &mut self,
+        id: usize,
+        image: Option<Arc<renderer::RenderImage>>,
+    ) -> Option<Arc<renderer::RenderImage>> {
+        if self.media.recycled.is_empty() {
+            self.media.retired_canvases.clear();
+        }
+        // A poster that decodes later must not replace the frame.
+        self.media.decoding.remove(&id);
+        let size = image.as_ref().map(|image| image.size());
+        match size {
+            Some(size) => self
+                .layout
+                .measurements
+                .naturals
+                .insert(id, [size.width as u32 as f32, size.height as u32 as f32]),
+            None => self.layout.measurements.naturals.remove(&id),
+        };
+        let old = match image {
+            Some(image) => self.media.images.insert(id, image),
+            None => self.media.images.remove(&id),
+        };
+        if old.as_ref().map(|old| old.size()) != size {
+            self.layout.relayout(id);
+        }
+        self.dirty = true;
+        // Only the first replaced frame can be on the GPU. Recycle later frames immediately to bound memory in
+        // unrendered windows.
+        match old {
+            Some(old) if self.media.retired_canvases.insert(id) => {
+                self.media.recycled.push((id, old));
+                None
+            }
+            old => old,
+        }
     }
 }

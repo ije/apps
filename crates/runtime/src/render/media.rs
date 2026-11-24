@@ -1,3 +1,6 @@
+use anyhow::ensure;
+use serde_json::{Value, json};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     collections::{HashMap, HashSet},
     rc::Rc,
@@ -79,5 +82,96 @@ impl Media {
         self.svg_images.remove(&id);
         self.sources.get_mut().remove(&id);
         self.decoding.remove(&id);
+    }
+
+    pub(crate) fn source_pixels(
+        &self,
+        id: usize,
+        size: Option<[u32; 2]>,
+    ) -> Option<crate::render::canvas::Source<'_>> {
+        use crate::render::canvas::{self, Source};
+        if let Some(canvas) = self.canvases.get(&id) {
+            return Some(Source::Pixels(&canvas.pixels));
+        }
+        let image = self.images.get(&id);
+        let svg = self.svg_images.get(&id).filter(|_| image.is_none());
+        let size = svg.map_or([0; 2], |(_, natural)| {
+            size.unwrap_or(natural.map(|side| side.ceil() as u32))
+        });
+        let key = (
+            image.map_or(0, |image| image.id),
+            svg.map_or(0, |(source, _)| Rc::as_ptr(source) as *const u8 as usize),
+            size,
+        );
+        let mut cache = self.sources.try_borrow_mut().ok()?;
+        let fresh = match cache.get(&id) {
+            Some((old, _, pixels)) if *old == key => return Some(Source::Shared(pixels.clone())),
+            Some(_) => {
+                cache.remove(&id);
+                false
+            }
+            None => true,
+        };
+        let pixels = Rc::new(match (image, svg) {
+            (Some(image), _) => canvas::pixmap(image)?,
+            (_, Some((source, _))) => canvas::svg_pixels(
+                &canvas::svg_tree(source, false).ok()?,
+                size[0],
+                size[1],
+                None,
+            )
+            .ok()?,
+            _ => return None,
+        });
+        if fresh {
+            let kept: usize = cache.values().map(|(.., pixels)| pixels.data().len()).sum();
+            if kept + pixels.data().len() > 64 << 20 {
+                cache.clear();
+            }
+            cache.insert(
+                id,
+                (key, svg.map(|(source, _)| source.clone()), pixels.clone()),
+            );
+        }
+        Some(Source::Shared(pixels))
+    }
+
+    pub(crate) fn load_image(
+        &mut self,
+        id: usize,
+        read: impl FnOnce() -> anyhow::Result<Vec<u8>> + Send + 'static,
+    ) -> Value {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let request = NEXT.fetch_add(1, Ordering::Relaxed);
+        self.decoding.insert(id, request);
+        let (decoded, wake) = (self.decoded.clone(), crate::jsc::Waker::current());
+        crate::render::image::decode_later(Box::new(move || {
+            let result = read().and_then(|bytes| {
+                ensure!(bytes.len() <= 64 * 1024 * 1024, "Image is too large");
+                crate::render::image::decode(&bytes)
+                    .map(Ok)
+                    .or_else(|error| {
+                        let options = crate::render::canvas::svg_options(false, false);
+                        let size = usvg::Tree::from_data(&bytes, &options)
+                            .map_err(|_| error)?
+                            .size();
+                        let text = if bytes.starts_with(&[0x1f, 0x8b]) {
+                            usvg::decompress_svgz(&bytes)?
+                        } else {
+                            bytes
+                        };
+                        Ok(Err((
+                            String::from_utf8_lossy(&text).into_owned(),
+                            [size.width(), size.height()],
+                        )))
+                    })
+            });
+            decoded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((id, request, result));
+            wake.wake();
+        }));
+        json!(request)
     }
 }

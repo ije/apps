@@ -729,11 +729,8 @@ impl Host {
                 if event[1] == "frame"
                     && let Some(node) = event[0].as_u64()
                     && let Some(image) = media.frame(node)
-                    && let Some(old) = crate::dom::show_frame(
-                        state,
-                        node as usize,
-                        Some(std::sync::Arc::new(image)),
-                    )
+                    && let Some(old) =
+                        state.show_frame(node as usize, Some(std::sync::Arc::new(image)))
                     && let Ok(old) = std::sync::Arc::try_unwrap(old)
                 {
                     media.recycle(node, old);
@@ -772,7 +769,7 @@ impl Host {
             "time" => return Ok(json!(media.time(node))),
             "close" => {
                 media.close(node);
-                crate::dom::show_frame(state, node as usize, None);
+                state.show_frame(node as usize, None);
                 page.dirty |= std::mem::take(&mut state.dirty);
             }
             _ => bail!("Unknown media operation: {op}"),
@@ -933,9 +930,8 @@ impl Host {
                 });
             }
             if op == "dom.fonts" {
-                crate::dom::styles(
+                state.restyle(
                     &mut page.doc,
-                    state,
                     *self.viewports.get(&id).unwrap_or(&[800., 600.]),
                 );
                 let loaded = crate::render::fonts::load(&page.doc, state, &self.app.assets);
@@ -951,7 +947,7 @@ impl Host {
                     args[1].as_str().context("Expected a URL")?,
                 )?
                 .context("Image is not a bundled asset or local file")?;
-                return Ok(crate::dom::load_image(state, node, move || {
+                return Ok(state.media.load_image(node, move || {
                     let metadata = std::fs::metadata(&path)?;
                     ensure!(
                         metadata.is_file() && metadata.len() <= 64 * 1024 * 1024,

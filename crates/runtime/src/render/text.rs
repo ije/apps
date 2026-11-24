@@ -1829,8 +1829,8 @@ impl renderer::Hooks for InlineText {
                         .pages
                         .get(&view.id)
                         .map_or("", |page| page.doc.nodes[*id].text.as_str());
-                    let start = range.start + crate::dom::shown_index(source, text, *start);
-                    let end = range.start + crate::dom::shown_index(source, text, *end);
+                    let start = range.start + crate::dom::text::shown_index(source, text, *start);
+                    let end = range.start + crate::dom::text::shown_index(source, text, *end);
                     if caret {
                         let ink = [Prop::CARET_COLOR, Prop::COLOR]
                             .into_iter()

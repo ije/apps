@@ -962,7 +962,7 @@ mod tests {
         impl Fn(&str) -> usize,
     ) {
         let mut doc = Document::parse(html);
-        let styles = crate::dom::styles(&mut doc, &mut Default::default(), [800., 600.]);
+        let styles = crate::render::PageState::default().restyle(&mut doc, [800., 600.]);
         let ids: HashMap<String, usize> = (0..doc.nodes.len())
             .filter_map(|id| Some((doc.nodes[id].attrs.get("id")?.clone(), id)))
             .collect();

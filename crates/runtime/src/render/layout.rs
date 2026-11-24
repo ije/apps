@@ -115,6 +115,14 @@ pub struct Rasters {
 }
 
 impl Layout {
+    // The content of node `id` changed, so it lays out again.
+    pub(crate) fn relayout(&mut self, id: usize) {
+        if let Some(node) = self.layout_nodes.get_mut(id) {
+            *node = None;
+            self.cull.seen = None;
+        }
+    }
+
     // A node left the page and waits for a GC: its layout data can go.
     pub(crate) fn forget_removed(&mut self, id: usize) {
         self.measurements.shown.remove(&id);

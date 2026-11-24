@@ -3459,7 +3459,7 @@ mod tests {
             "<style>main{display:grid;grid-template-columns:repeat(4,auto);grid-template-areas:'t f m n''.r a.'}div{display:flex;width:200px}input{width:100%;line-height:24px;padding:0 6px;border:1px solid}</style><main><b style='grid-area:t'></b><div style='grid-area:f'><input></div><div style='grid-area:r'><input></div><b style='grid-area:a'></b></main>",
         );
         let mut state = crate::render::PageState::default();
-        let styles = crate::dom::styles(&mut doc, &mut state, [800., 600.]);
+        let styles = state.restyle(&mut doc, [800., 600.]);
         let main = doc
             .nodes
             .iter()
@@ -3488,7 +3488,7 @@ mod tests {
             "<style>main{display:grid;grid-template-columns:100px 300px}i{display:block;padding:10% 0 0;height:0}</style><main><i></i><i></i></main>",
         );
         let mut state = crate::render::PageState::default();
-        let styles = crate::dom::styles(&mut doc, &mut state, [800., 600.]);
+        let styles = state.restyle(&mut doc, [800., 600.]);
         let main = doc
             .nodes
             .iter()
@@ -3517,7 +3517,7 @@ mod tests {
             "<style>main{display:grid;grid-template-columns:300px 200px}i{display:block;aspect-ratio:5/4}.b{box-sizing:border-box;padding:10px}.c{overflow:hidden}</style><main><div><i style='width:100%'></i></div><div><i class=b></i><p style='height:20px;margin:0'></p></div></main><main><div><i class=c style='aspect-ratio:10'><p style='height:90px;margin:0'></p></i></div><div><i style='aspect-ratio:10'><p style='height:90px;margin:0'></p></i></div></main>",
         );
         let mut state = crate::render::PageState::default();
-        let styles = crate::dom::styles(&mut doc, &mut state, [800., 600.]);
+        let styles = state.restyle(&mut doc, [800., 600.]);
         let rows: Vec<_> = (0..doc.nodes.len())
             .filter(|&id| doc.nodes[id].tag == "main")
             .map(|main| {
@@ -3544,7 +3544,7 @@ mod tests {
         let place = |html: &str| {
             let mut doc = Document::parse(html);
             let mut state = crate::render::PageState::default();
-            let styles = crate::dom::styles(&mut doc, &mut state, [800., 600.]);
+            let styles = state.restyle(&mut doc, [800., 600.]);
             let grid = doc
                 .nodes
                 .iter()

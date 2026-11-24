@@ -1,4 +1,4 @@
-use super::Selector;
+use super::{CHECKED, DIRTY, Selector, editable_value};
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
 
@@ -88,6 +88,48 @@ pub struct Node {
     pub(crate) state: u16,
     #[serde(skip)]
     pub(crate) value: Option<String>,
+}
+
+impl Node {
+    pub(crate) fn content_editable(&self) -> Option<bool> {
+        self.attrs
+            .get("contenteditable")
+            .and_then(|value| editable_value(value))
+    }
+
+    pub(crate) fn checked(&self) -> bool {
+        if self.state & DIRTY != 0 {
+            self.state & CHECKED != 0
+        } else {
+            self.attrs.contains_key(if self.tag == "option" {
+                "selected"
+            } else {
+                "checked"
+            })
+        }
+    }
+
+    pub(crate) fn password(&self) -> bool {
+        self.tag == "input"
+            && self
+                .attrs
+                .get("type")
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("password"))
+    }
+
+    pub(crate) fn shown_text(&self, text: String) -> String {
+        if self.password() {
+            "\u{2022}".repeat(text.chars().count())
+        } else {
+            text
+        }
+    }
+
+    pub(crate) fn current_value(&self) -> Option<&str> {
+        self.value.as_deref().or_else(|| {
+            (self.tag == "input").then(|| self.attrs.get("value").map_or("", String::as_str))
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

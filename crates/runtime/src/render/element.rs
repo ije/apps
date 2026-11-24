@@ -8974,18 +8974,20 @@ fn create(
                         return true;
                     };
                     let at = [position.x, position.y].map(f32::from);
-                    crate::dom::hit_test(&page.doc, state, computed, viewport, at, true, false)
-                        .as_u64()
-                        .is_none_or(|target| {
-                            std::iter::successors(Some(target as usize), |&node| {
-                                page.doc.nodes[node].parent
-                            })
-                            .find_map(|node| {
-                                computed.values[node]
-                                    .get(Prop::APP_REGION)
-                                    .filter(|value| *value != "none")
-                            }) == Some("drag")
+                    crate::render::hit::hit_test(
+                        &page.doc, state, computed, viewport, at, true, false,
+                    )
+                    .as_u64()
+                    .is_none_or(|target| {
+                        std::iter::successors(Some(target as usize), |&node| {
+                            page.doc.nodes[node].parent
                         })
+                        .find_map(|node| {
+                            computed.values[node]
+                                .get(Prop::APP_REGION)
+                                .filter(|value| *value != "none")
+                        }) == Some("drag")
+                    })
                 });
                 if !dragged {
                     return;
