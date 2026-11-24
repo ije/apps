@@ -160,11 +160,6 @@ pub(crate) struct Renderer {
     frame: RenderFrame,
     // A buffer for `Scene::native_glass`.
     glass_taken: Vec<usize>,
-    // The layers that Core Animation draws, which the frame skips, and those of them whose content it draws.
-    skip: Vec<usize>,
-    content: Vec<usize>,
-    // The last frame drew damage regions over the frame before.
-    regioned: bool,
     promoted: Vec<Promoted>,
     glass: Vec<NativeGlass>,
     glass_update: bool,
@@ -431,9 +426,6 @@ impl Renderer {
             pool: Pool::default(),
             frame: RenderFrame::default(),
             glass_taken: Vec::new(),
-            skip: Vec::new(),
-            content: Vec::new(),
-            regioned: false,
             promoted: Vec::new(),
             glass: Vec::new(),
             glass_update: false,
@@ -622,7 +614,7 @@ impl Renderer {
         // Nothing changed, so the window keeps its last frame.
         if damage.as_ref().is_some_and(Vec::is_empty)
             && self.promoted.iter().all(|promoted| promoted.drawn)
-            && (self.promoted.iter().map(|promoted| promoted.index)).eq(self.skip.iter().copied())
+            && (self.frame).skips(self.promoted.iter().map(|promoted| promoted.index))
             && !scene.shots.iter().any(|shot| shot.read)
         {
             self.last = last;
@@ -703,7 +695,7 @@ impl Renderer {
             .retain(|(texture, frame)| !ptr::eq(&**texture, &*frame_texture) && frames - frame < 4);
         self.drawables.push((frame_texture.clone(), frames));
         self.regions.retain(|(frame, _)| frames - frame < 4);
-        let regions = (self.regioned && shift.is_none()).then_some(own);
+        let regions = (self.frame.damaged() && shift.is_none()).then_some(own);
         self.regions.push((frames, regions));
         let (commands, sublayers) = match rendered {
             Ok(commands) => commands,
@@ -885,26 +877,11 @@ impl Renderer {
         srgb: Option<&ProtocolObject<dyn MTLTexture>>,
     ) -> Result<Rendered> {
         let mut frame = mem::take(&mut self.frame);
-        let skipped = mem::take(&mut self.skip);
-        self.content.clear();
-        for promoted in &self.promoted {
-            self.skip.push(promoted.index);
-            if !promoted.drawn {
-                self.content.push(promoted.index);
-            }
-        }
-        for glass in &self.glass {
-            self.skip.push(glass.index);
-            self.content.push(glass.index);
-        }
-        // A layer that left or joined Core Animation draws otherwise in the whole window.
-        let damage = match self.skip == skipped {
-            true => damage,
-            false => Vec::new(),
-        };
-        self.regioned = !damage.is_empty();
-        let (fresh, keeps_under) = (srgb.is_some(), true);
-        frame.prepare(&self.skip, &self.content, damage, fresh, keeps_under);
+        // Core Animation draws the promoted layers and the glass, and the frame draws their content when they need it.
+        let native = (self.promoted.iter())
+            .map(|promoted| (promoted.index, !promoted.drawn))
+            .chain(self.glass.iter().map(|glass| (glass.index, true)));
+        frame.prepare(native, damage, srgb.is_some(), true);
         frame.take_spare(&self.pool);
         frame.record(scene, window, MAX_TEXTURE_SIZE, true);
         let device = &self.device;
@@ -932,7 +909,7 @@ impl Renderer {
         // damaged the edges that they don't cover.
         let mut prelude: Vec<Prelude> = Vec::new();
         let mut kept = None;
-        if self.regioned
+        if frame.damaged()
             && let Some((last, shift)) = last
         {
             let whole = [0, 0, window[0] as i32, window[1] as i32];

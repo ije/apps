@@ -263,7 +263,7 @@ impl RenderFrame {
             self.cache.iter().any(|cached| cached.id == id)
                 || (self.under.as_ref()).is_some_and(|under| under.ids.contains(&id))
         };
-        let damaged = !self.damage.is_empty();
+        let damaged = self.damaged();
         pool.fill(
             &self.textures,
             &self.kept,
@@ -294,24 +294,47 @@ impl RenderFrame {
         pool.spare(&mut self.spare);
     }
 
-    // What the backend asks of the next frames. It draws the `skip` layers itself, and the frame draws the content of
-    // the `content` ones in targets of their own. `damage` lists the window regions to draw over the last frame, or
-    // none for the whole window. `fresh` draws cached layers again, and `keeps_under` keeps the window below what
-    // paints after a scrolled content.
+    // What the backend asks of the next frames. It draws the `native` layers itself, and the frame draws the
+    // content of those marked true in targets of their own. `damage` lists the window regions to draw over the last
+    // frame, or none for the whole window. `fresh` draws cached layers again, and `keeps_under` keeps the window
+    // below what paints after a scrolled content.
     #[cfg(target_os = "macos")]
     pub(crate) fn prepare(
         &mut self,
-        skip: &[usize],
-        content: &[usize],
+        native: impl Iterator<Item = (usize, bool)>,
         damage: Vec<[i32; 4]>,
         fresh: bool,
         keeps_under: bool,
     ) {
-        self.skip.clear();
-        self.skip.extend_from_slice(skip);
+        let (mut same, mut len) = (true, 0);
         self.content.clear();
-        self.content.extend_from_slice(content);
-        (self.damage, self.fresh, self.keeps_under) = (damage, fresh, keeps_under);
+        for (layer, content) in native {
+            if self.skip.get(len) != Some(&layer) {
+                same = false;
+                self.skip.truncate(len);
+                self.skip.push(layer);
+            }
+            len += 1;
+            if content {
+                self.content.push(layer);
+            }
+        }
+        same &= len == self.skip.len();
+        self.skip.truncate(len);
+        // A layer that left or joined the backend draws otherwise in the whole window.
+        self.damage = if same { damage } else { Vec::new() };
+        (self.fresh, self.keeps_under) = (fresh, keeps_under);
+    }
+
+    // Whether the frame skips exactly `layers`, which the backend draws.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn skips(&self, layers: impl Iterator<Item = usize>) -> bool {
+        self.skip.iter().copied().eq(layers)
+    }
+
+    // Whether the frame draws damage regions over the last frame.
+    pub(crate) fn damaged(&self) -> bool {
+        !self.damage.is_empty()
     }
 
     #[cfg(all(test, target_os = "macos"))]
