@@ -845,8 +845,7 @@ impl Host {
                 );
                 return Ok(Value::Null);
             }
-            let store = self.store.clone();
-            let mut store = store.try_borrow_mut().context("Host is busy")?;
+            let mut store = self.store.try_borrow_mut().context("Host is busy")?;
             let store = &mut *store;
             let page = store.pages.get_mut(&id).context("Window is closed")?;
             if op == "dom.viewport" {
