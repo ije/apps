@@ -108,7 +108,7 @@ impl Tasks {
         let (execute, data, state) = (item.execute, item.data as usize, item.state.clone());
         let (ready, wake, raw, work) = (
             self.ready.clone(),
-            crate::host::Waker::current(),
+            crate::jsc::Waker::current(),
             env as usize,
             work as usize,
         );
@@ -163,7 +163,7 @@ impl Tasks {
             finalized: false.into(),
             referenced: true.into(),
             ready: self.ready.clone(),
-            wake: crate::host::Waker::current(),
+            wake: crate::jsc::Waker::current(),
         });
         // Each acquiring thread and `live` own references. Keep the allocation alive after another thread aborts.
         let raw = Arc::as_ptr(&function);
@@ -214,7 +214,7 @@ pub(super) struct Threadsafe {
     finalized: AtomicBool,
     referenced: AtomicBool,
     ready: Queue,
-    wake: crate::host::Waker,
+    wake: crate::jsc::Waker,
 }
 
 impl Threadsafe {

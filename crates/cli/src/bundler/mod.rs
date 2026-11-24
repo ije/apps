@@ -1,9 +1,8 @@
 use anyhow::{Context, Result, bail, ensure};
 use apps_runtime::{
-    bundle::script_source,
     dom::Document,
-    host::{Role, Waker},
-    jsc::{JavaScriptCore, JsContext},
+    host::context::JsContext,
+    jsc::{JavaScriptCore, Role, Waker, script_source},
 };
 use bbtree::unsync::BBTreeMap;
 use emit::bundle;
@@ -51,7 +50,7 @@ struct Shared {
     workers: RefCell<BBTreeMap<(PathBuf, Realm), usize>>,
     scripts: RefCell<Vec<String>>,
     cache: Option<Rc<Cache>>,
-    disabled: u32,
+    features: apps_runtime::bundle::Features,
     aliases: Option<(PathBuf, Vec<String>)>,
     preload: Option<PathBuf>,
     loaders: Option<Rc<Loaders>>,
@@ -366,7 +365,7 @@ impl Shared {
                             if package.get(key).is_none() {
                                 let mut candidate = package.clone();
                                 candidate[key] = title.as_str().into();
-                                if apps_runtime::bundle::package_metadata(Some(
+                                if apps_runtime::bundle::Package::parse(Some(
                                     &candidate.to_string(),
                                 ))
                                 .is_ok()
@@ -381,9 +380,13 @@ impl Shared {
                 }
             }
             let source = package.to_string();
-            let (name, product_name, version, identifier) =
-                apps_runtime::bundle::package_metadata(Some(&source))?;
-            apps_runtime::bundle::disabled_features(Some(&source))?;
+            let apps_runtime::bundle::Package {
+                name,
+                product_name,
+                version,
+                identifier,
+                ..
+            } = apps_runtime::bundle::Package::parse(Some(&source))?;
             let mut metadata = json!({"name":name,"productName":product_name,"version":version,"identifier":identifier});
             if package["type"] == "rust" {
                 metadata["type"] = "rust".into();
@@ -396,8 +399,8 @@ impl Shared {
         Ok(())
     }
 
-    fn enabled(&self, feature: &str) -> bool {
-        self.disabled & apps_runtime::bundle::feature_bit(feature) == 0
+    fn enabled(&self, feature: apps_runtime::bundle::Feature) -> bool {
+        self.features.has(feature)
     }
 
     // Unlike Node, bare `imports` keys apply to all modules, including dependencies.
@@ -459,7 +462,7 @@ impl Shared {
 pub struct Cache {
     graphs: RefCell<HashMap<(Realm, PathBuf), Graph>>,
     loaders: RefCell<Option<Rc<Loaders>>>,
-    disabled: Cell<u32>,
+    features: Cell<apps_runtime::bundle::Features>,
     env: RefCell<Value>,
     pub resolutions: RefCell<HashMap<ResolutionKey, Resolved>>,
     // Cached resolutions skip the tsconfig lookup, so each build watches the configs found before.
@@ -741,8 +744,8 @@ pub fn compile(
             Some((manifest.as_ref()?.parent()?.to_owned(), keys))
         })
         .filter(|(_, keys)| !keys.is_empty());
-    let disabled = apps_runtime::bundle::disabled_features(package.as_deref())?;
-    if disabled & apps_runtime::bundle::feature_bit("reactCompiler") == 0
+    let features = apps_runtime::bundle::Features::parse(package.as_deref())?;
+    if features.has(apps_runtime::bundle::Feature::ReactCompiler)
         && let Some(react) = root.ancestors().find_map(|directory| {
             fs::read_to_string(directory.join("node_modules/react/package.json")).ok()
         })
@@ -792,7 +795,7 @@ pub fn compile(
             .unwrap()
             .with_file_name("package.json#loaders");
         let shared = Rc::new(Shared {
-            disabled,
+            features,
             aliases: aliases.clone(),
             root: root.clone(),
             files: files.clone(),
@@ -844,13 +847,13 @@ pub fn compile(
                 .retain(|(_, entry), _| entry.ends_with("package.json#loaders"));
         }
         // Cached modules inline `import.meta.env`.
-        if cache.disabled.replace(disabled) != disabled || *cache.env.borrow() != meta_env {
+        if cache.features.replace(features) != features || *cache.env.borrow() != meta_env {
             cache.env.replace(meta_env.clone());
             cache.graphs.borrow_mut().clear();
         }
     }
     let shared = Rc::new(Shared {
-        disabled,
+        features,
         aliases,
         preload,
         loaders,

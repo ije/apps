@@ -216,8 +216,6 @@ impl Drop for Listening {
     }
 }
 
-pub(crate) static ASSETS: OnceLock<HashMap<String, std::path::PathBuf>> = OnceLock::new();
-
 pub(crate) static LOCAL_NETWORK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -380,6 +378,7 @@ pub struct State {
     next_id: u64,
     fetches: HashMap<u64, Fetch>,
     agent: Option<Agent>,
+    assets: std::sync::Arc<HashMap<String, std::path::PathBuf>>,
 }
 
 pub(crate) fn url(input: &str, base: Option<&str>, set: Option<(&str, &str)>) -> Result<Url> {
@@ -416,15 +415,23 @@ pub(crate) fn url(input: &str, base: Option<&str>, set: Option<(&str, &str)>) ->
 }
 
 impl State {
-    pub fn configure_storage(&mut self, host: &crate::host::Host, window: Option<u64>) {
-        let namespace = host.app_name.as_deref().unwrap_or("apps");
+    pub(crate) fn new(
+        renderer: bool,
+        assets: std::sync::Arc<HashMap<String, std::path::PathBuf>>,
+        run_worker: crate::web::worker::Run,
+    ) -> Self {
+        Self {
+            renderer,
+            workers: crate::web::worker::State::new(run_worker),
+            assets,
+            ..Self::default()
+        }
+    }
+
+    pub fn configure_storage(&mut self, app: &crate::bundle::AppInfo, window: Option<u64>) {
+        let namespace = app.name.as_deref().unwrap_or("apps");
         self.storage.configure(namespace, window);
-        self.workers.configure(
-            namespace,
-            host.packaged,
-            host.disabled,
-            host.scripts.clone(),
-        );
+        self.workers.configure(app);
     }
     pub fn call(&mut self, op: &str, args: &mut Value) -> Result<Value> {
         match op {
@@ -435,7 +442,7 @@ impl State {
             "asset" => {
                 let url = Url::parse(args[0].as_str().context("Expected URL")?)?;
                 let name = url.path().trim_start_matches('/');
-                let path = ASSETS.get().and_then(|assets| assets.get(name));
+                let path = self.assets.get(name);
                 Ok(match path.map(std::fs::read) {
                     Some(Ok(data)) => crate::jsc::payload::write(data),
                     _ => Value::Null,
@@ -495,7 +502,7 @@ impl State {
                 let (demand, mut demand_rx) = mpsc::channel(1);
                 let (upload, upload_rx) = mpsc::channel::<Option<bytes::Bytes>>(16);
                 let mut upload_rx = (args[0]["stream"] == true).then_some(upload_rx);
-                let wake = crate::host::Waker::current();
+                let wake = crate::jsc::Waker::current();
                 let task = network.spawn(async move {
                     let result: Result<()> = async {
                         if upload_rx.is_some() { for _ in 0..16 { if events_tx.send(json!({"kind":"upload"}).into()).await.is_err() { return Ok(()); } } wake.wake(); }
@@ -656,4 +663,57 @@ impl State {
             },
         }
     }
+}
+
+pub(crate) unsafe extern "C" fn url_parts(
+    ctx: crate::jsc::Ptr,
+    _: crate::jsc::Ptr,
+    _: crate::jsc::Ptr,
+    count: usize,
+    args: *const crate::jsc::Ptr,
+    exception: *mut crate::jsc::Ptr,
+) -> crate::jsc::Ptr {
+    crate::jsc::encoding::native(ctx, count, args, exception, |api, arg| {
+        use ::url::Position::*;
+        let text = |index| {
+            api.chars(ctx, arg(index))
+                .map(|chars| api.utf8_string(chars))
+        };
+        let (input, base) = (text(0).context("Expected URL")?, text(1));
+        let (key, value) = (text(2), text(3));
+        let url = url(
+            &input,
+            base.as_deref(),
+            key.as_deref().zip(value.as_deref()),
+        )?;
+        let href = url.as_str();
+        let mut items = [std::ptr::null_mut(); 11];
+        items[0] = api.utf8(ctx, href.as_bytes())?;
+        for (item, position) in items[1..].iter_mut().zip([
+            AfterScheme,
+            BeforeUsername,
+            AfterUsername,
+            BeforePassword,
+            AfterPassword,
+            BeforeHost,
+            AfterHost,
+            AfterPort,
+            AfterPath,
+            AfterQuery,
+        ]) {
+            // Without a password, the url crate puts the end of the password after the `@`.
+            let position = match position {
+                BeforePassword | AfterPassword if url.password().is_none() => AfterUsername,
+                position => position,
+            };
+            let end = url[..position].len();
+            let end = if href.is_ascii() {
+                end
+            } else {
+                href[..end].encode_utf16().count()
+            };
+            *item = unsafe { (api.number)(ctx, end as f64) };
+        }
+        Ok(api.array(ctx, &items))
+    })
 }

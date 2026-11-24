@@ -9,7 +9,7 @@ pub(crate) mod grid;
 mod hud;
 pub mod image;
 mod input;
-mod inspect;
+pub(crate) mod inspect;
 pub(crate) mod native;
 mod paint;
 mod plan;
@@ -19,7 +19,7 @@ pub(crate) mod terminal;
 pub(crate) mod text;
 
 use crate::style::Prop;
-use crate::{desktop::Desktop, host::Host, style};
+use crate::{host::Host, style};
 pub(crate) use element::dimension;
 use element::{Build, element};
 pub(crate) use hud::Hud;
@@ -37,10 +37,27 @@ use std::{
 
 type MaskSources = Vec<(String, background::Source)>;
 
+// The app side of the page views: it runs page scripts and their events.
+pub(crate) trait Pages {
+    // The page context of view `id`. It expects the desktop free, where `try_renderer` skips a busy one.
+    fn renderer(&self, id: u64) -> Option<Rc<crate::host::context::JsContext>>;
+    fn try_renderer(&self, id: u64) -> Option<Rc<crate::host::context::JsContext>>;
+    fn dispatch(
+        &self,
+        id: u64,
+        name: &str,
+        path: &[usize],
+        data: serde_json::Value,
+        window: Option<&mut Window>,
+        cx: &mut App,
+    ) -> bool;
+    fn drive(&self, cx: &mut App);
+}
+
 pub(crate) struct PageState {
     pub(crate) id: u64,
     queued: Cell<bool>,
-    pub(crate) runtime: Rc<RefCell<Desktop>>,
+    pub(crate) runtime: Rc<dyn Pages>,
     pub(crate) host: Rc<RefCell<Host>>,
     images: RefCell<HashMap<usize, Arc<renderer::RenderImage>>>,
     pub(crate) frames: RefCell<HashMap<usize, Frame>>,
@@ -100,7 +117,7 @@ pub(crate) struct PageState {
 }
 
 pub(crate) struct Frame {
-    pub(crate) browser: crate::desktop::browser::Browser,
+    pub(crate) browser: apps_webview::Browser,
     loaded: String,
     pub(crate) bounds: [f64; 4],
     revision: u64,
@@ -121,8 +138,8 @@ thread_local! {
 
 // Do not use cx or window inside f: reflow accesses them through pointers.
 pub(crate) fn scripted<R>(cx: &mut App, window: Option<&mut Window>, f: impl FnOnce() -> R) -> R {
-    crate::jsc::REFLOW.set(Some(reflow));
-    crate::jsc::CLIPBOARD.set(Some(clipboard));
+    crate::host::context::REFLOW.set(Some(reflow));
+    crate::host::context::CLIPBOARD.set(Some(clipboard));
     let previous = SCRIPTS.replace(Some((cx, window.map(|window| window as *mut Window))));
     let result = f();
     SCRIPTS.set(previous);
@@ -143,7 +160,7 @@ fn clipboard(text: Option<String>) -> Option<String> {
 }
 
 pub(crate) fn edit(
-    renderer: &crate::jsc::JsContext,
+    renderer: &crate::host::context::JsContext,
     app: Option<(&mut App, Option<&mut Window>)>,
     command: &str,
     text: &str,
@@ -218,12 +235,7 @@ fn queue_layout(view: Rc<PageState>, window: &mut Window) {
     }
     window.next_frame(move |window, cx| {
         view.layout_queued.set(false);
-        let renderer = view
-            .runtime
-            .borrow()
-            .views
-            .get(&view.id)
-            .and_then(|view| view.renderer.clone());
+        let renderer = view.runtime.renderer(view.id);
         if let Some(renderer) = renderer
             && let Err(error) = scripted(cx, Some(window), || {
                 renderer.eval("__appsLayout()", "apps:layout")
@@ -232,7 +244,7 @@ fn queue_layout(view: Rc<PageState>, window: &mut Window) {
             eprintln!("apps: {error}");
         }
         let runtime = view.runtime.clone();
-        cx.defer(move |cx| Desktop::drive(runtime, cx));
+        cx.defer(move |cx| runtime.drive(cx));
     });
 }
 
@@ -245,11 +257,7 @@ pub(crate) fn queue_animation_frame(view: Rc<PageState>, window: &mut Window) {
 
 fn animation_frame(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
     view.queued.set(false);
-    let renderer = view.runtime.try_borrow().ok().and_then(|app| {
-        app.views
-            .get(&view.id)
-            .and_then(|view| view.renderer.clone())
-    });
+    let renderer = view.runtime.try_renderer(view.id);
     if let Some(renderer) = renderer
         && let Err(error) = scripted(cx, Some(window), || {
             renderer.eval("__appsAnimationFrame()", "apps:frame")
@@ -281,7 +289,7 @@ fn animation_frame(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
         queue_animation_frame(view.clone(), window);
     }
     let runtime = view.runtime.clone();
-    cx.defer(move |cx| Desktop::drive(runtime, cx));
+    cx.defer(move |cx| runtime.drive(cx));
 }
 
 impl PageState {
@@ -376,7 +384,7 @@ impl std::ops::Deref for PageView {
 impl PageView {
     pub(crate) fn new(
         id: u64,
-        runtime: Rc<RefCell<Desktop>>,
+        runtime: Rc<dyn Pages>,
         host: Rc<RefCell<Host>>,
         window: WindowId,
     ) -> Self {
@@ -519,11 +527,11 @@ impl PageView {
                         _ => return,
                     };
                     view.host.borrow_mut().command(
-                        crate::desktop::link::Target::Window(view.id),
+                        crate::host::link::Target::Window(view.id),
                         serde_json::json!({"op":"window","args":["inspect",view.id,f32::from(at.x),f32::from(at.y),click]}),
                     );
                     let runtime = view.runtime.clone();
-                    cx.defer(move |cx| Desktop::drive(runtime, cx));
+                    cx.defer(move |cx| runtime.drive(cx));
                     cx.stop_event();
                 });
             }
@@ -535,7 +543,7 @@ impl PageView {
                 let (kind, button) = match *event {
                     Event::PointerLeave { .. } => {
                         let [x, y] = view.screen(window, position);
-                        Desktop::dispatch(view.runtime.clone(), view.id, "pointerexit", &[], serde_json::json!({"clientX":f32::from(position.x),"clientY":f32::from(position.y),"screenX":x,"screenY":y}), Some(window), cx);
+                        view.runtime.dispatch(view.id, "pointerexit", &[], serde_json::json!({"clientX":f32::from(position.x),"clientY":f32::from(position.y),"screenX":x,"screenY":y}), Some(window), cx);
                         return;
                     }
                     Event::PointerMove { held, .. } => {
@@ -555,7 +563,7 @@ impl PageView {
                 if let Some(button) = button {
                     fields["button"] = button.into();
                 }
-                Desktop::dispatch(view.runtime.clone(), view.id, kind, &[], fields, Some(window), cx);
+                view.runtime.dispatch(view.id, kind, &[], fields, Some(window), cx);
             });
             let view = data.clone();
             window.on_bubble(move |event, window, cx| {
@@ -564,7 +572,7 @@ impl PageView {
                     view.buttons.set(view.buttons.get() | BUTTONS[usize::from(button)]);
                     let mut fields = view.pointer(window, at, modifiers);
                     (fields["button"], fields["detail"]) = (button.into(), clicks.into());
-                    Desktop::dispatch(view.runtime.clone(), view.id, "pointerdown", &[], fields, Some(window), cx);
+                    view.runtime.dispatch(view.id, "pointerdown", &[], fields, Some(window), cx);
                 }
             });
             let view = data.clone();
@@ -618,7 +626,7 @@ impl PageView {
                     let delta = if lines { delta.map(|value| value * 16.) } else { delta };
                     let mut fields = view.pointer(window, position, modifiers);
                     (fields["deltaX"], fields["deltaY"]) = ((-delta.x).into(), (-delta.y).into());
-                    if !Desktop::dispatch(view.runtime.clone(), view.id, "wheel", target.as_slice(), fields, Some(window), cx) {
+                    if !view.runtime.dispatch(view.id, "wheel", target.as_slice(), fields, Some(window), cx) {
                         cx.stop_event();
                         return;
                     }
@@ -645,9 +653,9 @@ impl PageView {
         if resized && !host.resized.contains(&self.id) {
             host.resized.push(self.id);
             let runtime = self.runtime.clone();
-            cx.defer(move |cx| Desktop::drive(runtime, cx));
+            cx.defer(move |cx| runtime.drive(cx));
         }
-        let inspectable = !host.packaged;
+        let inspectable = !host.app.packaged;
         let Some(page) = host.pages.get_mut(&self.id) else {
             return renderer::node().size_full().into();
         };
@@ -709,7 +717,7 @@ impl PageView {
         let cached = dom.computed.clone();
         let mut styles = crate::dom::styles(&mut doc, dom, [width, height]);
         if cached.is_none_or(|cached| !std::rc::Rc::ptr_eq(&cached, &styles))
-            && fonts::load(&doc, dom, &state.assets).0
+            && fonts::load(&doc, dom, &state.app.assets).0
         {
             styles = crate::dom::styles(&mut doc, dom, [width, height]);
         }
@@ -1138,7 +1146,7 @@ impl PageView {
             let frame = match frames.entry(node) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    match crate::desktop::browser::Browser::new(
+                    match apps_webview::Browser::new(
                         window,
                         &serde_json::json!({"javascript":attrs.get("sandbox").is_none_or(|s|s.split_whitespace().any(|s|s=="allow-scripts")),"inspectable":inspectable}),
                     ) {
@@ -1212,7 +1220,7 @@ impl PageView {
             .and_then(|id| styles.values[id].get(Prop::COLOR_SCHEME))
             .is_some_and(|scheme| {
                 scheme.contains("dark")
-                    && (!scheme.contains("light") || crate::desktop::native::theme_state() & 1 != 0)
+                    && (!scheme.contains("light") || crate::native::theme_state() & 1 != 0)
             });
         let source = background::canvas_source(&doc, &styles);
         // The html and body boxes read each other's background, which their kept builds don't track.
@@ -2137,7 +2145,7 @@ impl PageView {
         let measured = RefCell::new(std::mem::take(&mut dom.measurements));
         let walk = dom.style_walk.nodes.clone();
         for text in warnings {
-            host.log(serde_json::json!({"method":"Runtime.consoleAPICalled","params":{"type":"error","text":text,"context":crate::host::Role::Renderer(self.id)}}));
+            host.log(serde_json::json!({"method":"Runtime.consoleAPICalled","params":{"type":"error","text":text,"context":crate::jsc::Role::Renderer(self.id)}}));
         }
         drop(host);
         let text_system = window.text_system().clone();
@@ -2253,7 +2261,7 @@ impl PageView {
                             [[0.; 4]; 3],
                             self.0.clone(),
                             host.dom.get(&self.id).and_then(|state| state.base.as_ref()),
-                            &host.assets,
+                            &host.app.assets,
                             false,
                         ));
                     }
@@ -2654,12 +2662,12 @@ impl PageView {
                 origin: [0.; 2],
                 quiet: false,
             }))
-            .children(crate::desktop::mcp::profiling().then(|| {
+            .children(crate::native::devtools::profiling().then(|| {
                 renderer::canvas(
                     |_, _| (),
                     move |_, _, window| {
                         window.paint_volatile();
-                        crate::desktop::mcp::frame(id, started)
+                        crate::native::devtools::frame(id, started)
                     },
                 )
                 .absolute()
@@ -2820,12 +2828,7 @@ fn animation_events(
     events: Vec<(usize, &'static str, String, f64)>,
     cx: &mut App,
 ) {
-    let runtime = view.runtime.clone();
-    let renderer = runtime
-        .borrow()
-        .views
-        .get(&view.id)
-        .and_then(|view| view.renderer.clone());
+    let renderer = view.runtime.renderer(view.id);
     for (node, kind, name, elapsed) in events {
         let (pseudo, name) = name.split_once('\0').unwrap_or(("", &name));
         let data = if kind.starts_with("animation") {
@@ -2842,7 +2845,7 @@ fn animation_events(
             eprintln!("apps: {error}");
         }
     }
-    Desktop::drive(runtime, cx);
+    view.runtime.drive(cx);
 }
 
 fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
@@ -3143,8 +3146,8 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
     };
     animate(&view, dom, next, now, true, window, cx);
     drop(host);
-    if patched && !promoted && crate::desktop::mcp::profiling() {
-        crate::desktop::mcp::frame(view.id, started);
+    if patched && !promoted && crate::native::devtools::profiling() {
+        crate::native::devtools::frame(view.id, started);
     }
     if !patched || (!promoted || fresh) && !window.present() {
         window.refresh();

@@ -74,7 +74,7 @@ pub fn build(root: &Path, entry: &Path, release: bool, target: BuildTarget) -> R
             .to_owned();
     } else {
         let package = fs::read_to_string(root.join("package.json"))?;
-        name = apps_runtime::bundle::package_metadata(Some(&package))?.0;
+        name = apps_runtime::bundle::Package::parse(Some(&package))?.name;
         let sdk = std::env::var_os("APPS_RUST_SDK")
             .map(PathBuf::from)
             .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));

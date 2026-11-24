@@ -1,10 +1,6 @@
 use crate::bundler;
 use anyhow::{Context, Result};
-use apps_runtime::{
-    bundle::Bundle,
-    host::Role,
-    jsc::{JavaScriptCore, JsContext},
-};
+use apps_runtime::{bundle::Bundle, host::context::JsContext, jsc::JavaScriptCore, jsc::Role};
 use bbtree::unsync::BBTreeMap;
 use notify::Watcher;
 use std::{

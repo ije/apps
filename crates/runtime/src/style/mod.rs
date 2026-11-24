@@ -4662,7 +4662,7 @@ pub(crate) fn supports_condition(condition: &str) -> bool {
 }
 
 pub(crate) fn reduced_motion() -> bool {
-    crate::desktop::native::theme_state() & 32 != 0
+    crate::native::theme_state() & 32 != 0
 }
 
 impl MediaQuery {
@@ -5404,7 +5404,7 @@ pub(crate) fn compute_styles(
     // The generation and revision of each dependency key in the list of the current node.
     let (mut unique, mut generation) = (Vec::<(u32, u32)>::new(), 0u32);
     let (reduced_motion, native_theme) = context.map_or_else(
-        || (reduced_motion(), crate::desktop::native::theme_state()),
+        || (reduced_motion(), crate::native::theme_state()),
         |context| (context.reduced_motion, context.theme),
     );
     if let Some(text) = text_system {
@@ -10156,8 +10156,7 @@ fn resolve_style(
 
 pub(crate) fn dark(style: &Style) -> bool {
     style.get(Prop::COLOR_SCHEME).is_some_and(|v| {
-        v.contains("dark")
-            && (!v.contains("light") || crate::desktop::native::theme_state() & 1 != 0)
+        v.contains("dark") && (!v.contains("light") || crate::native::theme_state() & 1 != 0)
     })
 }
 

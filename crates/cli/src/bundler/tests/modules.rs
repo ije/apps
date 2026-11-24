@@ -51,10 +51,10 @@ fn commonjs_star_exports_follow_linked_packages() {
     fs::write(&entry, "import {named,change} from './outer.js';if(named!==42)throw Error('star');change();if(named!==43)throw Error('live star')").unwrap();
     for production in [false, true] {
         let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.load_bundle(&files, "app.js").unwrap();
@@ -92,10 +92,10 @@ fn oxc_transforms_typescript_and_export_declarations() {
         "#).unwrap();
     for production in [false, true] {
         let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.load_bundle(&files, "app.js").unwrap();
@@ -141,10 +141,10 @@ fn linked_imports_stay_live_without_a_with_scope() {
         "#).unwrap();
     for production in [false, true] {
         let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.load_bundle(&files, "app.js").unwrap();
@@ -170,10 +170,10 @@ fn linked_module_hot_loop() {
         let entry = dir.path().join(format!("{name}.js"));
         fs::write(&entry, format!("import {{ scale }} from './vec.js'; {extra} const run = () => {{ let s = 0; for (let i = 0; i < 2e7; i++) s += Math.sqrt(i) * scale.x; return s; }}; run(); const t = performance.now(); run(); globalThis.ms = Math.round(performance.now() - t);")).unwrap();
         let files = compile(&entry, Realm::Main, None, Rc::default(), true, None).unwrap();
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.load_bundle(&files, "app.js").unwrap();
@@ -196,10 +196,10 @@ fn development_maps_runtime_locations_to_original_sources() {
     let source = "import mapped from 'mapped';\ninterface Value { count: number }\nfunction esmProbe(value: Value) {\n  const text: string = '😀'; throw new Error(text);\n}\nglobalThis.esmProbe = esmProbe;\nglobalThis.cjsProbe = mapped.probe;\n";
     fs::write(&entry, source).unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
-    let engine = apps_runtime::jsc::JsContext::new(
+    let engine = apps_runtime::host::context::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         Rc::default(),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     engine.load_bundle(&files, "app.js").unwrap();
@@ -317,10 +317,10 @@ fn production_minifies_and_shakes_modules() {
         ] {
             assert_eq!(output.contains(marker), !production, "{marker}");
         }
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.load_bundle(&files, "test").unwrap();
@@ -365,10 +365,10 @@ fn jsx_tsx_and_commonjs_packages() {
         fs::write(&entry, "import Label from './label'; import {mode} from 'react'; interface Props {name: string} const props: Props = {name: 'Ada'}; globalThis.tree = <><Label {...props}/><input disabled data-id=\"1\" /></>; globalThis.result = tree.children[0].type(tree.children[0].props).children.join('') + ':' + mode;").unwrap();
         let watched = Rc::default();
         let files = compile(&entry, Realm::Renderer, None, watched, production, None).unwrap();
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.load_bundle(&files, "test").unwrap();
@@ -400,10 +400,10 @@ fn jsx_tsx_and_commonjs_packages() {
                 None,
             )
             .unwrap();
-            let engine = apps_runtime::jsc::JsContext::new(
+            let engine = apps_runtime::host::context::JsContext::new(
                 apps_runtime::jsc::JavaScriptCore::load().unwrap(),
                 Rc::default(),
-                apps_runtime::host::Role::Main,
+                apps_runtime::jsc::Role::Main,
             )
             .unwrap();
             engine.eval("delete globalThis.__apps", "test").unwrap();
@@ -434,10 +434,10 @@ fn commonjs_interop_patterns_of_express_dependencies() {
     )
     .unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
-    let engine = apps_runtime::jsc::JsContext::new(
+    let engine = apps_runtime::host::context::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         Rc::default(),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     engine.load_bundle(&files, "app.js").unwrap();
@@ -481,10 +481,10 @@ fn commonjs_require_runtime_semantics() {
         )
         .unwrap();
         let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.load_bundle(&files, "app.js").unwrap();
@@ -517,10 +517,10 @@ fn commonjs_cycles_and_module_exports() {
         let entry = dir.path().join("app.js");
         fs::write(&entry, "import counter,{count,seen,next} from 'counter';next();globalThis.result = [count, seen, counter.count, (await counter.load()).seen].join(':');").unwrap();
         let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.load_bundle(&files, "test").unwrap();
@@ -545,10 +545,10 @@ fn live_imports_typescript_and_dependencies() {
     let entry = dir.path().join("app.ts");
     fs::write(&entry,"import {count,next} from 'counter'; const x: number = 2; next(); if(count !== x) throw Error('stale import'); globalThis.result=count;").unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
-    let engine = apps_runtime::jsc::JsContext::new(
+    let engine = apps_runtime::host::context::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         std::rc::Rc::new(std::cell::RefCell::new(apps_runtime::host::Host::default())),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     engine.load_bundle(&files, "app.js").unwrap();
@@ -575,10 +575,10 @@ fn cycles_reexports_and_missing_exports() {
         "import {result as value} from './barrel.js'; globalThis.answer=value;",
     )
     .unwrap();
-    let engine = apps_runtime::jsc::JsContext::new(
+    let engine = apps_runtime::host::context::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         std::rc::Rc::new(std::cell::RefCell::new(apps_runtime::host::Host::default())),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
@@ -757,10 +757,10 @@ fn production_keeps_imports_that_shadow_globals() {
     fs::write(&entry, "import {String, Boolean, Array, Math, parseInt} from './shadow.js'; export {String}; globalThis.result = [String(1), Boolean(0), Array(2), Math.PI, parseInt('7'), ({String}).String === String].join(':');").unwrap();
     for production in [false, true] {
         let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.load_bundle(&files, "app.js").unwrap();
@@ -785,10 +785,10 @@ fn json_imports_keep_proto_keys_and_bundles_stay_ascii() {
     for production in [false, true] {
         let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
         assert!(files["app.js"].is_ascii(), "production={production}");
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.load_bundle(&files, "app.js").unwrap();
@@ -853,10 +853,10 @@ fn dynamic_imports_set_up_on_first_use_and_share_static_modules() {
                 .count(),
             if production { 3 } else { 0 }
         );
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine
@@ -950,10 +950,10 @@ globalThis.later = import('./later.js').then(ns => { globalThis.result += '|' + 
             assert!(files["app.js"].contains(",flat:1"));
             assert!(!files["app.js"].contains("get:()=>\"VALUE\""));
         }
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.load_bundle(&files, "app.js").unwrap();
@@ -1018,10 +1018,10 @@ globalThis.result = [globalThis.runs.join(), new Set(files).size, a.url !== b.ur
     let entry = root.join("src/app.js");
     let files = compile(&entry, Realm::Main, None, Rc::default(), true, None).unwrap();
     assert!(files["app.js"].contains("../node_modules/a/node_modules/x/index.js"));
-    let engine = apps_runtime::jsc::JsContext::new(
+    let engine = apps_runtime::host::context::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         Rc::default(),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     engine.load_bundle(&files, "app.js").unwrap();
@@ -1060,10 +1060,10 @@ globalThis.result = [nextId, early, viaGetter, viaMethod].join();",
     .unwrap();
     for production in [false, true] {
         let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.load_bundle(&files, "app.js").unwrap();
@@ -1093,10 +1093,10 @@ fn production_reads_only_the_builtin_exports_that_imports_use() {
                 reads,
                 "{entry:?} production={production}"
             );
-            let engine = apps_runtime::jsc::JsContext::new(
+            let engine = apps_runtime::host::context::JsContext::new(
                 apps_runtime::jsc::JavaScriptCore::load().unwrap(),
                 Rc::default(),
-                apps_runtime::host::Role::Main,
+                apps_runtime::jsc::Role::Main,
             )
             .unwrap();
             engine.load_bundle(&files, "app.js").unwrap();
@@ -1160,10 +1160,10 @@ fn production_drops_unused_modules_of_side_effect_free_packages() {
         for marker in ["UNUSED_ICON", "DEEP_MARKER", "PLAIN_MARKER", "OTHER_STAR"] {
             assert_eq!(files["app.js"].contains(marker), !production, "{marker}");
         }
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.load_bundle(&files, "app.js").unwrap();
@@ -1214,10 +1214,10 @@ fn exports_fall_back_to_the_next_condition_and_module_bindings_are_scoped() {
     fs::write(&entry, "import a from 'fallback'; import b from 'consumer'; const plugins = [{exports: new Set([1, 2])}]; let size = 0; for (const module of plugins) size += module.exports.size; globalThis.result = [a, b, size].join(':');").unwrap();
     for production in [false, true] {
         let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.load_bundle(&files, "app.js").unwrap();

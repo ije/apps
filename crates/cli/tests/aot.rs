@@ -299,7 +299,7 @@ setTimeout(async () => {
         assert!(scripts[name].as_u64().unwrap() > 0, "{name} must compile");
     }
     for name in scripts.keys().filter(|name| !name.starts_with("apps:")) {
-        let expected = apps_runtime::bundle::aot_source(id, name);
+        let expected = apps_runtime::jsc::aot::source(id, name);
         if let Some(source) = bundle.files.get(name) {
             assert_eq!(source, &expected);
         } else if name == "app.js" {
@@ -373,7 +373,7 @@ setTimeout(async () => {
     }
     for name in ["app.js", worker.as_str()] {
         let mut changed = files.clone();
-        changed.insert(name.into(), apps_runtime::bundle::aot_source("0", name));
+        changed.insert(name.into(), apps_runtime::jsc::aot::source("0", name));
         apps_runtime::bundle::write(&resources.join("app.bundle"), &changed, &[]).unwrap();
         let output = run(&executable);
         assert!(!output.status.success());
@@ -409,7 +409,7 @@ setTimeout(async () => {
             .unwrap()
             .main
             .unwrap()
-            .starts_with(apps_runtime::bundle::AOT_PREFIX.as_bytes())
+            .starts_with(apps_runtime::jsc::aot::AOT_PREFIX.as_bytes())
     );
     let output = run(&executable);
     assert!(

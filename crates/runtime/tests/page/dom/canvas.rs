@@ -545,7 +545,7 @@ fn bitmaps_free_their_pixels() {
 #[test]
 fn images_decode_on_workers_and_load_after_a_wake() {
     let (wake, woken) = std::sync::mpsc::channel();
-    apps_runtime::host::Waker::install(move || {
+    apps_runtime::jsc::Waker::install(move || {
         let _ = wake.send(());
     });
     let directory = tempfile::tempdir().unwrap();

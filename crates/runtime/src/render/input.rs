@@ -1,12 +1,7 @@
+use super::inspect::{Tool, tool};
 use super::{PageState, PageView};
+use crate::style;
 use crate::style::Prop;
-use crate::{
-    desktop::{
-        Desktop,
-        link::{Tool, tool},
-    },
-    style,
-};
 use anyhow::{Context as _, Result, ensure};
 use renderer::{App, Event, Pixels, Point, Rect, Utf16Selection, Window, point, px, size};
 use std::{
@@ -336,10 +331,7 @@ impl PageState {
     fn evaluate(&self, script: &str) -> Result<String> {
         let renderer = self
             .runtime
-            .borrow()
-            .views
-            .get(&self.id)
-            .and_then(|view| view.renderer.clone())
+            .renderer(self.id)
             .context("Page is not loaded")?;
         renderer.eval(script, "apps:input")
     }
@@ -383,7 +375,7 @@ impl PageState {
 
     pub(super) fn drive(&self, cx: &mut App) {
         let runtime = self.runtime.clone();
-        cx.defer(move |cx| Desktop::drive(runtime, cx));
+        cx.defer(move |cx| runtime.drive(cx));
     }
 
     fn drag_files(&self, kind: &str, position: Point<Pixels>, window: &mut Window, cx: &mut App) {
@@ -529,11 +521,7 @@ impl renderer::View for PageView {
         let view = self.0.clone();
         cx.defer(move |cx| {
             cx.update_window(view.window, |window, cx| {
-                let renderer = view.runtime.try_borrow().ok().and_then(|app| {
-                    app.views
-                        .get(&view.id)
-                        .and_then(|view| view.renderer.clone())
-                });
+                let renderer = view.runtime.try_renderer(view.id);
                 if let Some(renderer) = renderer
                     && let Err(error) = super::scripted(cx, Some(window), || {
                         renderer.eval(&format!("__appsPaint({changed:?})"), "apps:paint")
@@ -542,7 +530,7 @@ impl renderer::View for PageView {
                     eprintln!("apps: {error}");
                 }
                 let runtime = view.runtime.clone();
-                cx.defer(move |cx| Desktop::drive(runtime, cx));
+                cx.defer(move |cx| runtime.drive(cx));
             });
         });
     }
@@ -571,8 +559,8 @@ impl renderer::View for PageView {
             } => {
                 let key = named.name.as_str();
                 let pick = (key == "escape" && self.inspect.get().pick).then_some(Tool::Pick);
-                let tool =
-                    pick.or_else(|| tool(key, *modifiers).filter(|_| !self.host.borrow().packaged));
+                let tool = pick
+                    .or_else(|| tool(key, *modifiers).filter(|_| !self.host.borrow().app.packaged));
                 let open = self.inspect.get().open;
                 let args = match tool {
                     Some(Tool::Hud) => serde_json::json!(["hud", id]),
@@ -586,15 +574,14 @@ impl renderer::View for PageView {
                 };
                 if !args.is_null() {
                     self.host.borrow_mut().command(
-                        crate::desktop::link::Target::Window(id),
+                        crate::host::link::Target::Window(id),
                         serde_json::json!({"op":"window","args":args}),
                     );
                     self.drive(cx);
                     cx.stop_event();
                     return;
                 }
-                let allowed = Desktop::dispatch(
-                    self.runtime.clone(),
+                let allowed = self.runtime.dispatch(
                     id,
                     "keydown",
                     &[],
@@ -625,12 +612,7 @@ impl renderer::View for PageView {
                     modifiers.ctrl() && !modifiers.command()
                 };
                 if primary && !modifiers.alt() && matches!(key, "c" | "x" | "v") {
-                    let renderer = self
-                        .runtime
-                        .borrow()
-                        .views
-                        .get(&id)
-                        .and_then(|view| view.renderer.clone());
+                    let renderer = self.runtime.renderer(id);
                     if let Some(renderer) = renderer {
                         let command = match key {
                             "c" => "copy",
@@ -648,8 +630,7 @@ impl renderer::View for PageView {
                 modifiers,
                 ime,
             } => {
-                Desktop::dispatch(
-                    self.runtime.clone(),
+                self.runtime.dispatch(
                     id,
                     "keyup",
                     &[],
@@ -659,8 +640,7 @@ impl renderer::View for PageView {
                 );
             }
             Event::ModifiersChanged { modifiers, .. } => {
-                Desktop::dispatch(
-                    self.runtime.clone(),
+                self.runtime.dispatch(
                     id,
                     "modifiers",
                     &[],

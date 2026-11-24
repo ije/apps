@@ -21,7 +21,7 @@ pub(super) struct Page {
 pub(super) fn html(path: &Path, shared: &Shared) -> Result<Page> {
     let mut doc = Document::parse(&fs::read_to_string(path)?);
     let parent = path.parent().context("Missing HTML directory")?;
-    let http = shared.enabled("httpImport");
+    let http = shared.enabled(apps_runtime::bundle::Feature::HttpImport);
     let mut blocking = Vec::new();
     let mut scripts: [Vec<(usize, Entry)>; 2] = Default::default();
     for index in 0..doc.nodes.len() {

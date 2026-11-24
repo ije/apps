@@ -198,7 +198,12 @@ impl Builder {
             );
             return Ok((path, Some(source)));
         }
-        if let Some((path, source)) = remote(base, specifier, self.shared.enabled("httpImport"))? {
+        if let Some((path, source)) = remote(
+            base,
+            specifier,
+            self.shared
+                .enabled(apps_runtime::bundle::Feature::HttpImport),
+        )? {
             return Ok((path, Some(source)));
         }
         if let Some((file, query)) = specifier.split_once('?') {

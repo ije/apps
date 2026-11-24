@@ -1,4 +1,4 @@
-use super::{Callback, HOSTS, JavaScriptCore, Ptr};
+use super::{Callback, JavaScriptCore, Ptr};
 use anyhow::{Context, Result, bail, ensure};
 use std::ptr;
 
@@ -212,19 +212,14 @@ const CP1252: [u16; 32] = [
 
 const INVALID: &str = "The encoded data was not valid";
 
-fn native(
+pub(crate) fn native(
     ctx: Ptr,
     count: usize,
     args: *const Ptr,
     exception: *mut Ptr,
     action: impl FnOnce(&JavaScriptCore, &dyn Fn(usize) -> Ptr) -> Result<Ptr>,
 ) -> Ptr {
-    let Some(api) = HOSTS.with(|hosts| {
-        hosts
-            .borrow()
-            .get(&(ctx as usize))
-            .map(|binding| binding.api.clone())
-    }) else {
+    let Some(api) = super::engine(ctx) else {
         return ptr::null_mut();
     };
     let args = if count == 0 || args.is_null() {
@@ -576,83 +571,6 @@ unsafe extern "C" fn equal(
     })
 }
 
-unsafe extern "C" fn digest(
-    ctx: Ptr,
-    _: Ptr,
-    _: Ptr,
-    count: usize,
-    args: *const Ptr,
-    exception: *mut Ptr,
-) -> Ptr {
-    native(ctx, count, args, exception, |api, arg| {
-        let name = match api.chars(ctx, arg(0)) {
-            Some(Chars::Latin1(name)) => std::str::from_utf8(name).ok(),
-            _ => None,
-        }
-        .context("Expected a digest name")?;
-        let key = api.view(ctx, arg(2));
-        let mut hasher = crate::node::system::Hasher::new(name, key)?;
-        hasher.update(api.view(ctx, arg(1)).context("Expected bytes")?);
-        let digest = hasher.digest();
-        let (array, out) = api.uint8_array(ctx, digest.len())?;
-        out.copy_from_slice(&digest);
-        Ok(array)
-    })
-}
-
-unsafe extern "C" fn url(
-    ctx: Ptr,
-    _: Ptr,
-    _: Ptr,
-    count: usize,
-    args: *const Ptr,
-    exception: *mut Ptr,
-) -> Ptr {
-    native(ctx, count, args, exception, |api, arg| {
-        use ::url::Position::*;
-        let text = |index| {
-            api.chars(ctx, arg(index))
-                .map(|chars| api.utf8_string(chars))
-        };
-        let (input, base) = (text(0).context("Expected URL")?, text(1));
-        let (key, value) = (text(2), text(3));
-        let url = crate::web::url(
-            &input,
-            base.as_deref(),
-            key.as_deref().zip(value.as_deref()),
-        )?;
-        let href = url.as_str();
-        let mut items = [ptr::null_mut(); 11];
-        items[0] = api.utf8(ctx, href.as_bytes())?;
-        for (item, position) in items[1..].iter_mut().zip([
-            AfterScheme,
-            BeforeUsername,
-            AfterUsername,
-            BeforePassword,
-            AfterPassword,
-            BeforeHost,
-            AfterHost,
-            AfterPort,
-            AfterPath,
-            AfterQuery,
-        ]) {
-            // Without a password, the url crate puts the end of the password after the `@`.
-            let position = match position {
-                BeforePassword | AfterPassword if url.password().is_none() => AfterUsername,
-                position => position,
-            };
-            let end = url[..position].len();
-            let end = if href.is_ascii() {
-                end
-            } else {
-                href[..end].encode_utf16().count()
-            };
-            *item = unsafe { (api.number)(ctx, end as f64) };
-        }
-        Ok(unsafe { (api.make_array)(ctx, items.len(), items.as_ptr(), ptr::null_mut()) })
-    })
-}
-
 unsafe extern "C" fn drain(
     ctx: Ptr,
     _: Ptr,
@@ -667,7 +585,8 @@ unsafe extern "C" fn drain(
     })
 }
 
-pub(crate) fn install(api: &JavaScriptCore, ctx: Ptr) {
+// `services` are the fast functions of other modules, like digests and URLs.
+pub(crate) fn install(api: &JavaScriptCore, ctx: Ptr, services: &[(&str, Callback)]) {
     unsafe {
         let object = (api.object_make)(ctx, ptr::null_mut(), ptr::null_mut());
         for (name, callback) in [
@@ -680,16 +599,17 @@ pub(crate) fn install(api: &JavaScriptCore, ctx: Ptr) {
             ("compare", compare),
             ("random", random),
             ("equal", equal),
-            ("digest", digest),
             ("drain", drain),
-            ("url", url),
-        ] {
+        ]
+        .iter()
+        .chain(services)
+        {
             let name = api.string(name);
             (api.set)(
                 ctx,
                 object,
                 name,
-                (api.function)(ctx, name, callback),
+                (api.function)(ctx, name, *callback),
                 0,
                 ptr::null_mut(),
             );

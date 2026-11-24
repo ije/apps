@@ -79,7 +79,7 @@ impl State {
                 let _guard = network.enter();
                 let listener = tokio::net::TcpListener::from_std(listener)?;
                 let (sender, events) = mpsc::channel(64);
-                let wake = crate::host::Waker::current();
+                let wake = crate::jsc::Waker::current();
                 // `stop` drops the listener on the JavaScript thread, so the port is free before it returns.
                 let listener = Arc::new(Mutex::new(Some((
                     listener,
@@ -88,7 +88,7 @@ impl State {
                 let (stop, stopping) = watch::channel(false);
                 let accepting = listener.clone();
                 let task = network.spawn(async move {
-                    let _closed = crate::host::WakeOnDrop(wake.clone());
+                    let _closed = crate::jsc::WakeOnDrop(wake.clone());
                     let next_id = Arc::new(AtomicU64::new(0));
                     let mut connections = JoinSet::new();
                     let mut stopped = stopping.clone();
@@ -138,7 +138,7 @@ impl State {
                                     }
                                     wake.wake();
                                     // `poll` only sees a dropped reply, so wake it when the client goes away.
-                                    let _closed = crate::host::WakeOnDrop(wake.clone());
+                                    let _closed = crate::jsc::WakeOnDrop(wake.clone());
                                     let (failed, failure) = oneshot::channel();
                                     tokio::spawn(async move {
                                       let (mut buffer, mut wanted, mut ended) = (Vec::new(), false, false);
@@ -317,7 +317,7 @@ impl State {
                     let (sender, receiver) = mpsc::channel::<Option<Bytes>>(16);
                     let full = Arc::new(AtomicBool::new(false));
                     server.streams.insert(id, (sender, full.clone()));
-                    let closed = crate::host::WakeOnDrop(crate::host::Waker::current());
+                    let closed = crate::jsc::WakeOnDrop(crate::jsc::Waker::current());
                     StreamBody::new(futures_util::stream::unfold(
                         (receiver, closed, full),
                         |(mut receiver, closed, full)| async move {

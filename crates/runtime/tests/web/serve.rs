@@ -1,7 +1,4 @@
-use apps_runtime::{
-    host::Role,
-    jsc::{JavaScriptCore, JsContext},
-};
+use apps_runtime::{host::context::JsContext, jsc::JavaScriptCore, jsc::Role};
 use std::{
     net::{TcpListener, TcpStream},
     rc::Rc,
@@ -77,7 +74,7 @@ fn native_events_wake_the_loop_without_polling() {
     };
     let wakes = Arc::new(AtomicUsize::new(0));
     let counter = wakes.clone();
-    apps_runtime::host::Waker::install(move || {
+    apps_runtime::jsc::Waker::install(move || {
         counter.fetch_add(1, Ordering::Relaxed);
     });
     let engine =

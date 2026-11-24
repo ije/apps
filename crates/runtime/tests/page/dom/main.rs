@@ -1,13 +1,14 @@
 use apps_runtime::{
     dom::Document,
-    host::{Host, Page, Role},
-    jsc::{JavaScriptCore, JsContext},
+    host::context::JsContext,
+    host::{Host, Page},
+    jsc::{JavaScriptCore, Role},
 };
 use std::{cell::RefCell, rc::Rc};
 
 fn offscreen_page(source: &str) -> (Rc<RefCell<Host>>, JsContext, String) {
     let (wake, woken) = std::sync::mpsc::channel();
-    apps_runtime::host::Waker::install(move || {
+    apps_runtime::jsc::Waker::install(move || {
         let _ = wake.send(());
     });
     let host = Rc::new(RefCell::new(Host::default()));

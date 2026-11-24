@@ -1,8 +1,4 @@
-use crate::{
-    bundle::Bundle,
-    host::{Host, Role},
-    jsc::{JavaScriptCore, JsContext},
-};
+use crate::{bundle::Bundle, host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role};
 use anyhow::{Context, Result};
 use std::{cell::RefCell, rc::Rc, sync::mpsc, time::Duration};
 
@@ -21,35 +17,16 @@ pub fn run(mut bundle: Bundle, argv: Vec<String>) -> Result<i32> {
     };
     drop(bundle.files.remove("app.js"));
     let (wake, wakes) = mpsc::channel();
-    crate::host::Waker::install(move || {
+    crate::jsc::Waker::install(move || {
         let _ = wake.send(());
     });
-    let package = bundle.files.get("package.json").map(String::as_str);
-    let (_, name, version, _) = crate::bundle::package_metadata(package)?;
-    let assets: std::collections::HashMap<String, std::path::PathBuf> = bundle
-        .files
-        .get("assets.json")
-        .map(|source| serde_json::from_str(source))
-        .transpose()
-        .context("Invalid assets.json")?
-        .unwrap_or_default();
-    let _ = crate::web::ASSETS.set(assets.clone());
+    let package =
+        crate::bundle::Package::parse(bundle.files.get("package.json").map(String::as_str))?;
     let host = Rc::new(RefCell::new(Host {
-        app_version: Some(version),
-        disabled: crate::bundle::disabled_features(package)?,
-        app_name: Some(name),
-        app_path: if bundle.root.as_os_str().is_empty() {
-            std::env::current_dir().unwrap_or_default()
-        } else {
-            bundle.root
-        },
-        packaged: bundle.packaged,
-        scripts: bundle.scripts.into(),
-        assets,
+        app: crate::bundle::AppInfo::new(&mut bundle, &package, false)?,
         argv: Some(argv),
         ..Host::default()
     }));
-    host.borrow_mut().install(&bundle.files)?;
     let api = JavaScriptCore::load()?;
     let engine = JsContext::new(api.clone(), host, Role::Main)?;
     engine.eval(
@@ -57,7 +34,7 @@ pub fn run(mut bundle: Bundle, argv: Vec<String>) -> Result<i32> {
         "apps:node",
     )?;
     engine.eval_page(std::str::from_utf8(&source)?, "apps:node")?;
-    while engine.eval_page(crate::jsc::NEXT, "apps:node")? == "true" {}
+    while engine.eval_page(crate::host::context::NEXT, "apps:node")? == "true" {}
     let code = loop {
         let delay = engine.tick()?;
         if delay != 0 && !engine.addons_pending() && engine.call("__appsAlive", &[])? != "true" {
@@ -67,7 +44,7 @@ pub fn run(mut bundle: Bundle, argv: Vec<String>) -> Result<i32> {
             }
             continue;
         }
-        crate::host::idle(true);
+        crate::jsc::idle(true);
         let wait = if api.shrink_pending() && !(0..1000).contains(&delay) {
             1000
         } else {
@@ -86,7 +63,7 @@ pub fn run(mut bundle: Bundle, argv: Vec<String>) -> Result<i32> {
             crate::malloc::flush();
         }
         while wakes.try_recv().is_ok() {}
-        crate::host::idle(false);
+        crate::jsc::idle(false);
     };
     std::mem::forget(engine);
     Ok(code)

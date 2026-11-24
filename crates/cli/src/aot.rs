@@ -22,12 +22,12 @@ const NO_SOURCE: &str = "/*apps:no-source*/";
 pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<tempfile::TempDir> {
     let platform = std::env::consts::OS;
     let library = apps_runtime::jsc::library_path(runtime, platform)?;
-    let engine = apps_runtime::jsc::aot_engine_library(platform);
+    let engine = apps_runtime::jsc::aot::engine_library(platform);
     ensure!(
         library.with_file_name(engine).is_file(),
         "--aot needs {engine}; run bash scripts/build-jsc.sh --aot"
     );
-    let compiler_name = apps_runtime::jsc::aot_compiler_library(platform);
+    let compiler_name = apps_runtime::jsc::aot::compiler_library(platform);
     let compiler = library.with_file_name(compiler_name);
     let compiler = unsafe { libloading::Library::new(&compiler) }.with_context(|| {
         format!(
@@ -46,7 +46,7 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
         usize,
     ) -> bool;
     let compile = unsafe { *compiler.get::<Compile>(b"JSCompileAOT\0")? };
-    let front_name = apps_runtime::jsc::aot_front_end_library(platform);
+    let front_name = apps_runtime::jsc::aot::front_end_library(platform);
     let front = library.with_file_name(front_name);
     let front = unsafe { libloading::Library::new(&front) }.with_context(|| {
         format!(
@@ -104,8 +104,8 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
             }
         }
     }
-    let app = apps_runtime::bundle::script_source(files, true);
-    let wrapper = apps_runtime::bundle::script_source(&BBTreeMap::new(), true);
+    let app = apps_runtime::jsc::script_source(files, true);
+    let wrapper = apps_runtime::jsc::script_source(&BBTreeMap::new(), true);
     let loader = wrapper.strip_suffix("\n},true);").unwrap();
     let mut scripts: Vec<(&str, &str)> = files
         .iter()
@@ -113,9 +113,10 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
         .map(|(name, source)| (name.as_str(), source.as_str()))
         .collect();
     scripts.push(("app.js", &app));
-    let disabled =
-        apps_runtime::bundle::disabled_features(files.get("package.json").map(String::as_str))?;
-    let webgpu = disabled & apps_runtime::bundle::feature_bit("webgpu") == 0;
+    let webgpu =
+        apps_runtime::bundle::Package::parse(files.get("package.json").map(String::as_str))?
+            .features
+            .has(apps_runtime::bundle::Feature::WebGpu);
     for script in apps_runtime::jsc::runtime_scripts() {
         if webgpu || script.0 != "apps:gpu" {
             scripts.push(script);
@@ -292,10 +293,10 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
             fs::write(directory.path().join(&name), bytes)?;
             wasm_paths.push(name);
         }
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load()?,
             Default::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )?;
         let modules = serde_json::to_string(
             &wasm
@@ -389,7 +390,7 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
     }))?;
     for name in &names {
         if let Some(source) = files.get_mut(name) {
-            *source = apps_runtime::bundle::aot_source(&build, name);
+            *source = apps_runtime::jsc::aot::source(&build, name);
         }
     }
     fs::write(directory.path().join("manifest.json"), &manifest)?;

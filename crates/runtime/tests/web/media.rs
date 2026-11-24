@@ -1,17 +1,19 @@
 use apps_runtime::{
     dom::Document,
-    host::{Host, Page, Role},
-    jsc::{JavaScriptCore, JsContext},
+    host::context::JsContext,
+    host::{Host, Page},
+    jsc::JavaScriptCore,
+    jsc::Role,
 };
 use std::{cell::RefCell, path::Path, rc::Rc, time::Duration};
 
-fn page(disabled: u32) -> (Rc<RefCell<Host>>, JsContext, String) {
+fn page(features: apps_runtime::bundle::Features) -> (Rc<RefCell<Host>>, JsContext, String) {
     let host = Rc::new(RefCell::new(Host::default()));
     let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/media/");
     let base = url::Url::from_directory_path(&folder).unwrap();
     {
         let mut host = host.borrow_mut();
-        host.disabled = disabled;
+        host.app.features = features;
         host.pages.insert(
             1,
             Page {
@@ -53,7 +55,7 @@ const EVENTS: &str = "globalThis.events = []; for (const type of ['loadstart', '
 
 #[test]
 fn videos_decode_frames_seek_and_end() {
-    let (host, engine, base) = page(0);
+    let (host, engine, base) = page(apps_runtime::bundle::Features::default());
     for (file, codecs) in [
         ("clip.mp4", "video/mp4; codecs=\"avc1.42E01E, mp4a.40.2\""),
         ("clip.webm", "video/webm; codecs=\"vp9, opus\""),
@@ -127,7 +129,7 @@ fn videos_decode_frames_seek_and_end() {
 
 #[test]
 fn seeking_past_the_last_frame_shows_it() {
-    let (host, engine, base) = page(0);
+    let (host, engine, base) = page(apps_runtime::bundle::Features::default());
     engine
         .eval(
             &format!("globalThis.media = document.createElement('video'); document.body.replaceChildren(media); media.src = '{base}clip.mp4'"),
@@ -153,7 +155,7 @@ fn seeking_past_the_last_frame_shows_it() {
 
 #[test]
 fn audio_plays_to_the_end_and_loops() {
-    let (_host, engine, base) = page(0);
+    let (_host, engine, base) = page(apps_runtime::bundle::Features::default());
     engine
         .eval(
             &format!("globalThis.media = new Audio('{base}tone.mp3'); {EVENTS} globalThis.loops = 0; media.addEventListener('seeked', () => {{ if (++loops === 2) media.loop = false; }}); media.loop = true; media.play()"),
@@ -171,7 +173,7 @@ fn audio_plays_to_the_end_and_loops() {
 
 #[test]
 fn audio_params_clamp_and_periodic_waves_check_their_arrays() {
-    let (_host, engine, _base) = page(apps_runtime::bundle::disabled_features(None).unwrap());
+    let (_host, engine, _base) = page(apps_runtime::bundle::Features::NONE);
     let script = "(() => {
         const context = new OfflineAudioContext(1, 128, 8000), frequency = context.createOscillator().frequency;
         frequency.setValueAtTime(100, 0).linearRampToValueAtTime(10000, 1);
@@ -193,7 +195,7 @@ fn audio_params_clamp_and_periodic_waves_check_their_arrays() {
 
 #[test]
 fn web_audio_renders_oscillators_filters_and_automation_like_chrome() {
-    let (_host, engine, _base) = page(apps_runtime::bundle::disabled_features(None).unwrap());
+    let (_host, engine, _base) = page(apps_runtime::bundle::Features::NONE);
     let script = "(async () => {
         const offline = new OfflineAudioContext(1, 9600, 48000);
         const osc = offline.createOscillator(), gain = offline.createGain();
@@ -284,7 +286,7 @@ fn media_threads() -> usize {
 #[cfg(not(windows))]
 #[test]
 fn web_audio_sounds_free_their_players() {
-    let (_host, engine, _base) = page(apps_runtime::bundle::disabled_features(None).unwrap());
+    let (_host, engine, _base) = page(apps_runtime::bundle::Features::NONE);
     engine
         .eval(
             "globalThis.ended = 0; globalThis.live = new AudioContext();
@@ -316,7 +318,7 @@ fn web_audio_sounds_free_their_players() {
 #[cfg(not(windows))]
 #[test]
 fn paused_players_hold_no_threads() {
-    let (_host, engine, base) = page(0);
+    let (_host, engine, base) = page(apps_runtime::bundle::Features::default());
     engine
         .eval(
             &format!("globalThis.sounds = Array.from({{ length: 40 }}, () => new Audio('{base}tone.mp3'))"),
@@ -357,7 +359,7 @@ fn paused_players_hold_no_threads() {
 
 #[test]
 fn audio_survives_layout_and_rate_changes() {
-    let (_host, engine, base) = page(0);
+    let (_host, engine, base) = page(apps_runtime::bundle::Features::default());
     engine
         .eval(
             &format!("globalThis.media = new Audio('{base}switch.mp3'); {EVENTS} media.play()"),
@@ -375,7 +377,7 @@ fn audio_survives_layout_and_rate_changes() {
 
 #[test]
 fn absurd_pixel_aspect_ratios_fit_the_frame_size_limit() {
-    let (host, engine, base) = page(0);
+    let (host, engine, base) = page(apps_runtime::bundle::Features::default());
     engine
         .eval(
             &format!("globalThis.media = document.createElement('video'); document.body.replaceChildren(media); media.src = '{base}wide.mp4'"),
@@ -403,7 +405,7 @@ fn absurd_pixel_aspect_ratios_fit_the_frame_size_limit() {
 
 #[test]
 fn videos_need_the_media_feature() {
-    let (_host, engine, base) = page(apps_runtime::bundle::disabled_features(None).unwrap());
+    let (_host, engine, base) = page(apps_runtime::bundle::Features::NONE);
     engine
         .eval(&format!("globalThis.media = document.createElement('video'); {EVENTS} media.src = '{base}clip.mp4'; globalThis.rejected = ''; media.play().catch(error => rejected = error.name)"), "media-test")
         .unwrap();
@@ -424,7 +426,7 @@ fn videos_need_the_media_feature() {
 
 #[test]
 fn audio_plays_only_wave_files_without_the_media_feature() {
-    let (_host, engine, base) = page(apps_runtime::bundle::disabled_features(None).unwrap());
+    let (_host, engine, base) = page(apps_runtime::bundle::Features::NONE);
     engine
         .eval(
             &format!("globalThis.media = new Audio('{base}tone.wav'); {EVENTS} media.currentTime = 0.2; media.play()"),
@@ -469,7 +471,7 @@ fn audio_plays_only_wave_files_without_the_media_feature() {
 
 #[test]
 fn broken_media_reports_an_error() {
-    let (_host, engine, _) = page(0);
+    let (_host, engine, _) = page(apps_runtime::bundle::Features::default());
     engine
         .eval(&format!("globalThis.media = document.createElement('audio'); {EVENTS} media.src = 'data:audio/mpeg;base64,AAAAAAAA'"), "media-test")
         .unwrap();

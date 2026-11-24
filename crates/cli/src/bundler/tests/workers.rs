@@ -86,9 +86,9 @@ fn import_meta_url_in_modules_and_templates() {
         "#).unwrap();
     for production in [false, true] {
         for (realm, role) in [
-            (Realm::Main, apps_runtime::host::Role::Main),
-            (Realm::Preload, apps_runtime::host::Role::Preload(1)),
-            (Realm::Renderer, apps_runtime::host::Role::Renderer(1)),
+            (Realm::Main, apps_runtime::jsc::Role::Main),
+            (Realm::Preload, apps_runtime::jsc::Role::Preload(1)),
+            (Realm::Renderer, apps_runtime::jsc::Role::Renderer(1)),
         ] {
             let files = compile(&entry, realm, None, Rc::default(), production, None).unwrap();
             let host = Rc::new(RefCell::new(apps_runtime::host::Host::default()));
@@ -99,7 +99,7 @@ fn import_meta_url_in_modules_and_templates() {
                     dirty: false,
                 },
             );
-            let engine = apps_runtime::jsc::JsContext::new(
+            let engine = apps_runtime::host::context::JsContext::new(
                 apps_runtime::jsc::JavaScriptCore::load().unwrap(),
                 host,
                 role,
@@ -148,10 +148,10 @@ fn import_meta_url_preserves_non_utf8_paths() {
             None,
         )
         .unwrap();
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.load_bundle(&files, "app.js").unwrap();
@@ -233,10 +233,10 @@ fn bundled_workers_and_dynamic_imports_in_production() {
         fs::write(dir.path().join("worker.ts"), "import {parentPort} from 'node:worker_threads'; import {value} from './value'; if (typeof __appsStart !== 'undefined') throw Error('worker app startup'); parentPort.postMessage(value); export default { ready: false, fetch: false };").unwrap();
         fs::write(&entry,"import {Worker} from 'node:worker_threads'; const feature=await import('fixture/features/example'); let matched;matched??=/Mac/.test('Mac');if(feature.answer!==42||!matched)throw Error('package or regexp'); const dynamic=await import('./value'); if(dynamic.value!==42||!import.meta.url.endsWith('/app.ts'))throw Error('module '+JSON.stringify(dynamic)+' url '+import.meta.url); const worker=new Worker(new URL('./worker.ts',import.meta.url)); const value=await new Promise((resolve,reject)=>{worker.on('message',resolve);worker.on('error',reject)}); if(value!==42)throw Error('worker'); await worker.terminate(); globalThis.result='ok';").unwrap();
         let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         if let Err(error) = engine.load_bundle(&files, "app.js") {
@@ -420,10 +420,10 @@ if (threads.isMainThread) {
             2,
             "production={production}"
         );
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.load_bundle(&files, "app.js").unwrap();
@@ -475,7 +475,10 @@ if (threads.isMainThread) {
 
 #[test]
 fn page_workers_and_chunks_load_from_bundled_scripts() {
-    use apps_runtime::host::{Host, Page, Role};
+    use apps_runtime::{
+        host::{Host, Page},
+        jsc::Role,
+    };
     let dir = tempfile::tempdir().unwrap();
     fs::write(
         dir.path().join("worker.ts"),
@@ -513,7 +516,7 @@ fn page_workers_and_chunks_load_from_bundled_scripts() {
                 dirty: false,
             },
         );
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             host,
             Role::Renderer(1),
@@ -549,9 +552,9 @@ fn import_meta_filename_and_dirname_follow_node() {
     fs::write(&entry, "globalThis.result = typeof import.meta.filename === 'string' ? JSON.stringify([import.meta.filename === globalThis.__apps.url.fileURLToPath(import.meta.url), import.meta.dirname === globalThis.__apps.path.dirname(import.meta.filename), import.meta.filename]) : typeof import.meta.dirname;").unwrap();
     for production in [false, true] {
         for (realm, role) in [
-            (Realm::Main, apps_runtime::host::Role::Main),
-            (Realm::Preload, apps_runtime::host::Role::Preload(1)),
-            (Realm::Renderer, apps_runtime::host::Role::Renderer(1)),
+            (Realm::Main, apps_runtime::jsc::Role::Main),
+            (Realm::Preload, apps_runtime::jsc::Role::Preload(1)),
+            (Realm::Renderer, apps_runtime::jsc::Role::Renderer(1)),
         ] {
             let files = compile(&entry, realm, None, Rc::default(), production, None).unwrap();
             let host = Rc::new(RefCell::new(apps_runtime::host::Host::default()));
@@ -562,7 +565,7 @@ fn import_meta_filename_and_dirname_follow_node() {
                     dirty: false,
                 },
             );
-            let engine = apps_runtime::jsc::JsContext::new(
+            let engine = apps_runtime::host::context::JsContext::new(
                 apps_runtime::jsc::JavaScriptCore::load().unwrap(),
                 host,
                 role,

@@ -56,10 +56,10 @@ fn react_compiler_memoizes_page_components() {
                 None,
             )
             .unwrap();
-            let engine = apps_runtime::jsc::JsContext::new(
+            let engine = apps_runtime::host::context::JsContext::new(
                 apps_runtime::jsc::JavaScriptCore::load().unwrap(),
                 Rc::default(),
-                apps_runtime::host::Role::Main,
+                apps_runtime::jsc::Role::Main,
             )
             .unwrap();
             engine.load_bundle(&files, "test").unwrap();
@@ -116,10 +116,10 @@ fn declarative_lifecycle() {
             let files =
                 compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
             let host = Rc::new(RefCell::new(apps_runtime::host::Host::default()));
-            let engine = apps_runtime::jsc::JsContext::new(
+            let engine = apps_runtime::host::context::JsContext::new(
                 apps_runtime::jsc::JavaScriptCore::load().unwrap(),
                 host.clone(),
-                apps_runtime::host::Role::Main,
+                apps_runtime::jsc::Role::Main,
             )
             .unwrap();
             engine.load_bundle(&files, "app.js").unwrap();
@@ -236,8 +236,8 @@ fn declarative_handlers_are_main_only() {
     fs::write(&entry, "export default { ready: false, fetch: false };").unwrap();
     for production in [false, true] {
         for (realm, role) in [
-            (Realm::Preload, apps_runtime::host::Role::Preload(1)),
-            (Realm::Renderer, apps_runtime::host::Role::Renderer(1)),
+            (Realm::Preload, apps_runtime::jsc::Role::Preload(1)),
+            (Realm::Renderer, apps_runtime::jsc::Role::Renderer(1)),
         ] {
             let files = compile(&entry, realm, None, Rc::default(), production, None).unwrap();
             let host = Rc::new(RefCell::new(apps_runtime::host::Host::default()));
@@ -248,7 +248,7 @@ fn declarative_handlers_are_main_only() {
                     dirty: false,
                 },
             );
-            let engine = apps_runtime::jsc::JsContext::new(
+            let engine = apps_runtime::host::context::JsContext::new(
                 apps_runtime::jsc::JavaScriptCore::load().unwrap(),
                 host,
                 role,
@@ -272,10 +272,10 @@ fn builtin_web_contents_view_exports() {
         for production in [false, true] {
             let files =
                 compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
-            let engine = apps_runtime::jsc::JsContext::new(
+            let engine = apps_runtime::host::context::JsContext::new(
                 apps_runtime::jsc::JavaScriptCore::load().unwrap(),
                 Rc::default(),
-                apps_runtime::host::Role::Main,
+                apps_runtime::jsc::Role::Main,
             )
             .unwrap();
             engine.load_bundle(&files, "view-test").unwrap();
@@ -293,10 +293,10 @@ fn builtin_serve_export() {
     fs::write(&entry, "import apps, { serve } from '@pierre/apps'; if (apps.serve !== serve) throw Error('serve export'); const server = serve({ fetch: (req: Request) => new Response('hello world', {}), port: 0 }); globalThis.port = server.port; server.stop();").unwrap();
     for production in [false, true] {
         let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.load_bundle(&files, "serve-test").unwrap();
@@ -516,8 +516,8 @@ fn package_preload_dynamic_imports_follow_watch_changes() {
 fn react_counter() {
     for production in [false, true] {
         use apps_runtime::{
-            host::{Host, Page, Role},
-            jsc::{JavaScriptCore, JsContext},
+            host::{Host, Page, context::JsContext},
+            jsc::{JavaScriptCore, Role},
         };
         let host = Rc::new(RefCell::new(Host::default()));
         host.borrow_mut().pages.insert(
@@ -587,8 +587,8 @@ fn react_counter() {
 fn three_webgpu_renders_a_cube() {
     for production in [false, true] {
         use apps_runtime::{
-            host::{Host, Page, Role},
-            jsc::{JavaScriptCore, JsContext},
+            host::{Host, Page, context::JsContext},
+            jsc::{JavaScriptCore, Role},
         };
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/three")
@@ -739,10 +739,10 @@ fn node_file_roundtrip() {
     let file = serde_json::to_string(&dir.path().join("data.txt")).unwrap();
     fs::write(&entry,format!("import fs from 'node:fs'; import path from 'node:path'; const file={file}; fs.writeFileSync(file,'hello'); if(fs.readFileSync(file,'utf8')!=='hello') throw Error('read'); if(!fs.statSync(file).isFile()) throw Error('stat'); if(path.basename(file)!=='data.txt') throw Error('path'); fs.unlinkSync(file); if(fs.existsSync(file)) throw Error('unlink');")).unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
-    let engine = apps_runtime::jsc::JsContext::new(
+    let engine = apps_runtime::host::context::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         std::rc::Rc::new(std::cell::RefCell::new(apps_runtime::host::Host::default())),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     engine.load_bundle(&files, "app.js").unwrap();
@@ -779,10 +779,10 @@ fn node_builtin_exports_match_runtime_objects() {
     source += "globalThis.result=problems.join(', ')||'ok';";
     fs::write(&entry, source).unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
-    let engine = apps_runtime::jsc::JsContext::new(
+    let engine = apps_runtime::host::context::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         std::rc::Rc::new(std::cell::RefCell::new(apps_runtime::host::Host::default())),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     engine.load_bundle(&files, "app.js").unwrap();
@@ -806,11 +806,11 @@ fn node_ffi_imports() {
             lib.close();
         "#).unwrap();
     for (realm, role) in [
-        (Realm::Main, apps_runtime::host::Role::Main),
-        (Realm::Preload, apps_runtime::host::Role::Preload(1)),
+        (Realm::Main, apps_runtime::jsc::Role::Main),
+        (Realm::Preload, apps_runtime::jsc::Role::Preload(1)),
     ] {
         let files = compile(&entry, realm, None, Rc::default(), false, None).unwrap();
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::new(RefCell::new(apps_runtime::host::Host::default())),
             role,
@@ -840,10 +840,10 @@ fn node_sqlite_imports_persistence_and_context_cleanup() {
     let api = apps_runtime::jsc::JavaScriptCore::load().unwrap();
     let host = Rc::new(RefCell::new(apps_runtime::host::Host::default()));
     {
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             api.clone(),
             host.clone(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.load_bundle(&files, "app.js").unwrap();
@@ -860,7 +860,8 @@ fn node_sqlite_imports_persistence_and_context_cleanup() {
         "#)).unwrap();
     let files = compile(&entry, Realm::Preload, None, Rc::default(), false, None).unwrap();
     let engine =
-        apps_runtime::jsc::JsContext::new(api, host, apps_runtime::host::Role::Preload(1)).unwrap();
+        apps_runtime::host::context::JsContext::new(api, host, apps_runtime::jsc::Role::Preload(1))
+            .unwrap();
     engine.load_bundle(&files, "preload.js").unwrap();
 }
 
@@ -885,9 +886,9 @@ fn package_features_reach_the_runtime() {
             );
         }
     }
-    let gpu = |disabled| {
+    let gpu = |features| {
         let mut host = apps_runtime::host::Host::default();
-        host.disabled = disabled;
+        host.app.features = features;
         let host = Rc::new(RefCell::new(host));
         host.borrow_mut().pages.insert(
             1,
@@ -896,20 +897,20 @@ fn package_features_reach_the_runtime() {
                 dirty: false,
             },
         );
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             host,
-            apps_runtime::host::Role::Renderer(1),
+            apps_runtime::jsc::Role::Renderer(1),
         )
         .unwrap();
         engine.eval("const message = run => { try { run(); } catch (error) { return error.message; } }; [typeof __appsGPU, typeof GPUDevice, message(() => navigator.gpu.requestAdapter()), message(() => document.querySelector('canvas').getContext('webgpu'))].join()", "gpu-test").unwrap()
     };
     let error = r#"The webgpu feature is disabled. Add "webgpu" to "features" in package.json"#;
     assert_eq!(
-        gpu(apps_runtime::bundle::disabled_features(None).unwrap()),
+        gpu(apps_runtime::bundle::Features::NONE),
         format!("undefined,undefined,{error},{error}")
     );
-    assert!(gpu(0).starts_with("undefined,function,,"));
+    assert!(gpu(apps_runtime::bundle::Features::default()).starts_with("undefined,function,,"));
     fs::write(dir.path().join("package.json"), r#"{"features":["webgl"]}"#).unwrap();
     let error = compile(&entry, Realm::Main, None, Rc::default(), true, None).unwrap_err();
     assert!(
@@ -922,10 +923,10 @@ fn package_features_reach_the_runtime() {
 // builtin_table`.
 #[test]
 fn builtin_table_matches_the_runtime() {
-    let engine = apps_runtime::jsc::JsContext::new(
+    let engine = apps_runtime::host::context::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         Rc::default(),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     let table = engine

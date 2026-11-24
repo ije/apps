@@ -28,15 +28,19 @@ pub fn package_app(
     bytecode: bool,
     aot: Option<&Path>,
 ) -> Result<usize> {
-    let package = files.get("package.json").map(String::as_str);
-    let (name, product_name, version, identifier) =
-        apps_runtime::bundle::package_metadata(package)?;
+    let apps_runtime::bundle::Package {
+        name,
+        product_name,
+        version,
+        identifier,
+        features,
+    } = apps_runtime::bundle::Package::parse(files.get("package.json").map(String::as_str))?;
     let library_name = apps_runtime::jsc::library_name(target.platform)?;
-    let disabled = apps_runtime::bundle::disabled_features(package)?;
-    let enabled = |feature| disabled & apps_runtime::bundle::feature_bit(feature) == 0;
-    let webgpu = apps_runtime::gpu::library_name(target.platform).filter(|_| enabled("webgpu"));
+    let enabled = |feature| features.has(feature);
+    let webgpu = apps_runtime::gpu::library_name(target.platform)
+        .filter(|_| enabled(apps_runtime::bundle::Feature::WebGpu));
     // FFmpeg is LGPL, so it ships as its own library with its license, which users can replace.
-    let media = if enabled("media") {
+    let media = if enabled(apps_runtime::bundle::Feature::Media) {
         let ffmpeg = apps_runtime::media::ffmpeg_name(target.platform);
         ensure!(
             runtime.canonicalize()?.with_file_name(ffmpeg).is_file(),
@@ -51,7 +55,7 @@ pub fn package_app(
         Vec::new()
     };
     // libghostty-vt is in the terminal library, so its license ships with it.
-    let terminal = enabled("terminal").then(|| {
+    let terminal = enabled(apps_runtime::bundle::Feature::Terminal).then(|| {
         [
             apps_runtime::terminal::library_name(target.platform),
             apps_runtime::terminal::LICENSE,
@@ -154,7 +158,7 @@ pub fn package_app(
     fs::create_dir_all(&assets)?;
     let jsc = apps_runtime::jsc::library_path(runtime, target.platform)?;
     let main = (bytecode && files.contains_key("app.js"))
-        .then(|| apps_runtime::bundle::script_source(files, true));
+        .then(|| apps_runtime::jsc::script_source(files, true));
     let bytecode = if bytecode {
         ensure!(
             makes_bytecode(runtime, target)?,
@@ -166,13 +170,13 @@ pub fn package_app(
             .map(|(name, source)| (name.as_str(), source.as_str()))
             .chain(main.as_deref().map(|main| ("app.js", main)))
             .collect();
-        apps_runtime::jsc::bytecode(disabled, &app)?
+        apps_runtime::jsc::bytecode(enabled(apps_runtime::bundle::Feature::WebGpu), &app)?
     } else {
         Vec::new()
     };
     let mut bytes = apps_runtime::bundle::write(&assets.join("app.bundle"), files, &bytecode)?;
     if let Some(aot) = aot {
-        let image_name = apps_runtime::jsc::aot_image_name(target.platform);
+        let image_name = apps_runtime::jsc::aot::image_name(target.platform);
         target
             .validate_binary(aot)
             .with_context(|| format!("{image_name} does not match the build target"))?;
@@ -210,7 +214,7 @@ pub fn package_app(
     }
     // AOT code runs only in the JSC that its compiler was built with.
     let jsc = if aot.is_some() {
-        jsc.with_file_name(apps_runtime::jsc::aot_engine_library(target.platform))
+        jsc.with_file_name(apps_runtime::jsc::aot::engine_library(target.platform))
     } else {
         jsc
     };
@@ -440,7 +444,8 @@ mod tests {
             assert_eq!(binary.unix_mode().unwrap() & 0o777, 0o755);
             let bundle = apps_runtime::bundle::read(&out).unwrap();
             assert_eq!(
-                apps_runtime::bundle::package_metadata(Some(&bundle.files["package.json"]))
+                apps_runtime::bundle::Package::parse(Some(&bundle.files["package.json"]))
+                    .map(|p| (p.name, p.product_name, p.version, p.identifier))
                     .unwrap(),
                 (
                     name.into(),
@@ -625,7 +630,7 @@ mod tests {
         ];
         for name in &names {
             fs::copy(
-                apps_runtime::app::library_exe(name)
+                apps_runtime::native::library::exe(name)
                     .unwrap()
                     .with_file_name(name),
                 dir.path().join(name),
@@ -681,7 +686,7 @@ mod tests {
         let error = build(r#"["webgpu"]"#).unwrap_err();
         assert!(error.to_string().contains("WebGPU library"), "{error}");
         fs::copy(
-            apps_runtime::app::library_exe(name)
+            apps_runtime::native::library::exe(name)
                 .unwrap()
                 .with_file_name(name),
             dir.path().join(name),
@@ -736,7 +741,7 @@ mod tests {
         ];
         for name in names {
             fs::copy(
-                apps_runtime::app::library_exe(name)
+                apps_runtime::native::library::exe(name)
                     .unwrap()
                     .with_file_name(name),
                 dir.path().join(name),

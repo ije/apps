@@ -1,21 +1,15 @@
-use crate::{
-    dom::Document,
-    host::{Host, Page, Role},
-    jsc::{JavaScriptCore, JsContext, payload::Payload},
-};
+use crate::jsc::payload::Payload;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
     collections::HashMap,
     fmt::Write,
-    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
-    time::Duration,
 };
 
 enum Event {
@@ -28,7 +22,7 @@ enum Event {
 
 struct Parent {
     events: mpsc::Sender<Event>,
-    wake: crate::host::Waker,
+    wake: crate::jsc::Waker,
     data: Value,
     id: u64,
     stop: Arc<AtomicBool>,
@@ -75,13 +69,13 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 struct Subscriber {
     names: Vec<String>,
     queue: Vec<(String, Payload)>,
-    wake: crate::host::Waker,
+    wake: crate::jsc::Waker,
 }
 static CHANNELS: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, Subscriber>>> =
     std::sync::LazyLock::new(Default::default);
 
 // The VM of a worker while its thread runs, and the function that stops its script from another thread.
-type Running = Arc<std::sync::Mutex<Option<(usize, unsafe extern "C" fn(crate::jsc::Ptr))>>>;
+pub(crate) type Running = Arc<std::sync::Mutex<Option<crate::jsc::Terminator>>>;
 
 struct Worker {
     input: mpsc::Sender<Payload>,
@@ -98,8 +92,8 @@ impl Worker {
             .running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((group, terminate)) = *running {
-            unsafe { terminate(group as crate::jsc::Ptr) };
+        if let Some(terminator) = *running {
+            terminator.terminate();
         }
     }
 }
@@ -109,14 +103,53 @@ impl Drop for Worker {
     }
 }
 
+// The script of a new worker, for the function that runs it in a JavaScript context on the worker thread.
+pub(crate) struct Job {
+    pub(crate) app: crate::bundle::AppInfo,
+    pub(crate) source: bytes::Bytes,
+    // Main process and preload workers get the Node.js APIs.
+    pub(crate) native: bool,
+    // Ends when it has no work left, like a worker of `node:worker_threads`.
+    pub(crate) ends: bool,
+    pub(crate) stop: Arc<AtomicBool>,
+    pub(crate) inbox: mpsc::Receiver<Payload>,
+    pub(crate) running: Running,
+}
+
+impl Job {
+    // Tells the parent that the worker runs.
+    pub(crate) fn online(&self) {
+        PARENT.with(|parent| {
+            if let Some(parent) = parent.borrow().as_ref() {
+                let _ = parent.events.send(Event::Online);
+                parent.wake.wake();
+            }
+        });
+    }
+
+    // The buffers of the message that the worker receives now.
+    pub(crate) fn receive(&self, buffers: Vec<bytes::Bytes>) {
+        PARENT.with(|parent| {
+            if let Some(parent) = parent.borrow_mut().as_mut() {
+                parent.received = buffers;
+            }
+        });
+    }
+}
+
+pub(crate) type Run = fn(Job) -> Result<()>;
+
+// The host gives the function that runs workers. Without one, as in the tests of this module, workers fail.
+fn no_run(_: Job) -> Result<()> {
+    bail!("Workers are unavailable here")
+}
+
 #[derive(Default)]
 pub(crate) struct State {
     workers: HashMap<u64, Worker>,
-    namespace: String,
-    packaged: bool,
-    disabled: u32,
-    scripts: Arc<HashMap<String, bytes::Bytes>>,
+    app: crate::bundle::AppInfo,
     channels: Vec<u64>,
+    run: Option<Run>,
 }
 
 // A preload context ends without its thread ending, so its subscribers leave with its state.
@@ -132,18 +165,19 @@ impl Drop for State {
 }
 
 impl State {
-    pub(crate) fn configure(
-        &mut self,
-        namespace: &str,
-        packaged: bool,
-        disabled: u32,
-        scripts: Arc<HashMap<String, bytes::Bytes>>,
-    ) {
-        self.namespace = namespace.to_owned();
-        self.packaged = packaged;
-        self.disabled = disabled;
-        self.scripts = scripts;
+    pub(crate) fn new(run: Run) -> Self {
+        Self {
+            workers: HashMap::new(),
+            app: crate::bundle::AppInfo::default(),
+            channels: Vec::new(),
+            run: Some(run),
+        }
     }
+
+    pub(crate) fn configure(&mut self, app: &crate::bundle::AppInfo) {
+        self.app = app.clone();
+    }
+
     pub(crate) fn call(&mut self, op: &str, args: &mut Value) -> Result<Value> {
         match op {
             "info" => Ok(PARENT.with(|parent| {
@@ -203,7 +237,7 @@ impl State {
                     Subscriber {
                         names: Vec::new(),
                         queue: Vec::new(),
-                        wake: crate::host::Waker::current(),
+                        wake: crate::jsc::Waker::current(),
                     },
                 );
                 self.channels.push(id);
@@ -276,14 +310,15 @@ impl State {
                 ensure!(
                     args[1] == true
                         || args[2] == true
-                        || self.disabled & crate::bundle::feature_bit("jsExecute") == 0,
+                        || self.app.features.has(crate::bundle::Feature::JsExecute),
                     "Page workers from data: and blob: URLs need the jsExecute feature"
                 );
                 let source: bytes::Bytes = if args[2] == true {
                     let name = source
                         .strip_prefix("apps:///")
                         .context("Expected a bundled worker URL")?;
-                    self.scripts
+                    self.app
+                        .scripts
                         .get(name)
                         .cloned()
                         .with_context(|| format!("Missing bundled worker: {name}"))?
@@ -294,10 +329,15 @@ impl State {
                 // Web workers must not end when idle: they wait for messages.
                 let ends = native && args[3] == true;
                 let data = args[4].take();
-                let namespace = self.namespace.clone();
-                let packaged = self.packaged;
-                let disabled = self.disabled;
-                let scripts = self.scripts.clone();
+                // A worker gets the bundled scripts and assets of the app, not its native addons.
+                let app = crate::bundle::AppInfo {
+                    name: Some(self.app.name.as_deref().unwrap_or("apps").into()),
+                    packaged: self.app.packaged,
+                    features: self.app.features,
+                    scripts: self.app.scripts.clone(),
+                    assets: self.app.assets.clone(),
+                    ..Default::default()
+                };
                 let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
                 let (input, inbox) = mpsc::channel::<Payload>();
                 let (output, events) = mpsc::channel::<Event>();
@@ -305,55 +345,14 @@ impl State {
                 let cancelled = stop.clone();
                 let running = Running::default();
                 let started = running.clone();
-                let wake = crate::host::Waker::current();
+                let wake = crate::jsc::Waker::current();
                 let own = input.clone();
+                let run = self.run.unwrap_or(no_run);
+                let job = Job { app, source, native, ends, stop: cancelled.clone(), inbox, running: started };
                 std::thread::Builder::new().name(format!("apps-worker-{id}")).spawn(move || {
-                    crate::host::Waker::install(move || { let _ = own.send(Value::Null.into()); });
+                    crate::jsc::Waker::install(move || { let _ = own.send(Value::Null.into()); });
                     PARENT.with(|parent| *parent.borrow_mut() = Some(Parent { events: output.clone(), wake: wake.clone(), data, id, stop: cancelled.clone(), received, code: None }));
-                    let result = (|| -> Result<()> {
-                        let host = Rc::new(RefCell::new(Host { app_name: Some(namespace), packaged, disabled, scripts, ..Host::default() }));
-                        let role = if native { Role::Main } else {
-                            host.borrow_mut().pages.insert(crate::host::WORKER_PAGE, Page { doc: Document::parse("<html><body></body></html>"), dirty: false });
-                            Role::Renderer(crate::host::WORKER_PAGE)
-                        };
-                        let api = JavaScriptCore::load()?;
-                        let engine = JsContext::new_interruptible(api.clone(), host, role, Some(cancelled.clone()))?;
-                        // Declared after the engine, so it is cleared before the VM goes away.
-                        struct Clear(Running);
-                        impl Drop for Clear { fn drop(&mut self) { self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take(); } }
-                        *started.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = api.terminate.map(|terminate| (api.group as usize, terminate));
-                        let _clear = Clear(started);
-                        engine.eval("for (const name of ['document', 'window', 'screen', 'screenX', 'screenY', 'screenLeft', 'screenTop', 'outerWidth', 'outerHeight', 'localStorage', 'sessionStorage']) delete globalThis[name]; globalThis.self=globalThis;", "apps:worker-scope")?;
-                        if native { engine.eval("globalThis.require = globalThis.__apps.module.createRequire(); globalThis.onmessage = null;", "apps:worker-modules")?; }
-                        let _ = output.send(Event::Online);
-                        wake.wake();
-                        engine.eval_page(std::str::from_utf8(&source)?, "apps:worker")?;
-                        while engine.eval_page(crate::jsc::NEXT, "apps:worker")? == "true" {}
-                        while !cancelled.load(Ordering::Acquire) {
-                            let delay = engine.tick()?;
-                            if ends && delay != 0 && engine.call("__appsAlive", &[])? != "true" { break; }
-                            crate::host::idle(true);
-                            let wait = if api.shrink_pending() && !(0..1000).contains(&delay) { 1000 } else { delay };
-                            let message = if wait < 0 { inbox.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected) } else { inbox.recv_timeout(Duration::from_millis(wait as u64)) };
-                            if api.shrink_due() {
-                                api.shrink();
-                                #[cfg(target_os = "macos")]
-                                crate::malloc::flush();
-                            }
-                            crate::host::idle(false);
-                            match message {
-                                Ok(message) => for message in std::iter::once(message).chain(inbox.try_iter().take(63)) {
-                                    if let Some(text) = message.value[0].as_str() {
-                                        PARENT.with(|parent| if let Some(parent) = parent.borrow_mut().as_mut() { parent.received = message.buffers; });
-                                        engine.call("__appsWorkerReceive", &[text])?;
-                                    }
-                                },
-                                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-                            }
-                        }
-                        Ok(())
-                    })();
+                    let result = run(job);
                     let terminated=cancelled.load(Ordering::Acquire);
                     let code = PARENT.with(|parent| parent.borrow().as_ref().and_then(|parent| parent.code)).unwrap_or(if result.is_ok() && !terminated {0} else {1});
                     if !terminated && let Err(error) = &result { let _ = output.send(Event::Error(json!({"message":format!("{error:#}")}))); }

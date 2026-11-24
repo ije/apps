@@ -914,7 +914,7 @@ impl State {
     }
 
     fn theme(&self) -> u32 {
-        crate::desktop::native::theme_state()
+        crate::native::theme_state()
             | ((self.pixel_ratio.clamp(0., 600.) * 100.).round() as u32) << 16
     }
 
@@ -1259,7 +1259,7 @@ fn slots(
 pub(crate) struct Placeholder {
     frames: Frames,
     node: usize,
-    wake: crate::host::Waker,
+    wake: crate::jsc::Waker,
 }
 
 type Frames = Arc<Mutex<HashMap<usize, Arc<renderer::RenderImage>>>>;
@@ -1398,7 +1398,7 @@ pub(crate) fn load_image(
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let request = NEXT.fetch_add(1, Ordering::Relaxed);
     state.decoding.insert(id, request);
-    let (decoded, wake) = (state.decoded.clone(), crate::host::Waker::current());
+    let (decoded, wake) = (state.decoded.clone(), crate::jsc::Waker::current());
     crate::render::image::decode_later(Box::new(move || {
         let result = read().and_then(|bytes| {
             ensure!(bytes.len() <= 64 * 1024 * 1024, "Image is too large");
@@ -3150,7 +3150,7 @@ pub fn call(
                 #[cfg(target_os = "macos")]
                 Some("image/jpeg") => {
                     let quality = args[3].as_f64().filter(|q| (0. ..=1.).contains(q));
-                    let jpeg = crate::desktop::native::native_call(
+                    let jpeg = crate::native::native_call(
                         "image",
                         &json!({"op": "jpeg", "data": base64.encode(&png), "quality": quality.unwrap_or(0.92) * 100.}),
                     )?;
@@ -3316,7 +3316,7 @@ pub fn call(
                 .unwrap_or_else(|| Placeholder {
                     frames: state.frames.clone(),
                     node: id,
-                    wake: crate::host::Waker::current(),
+                    wake: crate::jsc::Waker::current(),
                 });
             PLACEHOLDERS
                 .lock()
@@ -5294,8 +5294,10 @@ pub(crate) fn utf16_index(text: &str, index: usize) -> usize {
 mod tests {
     use super::*;
     use crate::{
-        host::{Host, Page, Role},
-        jsc::{JavaScriptCore, JsContext},
+        host::context::JsContext,
+        host::{Host, Page},
+        jsc::JavaScriptCore,
+        jsc::Role,
     };
     use std::cell::RefCell;
 
@@ -5490,8 +5492,7 @@ mod tests {
             r#"<style>@font-face{font-family:Css;src:url(test.woff) format("woff")}
                     @font-face{font-family:Later;src:url(later.woff);unicode-range:U+0400-04FF}</style><p>AB</p>"#,
         );
-        host.borrow_mut()
-            .assets
+        std::sync::Arc::make_mut(&mut host.borrow_mut().app.assets)
             .insert("test.woff".into(), fixtures.join("test.woff"));
         {
             let mut host = host.borrow_mut();

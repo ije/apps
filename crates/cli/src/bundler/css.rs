@@ -171,7 +171,11 @@ pub(super) fn css(
             continue;
         }
         let directory = path.parent().unwrap();
-        let mut imported = match remote(directory, name, shared.enabled("httpImport"))? {
+        let mut imported = match remote(
+            directory,
+            name,
+            shared.enabled(apps_runtime::bundle::Feature::HttpImport),
+        )? {
             Some((target, text)) => css(&target, Some(text), stack, shared)?,
             None => {
                 let target = if name.starts_with(['.', '/']) || Path::new(name).is_absolute() {

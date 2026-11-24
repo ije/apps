@@ -333,7 +333,7 @@ pub(crate) unsafe extern "C" fn release_bytes(_pointer: crate::jsc::Ptr, owner: 
     drop(unsafe { Box::from_raw(owner.cast::<Bytes>()) });
 }
 
-// A call result that is JSON text already. JavaScriptCore parses it as it is, so a large message is not parsed and
+// A call result that is JSON text already. crate::jsc::JavaScriptCore parses it as it is, so a large message is not parsed and
 // serialized again here. `buffers` has the shape of the result, but only down to its `$appsBytes` markers.
 pub(crate) fn raw(json: String, buffers: Value) -> Value {
     json!({"$appsRaw": json, "$appsBuffers": buffers})
@@ -405,4 +405,265 @@ pub(crate) fn output(
         (api.unprotect)(ctx, object);
     }
     object
+}
+
+fn buffer_object(
+    api: &crate::jsc::JavaScriptCore,
+    ctx: crate::jsc::Ptr,
+    bytes: bytes::Bytes,
+) -> (crate::jsc::Ptr, bool) {
+    let taken = taken(&bytes);
+    unsafe {
+        if let (Some((contents, kind)), Some(functions)) = (taken, api.contents)
+            && kind != MOVED
+        {
+            let object = (functions.make)(ctx, contents);
+            if !object.is_null() {
+                return (object, kind == SHARED_BUFFER);
+            }
+        }
+        // Memory that another thread gave up has one owner, so the buffer can use it as it is.
+        if taken.is_some() {
+            let bytes = Box::new(bytes);
+            let buffer = (api.make_buffer)(
+                ctx,
+                bytes.as_ptr().cast_mut().cast(),
+                bytes.len(),
+                Some(release_bytes),
+                Box::into_raw(bytes).cast(),
+                std::ptr::null_mut(),
+            );
+            return (buffer, true);
+        }
+        let bytes = Box::new(Vec::from(bytes));
+        let buffer = (api.make_buffer)(
+            ctx,
+            bytes.as_ptr().cast_mut().cast(),
+            bytes.len(),
+            Some(release),
+            Box::into_raw(bytes).cast(),
+            std::ptr::null_mut(),
+        );
+        (buffer, true)
+    }
+}
+
+pub(crate) fn buffer(
+    api: &crate::jsc::JavaScriptCore,
+    ctx: crate::jsc::Ptr,
+    bytes: bytes::Bytes,
+) -> crate::jsc::Ptr {
+    // Copy small results into JSC memory. External buffers cost more and escape GC accounting.
+    if bytes.len() <= 16384
+        && taken(&bytes).is_none_or(|(_, kind)| kind == MOVED)
+        && let Ok((array, out)) = api.uint8_array(ctx, bytes.len())
+    {
+        out.copy_from_slice(&bytes);
+        return array;
+    }
+    match buffer_object(api, ctx, bytes) {
+        (buffer, true) => unsafe { (api.typed_from_buffer)(ctx, 3, buffer, std::ptr::null_mut()) },
+        (object, false) => object,
+    }
+}
+
+pub(crate) fn result(
+    api: &crate::jsc::JavaScriptCore,
+    ctx: crate::jsc::Ptr,
+    payload: Payload,
+) -> crate::jsc::Ptr {
+    use serde_json::Value;
+    let Payload { value, mut buffers } = payload;
+    unsafe {
+        match value {
+            Value::Null => (api.null)(ctx),
+            Value::Bool(value) => (api.boolean)(ctx, value),
+            Value::Number(value) => (api.number)(ctx, value.as_f64().unwrap_or(f64::NAN)),
+            Value::String(text) => api
+                .utf8(ctx, text.as_bytes())
+                .unwrap_or_else(|_| (api.null)(ctx)),
+            Value::Array(values)
+                if values.len() <= 32
+                    && values
+                        .iter()
+                        .all(|value| !value.is_array() && !value.is_object()) =>
+            {
+                // The items stay on the stack, where JSC's conservative scan keeps them alive.
+                let mut items = [std::ptr::null_mut(); 32];
+                let count = values.len();
+                for (item, value) in items.iter_mut().zip(values) {
+                    *item = result(api, ctx, value.into());
+                }
+                (api.make_array)(ctx, count, items.as_ptr(), std::ptr::null_mut())
+            }
+            value => {
+                if let Some(bytes) = value
+                    .get("$appsBytes")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| buffers.get_mut(index as usize))
+                {
+                    return buffer(api, ctx, std::mem::take(bytes));
+                }
+                // See `payload::raw`.
+                let (text, value) = match value {
+                    Value::Object(mut raw) if raw.contains_key("$appsRaw") => {
+                        match (raw.remove("$appsRaw"), raw.remove("$appsBuffers")) {
+                            (Some(Value::String(text)), Some(tree)) => (text, tree),
+                            _ => return (api.null)(ctx),
+                        }
+                    }
+                    value => (value.to_string(), value),
+                };
+                let markers = !buffers.is_empty();
+                let json = api.string_owned(text);
+                let root = (api.json_value)(ctx, json);
+                (api.string_release)(json);
+                if !markers || root.is_null() {
+                    return root;
+                }
+                (api.protect)(ctx, root);
+                let mut arrays: Vec<(crate::jsc::Ptr, bool)> =
+                    vec![(std::ptr::null_mut(), true); buffers.len()];
+                let mut pending = vec![(&value, root)];
+                while let Some((value, object)) = pending.pop() {
+                    let children: Vec<(crate::jsc::Ptr, Option<u32>, &Value)> = match value {
+                        Value::Array(values) => values
+                            .iter()
+                            .enumerate()
+                            .map(|(index, value)| (std::ptr::null_mut(), Some(index as u32), value))
+                            .collect(),
+                        Value::Object(values) => values
+                            .iter()
+                            .map(|(key, value)| (api.string(key), None, value))
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    for (key, index, child) in children {
+                        if let Some(marker) = child.get("$appsBytes").and_then(Value::as_u64)
+                            && let Some(bytes) = buffers.get_mut(marker as usize)
+                        {
+                            let array = &mut arrays[marker as usize];
+                            if array.0.is_null() {
+                                *array = buffer_object(api, ctx, std::mem::take(bytes));
+                                (api.protect)(ctx, array.0);
+                            }
+                            let view = if array.1 {
+                                (api.typed_from_buffer)(ctx, 3, array.0, std::ptr::null_mut())
+                            } else {
+                                array.0
+                            };
+                            match index {
+                                Some(index) => {
+                                    (api.set_index)(ctx, object, index, view, std::ptr::null_mut())
+                                }
+                                None => (api.set)(ctx, object, key, view, 0, std::ptr::null_mut()),
+                            }
+                        } else if child.is_array() || child.is_object() {
+                            let inner = match index {
+                                Some(index) => {
+                                    (api.get_index)(ctx, object, index, std::ptr::null_mut())
+                                }
+                                None => (api.get)(ctx, object, key, std::ptr::null_mut()),
+                            };
+                            if !inner.is_null() && (api.value_type)(ctx, inner) == 5 {
+                                pending.push((child, inner));
+                            }
+                        }
+                        if !key.is_null() {
+                            (api.string_release)(key);
+                        }
+                    }
+                }
+                for (array, _) in arrays.into_iter().filter(|array| !array.0.is_null()) {
+                    (api.unprotect)(ctx, array);
+                }
+                (api.unprotect)(ctx, root);
+                root
+            }
+        }
+    }
+}
+
+// Calls the global function `function` of a context with a payload.
+pub(crate) fn bridge(
+    api: &crate::jsc::JavaScriptCore,
+    context: crate::jsc::Ptr,
+    function: &str,
+    payload: Payload,
+) -> Result<crate::jsc::Ptr> {
+    let name = api.string(function);
+    let mut error = std::ptr::null_mut();
+    let receiver = unsafe { (api.get)(context, (api.global)(context), name, &mut error) };
+    unsafe {
+        (api.string_release)(name);
+    }
+    // JSC casts call targets to objects without checking, so a primitive would crash.
+    anyhow::ensure!(
+        error.is_null()
+            && unsafe { (api.value_type)(context, receiver) } == 5
+            && unsafe { (api.is_function)(context, receiver) },
+        "Bridge target is unavailable"
+    );
+    let argument = output(api, context, payload);
+    unsafe {
+        (api.protect)(context, argument);
+    }
+    let result = unsafe {
+        (api.invoke)(
+            context,
+            receiver,
+            std::ptr::null_mut(),
+            1,
+            &argument,
+            &mut error,
+        )
+    };
+    unsafe {
+        (api.unprotect)(context, argument);
+    }
+    if !error.is_null() {
+        anyhow::bail!("{}", api.text(context, error));
+    }
+    Ok(result)
+}
+
+pub(crate) fn receive(
+    api: &crate::jsc::JavaScriptCore,
+    context: crate::jsc::Ptr,
+    payload: Payload,
+) -> Result<Payload> {
+    let result = bridge(api, context, "__appsBridgeReceiveBytes", payload)?;
+    anyhow::ensure!(
+        !result.is_null() && unsafe { (api.value_type)(context, result) } == 5,
+        "Invalid bridge reply"
+    );
+    unsafe {
+        (api.protect)(context, result);
+    }
+    let mut error = std::ptr::null_mut();
+    let decoded = (|| -> Result<_> {
+        let name = api.string("json");
+        let json = unsafe { (api.get)(context, result, name, &mut error) };
+        unsafe {
+            (api.string_release)(name);
+        }
+        let mut json = api.text(context, json);
+        crate::jsc::well_formed(&mut json);
+        let value = serde_json::from_str(&json)?;
+        let name = api.string("buffers");
+        let buffers = unsafe { (api.get)(context, result, name, &mut error) };
+        unsafe {
+            (api.string_release)(name);
+        }
+        let buffers = input(api, context, buffers)?
+            .0
+            .iter()
+            .map(|bytes| bytes::Bytes::copy_from_slice(bytes))
+            .collect();
+        Ok(Payload { value, buffers })
+    })();
+    unsafe {
+        (api.unprotect)(context, result);
+    }
+    decoded
 }

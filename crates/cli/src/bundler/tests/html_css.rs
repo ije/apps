@@ -310,7 +310,7 @@ fn load_file_literals_bundle_plain_electron_pages() {
             files.contains_key("index.html")
                 && files.keys().filter(|name| name.ends_with(".html")).count() == 1
         );
-        let app = apps_runtime::bundle::script_source(&files, false);
+        let app = apps_runtime::jsc::script_source(&files, false);
         assert!(app.matches("apps:///index.html").count() == 2 && app.contains("missing.html"));
         assert_eq!(
             apps_runtime::desktop::Desktop::new(&files)
@@ -358,10 +358,10 @@ fn resolved_html_survives_relocation() {
         apps_runtime::bundle::write(&output.path().join("app.bundle"), &files, &[]).unwrap();
         dir.close().unwrap();
         let bundle = apps_runtime::bundle::read(output.path()).unwrap();
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.validate_bundle(&files).unwrap();

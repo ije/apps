@@ -1,8 +1,6 @@
-use super::{
-    Desktop,
-    link::{Link, Main, ToPage},
-};
+use super::{Desktop, main::Main};
 use crate::bundle::Bundle;
+use crate::host::link::{Link, ToPage};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -11,71 +9,6 @@ use std::{
     rc::{Rc, Weak},
     sync::Arc,
 };
-
-static DEV_LIBRARIES: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-
-// The executable whose folder holds the library `name`.
-#[doc(hidden)]
-// Only debug builds read `name`.
-#[cfg_attr(not(debug_assertions), allow(unused_variables))]
-pub fn library_exe(name: &str) -> std::io::Result<std::path::PathBuf> {
-    if let Some(exe) = DEV_LIBRARIES.get() {
-        return Ok(exe.clone());
-    }
-    let exe = std::env::current_exe()?.canonicalize()?;
-    // Since Cargo 1.100, a test runs in `build/<package>/<hash>/out` of the profile folder, and a library that
-    // only a test needs stays in such a folder. The newest one goes to the profile folder, where FFmpeg is.
-    #[cfg(debug_assertions)]
-    if let Some(profile) = exe
-        .ancestors()
-        .nth(4)
-        .filter(|build| {
-            build.ends_with("build") && exe.parent().is_some_and(|out| out.ends_with("out"))
-        })
-        .and_then(std::path::Path::parent)
-        .or(exe.parent())
-        && let Some(file) = exe.file_name()
-    {
-        let package = name
-            .trim_start_matches("lib")
-            .split('.')
-            .next()
-            .unwrap_or(name);
-        let package = if package == "Ghostty" {
-            "apps-terminal"
-        } else {
-            package
-        };
-        let modified =
-            |path: &std::path::Path| path.metadata().and_then(|file| file.modified()).ok();
-        let target = profile.join(name);
-        let built = std::fs::read_dir(profile.join("build").join(package.replace('_', "-")))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|hash| {
-                let path = hash.path().join("out").join(name);
-                Some((modified(&path)?, path))
-            })
-            .max();
-        // The threads of a test share the name of the temporary file, so one of them copies at a time.
-        static COPY: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _copy = COPY.lock();
-        if let Some((time, path)) = built
-            && modified(&target).is_none_or(|old| old < time)
-        {
-            // MacOS kills processes that load a library rewritten in place, so copy to a new file.
-            let temporary = profile.join(format!(".{name}.{}", std::process::id()));
-            if std::fs::copy(&path, &temporary).is_ok() {
-                let _ = std::fs::rename(&temporary, &target);
-            }
-        }
-        return Ok(profile.join(file));
-    }
-    Ok(exe)
-}
-
-pub(crate) type Handler = Arc<dyn Fn(u64, Vec<Value>) -> Result<Value> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct App(Rc<State>);
@@ -96,13 +29,7 @@ impl App {
         handler: impl Fn(u64, Vec<Value>) -> Result<Value> + Send + Sync + 'static,
     ) -> Result<()> {
         let main = self.0.main.upgrade().context("App has exited")?;
-        let mut handlers = main.handlers.borrow_mut();
-        ensure!(
-            !handlers.contains_key(channel),
-            "Duplicate Rust handler {channel:?}"
-        );
-        handlers.insert(channel.to_owned(), Arc::new(handler));
-        Ok(())
+        main.handle(channel, Arc::new(handler))
     }
 
     pub fn app_handle(&self) -> AppHandle {
@@ -192,7 +119,7 @@ pub fn run(setup: impl FnOnce(&App) -> Result<()>) -> Result<()> {
         !resources.join("app.bundle").is_file() && std::env::var_os("APPS_RUST_DEV").is_some();
     let (bundle, input) = if dev {
         if let Some(path) = std::env::var_os("APPS_RUST_LIBRARIES") {
-            let _ = DEV_LIBRARIES.set(path.into());
+            crate::native::library::set_dev_path(path.into());
         }
         let (bundle, input) =
             crate::bundle::from_stdin().context("Cannot read renderer bundle from apps run")?;
@@ -202,7 +129,7 @@ pub fn run(setup: impl FnOnce(&App) -> Result<()>) -> Result<()> {
             .context("Start this app with apps run or apps build")?;
         (bundle, None)
     };
-    let desktop = bootstrap(bundle, setup)?;
+    let desktop = Desktop::rust(bundle, setup)?;
     if let Some(input) = input {
         desktop.reload_from(input);
     }
@@ -221,22 +148,25 @@ pub fn run(setup: impl FnOnce(&App) -> Result<()>) -> Result<()> {
     Ok(())
 }
 
-fn bootstrap(bundle: Bundle, setup: impl FnOnce(&App) -> Result<()>) -> Result<Desktop> {
-    let pages = bundle
-        .pages
-        .keys()
-        .chain(bundle.files.keys().filter(|name| name.ends_with(".html")))
-        .cloned()
-        .collect();
-    let desktop = Desktop::create(bundle, true)?;
-    let main = desktop.main.as_ref().context("Missing the main side")?;
-    setup(&App(Rc::new(State {
-        main: Rc::downgrade(main),
-        link: desktop.link.clone(),
-        pages,
-        next_id: Cell::new(1),
-    })))?;
-    Ok(desktop)
+impl Desktop {
+    // A desktop with a Rust main, after `setup` ran.
+    fn rust(bundle: Bundle, setup: impl FnOnce(&App) -> Result<()>) -> Result<Self> {
+        let pages = bundle
+            .pages
+            .keys()
+            .chain(bundle.files.keys().filter(|name| name.ends_with(".html")))
+            .cloned()
+            .collect();
+        let desktop = Self::create(bundle, true)?;
+        let main = desktop.main.as_ref().context("Missing the main side")?;
+        setup(&App(Rc::new(State {
+            main: Rc::downgrade(main),
+            link: desktop.link.clone(),
+            pages,
+            next_id: Cell::new(1),
+        })))?;
+        Ok(desktop)
+    }
 }
 
 #[cfg(test)]
@@ -258,7 +188,7 @@ mod tests {
         bundle.files.insert("index.html".into(), page.into());
         let thread = std::thread::current().id();
         let mut handle = None;
-        let mut desktop = bootstrap(bundle, |app| {
+        let mut desktop = Desktop::rust(bundle, |app| {
             app.handle("double", move |id, args| {
                 ensure!(id == 1 && thread != std::thread::current().id());
                 Ok((args[0].as_i64().unwrap() * 2).into())
@@ -270,7 +200,7 @@ mod tests {
             assert!(window.load_file("missing.html").is_err());
             window.load_file("index.html")
         })?;
-        assert!(desktop.main.as_ref().unwrap().engine.is_none());
+        assert!(desktop.main.as_ref().unwrap().engine().is_none());
         desktop.pump(None, None)?;
         let handle = handle.unwrap();
         std::thread::spawn(move || {

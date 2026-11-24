@@ -1,7 +1,9 @@
 use apps_runtime::{
     dom::Document,
-    host::{Host, Page, Role},
-    jsc::{JavaScriptCore, JsContext},
+    host::context::JsContext,
+    host::{Host, Page},
+    jsc::JavaScriptCore,
+    jsc::Role,
 };
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
@@ -15,9 +17,10 @@ fn contexts(features: &str) -> Contexts {
     let host = Rc::new(RefCell::new(Host::default()));
     {
         let mut host = host.borrow_mut();
-        host.disabled =
-            apps_runtime::bundle::disabled_features(Some(&format!(r#"{{"features":{features}}}"#)))
-                .unwrap();
+        host.app.features =
+            apps_runtime::bundle::Package::parse(Some(&format!(r#"{{"features":{features}}}"#)))
+                .unwrap()
+                .features;
         host.pages.insert(
             1,
             Page {

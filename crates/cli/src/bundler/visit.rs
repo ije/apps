@@ -233,8 +233,11 @@ impl Builder {
             parsed.diagnostics
         );
         let mut program = parsed.program;
-        let react =
-            self.realm == Realm::Renderer && !dependency && self.shared.enabled("reactCompiler");
+        let react = self.realm == Realm::Renderer
+            && !dependency
+            && self
+                .shared
+                .enabled(apps_runtime::bundle::Feature::ReactCompiler);
         let semantic = SemanticBuilder::new()
             .with_check_syntax_error(true)
             .with_enum_eval(true)
@@ -1303,8 +1306,9 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                             } else {
                                 "jsExecute or httpImport"
                             };
-                            let enabled = shared.enabled("jsExecute")
-                                || (!data && shared.enabled("httpImport"));
+                            let enabled = shared.enabled(apps_runtime::bundle::Feature::JsExecute)
+                                || (!data
+                                    && shared.enabled(apps_runtime::bundle::Feature::HttpImport));
                             // Unresolved imports in node_modules fail at run time, so unused paths do not
                             // break the build.
                             if !enabled && in_packages(self.path) {

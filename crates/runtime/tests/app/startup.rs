@@ -55,7 +55,7 @@ fn runs_runtime_scripts_and_app_code_from_bundled_bytecode() {
         format!("$appsDefine({definition});")
     };
     let chunk = |code: &str| {
-        apps_runtime::bundle::script_source(
+        apps_runtime::jsc::script_source(
             &bbtree::unsync::BBTreeMap::from([("app.js".into(), define(code))]),
             true,
         )
@@ -66,13 +66,13 @@ fn runs_runtime_scripts_and_app_code_from_bundled_bytecode() {
         ("script-0.js".into(), chunk("if(document.querySelector('h1').textContent!=='Bytecode'||new URL('a','https://b.c/').href!=='https://b.c/a')throw Error('renderer');")),
         ("script-1.js".into(), chunk("if(!new TextEncoder().encode('x').length)throw Error('preload');")),
     ]);
-    let main = apps_runtime::bundle::script_source(&files, true);
+    let main = apps_runtime::jsc::script_source(&files, true);
     let app = [
         ("app.js", main.as_str()),
         ("script-0.js", files["script-0.js"].as_str()),
         ("script-1.js", files["script-1.js"].as_str()),
     ];
-    let bytecode = apps_runtime::jsc::bytecode(0, &app).unwrap();
+    let bytecode = apps_runtime::jsc::bytecode(true, &app).unwrap();
     for name in [
         "apps:bootstrap",
         "apps:dom",
@@ -141,10 +141,7 @@ fn rejects_invalid_streamed_bundles_and_conflicting_arguments() {
 #[test]
 #[ignore = "release performance measurement"]
 fn engine_launch() {
-    use apps_runtime::{
-        host::Role,
-        jsc::{JavaScriptCore, JsContext},
-    };
+    use apps_runtime::{host::context::JsContext, jsc::JavaScriptCore, jsc::Role};
     let api = JavaScriptCore::load().unwrap();
     let host: std::rc::Rc<std::cell::RefCell<apps_runtime::host::Host>> = std::rc::Rc::default();
     let mut times = Vec::new();

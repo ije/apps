@@ -75,166 +75,293 @@ pub struct Bundle {
     pub main: Option<bytes::Bytes>,
 }
 
-pub const AOT_PREFIX: &str = "\"apps:aot:";
-
-pub fn aot_source(build: &str, name: &str) -> String {
-    format!("{AOT_PREFIX}{build}:{name}\";throw Error(\"Missing AOT image\");")
+// The fields of package.json that the runtime and the build use.
+pub struct Package {
+    pub name: String,
+    pub product_name: String,
+    pub version: String,
+    pub identifier: String,
+    pub features: Features,
 }
 
-// Keep module code outside the loader scope to hide internals such as `compile`. Expose only `$appsDefine`.
-pub fn script_source(files: &BBTreeMap<String, String>, execute: bool) -> String {
-    let app = files.get("app.js").map_or("", String::as_str);
-    if execute && app.starts_with(AOT_PREFIX) {
-        return app.to_owned();
-    }
-    let modules = js!("modules.js");
-    let mut source = String::with_capacity(modules.len() + app.len() + 64);
-    source.push_str("(()=>{");
-    source.push_str(modules);
-    source.push_str("})()(($appsDefine)=>{\n");
-    source.push_str(app);
-    source.push_str(if execute { "\n},true);" } else { "\n},false);" });
-    source
-}
-
-pub fn package_metadata(source: Option<&str>) -> Result<(String, String, String, String)> {
-    let package: serde_json::Value =
-        serde_json::from_str(source.unwrap_or("{}")).context("Invalid package.json")?;
-    ensure!(package.is_object(), "Expected an object in package.json");
-    let name = package
-        .get("executableName")
-        .or_else(|| package.get("name"))
-        .map(|value| value.as_str().context("package.json name must be a string"))
-        .transpose()?
-        .unwrap_or("App");
-    let rust = package["type"] == "rust";
-    ensure!(
-        name.len() >= 2
-            && name.as_bytes()[0].is_ascii_alphabetic()
-            && name
-                .bytes()
-                .skip(1)
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || rust && byte == b'-'),
-        "Invalid executable name {name:?}; expected ^[a-zA-Z][a-zA-Z0-9_{}]+$",
-        if rust { "-" } else { "" }
-    );
-    let product_name = package
-        .get("productName")
-        .map(|value| {
-            value
-                .as_str()
-                .context("package.json productName must be a string")
-        })
-        .transpose()?
-        .unwrap_or(name);
-    ensure!(
-        !product_name.is_empty()
-            && !product_name.ends_with([' ', '.'])
-            && !product_name
-                .chars()
-                .any(|c| c.is_control() || "/\\:*?\"<>|".contains(c)),
-        "Invalid productName {product_name:?}; expected a valid filename"
-    );
-    let version = package
-        .get("version")
-        .map(|value| {
-            value
-                .as_str()
-                .context("package.json version must be a string")
-        })
-        .transpose()?
-        .unwrap_or("0.0.0");
-    let (core, suffix) = version
-        .split_once('-')
-        .map_or((version, None), |(core, suffix)| (core, Some(suffix)));
-    let mut parts = core.split('.');
-    ensure!(
-        (0..3).all(|_| {
-            parts.next().is_some_and(|part| {
-                !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+impl Package {
+    pub fn parse(source: Option<&str>) -> Result<Self> {
+        let package: serde_json::Value =
+            serde_json::from_str(source.unwrap_or("{}")).context("Invalid package.json")?;
+        ensure!(package.is_object(), "Expected an object in package.json");
+        let name = package
+            .get("executableName")
+            .or_else(|| package.get("name"))
+            .map(|value| value.as_str().context("package.json name must be a string"))
+            .transpose()?
+            .unwrap_or("App");
+        let rust = package["type"] == "rust";
+        ensure!(
+            name.len() >= 2
+                && name.as_bytes()[0].is_ascii_alphabetic()
+                && name.bytes().skip(1).all(|byte| byte.is_ascii_alphanumeric()
+                    || byte == b'_'
+                    || rust && byte == b'-'),
+            "Invalid executable name {name:?}; expected ^[a-zA-Z][a-zA-Z0-9_{}]+$",
+            if rust { "-" } else { "" }
+        );
+        let product_name = package
+            .get("productName")
+            .map(|value| {
+                value
+                    .as_str()
+                    .context("package.json productName must be a string")
             })
-        }) && parts.next().is_none()
-            && suffix.is_none_or(|suffix| !suffix.is_empty()
-                && suffix.bytes().all(|byte| byte.is_ascii_lowercase()
-                    || byte.is_ascii_digit()
-                    || matches!(byte, b'.' | b'_' | b'-'))),
-        r"Invalid package version {version:?}; expected ^\d+\.\d+\.\d+(-[a-z0-9._-]+)?$"
-    );
-    let identifier = match package.get("identifier") {
-        Some(value) => value
-            .as_str()
-            .context("package.json identifier must be a string")?
-            .to_owned(),
-        None => format!("com.apps.{}", name.replace('_', "-")),
-    };
-    ensure!(
-        identifier.contains('.')
-            && identifier.split('.').all(|part| {
-                !part.is_empty()
-                    && part
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            }),
-        r"Invalid identifier {identifier:?}; expected ^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$"
-    );
-    Ok((name.into(), product_name.into(), version.into(), identifier))
-}
-
-// Every feature is off unless package.json turns it on.
-pub const FEATURES: [&str; 7] = [
-    "webgpu",
-    "media",
-    "jsExecute",
-    "httpImport",
-    "localNetwork",
-    "reactCompiler",
-    "terminal",
-];
-
-pub fn feature_bit(feature: &str) -> u32 {
-    1 << FEATURES
-        .iter()
-        .position(|name| *name == feature)
-        .expect("Known feature")
-}
-
-pub fn disabled_features(source: Option<&str>) -> Result<u32> {
-    let package: serde_json::Value =
-        serde_json::from_str(source.unwrap_or("{}")).context("Invalid package.json")?;
-    let mut disabled = (1 << FEATURES.len()) - 1;
-    let Some(features) = package.get("features") else {
-        return Ok(disabled);
-    };
-    for feature in features
-        .as_array()
-        .context("package.json features must be an array")?
-    {
-        let feature = feature
-            .as_str()
-            .context("package.json features must be strings")?;
-        let (name, enable) = feature
-            .strip_prefix('-')
-            .map_or((feature, true), |name| (name, false));
-        let bits = if name == "*" {
-            (1 << FEATURES.len()) - 1
-        } else {
-            1 << FEATURES
-                .iter()
-                .position(|known| *known == name)
-                .with_context(|| {
-                    format!(
-                        "Unknown feature {name:?} in package.json; expected *, {}",
-                        FEATURES.join(", ")
-                    )
-                })?
+            .transpose()?
+            .unwrap_or(name);
+        ensure!(
+            !product_name.is_empty()
+                && !product_name.ends_with([' ', '.'])
+                && !product_name
+                    .chars()
+                    .any(|c| c.is_control() || "/\\:*?\"<>|".contains(c)),
+            "Invalid productName {product_name:?}; expected a valid filename"
+        );
+        let version = package
+            .get("version")
+            .map(|value| {
+                value
+                    .as_str()
+                    .context("package.json version must be a string")
+            })
+            .transpose()?
+            .unwrap_or("0.0.0");
+        let (core, suffix) = version
+            .split_once('-')
+            .map_or((version, None), |(core, suffix)| (core, Some(suffix)));
+        let mut parts = core.split('.');
+        ensure!(
+            (0..3).all(|_| {
+                parts.next().is_some_and(|part| {
+                    !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+                })
+            }) && parts.next().is_none()
+                && suffix.is_none_or(|suffix| !suffix.is_empty()
+                    && suffix.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'.' | b'_' | b'-'))),
+            r"Invalid package version {version:?}; expected ^\d+\.\d+\.\d+(-[a-z0-9._-]+)?$"
+        );
+        let identifier = match package.get("identifier") {
+            Some(value) => value
+                .as_str()
+                .context("package.json identifier must be a string")?
+                .to_owned(),
+            None => format!("com.apps.{}", name.replace('_', "-")),
         };
-        disabled = if enable {
-            disabled & !bits
-        } else {
-            disabled | bits
-        };
+        ensure!(
+            identifier.contains('.')
+                && identifier.split('.').all(|part| {
+                    !part.is_empty()
+                        && part
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                }),
+            r"Invalid identifier {identifier:?}; expected ^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$"
+        );
+        let features = Features::read(&package)?;
+        Ok(Self {
+            name: name.into(),
+            product_name: product_name.into(),
+            version: version.into(),
+            identifier,
+            features,
+        })
     }
-    Ok(disabled)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Feature {
+    WebGpu,
+    Media,
+    JsExecute,
+    HttpImport,
+    LocalNetwork,
+    ReactCompiler,
+    Terminal,
+}
+
+impl Feature {
+    pub const ALL: [Self; 7] = [
+        Self::WebGpu,
+        Self::Media,
+        Self::JsExecute,
+        Self::HttpImport,
+        Self::LocalNetwork,
+        Self::ReactCompiler,
+        Self::Terminal,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::WebGpu => "webgpu",
+            Self::Media => "media",
+            Self::JsExecute => "jsExecute",
+            Self::HttpImport => "httpImport",
+            Self::LocalNetwork => "localNetwork",
+            Self::ReactCompiler => "reactCompiler",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+// The enabled features. Every feature is off unless package.json turns it on. The default, for hosts without a
+// package, has all of them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Features(u32);
+
+impl Default for Features {
+    fn default() -> Self {
+        Self((1 << Feature::ALL.len()) - 1)
+    }
+}
+
+impl Features {
+    pub const NONE: Self = Self(0);
+
+    pub fn has(self, feature: Feature) -> bool {
+        self.0 & 1 << feature as u32 != 0
+    }
+
+    pub fn without(self, feature: Feature) -> Self {
+        Self(self.0 & !(1 << feature as u32))
+    }
+
+    // The features of a package.json, without checking its other fields.
+    pub fn parse(source: Option<&str>) -> Result<Self> {
+        let package: serde_json::Value =
+            serde_json::from_str(source.unwrap_or("{}")).context("Invalid package.json")?;
+        Self::read(&package)
+    }
+
+    fn read(package: &serde_json::Value) -> Result<Self> {
+        let all = (1 << Feature::ALL.len()) - 1;
+        let mut enabled = 0;
+        let Some(features) = package.get("features") else {
+            return Ok(Self(enabled));
+        };
+        for feature in features
+            .as_array()
+            .context("package.json features must be an array")?
+        {
+            let feature = feature
+                .as_str()
+                .context("package.json features must be strings")?;
+            let (name, enable) = feature
+                .strip_prefix('-')
+                .map_or((feature, true), |name| (name, false));
+            let bits = if name == "*" {
+                all
+            } else {
+                1 << Feature::ALL
+                    .iter()
+                    .position(|known| known.name() == name)
+                    .with_context(|| {
+                        format!(
+                            "Unknown feature {name:?} in package.json; expected *, {}",
+                            Feature::ALL.map(Feature::name).join(", ")
+                        )
+                    })?
+            };
+            enabled = if enable {
+                enabled | bits
+            } else {
+                enabled & !bits
+            };
+        }
+        Ok(Self(enabled))
+    }
+}
+
+// What the runtime knows about the app from its package.
+#[derive(Clone, Default)]
+pub struct AppInfo {
+    // The product name, which `app.getName()` returns.
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub path: std::path::PathBuf,
+    pub packaged: bool,
+    pub rust_main: bool,
+    pub features: Features,
+    pub scripts: std::sync::Arc<HashMap<String, bytes::Bytes>>,
+    pub assets: std::sync::Arc<HashMap<String, std::path::PathBuf>>,
+    pub native_modules: HashMap<String, std::path::PathBuf>,
+}
+
+impl AppInfo {
+    // Takes the scripts of the bundle. `files` are its other files.
+    pub fn new(bundle: &mut Bundle, package: &Package, rust_main: bool) -> Result<Self> {
+        let assets = bundle
+            .files
+            .get("assets.json")
+            .map(|source| serde_json::from_str(source))
+            .transpose()
+            .context("Invalid assets.json")?
+            .unwrap_or_default();
+        let mut app = Self {
+            name: Some(package.product_name.clone()),
+            version: Some(package.version.clone()),
+            path: if bundle.root.as_os_str().is_empty() {
+                std::env::current_dir().unwrap_or_default()
+            } else {
+                bundle.root.clone()
+            },
+            packaged: bundle.packaged,
+            rust_main,
+            features: package.features,
+            scripts: std::sync::Arc::new(std::mem::take(&mut bundle.scripts)),
+            assets: std::sync::Arc::new(assets),
+            native_modules: HashMap::new(),
+        };
+        app.install(&bundle.files)?;
+        Ok(app)
+    }
+
+    // Adds the native addons and script chunks of a development bundle.
+    pub fn install(&mut self, files: &BBTreeMap<String, String>) -> Result<()> {
+        let paths: HashMap<String, std::path::PathBuf> =
+            serde_json::from_str(files.get("native.json").map_or("{}", String::as_str))?;
+        self.native_modules.extend(paths);
+        let mut scripts = files
+            .iter()
+            .filter(|(name, _)| name.starts_with("script-"))
+            .peekable();
+        if scripts.peek().is_some() {
+            std::sync::Arc::make_mut(&mut self.scripts)
+                .extend(scripts.map(|(name, source)| (name.clone(), source.clone().into())));
+        }
+        Ok(())
+    }
+}
+
+// The files a page may name: its bundled assets, and local files only for a page that is a local file itself. A
+// file URL with a host is a network share, which is never read.
+pub(crate) fn local_path(
+    assets: &HashMap<String, std::path::PathBuf>,
+    base: &url::Url,
+    url: &url::Url,
+) -> Option<std::path::PathBuf> {
+    match url.scheme() {
+        "apps" => assets.get(url.path().trim_start_matches('/')).cloned(),
+        "file" if base.scheme() == "file" && url.host_str().is_none_or(str::is_empty) => {
+            url.to_file_path().ok()
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn local_file(
+    assets: &HashMap<String, std::path::PathBuf>,
+    base: Option<&url::Url>,
+    url: &str,
+) -> Result<Option<std::path::PathBuf>> {
+    let base = base.context("Missing page URL")?;
+    Ok(local_path(assets, base, &base.join(url)?))
 }
 
 fn check_entry(main: bool, package: Option<&String>) -> Result<()> {
@@ -303,7 +430,10 @@ pub fn write(
             ));
         } else if name == "app.js" {
             // The bundle holds the main script as it runs, so the app reads it in place.
-            owned.push((name.clone(), script_source(files, true).into_bytes()));
+            owned.push((
+                name.clone(),
+                crate::jsc::script_source(files, true).into_bytes(),
+            ));
         } else {
             ensure!(
                 name.ends_with(".js") || name == "package.json",
@@ -580,10 +710,15 @@ pub(crate) mod map {
 mod tests {
     use super::*;
     use crate::{
-        host::{Host, Page, Role},
+        host::{Host, Page},
+        jsc::Role,
         style,
     };
     use serde_json::json;
+
+    fn metadata(source: Option<&str>) -> Result<(String, String, String, String)> {
+        Package::parse(source).map(|p| (p.name, p.product_name, p.version, p.identifier))
+    }
 
     #[test]
     fn package_metadata_uses_product_name_and_defaults() {
@@ -620,7 +755,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                package_metadata(source).unwrap(),
+                metadata(source).unwrap(),
                 (
                     name.into(),
                     product_name.into(),
@@ -640,21 +775,18 @@ mod tests {
             "com.aé",
             "com/app",
         ] {
-            let error =
-                package_metadata(Some(&json!({"identifier":identifier}).to_string())).unwrap_err();
+            let error = metadata(Some(&json!({"identifier":identifier}).to_string())).unwrap_err();
             assert!(
                 error.to_string().contains("Invalid identifier"),
                 "{identifier:?}"
             );
         }
         for value in [json!(null), json!(42), json!([])] {
-            assert!(package_metadata(Some(&json!({"identifier":value}).to_string())).is_err());
+            assert!(metadata(Some(&json!({"identifier":value}).to_string())).is_err());
         }
         for name in ["Aa", "a_", "A1", "my_App12"] {
             assert_eq!(
-                package_metadata(Some(&json!({"name":name}).to_string()))
-                    .unwrap()
-                    .0,
+                metadata(Some(&json!({"name":name}).to_string())).unwrap().0,
                 name
             );
         }
@@ -677,14 +809,14 @@ mod tests {
             "a\0b",
             "app\n",
         ] {
-            let error = package_metadata(Some(&json!({"name":name}).to_string())).unwrap_err();
+            let error = metadata(Some(&json!({"name":name}).to_string())).unwrap_err();
             assert!(
                 error.to_string().contains("^[a-zA-Z][a-zA-Z0-9_]+$"),
                 "{name:?}"
             );
         }
         for value in [json!(null), json!(42), json!([])] {
-            assert!(package_metadata(Some(&json!({"name":value}).to_string())).is_err());
+            assert!(metadata(Some(&json!({"name":value}).to_string())).is_err());
         }
         for name in [
             "",
@@ -698,13 +830,13 @@ mod tests {
             "a\0b",
             "app\n",
         ] {
-            assert!(package_metadata(Some(&json!({"productName":name}).to_string())).is_err());
+            assert!(metadata(Some(&json!({"productName":name}).to_string())).is_err());
         }
         for value in [json!(null), json!(42), json!([])] {
-            assert!(package_metadata(Some(&json!({"productName":value}).to_string())).is_err());
+            assert!(metadata(Some(&json!({"productName":value}).to_string())).is_err());
         }
-        assert!(package_metadata(Some("{")).is_err());
-        assert!(package_metadata(Some("[]")).is_err());
+        assert!(metadata(Some("{")).is_err());
+        assert!(metadata(Some("[]")).is_err());
     }
 
     #[test]
@@ -727,13 +859,16 @@ mod tests {
         ] {
             let package = features.map_or(json!({}), |features| json!({ "features": features }));
             assert_eq!(
-                disabled_features(Some(&package.to_string())).unwrap(),
+                127 & !Package::parse(Some(&package.to_string()))
+                    .unwrap()
+                    .features
+                    .0,
                 disabled,
                 "{package}"
             );
         }
         for features in [json!("webgpu"), json!([1]), json!(["sqlite"]), json!(["-"])] {
-            assert!(disabled_features(Some(&json!({ "features": features }).to_string())).is_err());
+            assert!(Package::parse(Some(&json!({ "features": features }).to_string())).is_err());
         }
     }
 
@@ -751,7 +886,7 @@ mod tests {
             "12.34.56-1",
         ] {
             assert_eq!(
-                package_metadata(Some(&json!({"version":version}).to_string()))
+                metadata(Some(&json!({"version":version}).to_string()))
                     .unwrap()
                     .2,
                 version
@@ -781,8 +916,7 @@ mod tests {
             "１.2.3",
             "1.2.3-α",
         ] {
-            let error =
-                package_metadata(Some(&json!({"version":version}).to_string())).unwrap_err();
+            let error = metadata(Some(&json!({"version":version}).to_string())).unwrap_err();
             assert!(
                 error
                     .to_string()
@@ -792,7 +926,7 @@ mod tests {
         }
         for version in [json!(null), json!(123), json!([]), json!({})] {
             assert!(
-                package_metadata(Some(&json!({"version":version}).to_string()))
+                metadata(Some(&json!({"version":version}).to_string()))
                     .unwrap_err()
                     .to_string()
                     .contains("must be a string")
@@ -920,7 +1054,7 @@ mod tests {
         assert!(bundle.files.is_empty());
         assert_eq!(
             &bundle.main.as_ref().unwrap()[..],
-            script_source(&files, true).as_bytes()
+            crate::jsc::script_source(&files, true).as_bytes()
         );
         assert_eq!(
             &bundle.scripts["script-0.js"][..],
@@ -934,7 +1068,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             &bundle.main.as_ref().unwrap()[..],
-            script_source(&files, true).as_bytes()
+            crate::jsc::script_source(&files, true).as_bytes()
         );
         assert_eq!(
             &bundle.scripts["script-0.js"][..],

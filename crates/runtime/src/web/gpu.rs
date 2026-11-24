@@ -43,15 +43,15 @@ extern "C" fn write(bytes: *const u8, length: usize) -> usize {
 }
 
 pub(crate) extern "C" fn waker() -> *mut c_void {
-    Box::into_raw(Box::new(crate::host::Waker::current())).cast()
+    Box::into_raw(Box::new(crate::jsc::Waker::current())).cast()
 }
 
 pub(crate) extern "C" fn wake(waker: *mut c_void) {
-    unsafe { &*waker.cast::<crate::host::Waker>() }.wake();
+    unsafe { &*waker.cast::<crate::jsc::Waker>() }.wake();
 }
 
 pub(crate) extern "C" fn drop_waker(waker: *mut c_void) {
-    drop(unsafe { Box::from_raw(waker.cast::<crate::host::Waker>()) });
+    drop(unsafe { Box::from_raw(waker.cast::<crate::jsc::Waker>()) });
 }
 
 #[derive(Default)]
@@ -100,34 +100,6 @@ pub fn library_name(platform: &str) -> Option<&'static str> {
     }
 }
 
-// Like JavaScriptCore, the library only loads from the app, never from the environment. It is never unloaded,
-// because its threads may outlive every page and device.
-pub(crate) fn library(
-    name: &str,
-    what: &str,
-    abi_symbol: &[u8],
-    abi: u32,
-) -> Result<&'static libloading::Library> {
-    let executable = crate::desktop::app::library_exe(name)?;
-    let directory = executable
-        .parent()
-        .context("Missing executable directory")?;
-    let path = ["../Frameworks", "."]
-        .iter()
-        .map(|folder| directory.join(folder).join(name))
-        .find(|path| path.is_file())
-        .with_context(|| format!("The {what} library {name} is missing next to the runtime"))?;
-    let library = unsafe { libloading::Library::new(&path) }
-        .with_context(|| format!("Cannot load the {what} library from {}", path.display()))?;
-    let version: libloading::Symbol<extern "C" fn() -> u32> = unsafe { library.get(abi_symbol)? };
-    ensure!(
-        version() == abi,
-        "{} does not match this runtime",
-        path.display()
-    );
-    Ok(Box::leak(Box::new(library)))
-}
-
 #[cfg(target_os = "linux")]
 fn load() -> Result<Library> {
     use apps_webgpu as webgpu;
@@ -146,7 +118,7 @@ fn load() -> Result<Library> {
 fn load() -> Result<Library> {
     let name =
         library_name(std::env::consts::OS).context("WebGPU is unavailable on this platform")?;
-    let library = library(name, "WebGPU", b"apps_webgpu_abi\0", ABI)?;
+    let library = crate::native::library::load(name, "WebGPU", b"apps_webgpu_abi\0", ABI, "")?;
     unsafe {
         Ok(Library {
             new: *library.get(b"apps_webgpu_new\0")?,
@@ -263,8 +235,10 @@ impl Drop for Gpu {
 mod tests {
     use crate::{
         dom::Document,
-        host::{Host, Page, Role},
-        jsc::{JavaScriptCore, JsContext},
+        host::context::JsContext,
+        host::{Host, Page},
+        jsc::JavaScriptCore,
+        jsc::Role,
     };
     use std::{cell::RefCell, rc::Rc};
 

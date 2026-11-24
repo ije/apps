@@ -1,7 +1,9 @@
 use apps_runtime::{
     dom::Document,
-    host::{Host, Page, Role},
-    jsc::{JavaScriptCore, JsContext},
+    host::context::JsContext,
+    host::{Host, Page},
+    jsc::JavaScriptCore,
+    jsc::Role,
 };
 use std::{
     cell::RefCell,

@@ -1,5 +1,5 @@
 use crate::{
-    host::Role,
+    jsc::Role,
     jsc::{JavaScriptCore, Ptr},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -599,9 +599,12 @@ mod tests {
 
     #[test]
     fn callback_outside_a_call_does_not_poison_the_next_call() {
-        let engine =
-            crate::jsc::JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main)
-                .unwrap();
+        let engine = crate::host::context::JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            Rc::default(),
+            Role::Main,
+        )
+        .unwrap();
         let address = engine.eval("globalThis.lib=new __apps.ffi.DynamicLibrary(null);String(lib.registerCallback(()=>{throw Error('outside call')}))", "test").unwrap().parse::<usize>().unwrap();
         let callback: unsafe extern "C" fn() = unsafe { std::mem::transmute(address) };
         unsafe {

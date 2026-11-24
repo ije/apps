@@ -323,7 +323,7 @@ impl Grid {
         let origin = [bounds.origin.x, bounds.origin.y].map(f32::from);
         if terminal.fit(origin, cells, look.cell, scale) {
             // The page reads the new size in its next task.
-            crate::host::Waker::current().wake();
+            crate::jsc::Waker::current().wake();
         }
         terminal.focus(focused && cx.window.is_active());
         let mut frame: Frame = unsafe { std::mem::zeroed() };

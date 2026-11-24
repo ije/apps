@@ -18,10 +18,10 @@ fn export_conditions_keep_order_and_accept_arrays() {
     )
     .unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
-    let engine = apps_runtime::jsc::JsContext::new(
+    let engine = apps_runtime::host::context::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         Rc::default(),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     engine.load_bundle(&files, "app.js").unwrap();
@@ -55,10 +55,10 @@ fn package_loaders_transform_files_with_source_maps() {
                 (!production).then(|| cache.clone()),
             )
             .unwrap();
-            let engine = apps_runtime::jsc::JsContext::new(
+            let engine = apps_runtime::host::context::JsContext::new(
                 apps_runtime::jsc::JavaScriptCore::load().unwrap(),
                 Rc::default(),
-                apps_runtime::host::Role::Main,
+                apps_runtime::jsc::Role::Main,
             )
             .unwrap();
             engine.load_bundle(&files, "app.js").unwrap();
@@ -403,10 +403,10 @@ fn resolves_dotted_files_package_imports_browser_fields_and_type_only_imports() 
             None,
         )
         .unwrap();
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.load_bundle(&files, "app.js").unwrap();
@@ -465,10 +465,10 @@ fn app_imports_map_bare_specifiers_in_dependencies() {
     }
     let entry = dir.path().join("app.ts");
     let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
-    let engine = apps_runtime::jsc::JsContext::new(
+    let engine = apps_runtime::host::context::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         Rc::default(),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     engine.load_bundle(&files, "app.js").unwrap();
@@ -519,10 +519,10 @@ fn tsconfig_paths_and_css_package_exports() {
     let entry = dir.path().join("app.ts");
     let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
     assert!(files["index.html"].contains(".kit{color:red}"));
-    let engine = apps_runtime::jsc::JsContext::new(
+    let engine = apps_runtime::host::context::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         Rc::default(),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     engine.load_bundle(&files, "app.js").unwrap();
@@ -605,10 +605,10 @@ fn package_folders_css_packages_and_asset_urls() {
     let assets: std::collections::BTreeMap<String, PathBuf> =
         serde_json::from_str(&files["assets.json"]).unwrap();
     assert_eq!(assets.len(), 1);
-    let engine = apps_runtime::jsc::JsContext::new(
+    let engine = apps_runtime::host::context::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         Rc::default(),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     engine.load_bundle(&files, "app.js").unwrap();
@@ -688,10 +688,10 @@ fn http_imports_download_with_the_feature() {
                 "{css}"
             );
         }
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::context::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load().unwrap(),
             Rc::default(),
-            apps_runtime::host::Role::Main,
+            apps_runtime::jsc::Role::Main,
         )
         .unwrap();
         engine.load_bundle(&files, "app.js").unwrap();

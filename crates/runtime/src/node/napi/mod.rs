@@ -627,13 +627,14 @@ impl Root {
         let host = self.host.upgrade().context("Node-API context is closed")?;
         let path = host
             .borrow()
+            .app
             .native_modules
             .get(name)
             .cloned()
             .with_context(|| format!("Native addon is not in the bundle: {name}"))?;
         let packed = path
             .to_str()
-            .and_then(|key| host.borrow().scripts.get(key).cloned());
+            .and_then(|key| host.borrow().app.scripts.get(key).cloned());
         // Replace cached addons by rename, never in place. Hash name and content so copies at different paths
         // remain separate modules.
         let path = match packed {
@@ -650,7 +651,7 @@ impl Root {
                     std::env::var_os("XDG_CACHE_HOME")
                         .map_or_else(|| home.join(".cache"), Into::into)
                 }
-                .join(host.borrow().app_name.as_deref().unwrap_or("apps"));
+                .join(host.borrow().app.name.as_deref().unwrap_or("apps"));
                 let hash = name
                     .bytes()
                     .chain([0])
@@ -909,7 +910,8 @@ mod tests {
         let api = JavaScriptCore::load().unwrap();
         let host = Rc::new(RefCell::new(Host::default()));
         let _engine =
-            crate::jsc::JsContext::new(api.clone(), host.clone(), crate::host::Role::Main).unwrap();
+            crate::host::context::JsContext::new(api.clone(), host.clone(), crate::jsc::Role::Main)
+                .unwrap();
         let root = CONTEXTS
             .with(|contexts| contexts.borrow().values().find_map(Weak::upgrade))
             .unwrap();

@@ -3,7 +3,6 @@ pub(crate) mod ffi;
 mod fs;
 pub(crate) mod napi;
 pub(crate) mod pty;
-pub mod script;
 pub(crate) mod sqlite;
 pub(crate) mod system;
 
@@ -313,7 +312,7 @@ impl State {
                 for event in self.receiver.try_iter() {
                     events.push(event.into_value());
                     if events.len() == 256 {
-                        crate::host::Waker::current().wake();
+                        crate::jsc::Waker::current().wake();
                         break;
                     }
                 }
@@ -327,7 +326,7 @@ impl State {
                 let (files, sender, wake) = (
                     self.files.clone(),
                     self.sender.clone(),
-                    crate::host::Waker::current(),
+                    crate::jsc::Waker::current(),
                 );
                 blocking(move || {
                     let result = crate::jsc::payload::Payload::capture(payload.buffers, || {
@@ -347,7 +346,7 @@ impl State {
             "watch" => {
                 self.next += 1;
                 let id = self.next;
-                let (sender, wake) = (self.sender.clone(), crate::host::Waker::current());
+                let (sender, wake) = (self.sender.clone(), crate::jsc::Waker::current());
                 let root = Path::new(args[0].as_str().context("Expected watch path")?);
                 let base = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
                 let mut watcher = notify::recommended_watcher(
@@ -465,7 +464,7 @@ impl State {
                 Ok(Value::Null)
             }
             "loop" => {
-                let (start, _, idle) = crate::host::IDLE.with(std::cell::Cell::get);
+                let (start, _, idle) = crate::jsc::IDLE.with(std::cell::Cell::get);
                 Ok(start.map_or(Value::Null, |start| {
                     json!([
                         idle.as_secs_f64() * 1000.,
@@ -479,7 +478,7 @@ impl State {
                     use std::sync::atomic::{AtomicI32, Ordering::Relaxed};
                     type Subscriber = (
                         mpsc::Sender<crate::jsc::payload::Payload>,
-                        crate::host::Waker,
+                        crate::jsc::Waker,
                     );
                     // The handler may only write to a non-blocking pipe; a thread turns each byte into `resize` events.
                     static PIPE: AtomicI32 = AtomicI32::new(-1);
@@ -525,7 +524,7 @@ impl State {
                             libc::signal(libc::SIGWINCH, resized as *const () as libc::sighandler_t)
                         };
                     }
-                    subscribers.push((self.sender.clone(), crate::host::Waker::current()));
+                    subscribers.push((self.sender.clone(), crate::jsc::Waker::current()));
                 }
                 Ok(Value::Null)
             }

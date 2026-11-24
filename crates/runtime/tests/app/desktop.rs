@@ -5,10 +5,10 @@ fn native_desktop_dispatches_application_events() {
     use std::{path::Path, process::Command};
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let output = tempfile::tempdir().unwrap();
-    let engine = apps_runtime::jsc::JsContext::new(
+    let engine = apps_runtime::host::context::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         std::rc::Rc::default(),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     engine
@@ -71,10 +71,10 @@ fn native_desktop_dispatches_application_events() {
 
 #[test]
 fn application_menu_defaults_and_overrides() {
-    let engine = apps_runtime::jsc::JsContext::new(
+    let engine = apps_runtime::host::context::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         std::rc::Rc::default(),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     engine
@@ -85,10 +85,10 @@ fn application_menu_defaults_and_overrides() {
 
 #[test]
 fn native_theme_properties_and_events() {
-    let engine = apps_runtime::jsc::JsContext::new(
+    let engine = apps_runtime::host::context::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         std::rc::Rc::default(),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     engine
@@ -101,10 +101,10 @@ fn native_theme_properties_and_events() {
 
 #[test]
 fn power_save_blocker_and_system_preferences() {
-    let engine = apps_runtime::jsc::JsContext::new(
+    let engine = apps_runtime::host::context::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         std::rc::Rc::default(),
-        apps_runtime::host::Role::Main,
+        apps_runtime::jsc::Role::Main,
     )
     .unwrap();
     engine

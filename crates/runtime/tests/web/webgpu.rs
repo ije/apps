@@ -1,7 +1,9 @@
 use apps_runtime::{
     dom::Document,
-    host::{Host, Page, Role},
-    jsc::{JavaScriptCore, JsContext},
+    host::context::JsContext,
+    host::{Host, Page},
+    jsc::JavaScriptCore,
+    jsc::Role,
 };
 use std::{
     cell::RefCell,
@@ -102,7 +104,7 @@ fn present(host: &RefCell<Host>, node: usize) -> Arc<renderer::RenderImage> {
 #[ignore = "Requires a native GPU adapter"]
 fn bitmaps_upload_and_offscreen_canvases_draw() {
     let (wake, woken) = std::sync::mpsc::channel();
-    apps_runtime::host::Waker::install(move || {
+    apps_runtime::jsc::Waker::install(move || {
         let _ = wake.send(());
     });
     let (host, engine) =

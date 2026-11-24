@@ -1,10 +1,7 @@
 #[cfg(unix)]
 #[test]
 fn native_addons_values_callbacks_and_contexts() {
-    use apps_runtime::{
-        host::{Host, Role},
-        jsc::{JavaScriptCore, JsContext},
-    };
+    use apps_runtime::{host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role};
     use std::{cell::RefCell, process::Command, rc::Rc};
     let dir = tempfile::tempdir().unwrap();
     let library = dir.path().join("addon.node");
@@ -29,9 +26,11 @@ fn native_addons_values_callbacks_and_contexts() {
     std::fs::copy(&library, &second).unwrap();
     for role in [Role::Main, Role::Preload(1)] {
         let mut host = Host::default();
-        host.native_modules
+        host.app
+            .native_modules
             .insert("fixture/addon.node".into(), library.clone());
-        host.native_modules
+        host.app
+            .native_modules
             .insert("fixture/second.node".into(), second.clone());
         let engine = JsContext::new(
             JavaScriptCore::load().unwrap(),
@@ -143,7 +142,8 @@ fn native_addons_values_callbacks_and_contexts() {
     // has not started must never start.
     let load = || {
         let mut host = Host::default();
-        host.native_modules
+        host.app
+            .native_modules
             .insert("fixture/addon.node".into(), library.clone());
         JsContext::new(
             JavaScriptCore::load().unwrap(),

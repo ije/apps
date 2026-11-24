@@ -73,7 +73,7 @@ pub(super) fn register(controls: &std::cell::RefCell<Controls>, id: usize) {
         controls.shown.insert(id, (controls.next, 0));
     }
     if controls.sink.is_none() {
-        let (events, waker) = (controls.events.clone(), crate::host::Waker::current());
+        let (events, waker) = (controls.events.clone(), crate::jsc::Waker::current());
         controls.sink = Some(Arc::new(move |event| {
             events
                 .lock()

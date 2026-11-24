@@ -1,4 +1,4 @@
-use crate::host::Role;
+use crate::jsc::Role;
 use anyhow::{Context, Result, bail, ensure};
 #[cfg(not(target_os = "macos"))]
 pub(crate) use libsqlite3_sys as ffi;

@@ -1,7 +1,4 @@
-use apps_runtime::{
-    host::Role,
-    jsc::{JavaScriptCore, JsContext},
-};
+use apps_runtime::{host::context::JsContext, jsc::JavaScriptCore, jsc::Role};
 use std::{
     rc::Rc,
     time::{Duration, Instant},

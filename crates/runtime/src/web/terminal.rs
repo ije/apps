@@ -193,11 +193,12 @@ pub fn library_name(platform: &str) -> &'static str {
 }
 
 fn load() -> Result<Library> {
-    let library = super::gpu::library(
+    let library = crate::native::library::load(
         library_name(std::env::consts::OS),
         "terminal",
         b"apps_terminal_abi\0",
         ABI,
+        "",
     )
     .context("The terminal library needs libghostty-vt: run bash scripts/build-ghostty.sh")?;
     unsafe {
@@ -627,7 +628,7 @@ impl crate::host::Host {
     /// Runs an operation of a terminal session for the page, or for its preload script.
     pub fn terminal(&mut self, id: u64, preload: bool, op: &str, args: &Value) -> Result<Value> {
         ensure!(
-            self.enabled("terminal"),
+            self.app.features.has(crate::bundle::Feature::Terminal),
             "The terminal feature is disabled. Add \"terminal\" to \"features\" in package.json"
         );
         // Only a preload script starts programs, and only the page has elements.

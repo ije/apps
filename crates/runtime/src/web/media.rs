@@ -75,11 +75,12 @@ pub fn ffmpeg_name(platform: &str) -> &'static str {
 }
 
 fn load() -> Result<Library> {
-    let library = super::gpu::library(
+    let library = crate::native::library::load(
         library_name(std::env::consts::OS),
         "media",
         b"apps_media_abi\0",
         ABI,
+        "",
     )?;
     unsafe {
         Ok(Library {

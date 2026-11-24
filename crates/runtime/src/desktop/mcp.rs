@@ -1,42 +1,19 @@
-use super::{
-    Desktop,
-    link::{Link, state_json},
-    png,
+use super::{Desktop, main::state_json, png};
+use crate::{
+    host::link::Link,
+    jsc,
+    jsc::Role,
+    native::devtools::{Done, Host},
 };
-use crate::{host::Role, jsc};
-use anyhow::{Context as _, Result, anyhow, bail, ensure};
+use anyhow::{Context as _, Result, anyhow, bail};
 use renderer::{App, Button, Event, Key, Modifiers, WheelPhase, WindowId, point, px};
 use serde_json::{Value, json};
 use std::{
-    ffi::{CStr, c_char, c_void},
+    ffi::c_void,
     sync::{Arc, Mutex, OnceLock, PoisonError},
     time::Instant,
 };
 
-// The reply, ok, JSON value or error text, and an optional PNG.
-type Done = extern "C" fn(*mut c_void, bool, *const u8, usize, *const u8, usize);
-
-#[repr(C)]
-struct Host {
-    connect: extern "C" fn(usize) -> i32,
-    inspect: extern "C" fn(usize, *const u8, usize) -> bool,
-    messages: extern "C" fn(*mut c_void, extern "C" fn(*mut c_void, usize, *const u8, usize)),
-    contexts: extern "C" fn(*mut c_void, extern "C" fn(*mut c_void, usize, u32, u64)),
-    wake: extern "C" fn(u64),
-    call: extern "C" fn(*mut c_void, *const u8, usize, *const u8, usize, *mut c_void, Done),
-}
-
-struct Library {
-    install: extern "C" fn(u64),
-    uninstall: extern "C" fn(),
-    poll: extern "C" fn(*mut c_void) -> bool,
-    paused: unsafe extern "C" fn(usize, *mut bool),
-    logs: unsafe extern "C" fn(*const u8, usize),
-    profiling: extern "C" fn() -> bool,
-    frame: extern "C" fn(u64, u64),
-}
-
-static LIBRARY: OnceLock<Library> = OnceLock::new();
 static LINK: OnceLock<Link> = OnceLock::new();
 static HOST: Host = Host {
     connect,
@@ -48,94 +25,22 @@ static HOST: Host = Host {
 };
 
 pub(crate) fn start(port: u16, link: Link) -> Result<()> {
-    let library = super::devtools::load()?;
-    let (start, library) = unsafe {
-        let start: extern "C" fn(u16, &'static Host) -> *const c_char =
-            *library.get(b"apps_devtools_mcp_start\0")?;
-        let functions = Library {
-            install: *library.get(b"apps_devtools_mcp_install\0")?,
-            uninstall: *library.get(b"apps_devtools_mcp_uninstall\0")?,
-            poll: *library.get(b"apps_devtools_mcp_poll\0")?,
-            paused: *library.get(b"apps_devtools_mcp_paused\0")?,
-            logs: *library.get(b"apps_devtools_mcp_logs\0")?,
-            profiling: *library.get(b"apps_devtools_mcp_profiling\0")?,
-            frame: *library.get(b"apps_devtools_mcp_frame\0")?,
-        };
-        (start, functions)
-    };
     let _ = LINK.set(link);
-    let error = start(port, &HOST);
-    ensure!(
-        error.is_null(),
-        "{}",
-        unsafe { CStr::from_ptr(error) }.to_string_lossy()
-    );
-    let _ = LIBRARY.set(library);
-    Ok(())
-}
-
-pub(crate) fn enabled() -> bool {
-    LIBRARY.get().is_some()
-}
-
-pub(crate) fn install(key: u64) {
-    if let Some(library) = LIBRARY.get() {
-        (library.install)(key);
-    }
-}
-
-pub(crate) fn uninstall() {
-    if let Some(library) = LIBRARY.get() {
-        (library.uninstall)();
-    }
-}
-
-pub(crate) fn poll_main() -> bool {
-    LIBRARY
-        .get()
-        .is_some_and(|library| (library.poll)(std::ptr::null_mut()))
+    crate::native::devtools::start(port, &HOST)
 }
 
 pub(crate) fn poll(desktop: &Desktop, cx: &mut App) -> bool {
     let mut app = (desktop, cx);
-    LIBRARY
-        .get()
-        .is_some_and(|library| (library.poll)((&raw mut app).cast()))
-}
-
-pub(crate) fn logs(logs: &[Value]) {
-    if let Some(library) = LIBRARY.get()
-        && let Ok(logs) = serde_json::to_vec(logs)
-    {
-        unsafe { (library.logs)(logs.as_ptr(), logs.len()) };
-    }
-}
-
-pub(crate) fn profiling() -> bool {
-    LIBRARY.get().is_some_and(|library| (library.profiling)())
-}
-
-pub(crate) fn frame(window: u64, started: Instant) {
-    if let Some(library) = LIBRARY.get() {
-        (library.frame)(window, started.elapsed().as_nanos() as u64);
-    }
-}
-
-// Runs while JSC is paused in `ctx`. It must dispatch protocol messages until `done` is set.
-pub(crate) fn paused(ctx: usize, done: *mut bool) {
-    match LIBRARY.get() {
-        Some(library) => unsafe { (library.paused)(ctx, done) },
-        None => drop(jsc::inspect(ctx, r#"{"id":0,"method":"Debugger.resume"}"#)),
-    }
+    crate::native::devtools::poll((&raw mut app).cast())
 }
 
 extern "C" fn connect(ctx: usize) -> i32 {
-    jsc::connect_inspector(ctx).map_or(-1, i32::from)
+    crate::host::context::connect_inspector(ctx).map_or(-1, i32::from)
 }
 
 extern "C" fn inspect(ctx: usize, message: *const u8, len: usize) -> bool {
     let message = unsafe { std::slice::from_raw_parts(message, len) };
-    jsc::inspect(ctx, &String::from_utf8_lossy(message)).is_ok()
+    crate::host::context::inspect(ctx, &String::from_utf8_lossy(message)).is_ok()
 }
 
 extern "C" fn messages(
@@ -148,7 +53,7 @@ extern "C" fn messages(
 }
 
 extern "C" fn contexts(list: *mut c_void, push: extern "C" fn(*mut c_void, usize, u32, u64)) {
-    for (ctx, role) in jsc::contexts() {
+    for (ctx, role) in crate::host::context::contexts() {
         let (role, id) = match role {
             Role::Main => (0, 0),
             Role::Preload(id) => (1, id),
@@ -233,10 +138,10 @@ extern "C" fn call(
     let app = unsafe { app.cast::<(&Desktop, &mut App)>().as_mut() };
     let result = match (op, app) {
         (b"cpu", _) => crate::node::system::call("process.cpu", &Value::Null).map(Some),
-        (b"windows", Some((desktop, cx))) => windows(desktop, cx).map(Some),
+        (b"windows", Some((desktop, cx))) => Ok(Some(desktop.windows(cx))),
         (b"screenshot", Some((desktop, cx))) => screenshot(&args, desktop, cx, &reply),
         (b"input", Some((desktop, cx))) => input(&args, desktop, cx, &reply),
-        (b"memory", Some((desktop, _))) => memory(&args, desktop).map(Some),
+        (b"memory", Some((desktop, _))) => desktop.memory(args["gc"] == true).map(Some),
         _ => Err(anyhow!("Unknown devtools operation")),
     };
     match result {
@@ -246,45 +151,69 @@ extern "C" fn call(
     }
 }
 
-fn page(args: &Value, desktop: &Desktop) -> Result<(u64, WindowId)> {
-    let window = match args["window"].as_u64() {
-        Some(id) => id,
-        None => desktop
+impl Desktop {
+    // The window `id`, or the first one, and its native handle.
+    fn window(&self, id: Option<u64>) -> Result<(u64, WindowId)> {
+        let window = match id {
+            Some(id) => id,
+            None => self
+                .views
+                .keys()
+                .copied()
+                .min()
+                .context("The app has no windows")?,
+        };
+        let handle = self
             .views
-            .keys()
-            .copied()
-            .min()
-            .context("The app has no windows")?,
-    };
-    let handle = desktop
-        .views
-        .get(&window)
-        .and_then(|view| view.handle)
-        .context("No such window")?;
-    Ok((window, handle))
-}
-
-fn windows(desktop: &Desktop, cx: &mut App) -> Result<Value> {
-    let host = desktop.host.borrow();
-    let mut ids: Vec<_> = desktop.views.keys().copied().collect();
-    ids.sort_unstable();
-    let mut list = Vec::new();
-    for id in ids {
-        let view = &desktop.views[&id];
-        let state = view.handle.and_then(|handle| {
-            cx.update_window(handle, |window, _| {
-                state_json(&window.window_state(), window.is_active())
-            })
-        });
-        list.push(json!({
-            "id": id,
-            "title": view.title,
-            "url": host.dom.get(&id).and_then(|dom| dom.base.as_ref()).map(url::Url::as_str),
-            "state": state,
-            "preload": view.preload.is_some(),
-        }));
+            .get(&window)
+            .and_then(|view| view.handle)
+            .context("No such window")?;
+        Ok((window, handle))
     }
-    Ok(json!(list))
+
+    fn windows(&self, cx: &mut App) -> Value {
+        let host = self.host.borrow();
+        let mut ids: Vec<_> = self.views.keys().copied().collect();
+        ids.sort_unstable();
+        let mut list = Vec::new();
+        for id in ids {
+            let view = &self.views[&id];
+            let state = view.handle.and_then(|handle| {
+                cx.update_window(handle, |window, _| {
+                    state_json(&window.window_state(), window.is_active())
+                })
+            });
+            list.push(json!({
+                "id": id,
+                "title": view.title,
+                "url": host.dom.get(&id).and_then(|dom| dom.base.as_ref()).map(url::Url::as_str),
+                "state": state,
+                "preload": view.preload.is_some(),
+            }));
+        }
+        json!(list)
+    }
+
+    fn memory(&self, gc: bool) -> Result<Value> {
+        let engine = self
+            .views
+            .iter()
+            .filter_map(|(&id, view)| view.renderer.as_deref().map(|engine| (id, engine)))
+            .min_by_key(|(id, _)| *id)
+            .map(|(_, engine)| engine);
+        if gc && let Some(engine) = engine {
+            engine.collect_garbage();
+        }
+        let heap = engine
+            .map(|engine| engine.heap())
+            .transpose()?
+            .unwrap_or(Value::Null);
+        Ok(json!({
+            "rss": crate::node::system::call("process.memory", &Value::Null)?,
+            "heap": heap,
+            "domNodes": self.host.borrow().memory(),
+        }))
+    }
 }
 
 fn screenshot(
@@ -293,7 +222,7 @@ fn screenshot(
     cx: &mut App,
     reply: &Reply,
 ) -> Result<Option<Value>> {
-    let (window, handle) = page(args, desktop)?;
+    let (window, handle) = desktop.window(args["window"].as_u64())?;
     let (crop, css, reply) = (
         args["crop"].clone(),
         args["device_pixels"] != true,
@@ -316,7 +245,7 @@ fn screenshot(
 }
 
 fn input(args: &Value, desktop: &Desktop, cx: &mut App, reply: &Reply) -> Result<Option<Value>> {
-    let (window, handle) = page(args, desktop)?;
+    let (window, handle) = desktop.window(args["window"].as_u64())?;
     let action = args["action"].as_str().context("Expected an action")?;
     let at = point(
         px(args["x"].as_f64().unwrap_or(0.) as f32),
@@ -453,44 +382,13 @@ fn input(args: &Value, desktop: &Desktop, cx: &mut App, reply: &Reply) -> Result
     Ok(None)
 }
 
-fn memory(args: &Value, desktop: &Desktop) -> Result<Value> {
-    let engine = desktop
-        .views
-        .iter()
-        .filter_map(|(&id, view)| view.renderer.as_deref().map(|engine| (id, engine)))
-        .min_by_key(|(id, _)| *id)
-        .map(|(_, engine)| engine);
-    if args["gc"] == true
-        && let Some(engine) = engine
-    {
-        engine.collect_garbage();
-    }
-    let heap = engine
-        .map(|engine| engine.heap())
-        .transpose()?
-        .unwrap_or(Value::Null);
-    let host = desktop.host.borrow();
-    let report = json!({
-        "rss": crate::node::system::call("process.memory", &Value::Null)?,
-        "heap": heap,
-        "domNodes": host.pages.iter().map(|(id, page)| {
-            let (mut attached, mut pending) = (0, vec![0]);
-            while let Some(node) = pending.pop() {
-                attached += 1;
-                pending.extend(&page.doc.nodes[node].children);
-            }
-            let free = host.dom.get(id).map_or(0, |state| state.free.len());
-            (format!("window {id}"), json!({"attached": attached, "allocated": page.doc.nodes.len(), "free": free}))
-        }).collect::<serde_json::Map<_, _>>(),
-    });
-    Ok(report)
-}
-
 #[cfg(test)]
 mod tests {
     use crate::{
-        host::{Host, Role},
-        jsc::{self, JavaScriptCore, JsContext},
+        host::Host,
+        host::context::JsContext,
+        jsc::Role,
+        jsc::{self, JavaScriptCore},
     };
 
     #[test]
@@ -501,16 +399,16 @@ mod tests {
             Role::Main,
         )
         .unwrap();
-        let [(ctx, Role::Main)] = jsc::contexts()[..] else {
+        let [(ctx, Role::Main)] = crate::host::context::contexts()[..] else {
             panic!("Expected one main context");
         };
-        assert!(jsc::connect_inspector(ctx).unwrap());
+        assert!(crate::host::context::connect_inspector(ctx).unwrap());
         for message in [
             r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"6 * 7","returnByValue":true}}"#,
             r#"{"id":2,"method":"Debugger.enable","params":{}}"#,
             r#"{"id":3,"method":"Debugger.setPauseOnDebuggerStatements","params":{"enabled":true}}"#,
         ] {
-            jsc::inspect(ctx, message).unwrap();
+            crate::host::context::inspect(ctx, message).unwrap();
         }
         let messages: Vec<_> = jsc::inspector_messages()
             .into_iter()
@@ -528,7 +426,7 @@ mod tests {
         );
         assert_eq!(engine.eval("debugger; 'after'", "test").unwrap(), "after");
         drop(engine);
-        assert!(jsc::contexts().is_empty());
+        assert!(crate::host::context::contexts().is_empty());
         let _ = Host::default();
     }
 }
