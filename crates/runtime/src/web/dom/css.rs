@@ -355,7 +355,12 @@ pub(super) fn computed(
     });
     let mut sampled = None;
     let backdrop = (pseudo == "backdrop")
-        .then(|| state.styles.motion.backdrop(id, styles.backdrops.get(&id)?))
+        .then(|| {
+            state
+                .styles
+                .motion
+                .backdrop(id, styles.extras(id).backdrop.as_ref()?)
+        })
         .flatten();
     let style = match pseudo {
         "" => Some(current.as_ref().unwrap_or_else(|| {
@@ -370,20 +375,21 @@ pub(super) fn computed(
             .styles
             .animating_pseudos
             .get(&id)
-            .or_else(|| styles.pseudos.get(&id))
+            .or_else(|| styles.generated(id))
             .map(|values| &values[usize::from(pseudo == "after")]),
         "backdrop" => backdrop
             .as_ref()
-            .or_else(|| styles.backdrops.get(&id).map(|style| &**style)),
-        "selection" => styles.selections.get(&id).map(|style| &**style),
+            .or_else(|| styles.extras(id).backdrop.as_deref()),
+        "selection" => styles.extras(id).selection.as_deref(),
         // The button of a file input shares the slot of the scrollbar track.
         "file-selector-button" | "-webkit-file-upload-button"
             if doc.nodes[id].tag == "input"
                 && doc.nodes[id].input_type().eq_ignore_ascii_case("file") =>
         {
             styles
+                .extras(id)
                 .scrollbars
-                .get(&id)
+                .as_ref()
                 .and_then(|styles| styles[1].as_ref())
         }
         "marker" | "first-letter" | "first-line" | "placeholder" => {
@@ -392,8 +398,9 @@ pub(super) fn computed(
                 .position(|name| *name == pseudo)
                 .unwrap_or(3);
             styles
-                .text_pseudos
-                .get(&id)
+                .extras(id)
+                .text
+                .as_ref()
                 .and_then(|styles| styles[index].as_ref())
         }
         _ => None,
@@ -887,12 +894,12 @@ pub(super) fn computed(
             // Chrome gives the strings and `attr()` values of generated content as one string.
             ("content", _) if !pseudo.is_empty() && value != "none" && value != "normal" => {
                 // Counters keep their declared form, which `counting` holds.
-                let value = match styles.counting.get(&id) {
-                    Some(sides) if matches!(pseudo, "before" | "after") => sides
-                        [usize::from(pseudo == "after")]
-                    .as_deref()
-                    .map_or(value, str::to_owned),
-                    _ => value,
+                let sides = &styles.extras(id).counting;
+                let value = match matches!(pseudo, "before" | "after") {
+                    true => sides[usize::from(pseudo == "after")]
+                        .as_deref()
+                        .map_or(value, str::to_owned),
+                    false => value,
                 };
                 let (mut parts, mut text) = (Vec::new(), None::<String>);
                 let quote = |text: String| {

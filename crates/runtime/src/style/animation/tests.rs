@@ -47,7 +47,7 @@ fn keyframes_follow_delay_easing_iterations_and_fill() {
             wake.is_some(),
         )
     };
-    let effect = &styles.animations[&id][0];
+    let effect = &styles.extras(id).animations.as_ref().unwrap()[0];
     assert_eq!(sample(effect, 0.4), (None, true));
     assert_eq!(sample(effect, 0.8), (Some(1.), true));
     assert!(sample(effect, 1.4).0.unwrap() < 0.0001);
@@ -79,7 +79,7 @@ fn keyframes_animate_many_properties_with_per_keyframe_easing() {
     let p = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
     let mut out = Style::new();
     let sample = |id: usize, elapsed: f64, out: &mut Style| {
-        styles.animations[&id][0].sample(
+        styles.extras(id).animations.as_ref().unwrap()[0].sample(
             elapsed,
             false,
             &styles.values[id],
@@ -107,7 +107,7 @@ fn implicit_end_frames_follow_the_value_under_them() {
     );
     let styles = computed_styles(&doc);
     let div = doc.nodes.iter().position(|node| node.tag == "div").unwrap();
-    let effect = &styles.animations[&div][0];
+    let effect = &styles.extras(div).animations.as_ref().unwrap()[0];
     let sample = |under: Option<&str>| {
         let mut out = Style::new();
         if let Some(under) = under {
@@ -439,7 +439,15 @@ fn starting_styles_transition_new_and_shown_elements() {
     let mut motion = Motion::default();
     let mut events = Vec::new();
     let styles = computed_styles(&doc);
-    assert_eq!(styles.starting[&p].get(Prop::OPACITY), Some("0"));
+    assert_eq!(
+        styles
+            .extras(p)
+            .starting
+            .as_ref()
+            .unwrap()
+            .get(Prop::OPACITY),
+        Some("0")
+    );
     motion.update(
         &doc,
         &styles,
@@ -610,7 +618,7 @@ fn animations_wake_the_view_only_when_their_output_can_change() {
     let styles = computed_styles(&doc);
     let p = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
     let wake = |coarse| {
-        let effect = &styles.animations[&p][0];
+        let effect = &styles.extras(p).animations.as_ref().unwrap()[0];
         let mut out = Style::new();
         effect
             .sample(
@@ -1813,7 +1821,7 @@ fn keyframes_interpolate_filters_keywords_shapes_and_steps() {
     let styles = computed_styles(&doc);
     let div = node(&doc, "div");
     assert!(
-        styles.animations[&div][0]
+        styles.extras(div).animations.as_ref().unwrap()[0]
             .tracks
             .iter()
             .all(|(_, frames)| frames[0].lerp.is_some())

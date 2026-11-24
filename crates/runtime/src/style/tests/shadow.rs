@@ -14,7 +14,11 @@ fn scrollbar_parts_reach_scroll_containers_only() {
         &mut StyleCache::default(),
         None,
     );
-    let parts = &computed.scrollbars[&element(&doc, "div")];
+    let parts = &computed
+        .extras(element(&doc, "div"))
+        .scrollbars
+        .as_ref()
+        .unwrap();
     assert_eq!(&parts[0].as_ref().unwrap()["width"], "8px");
     assert_eq!(&parts[1].as_ref().unwrap()["background-color"], "#eee");
     let [thumb, hovered] = [&parts[2], &parts[4]].map(|part| part.as_ref().unwrap());
@@ -23,7 +27,7 @@ fn scrollbar_parts_reach_scroll_containers_only() {
         ("red", "blue")
     );
     assert_eq!(&hovered["border-top-left-radius"], "4px");
-    assert!(!computed.scrollbars.contains_key(&element(&doc, "p")));
+    assert!(computed.extras(element(&doc, "p")).scrollbars.is_none());
 }
 
 #[test]
@@ -113,24 +117,37 @@ fn hosts_take_pseudo_elements_from_their_shadow_tree() {
     let shadows = attach(&mut doc);
     let (mut cache, mut last) = (StyleCache::default(), None);
     let out = shadowed(&doc, &shadows, &mut cache, &mut last);
-    let pseudos = out.pseudos.get(&host).cloned().unwrap();
+    let pseudos = out.generated(host).cloned().unwrap();
     assert_eq!(pseudos[0].get(Prop::CONTENT), Some("'A'"));
     assert_eq!(pseudos[0].get(Prop::COLOR), Some("blue"));
     assert_eq!(pseudos[0].get(Prop::BACKGROUND_COLOR), Some("red"));
     assert_eq!(pseudos[1].get(Prop::CONTENT), Some("'B'"));
     assert_eq!(pseudos[1].get(Prop::COLOR), Some("green"));
-    assert_eq!(out.starting[&host].get(Prop::OPACITY), Some("0"));
+    assert_eq!(
+        out.extras(host)
+            .starting
+            .as_ref()
+            .unwrap()
+            .get(Prop::OPACITY),
+        Some("0")
+    );
     doc.nodes[host].attrs.set("class", "off");
     let out = shadowed(&doc, &shadows, &mut cache, &mut last);
-    let pseudos = out.pseudos.get(&host).cloned().unwrap();
+    let pseudos = out.generated(host).cloned().unwrap();
     assert_eq!(pseudos[0].get(Prop::CONTENT), Some("'A'"));
     assert!(!pseudos[1].contains(Prop::CONTENT));
     doc.nodes[host].attrs.set("class", "on");
     let out = shadowed(&doc, &shadows, &mut cache, &mut last);
-    assert_eq!(out.pseudos[&host][1].get(Prop::CONTENT), Some("'B'"));
+    assert_eq!(
+        out.generated(host).unwrap()[1].get(Prop::CONTENT),
+        Some("'B'")
+    );
     doc.nodes[host].state = crate::css::selector::HOVER;
     let out = shadowed(&doc, &shadows, &mut cache, &mut last);
-    assert_eq!(out.pseudos[&host][1].get(Prop::COLOR), Some("purple"));
+    assert_eq!(
+        out.generated(host).unwrap()[1].get(Prop::COLOR),
+        Some("purple")
+    );
     #[cfg(debug_assertions)]
     assert_eq!(cache.incremental, 3);
 }
@@ -162,8 +179,7 @@ fn host_rules_query_the_containers_of_the_flat_tree() {
         let out = shadowed(&doc, &shadows, &mut cache, &mut last);
         let get = |id: usize, prop: Prop| out.values[id].get(prop).map(str::to_owned);
         let content = |slot: usize| {
-            out.pseudos
-                .get(&host)
+            out.generated(host)
                 .and_then(|pair| pair[slot].get(Prop::CONTENT).map(str::to_owned))
         };
         let (wide, narrow, slim) = (
@@ -186,7 +202,7 @@ fn host_rules_query_the_containers_of_the_flat_tree() {
         assert_eq!(content(0).as_deref(), narrow.then_some("'C'"));
         assert_eq!(content(1).as_deref(), (!narrow).then_some("'D'"));
         assert_eq!(get(s, Prop::PADDING_LEFT).as_deref(), slim.then_some("5px"));
-        assert_eq!(out.pseudos[&p][0].get(Prop::CONTENT), Some("'P'"));
+        assert_eq!(out.generated(p).unwrap()[0].get(Prop::CONTENT), Some("'P'"));
         let mut fresh = StyleCache {
             containers: sizes.clone(),
             ..Default::default()
@@ -203,7 +219,10 @@ fn host_rules_query_the_containers_of_the_flat_tree() {
                 ..Default::default()
             }),
         );
-        assert!(out.values == reference.values && out.pseudos == reference.pseudos);
+        assert!(
+            out.values == reference.values
+                && (0..out.values.len()).all(|id| out.generated(id) == reference.generated(id))
+        );
     };
     check(&sizes);
     sizes.insert(host, [400., 50.]);
@@ -254,8 +273,7 @@ fn part_and_slotted_rules_query_the_containers_of_the_node_they_reach() {
         let out = shadowed(&doc, &shadows, &mut cache, &mut last);
         let get = |id: usize, prop: Prop| out.values[id].get(prop).map(str::to_owned);
         let content = |id: usize, slot: usize| {
-            out.pseudos
-                .get(&id)
+            out.generated(id)
                 .and_then(|pair| pair[slot].get(Prop::CONTENT).map(str::to_owned))
         };
         let [within, own, slim, inside] = [inner, p, s, slot].map(|id| sizes[&id][0]);
@@ -295,7 +313,10 @@ fn part_and_slotted_rules_query_the_containers_of_the_node_they_reach() {
                 ..Default::default()
             }),
         );
-        assert!(out.values == reference.values && out.pseudos == reference.pseudos);
+        assert!(
+            out.values == reference.values
+                && (0..out.values.len()).all(|id| out.generated(id) == reference.generated(id))
+        );
     };
     check(&sizes);
     sizes.insert(inner, [600., 50.]);
@@ -330,13 +351,13 @@ fn slotted_and_part_rules_style_pseudo_elements() {
     let (mut cache, mut last) = (StyleCache::default(), None);
     let out = shadowed(&doc, &shadows, &mut cache, &mut last);
     let pseudo = |out: &ComputedStyles, id: usize, slot: usize, prop: Prop| {
-        out.pseudos
-            .get(&id)
+        out.generated(id)
             .and_then(|pair| pair[slot].get(prop).map(str::to_owned))
     };
     let text = |out: &ComputedStyles, id: usize, slot: usize| {
-        out.text_pseudos
-            .get(&id)
+        out.extras(id)
+            .text
+            .as_ref()
             .and_then(|list| list[slot].as_ref()?.get(Prop::COLOR).map(str::to_owned))
     };
     assert_eq!(out.values[a].get(Prop::COLOR), Some("green"));
@@ -355,12 +376,21 @@ fn slotted_and_part_rules_style_pseudo_elements() {
     assert_eq!(pseudo(&out, p, 0, Prop::CONTENT).as_deref(), Some("'P'"));
     assert_eq!(pseudo(&out, p, 0, Prop::COLOR).as_deref(), Some("green"));
     assert_eq!(text(&out, p, 2).as_deref(), Some("green"));
-    assert_eq!(out.selections[&p].get(Prop::COLOR), Some("green"));
+    assert_eq!(
+        out.extras(p).selection.as_ref().unwrap().get(Prop::COLOR),
+        Some("green")
+    );
     assert_eq!(text(&out, i, 3).as_deref(), Some("green"));
     assert_ne!(out.values[p].get(Prop::COLOR), Some("red"));
-    assert_eq!(out.starting[&a].get(Prop::OPACITY), Some("0"));
-    assert_eq!(out.starting[&p].get(Prop::OPACITY), Some("0.5"));
-    assert!(!out.starting.contains_key(&b));
+    assert_eq!(
+        out.extras(a).starting.as_ref().unwrap().get(Prop::OPACITY),
+        Some("0")
+    );
+    assert_eq!(
+        out.extras(p).starting.as_ref().unwrap().get(Prop::OPACITY),
+        Some("0.5")
+    );
+    assert!(out.extras(b).starting.is_none());
     doc.nodes[a].state = crate::css::selector::HOVER;
     doc.nodes[p].state = crate::css::selector::HOVER;
     doc.nodes[p].attrs.set("class", "x");
@@ -403,8 +433,7 @@ fn parts_take_pseudo_classes_names_and_their_own_trees_host_rules() {
         );
         assert_eq!(get(p, Prop::PADDING_LEFT).as_deref(), Some("1px"));
         assert_eq!(
-            out.pseudos
-                .get(&p)
+            out.generated(p)
                 .and_then(|pair| pair[0].get(Prop::CONTENT).map(str::to_owned))
                 .as_deref(),
             on.then_some("'H'")
@@ -450,13 +479,15 @@ fn range_progress_and_file_parts_take_their_pseudo_elements_like_chrome() {
             .filter(|&id| doc.nodes[id].tag == tag)
             .nth(usize::from(file))
             .unwrap();
-        computed.scrollbars[&id][slot].clone().unwrap()
+        computed.extras(id).scrollbars.as_ref().unwrap()[slot]
+            .clone()
+            .unwrap()
     };
     assert_eq!(&part("input", false, 1)["height"], "8px");
     assert_eq!(&part("input", false, 2)["background-color"], "gray");
     assert_eq!(&part("progress", false, 2)["background-color"], "red");
     assert_eq!(&part("input", true, 1)["padding-top"], "6px");
-    assert!(!computed.scrollbars.contains_key(&element(&doc, "div")));
+    assert!(computed.extras(element(&doc, "div")).scrollbars.is_none());
 }
 
 #[test]

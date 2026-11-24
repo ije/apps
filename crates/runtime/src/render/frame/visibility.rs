@@ -204,8 +204,7 @@ pub(super) fn drop_hidden_images(
                         || masked(style, &[Prop::CLIP_PATH, Prop::WEBKIT_CLIP_PATH])
                 }),
                 _ => styles
-                    .pseudos
-                    .get(&id)
+                    .generated(id)
                     .and_then(|pseudos| pseudos.get(usize::from(slot) - 1))
                     .is_some_and(|style| masked(style, &images)),
             }
@@ -229,8 +228,7 @@ pub(super) fn drop_hidden_images(
                     Some(slot) if slot < 8 => match slot {
                         0 => styles.values.get(id).map(|style| &**style),
                         _ => styles
-                            .pseudos
-                            .get(&id)
+                            .generated(id)
                             .and_then(|pseudos| pseudos.get(slot - 1)),
                     }
                     .and_then(|style| style.get(Prop::BORDER_IMAGE_SOURCE))
@@ -241,10 +239,9 @@ pub(super) fn drop_hidden_images(
             visible.get(id) == Some(&true)
                 && match layer / 64 {
                     0 => styles.values.get(id).map(|style| &**style),
-                    3 => styles.backdrops.get(&id).map(|style| &**style),
+                    3 => styles.extras(id).backdrop.as_deref(),
                     slot => styles
-                        .pseudos
-                        .get(&id)
+                        .generated(id)
                         .and_then(|pseudos| pseudos.get(slot - 1)),
                 }
                 .and_then(|style| style.get(Prop::BACKGROUND_IMAGE))

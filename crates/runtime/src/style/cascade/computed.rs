@@ -69,19 +69,59 @@ impl ComputedStyles {
         self.flags[id] = 0;
         self.lengths.unset(id);
         self.containers[id] = None;
-        self.pseudos.remove(&id);
-        self.text_pseudos.remove(&id);
-        self.backdrops.remove(&id);
-        self.backdrop_starts.remove(&id);
-        self.counting.remove(&id);
-        self.scrollbars.remove(&id);
-        self.selections.remove(&id);
-        self.animations.remove(&id);
-        self.important.remove(&id);
-        self.starting.remove(&id);
-        self.slotted.remove(&id);
-        self.parts.remove(&id);
-        self.exported.remove(&id);
+        self.extras.remove(&id);
+    }
+
+    // A fast pass starts from the styles of the last pass.
+    pub(crate) fn start_from(&mut self, previous: &ComputedStyles, count: usize) {
+        self.values.clone_from(&previous.values);
+        self.vars.clone_from(&previous.vars);
+        self.flags.clone_from(&previous.flags);
+        self.lengths.clone_from(&previous.lengths);
+        self.lengths.grow(count);
+        self.extras.clone_from(&previous.extras);
+        self.containers.clone_from(&previous.containers);
+    }
+
+    pub(crate) fn extras(&self, id: usize) -> &Extras {
+        self.extras.get(&id).map_or(&NO_EXTRAS, |extras| extras)
+    }
+
+    pub(crate) fn all_extras(&self) -> impl Iterator<Item = (usize, &Extras)> {
+        self.extras.iter().map(|(&id, extras)| (id, &**extras))
+    }
+
+    // The styles of `::before` and `::after`.
+    pub(crate) fn generated(&self, id: usize) -> Option<&Rc<[Style; 2]>> {
+        self.extras(id).generated.as_ref()
+    }
+
+    // Puts the values of an animation frame in place of the cascade ones, and the cascade ones in the lists. A
+    // second call with the same lists puts them back. Pseudo-elements without cascade styles are dropped.
+    pub(crate) fn swap_frame(
+        &mut self,
+        values: &mut [(usize, Rc<Style>)],
+        generated: &mut Vec<(usize, Rc<[Style; 2]>)>,
+        lengths: &mut [(usize, Lengths)],
+    ) {
+        for (id, style) in values {
+            std::mem::swap(&mut self.values[*id], style);
+        }
+        generated.retain_mut(|(id, pair)| {
+            let Some(extras) = self
+                .extras
+                .get_mut(id)
+                .filter(|kept| kept.generated.is_some())
+            else {
+                return false;
+            };
+            std::mem::swap(Rc::make_mut(extras).generated.as_mut().unwrap(), pair);
+            true
+        });
+        for (id, new) in lengths {
+            let old = *self.lengths.get(*id).unwrap_or(new);
+            self.lengths.set(*id, std::mem::replace(new, old));
+        }
     }
 
     // Gives a new detached node the styles of an unstyled node, as a full pass does, and grows every list.
@@ -192,25 +232,10 @@ pub(crate) struct ComputedStyles {
     pub vars: Chunked<Vars>,
     pub flags: Chunked<u16>,
     pub lengths: NodeLengths,
-    pub pseudos: FxHashMap<usize, Rc<[Style; 2]>>,
-    pub text_pseudos: FxHashMap<usize, Rc<[Option<Style>; 4]>>,
-    pub backdrops: FxHashMap<usize, Rc<Style>>,
-    pub backdrop_starts: FxHashMap<usize, Rc<Style>>,
-    pub scrollbars: FxHashMap<usize, Rc<[Option<Style>; 5]>>,
-    pub selections: FxHashMap<usize, Rc<Style>>,
+    pub(crate) extras: FxHashMap<usize, Rc<Extras>>,
     pub user_select: Chunked<(UserSelect, usize)>,
-    pub animations: FxHashMap<usize, Rc<[Animation]>>,
-    // Properties whose winning declaration is important, so animations don't change them.
-    pub important: FxHashMap<usize, Rc<[Prop]>>,
     pub children: FxHashMap<usize, Vec<usize>>,
-    pub slotted: FxHashMap<usize, Shadowed>,
-    pub parts: FxHashMap<usize, Shadowed>,
-    pub exported: FxHashMap<usize, Shadowed>,
-    pub starting: FxHashMap<usize, Rc<Style>>,
     pub list_items: FxHashMap<usize, i64>,
-    // The declared `content` of `::before` and `::after` where it has a counter. Their styles hold the text of
-    // the last pass.
-    pub(crate) counting: FxHashMap<usize, [Option<Rc<str>>; 2]>,
     pub registry: Rc<Registry>,
     pub authored: FxHashMap<usize, Rc<Style>>,
     // The own flags of the nodes that an anonymous table changed. Their own styles are in `authored`.
@@ -222,6 +247,45 @@ pub(crate) struct ComputedStyles {
     // The native theme bits that this pass styled with.
     pub(crate) theme: u32,
 }
+
+// The rare results of a node, kept together so a pass adds, drops and copies them at once. Cached styles share
+// them.
+#[derive(Clone, Default)]
+pub(crate) struct Extras {
+    pub(crate) generated: Option<Rc<[Style; 2]>>,
+    // `::marker`, `::first-letter`, `::first-line` and `::placeholder`.
+    pub(crate) text: Option<Rc<[Option<Style>; 4]>>,
+    pub(crate) backdrop: Option<Rc<Style>>,
+    pub(crate) backdrop_start: Option<Rc<Style>>,
+    pub(crate) scrollbars: Option<Rc<[Option<Style>; 5]>>,
+    pub(crate) selection: Option<Rc<Style>>,
+    pub(crate) animations: Option<Rc<[Animation]>>,
+    // Properties whose winning declaration is important, so animations don't change them.
+    pub(crate) important: Option<Rc<[Prop]>>,
+    pub(crate) starting: Option<Rc<Style>>,
+    pub(crate) slotted: Option<Shadowed>,
+    pub(crate) parts: Option<Shadowed>,
+    pub(crate) exported: Option<Shadowed>,
+    // The declared `content` of `::before` and `::after` where it has a counter. Their styles hold the text of
+    // the last pass.
+    pub(crate) counting: [Option<Rc<str>>; 2],
+}
+
+pub(crate) const NO_EXTRAS: Extras = Extras {
+    generated: None,
+    text: None,
+    backdrop: None,
+    backdrop_start: None,
+    scrollbars: None,
+    selection: None,
+    animations: None,
+    important: None,
+    starting: None,
+    slotted: None,
+    parts: None,
+    exported: None,
+    counting: [None, None],
+};
 
 #[derive(Clone, Copy, Default, PartialEq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]

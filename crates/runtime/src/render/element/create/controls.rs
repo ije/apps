@@ -41,8 +41,9 @@ pub(super) fn controls(
     } = *reader;
     if input.is_some_and(|kind| kind.eq_ignore_ascii_case("file"))
         && let Some(part) = styles
+            .extras(id)
             .scrollbars
-            .get(&id)
+            .as_ref()
             .and_then(|parts| parts[1].as_ref())
     {
         // The button takes its box from `::file-selector-button`, which the agent sheet always gives.
@@ -179,8 +180,9 @@ pub(super) fn controls(
             .and_then(css::value::color::paint)
             .unwrap_or(text_color);
         let pseudo = styles
-            .text_pseudos
-            .get(&id)
+            .extras(id)
+            .text
+            .as_ref()
             .and_then(|pseudos| pseudos[3].as_ref());
         let mut placeholder_color = pseudo
             .and_then(|pseudo| css::value::color::paint(pseudo.get(Prop::COLOR)?))

@@ -63,8 +63,9 @@ impl Motion {
         styles: &'a ComputedStyles,
     ) -> impl Iterator<Item = (&'a Animation, &'a Clock)> {
         let effects = styles
+            .extras(id)
             .animations
-            .get(&id)
+            .as_ref()
             .map_or(&[][..], |effects| effects);
         effects
             .iter()
@@ -84,7 +85,7 @@ impl Motion {
         let registry = &*styles.registry;
         let base = match slot {
             0 => &*styles.values[id],
-            slot => match styles.pseudos.get(&id) {
+            slot => match styles.generated(id) {
                 Some(pair) => &pair[usize::from(slot) - 1],
                 None => return Vec::new(),
             },
@@ -331,8 +332,7 @@ impl Motion {
                     .is_some_and(|previous| Rc::ptr_eq(previous, style))
                     || !moves(style)
                         && styles
-                            .pseudos
-                            .get(&id)
+                            .generated(id)
                             .is_none_or(|pseudos| !pseudos.iter().any(moves))
             })
         })
@@ -452,8 +452,9 @@ impl Motion {
             };
             let clock = &mut clocks[index];
             let effect = styles
+                .extras(node)
                 .animations
-                .get(&node)
+                .as_ref()
                 .and_then(|effects| effects.get(index))
                 .filter(|effect| effect.name == clock.name);
             let rate = |clock: &Clock| {
@@ -668,7 +669,7 @@ impl Motion {
             let exiting = running
                 .iter()
                 .any(|transition| transition.property == Prop::DISPLAY);
-            let old = match styles.starting.get(&id) {
+            let old = match styles.extras(id).starting.as_ref() {
                 Some(starting)
                     if old.is_empty()
                         || !exiting
@@ -721,10 +722,13 @@ impl Motion {
             }
         }
         let mut gone = std::mem::take(&mut self.backdrop);
-        for (&id, new) in &styles.backdrops {
+        for (id, new) in styles
+            .all_extras()
+            .filter_map(|(id, extras)| Some((id, extras.backdrop.as_ref()?)))
+        {
             let (old, running) = match gone.remove(&id) {
                 Some((old, running)) => (Some(old), running),
-                None => (styles.backdrop_starts.get(&id).cloned(), Vec::new()),
+                None => (styles.extras(id).backdrop_start.clone(), Vec::new()),
             };
             let next = match old {
                 Some(old) if !repass && !Rc::ptr_eq(&old, new) => {
@@ -759,7 +763,7 @@ impl Motion {
             }
         };
         self.clocks.retain(|&id, clocks| {
-            let kept = painted.get(id) == Some(&true) && styles.animations.contains_key(&id);
+            let kept = painted.get(id) == Some(&true) && styles.extras(id).animations.is_some();
             if !kept {
                 for clock in clocks.iter() {
                     cancel_clock(id, clock, events);
@@ -785,7 +789,10 @@ impl Motion {
         animated.reserve(self.styled.len());
         let mut pseudo: FxHashMap<(usize, u8), Style> = FxHashMap::default();
         let mut wakes: Vec<Wake> = Vec::new();
-        for (&id, effects) in &styles.animations {
+        for (id, effects) in styles
+            .all_extras()
+            .filter_map(|(id, extras)| Some((id, extras.animations.as_ref()?)))
+        {
             if painted.get(id) != Some(&true) {
                 continue;
             }
@@ -838,7 +845,7 @@ impl Motion {
                 let (base, out) = match effect.pseudo {
                     0 => (&*styles.values[id], animated.entry(id).or_default()),
                     slot => {
-                        let Some(pair) = styles.pseudos.get(&id) else {
+                        let Some(pair) = styles.generated(id) else {
                             continue;
                         };
                         (
@@ -1081,7 +1088,7 @@ impl Motion {
         let mut pairs: FxHashMap<usize, [Style; 2]> = FxHashMap::default();
         let mut only = Vec::new();
         for ((id, slot), values) in pseudo {
-            let Some(pair) = styles.pseudos.get(&id).filter(|_| !values.is_empty()) else {
+            let Some(pair) = styles.generated(id).filter(|_| !values.is_empty()) else {
                 continue;
             };
             if values.iter().any(|(key, _)| !PAINT.contains(&key)) {

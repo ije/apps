@@ -4,8 +4,8 @@ use crate::css::value::color::color;
 use crate::css::value::units::{FontUnits, Lengths};
 use crate::dom::Document;
 use crate::style::cascade::computed::{
-    AGENT_DISPLAY, CAPTION, CELL, COUNTED, ComputedStyles, DISPLAY_CONTENTS, DISPLAY_NONE,
-    INVISIBLE, SELECT_ALL, SELECT_NONE, SELECT_TEXT, TABLE_DISPLAYS, empty, table_box,
+    AGENT_DISPLAY, CAPTION, CELL, COUNTED, ComputedStyles, DISPLAY_CONTENTS, DISPLAY_NONE, Extras,
+    INVISIBLE, NO_EXTRAS, SELECT_ALL, SELECT_NONE, SELECT_TEXT, TABLE_DISPLAYS, empty, table_box,
 };
 use crate::style::cascade::container::{ContainerQuery, query_containers};
 use crate::style::cascade::counters::{list_item, listed};
@@ -137,20 +137,8 @@ impl NodePass<'_> {
             vars: custom,
             flags: style_flags,
             lengths,
-            pseudos,
-            text_pseudos,
-            backdrops,
-            backdrop_starts,
-            scrollbars,
-            selections,
-            animations,
-            important,
-            slotted,
-            parts,
-            exported,
-            starting: starts,
+            extras,
             list_items: _,
-            counting,
             authored: _,
             anonymous: _,
             containers,
@@ -159,23 +147,6 @@ impl NodePass<'_> {
             ..
         } = out;
         *revision = doc.nodes.latest();
-        macro_rules! unstyle {
-            ($id:expr) => {
-                pseudos.remove(&$id);
-                text_pseudos.remove(&$id);
-                backdrops.remove(&$id);
-                backdrop_starts.remove(&$id);
-                counting.remove(&$id);
-                scrollbars.remove(&$id);
-                selections.remove(&$id);
-                animations.remove(&$id);
-                important.remove(&$id);
-                starts.remove(&$id);
-                slotted.remove(&$id);
-                parts.remove(&$id);
-                exported.remove(&$id);
-            };
-        }
         const CHANGED: u8 = 1;
         const DEEP: u8 = 2;
         macro_rules! changed {
@@ -204,26 +175,30 @@ impl NodePass<'_> {
             |list: Option<&Option<Rc<Container>>>| list.map(|list| list.as_ref().map(Rc::as_ptr));
         let mut hosted: Vec<Passed> = Vec::new();
         let mut texts =
-            FxHashMap::<_, (Rc<Style>, Vars, u16, Lengths, Option<Rc<Style>>)>::default();
+            FxHashMap::<_, (Rc<Style>, Vars, u16, Lengths, Option<Rc<Extras>>)>::default();
         macro_rules! settle {
             (@changed $id:expr, $up:expr) => {
                 let (id, up): (usize, Option<usize>) = ($id, $up);
                 if shadows.roots.contains_key(&id) {
                     let list = exported_parts(
                         std::mem::take(&mut hosted),
-                        parts.get(&id),
-                        exported.get(&walk.trees[walk.tree[id] as usize].1),
+                        extras.get(&id).and_then(|extras| extras.parts.as_ref()),
+                        extras
+                            .get(&walk.trees[walk.tree[id] as usize].1)
+                            .and_then(|extras| extras.exported.as_ref()),
                         doc.nodes[id].attrs.get("exportparts"),
-                        last.and_then(|last| last.exported.get(&id)),
+                        last.and_then(|last| last.extras(id).exported.as_ref()),
                     );
-                    match list {
-                        Some(list) => exported.insert(id, list),
-                        None => exported.remove(&id),
-                    };
+                    let had = extras.get(&id).is_some_and(|extras| extras.exported.is_some());
+                    if list.is_some() || had {
+                        Rc::make_mut(extras.entry(id).or_default()).exported = list;
+                    }
                 }
                 if let Some(previous) = previous.filter(|_| fast) {
                     let font = previous.lengths.get(id).map(|old| old.font);
                     let pointer = |list: Option<&Shadowed>| list.map(Rc::as_ptr);
+                    let old = previous.extras(id);
+                    let new = extras.get(&id).map_or(&NO_EXTRAS, |extras| extras);
                     changed[id] = stamp | u64::from(u8::from(
                         !(previous
                             .authored
@@ -236,11 +211,11 @@ impl NodePass<'_> {
                                 .is_some_and(|old| Rc::ptr_eq(old, &custom[id]))
                             && font == Some(lengths[id].font)
                             && address(previous.containers.get(id)) == address(containers.get(id))
-                            && previous.selections.get(&id) == selections.get(&id)
-                            && pointer(previous.slotted.get(&id)) == pointer(slotted.get(&id))),
+                            && old.selection == new.selection
+                            && pointer(old.slotted.as_ref()) == pointer(new.slotted.as_ref())),
                     ) * CHANGED
                         | up.map_or(0, |up| changed!(up) & DEEP)
-                        | u8::from(pointer(previous.exported.get(&id)) != pointer(exported.get(&id)))
+                        | u8::from(pointer(old.exported.as_ref()) != pointer(new.exported.as_ref()))
                             * DEEP);
                     all |= (id == 0 || html.contains(&id)) && font != Some(root);
                     if !recount {
@@ -349,7 +324,7 @@ impl NodePass<'_> {
                 if stored {
                     matches.clean(id);
                 }
-                unstyle!(id);
+                extras.remove(&id);
             }
             let up = (up != u32::MAX).then_some(up as usize);
             // A patched walk without shadow trees leaves `tree` as it was.
@@ -367,8 +342,13 @@ impl NodePass<'_> {
                 containers.set(id, containers[host].clone(), |a, b| {
                     address(Some(a)) == address(Some(b))
                 });
-                if let Some(selection) = selections.get(&host).cloned() {
-                    selections.insert(id, selection);
+                let selection = extras.get(&host).and_then(|host| host.selection.clone());
+                if selection.is_some() {
+                    let kept = Extras {
+                        selection,
+                        ..Extras::default()
+                    };
+                    extras.insert(id, Rc::new(kept));
                 }
                 settle!(@changed id, up);
                 continue;
@@ -523,12 +503,12 @@ impl NodePass<'_> {
                     shadow.push(rule);
                 }
             }
-            let selection = up.and_then(|up| selections.get(&up));
+            let selection = up.and_then(|up| extras.get(&up)?.selection.as_ref());
             let assigned = up
                 .filter(|&up| node.parent != Some(up))
-                .and_then(|up| slotted.get(&up));
+                .and_then(|up| extras.get(&up)?.slotted.as_ref());
             let names = (tree != 0).then(|| node.attrs.get("part")).flatten();
-            let named = names.and_then(|_| exported.get(&walk.trees[tree].1));
+            let named = names.and_then(|_| extras.get(&walk.trees[tree].1)?.exported.as_ref());
             if assigned.is_some() || named.is_some() {
                 matches.begin();
                 for passed in assigned.into_iter().flat_map(|list| list.iter()).chain(
@@ -576,15 +556,15 @@ impl NodePass<'_> {
                         selection.map(Rc::as_ptr),
                     )
                 });
-            if let Some((style, vars, flags, units, selected)) =
+            if let Some((style, vars, flags, units, kept)) =
                 text.as_ref().and_then(|text| texts.get(text))
             {
                 styles.set(id, style.clone(), Rc::ptr_eq);
                 custom.set(id, vars.clone(), Rc::ptr_eq);
                 style_flags.set(id, *flags, u16::eq);
                 lengths.set(id, *units);
-                if let Some(selected) = selected {
-                    selections.insert(id, selected.clone());
+                if let Some(kept) = kept {
+                    extras.insert(id, kept.clone());
                 }
                 settle!(id, up, seen);
                 continue;
@@ -1126,37 +1106,8 @@ impl NodePass<'_> {
                 if id == 0 || node.tag == "html" {
                     root = cached.lengths.font;
                 }
-                if let Some(values) = &cached.pseudos {
-                    pseudos.insert(id, values.clone());
-                }
-                if let Some(values) = &cached.text_pseudos {
-                    text_pseudos.insert(id, values.clone());
-                }
-                if let Some(values) = &cached.backdrop {
-                    backdrops.insert(id, values.clone());
-                }
-                if let Some(values) = &cached.backdrop_start {
-                    backdrop_starts.insert(id, values.clone());
-                }
-                if let Some(values) = &cached.scrollbars {
-                    scrollbars.insert(id, values.clone());
-                }
-                if let Some(values) = &cached.selection {
-                    selections.insert(id, values.clone());
-                }
-                if let Some(values) = &cached.animations {
-                    animations.insert(id, values.clone());
-                }
-                if let Some(values) = &cached.important {
-                    important.insert(id, values.clone());
-                }
-                if let Some(values) = &cached.starting {
-                    starts.insert(id, values.clone());
-                }
-                for (values, list) in cached.shadowed.iter().zip([&mut *slotted, &mut *parts]) {
-                    if let Some(values) = values {
-                        list.insert(id, values.clone());
-                    }
+                if let Some(values) = &cached.extras {
+                    extras.insert(id, values.clone());
                 }
                 if let Some(text) = text {
                     let outputs = (
@@ -1164,7 +1115,7 @@ impl NodePass<'_> {
                         custom[id].clone(),
                         style_flags[id],
                         lengths[id],
-                        selections.get(&id).cloned(),
+                        cached.extras.clone(),
                     );
                     texts.insert(text, outputs);
                 }
@@ -1172,6 +1123,7 @@ impl NodePass<'_> {
                 continue;
             }
             let mut key = key.unwrap();
+            let mut extra = Extras::default();
             let mut style = match &theme {
                 Some(theme) if id == 0 => (**theme).clone(),
                 _ => Style::new(),
@@ -1487,9 +1439,7 @@ impl NodePass<'_> {
                 if !keep && declared.is_empty() {
                     values.set_vars(empty.clone());
                 }
-                let values = Rc::new(values);
-                starts.insert(id, values.clone());
-                values
+                Rc::new(values)
             });
             // A pseudo-element inherits custom properties from its element, like a child.
             let handed = inherit(style.vars());
@@ -1532,21 +1482,16 @@ impl NodePass<'_> {
                 for (prop, (rank, value)) in backdrop_starting {
                     put(&mut first, prop, rank, value);
                 }
-                if let Some(values) = derive(first) {
-                    backdrop_starts.insert(id, Rc::new(values));
-                }
+                extra.backdrop_start = derive(first).map(Rc::new);
             }
-            if layered && let Some(values) = derive(backdrop) {
-                backdrops.insert(id, Rc::new(values));
+            if layered {
+                extra.backdrop = derive(backdrop).map(Rc::new);
             }
             if [&marker, &letter, &line, &placeholder]
                 .iter()
                 .any(|cascade| !cascade.is_empty())
             {
-                text_pseudos.insert(
-                    id,
-                    Rc::new([marker, letter, line, placeholder].map(&derive)),
-                );
+                extra.text = Some(Rc::new([marker, letter, line, placeholder].map(&derive)));
             }
             if [&bar, &track, &thumb, &corner, &hovered]
                 .iter()
@@ -1569,13 +1514,10 @@ impl NodePass<'_> {
                         hovered.entry(*prop).or_insert(*value);
                     }
                 }
-                scrollbars.insert(
-                    id,
-                    Rc::new([bar, track, thumb, corner, hovered].map(&derive)),
-                );
+                extra.scrollbars = Some(Rc::new([bar, track, thumb, corner, hovered].map(&derive)));
             }
-            if !selected.is_empty() || up.is_some_and(|up| selections.contains_key(&up)) {
-                let parent = up.and_then(|up| selections.get(&up));
+            if !selected.is_empty() || selection.is_some() {
+                let parent = selection;
                 let mut values = parent.map(|parent| (**parent).clone()).unwrap_or_default();
                 values.set_vars(handed.clone());
                 if let Some(scheme) = style.value(Prop::COLOR_SCHEME) {
@@ -1655,54 +1597,48 @@ impl NodePass<'_> {
                         Some(parent) if **parent == values => parent.clone(),
                         _ => Rc::new(values),
                     };
-                    selections.insert(id, values);
+                    extra.selection = Some(values);
                 }
             }
             if [&before, &after]
                 .iter()
                 .any(|values| values.contains_key(&Prop::CONTENT))
             {
-                pseudos.insert(
-                    id,
-                    Rc::new([before, after].map(|cascade| {
-                        let mut values = derive(cascade).unwrap_or_default();
-                        if values.contains(Prop::CONTENT) {
-                            let display = style.get(Prop::DISPLAY);
-                            let flex = matches!(
-                                display,
-                                Some("flex" | "inline-flex" | "grid" | "inline-grid")
-                            );
-                            blockify(
-                                &mut values,
-                                flex || item && display == Some("contents"),
-                                false,
-                            );
-                        }
-                        values
-                    })),
-                );
+                extra.generated = Some(Rc::new([before, after].map(|cascade| {
+                    let mut values = derive(cascade).unwrap_or_default();
+                    if values.contains(Prop::CONTENT) {
+                        let display = style.get(Prop::DISPLAY);
+                        let flex = matches!(
+                            display,
+                            Some("flex" | "inline-flex" | "grid" | "inline-grid")
+                        );
+                        blockify(
+                            &mut values,
+                            flex || item && display == Some("contents"),
+                            false,
+                        );
+                    }
+                    values
+                })));
             }
             if node.tag != "slot" {
                 groups[0].clear();
             }
             let [inner, outer] = groups;
-            let mut store = |list: Vec<Passed>, part: bool| {
+            let store = |list: Vec<Passed>, part: bool| {
                 (!list.is_empty()).then(|| {
-                    let list = last
-                        .and_then(|last| if part { &last.parts } else { &last.slotted }.get(&id))
+                    last.map(|last| last.extras(id))
+                        .and_then(|last| if part { &last.parts } else { &last.slotted }.as_ref())
                         .filter(|old| ***old == list)
                         .cloned()
-                        .unwrap_or_else(|| Rc::new(list));
-                    if part { &mut *parts } else { &mut *slotted }.insert(id, list.clone());
-                    list
+                        .unwrap_or_else(|| Rc::new(list))
                 })
             };
-            let shadowed = [store(inner, false), store(outer, true)];
+            extra.slotted = store(inner, false);
+            extra.parts = store(outer, true);
             let kept = previous.filter(|_| animated.is_some());
             if let Some(previous) = kept {
-                if let Some(effects) = previous.animations.get(&id) {
-                    animations.insert(id, effects.clone());
-                }
+                extra.animations = previous.extras(id).animations.clone();
             } else {
                 let mut effects =
                     if style.contains(Prop::ANIMATION) || style.contains(Prop::ANIMATION_NAME) {
@@ -1710,9 +1646,9 @@ impl NodePass<'_> {
                     } else {
                         Vec::new()
                     };
-                for (slot, pseudo) in pseudos
-                    .get(&id)
-                    .into_iter()
+                for (slot, pseudo) in extra
+                    .generated
+                    .iter()
                     .flat_map(|pair| pair.iter().enumerate())
                 {
                     if pseudo.contains(Prop::ANIMATION) || pseudo.contains(Prop::ANIMATION_NAME) {
@@ -1732,7 +1668,7 @@ impl NodePass<'_> {
                     }
                 }
                 if !effects.is_empty() {
-                    animations.insert(id, effects.into());
+                    extra.animations = Some(effects.into());
                 }
             }
             // Reuse equal styles from the previous frame. Pointer changes invalidate layout caches.
@@ -1770,7 +1706,7 @@ impl NodePass<'_> {
             ]
             .into_iter()
             .any(|prop| style.contains(prop))
-                || pseudos.get(&id).is_some_and(|pseudos| {
+                || extra.generated.as_ref().is_some_and(|pseudos| {
                     pseudos.iter().any(|pseudo| {
                         pseudo
                             .get(Prop::CONTENT)
@@ -1795,6 +1731,8 @@ impl NodePass<'_> {
                 | flag(agent_display, AGENT_DISPLAY)
                 | role << 8;
             style_flags.set(id, bits, u16::eq);
+            extra.starting = starting;
+            extra.important = (!strong.is_empty()).then(|| strong.into());
             let style = match context
                 .and_then(|context| context.previous.as_deref())
                 .and_then(|previous| {
@@ -1812,15 +1750,18 @@ impl NodePass<'_> {
                                 && units.container.is_none()
                                 && units_bits(old) == units_bits(&units)
                         })
-                        && previous.pseudos.get(&id) == pseudos.get(&id)
-                        && previous.text_pseudos.get(&id) == text_pseudos.get(&id)
-                        && previous.backdrops.get(&id) == backdrops.get(&id)
-                        && previous.backdrop_starts.get(&id) == backdrop_starts.get(&id)
-                        && previous.scrollbars.get(&id) == scrollbars.get(&id)
-                        && previous.selections.get(&id) == selections.get(&id)
-                        && previous.starting.get(&id) == starting.as_ref()
-                        && !previous.animations.contains_key(&id)
-                        && !animations.contains_key(&id)
+                        && {
+                            let old = previous.extras(id);
+                            old.generated == extra.generated
+                                && old.text == extra.text
+                                && old.backdrop == extra.backdrop
+                                && old.backdrop_start == extra.backdrop_start
+                                && old.scrollbars == extra.scrollbars
+                                && old.selection == extra.selection
+                                && old.starting == extra.starting
+                                && old.animations.is_none()
+                                && extra.animations.is_none()
+                        }
                         // A `contents` box needs a new style when its ancestors change the items below it.
                         && style_flags[id] & DISPLAY_CONTENTS == 0 =>
                 {
@@ -1828,6 +1769,17 @@ impl NodePass<'_> {
                 }
                 _ => Rc::new(style),
             };
+            let rare = extra.generated.is_some()
+                || extra.text.is_some()
+                || extra.backdrop.is_some()
+                || extra.backdrop_start.is_some()
+                || extra.scrollbars.is_some()
+                || extra.selection.is_some()
+                || extra.animations.is_some()
+                || extra.important.is_some()
+                || extra.starting.is_some()
+                || extra.slotted.is_some()
+                || extra.parts.is_some();
             let cached = Rc::new(CachedStyle {
                 used: std::cell::Cell::new(style_cache.pass),
                 inline: written.map(Into::into),
@@ -1838,23 +1790,13 @@ impl NodePass<'_> {
                 missing: missing.into_boxed_slice(),
                 flags: style_flags[id],
                 lengths: units,
-                pseudos: pseudos.get(&id).cloned(),
-                text_pseudos: text_pseudos.get(&id).cloned(),
-                backdrop: backdrops.get(&id).cloned(),
-                backdrop_start: backdrop_starts.get(&id).cloned(),
-                scrollbars: scrollbars.get(&id).cloned(),
-                selection: selections.get(&id).cloned(),
-                animations: animations.get(&id).cloned(),
-                important: (!strong.is_empty()).then(|| {
-                    let values: Rc<[Prop]> = strong.into();
-                    important.insert(id, values.clone());
-                    values
-                }),
-                shadowed,
-                starting,
+                extras: rare.then(|| Rc::new(extra)),
                 viewport,
                 keyword,
             });
+            if let Some(values) = &cached.extras {
+                extras.insert(id, values.clone());
+            }
             if animated.is_none() {
                 if let Some(node) = scoped.nodes[id].as_mut() {
                     node.cached = Some(CachedNode::new(

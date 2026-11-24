@@ -337,11 +337,7 @@ pub(super) fn grid_container(
                 continue;
             };
             // Like a grid item, a pseudo-element takes percentages from its grid area.
-            if let Some(pseudo) = styles
-                .pseudos
-                .get(&id)
-                .and_then(|pseudos| pseudos.get(index))
-            {
+            if let Some(pseudo) = styles.generated(id).and_then(|pseudos| pseudos.get(index)) {
                 let base = grid.area(grid.cells[at].1)[0];
                 let pseudo_units = pseudo_lengths(&units, style, pseudo, text, pixel_ratio);
                 let [padding, borders] = [

@@ -3,8 +3,8 @@ use crate::css::{
     value::units::Lengths,
 };
 use crate::style::cascade::Container;
-use crate::style::cascade::shadow::{ShadowRule, Shadowed};
-use crate::style::keyframes::Animation;
+use crate::style::cascade::computed::Extras;
+use crate::style::cascade::shadow::ShadowRule;
 use std::rc::Rc;
 pub(crate) struct StyleRef<T: ?Sized = Style>(pub(crate) Rc<T>);
 
@@ -136,16 +136,7 @@ pub(crate) struct CachedStyle {
     pub(crate) missing: Box<[Box<str>]>,
     pub(crate) flags: u16,
     pub(crate) lengths: Lengths,
-    pub(crate) pseudos: Option<Rc<[Style; 2]>>,
-    pub(crate) text_pseudos: Option<Rc<[Option<Style>; 4]>>,
-    pub(crate) backdrop: Option<Rc<Style>>,
-    pub(crate) backdrop_start: Option<Rc<Style>>,
-    pub(crate) scrollbars: Option<Rc<[Option<Style>; 5]>>,
-    pub(crate) selection: Option<Rc<Style>>,
-    pub(crate) animations: Option<Rc<[Animation]>>,
-    pub(crate) important: Option<Rc<[Prop]>>,
-    pub(crate) shadowed: [Option<Shadowed>; 2],
-    pub(crate) starting: Option<Rc<Style>>,
+    pub(crate) extras: Option<Rc<Extras>>,
     pub(crate) viewport: bool,
     pub(crate) keyword: bool,
 }

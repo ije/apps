@@ -71,7 +71,10 @@ fn selector_dependencies_follow_tree_and_attribute_changes() {
             None,
         );
         assert_eq!(cached.values, fresh.values, "mutation {step}");
-        assert_eq!(cached.pseudos, fresh.pseudos, "mutation {step}");
+        assert!(
+            (0..doc.nodes.len()).all(|id| cached.generated(id) == fresh.generated(id)),
+            "mutation {step}"
+        );
     }
 }
 
@@ -105,7 +108,7 @@ fn cached_styles_follow_selectors_inheritance_and_stylesheets() {
     let inherited = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
     assert_eq!(&inherited.values[children[0]]["color"], "green");
     assert_eq!(
-        &inherited.selections[&children[0]]["background-color"],
+        &inherited.extras(children[0]).selection.as_ref().unwrap()["background-color"],
         "green"
     );
     doc.nodes[children[1]].tag = "b".into();
@@ -233,7 +236,7 @@ fn media_results_restyle_their_nodes_and_rebuild_scopes_only_for_other_rules() {
             computed.values[div].get(Prop::COLOR),
             fresh[div].get("color").map(String::as_str)
         );
-        assert_eq!(computed.pseudos.contains_key(&div), width <= 500.);
+        assert_eq!(computed.generated(div).is_some(), width <= 500.);
         assert_eq!(
             &computed.values[div]["font-size"],
             format!("{}px", width / 50.)
@@ -393,7 +396,7 @@ fn keyframes_added_or_removed_later_restart_animations() {
     let animated = |cache: &mut StyleCache, sheets: &mut HashMap<Rc<str>, Rc<Stylesheet>>| {
         let computed = compute_styles(&doc, 800., 600., None, sheets, cache, None);
         cache.finish();
-        computed.animations.contains_key(&div)
+        computed.extras(div).animations.is_some()
     };
     assert!(!animated(&mut cache, &mut sheets));
     for (top, edit, expected) in [
@@ -609,13 +612,13 @@ fn animated_passes_start_from_the_stored_pass() {
     assert_eq!(out.values[p].get(Prop::COLOR), Some("blue"));
     assert!(Rc::ptr_eq(&out.values[i], &base.values[i]));
     assert_eq!(
-        format!("{:?}", out.animations.get(&a)),
-        format!("{:?}", base.animations.get(&a))
+        format!("{:?}", out.extras(a).animations.as_ref()),
+        format!("{:?}", base.extras(a).animations.as_ref())
     );
     let after = incremental(&doc, &mut cache, &mut last, [800., 600.]);
     assert_eq!(after.values[b].get(Prop::WIDTH), Some("1px"));
     assert_eq!(after.values[a].get(Prop::WIDTH), Some("1px"));
-    assert!(after.animations.contains_key(&b));
+    assert!(after.extras(b).animations.is_some());
 }
 
 #[test]
@@ -924,7 +927,14 @@ fn values_keep_a_style_per_inline_source_selection_and_custom_properties() {
         None,
     );
     let id = |selector: &str| element(&doc, selector);
-    let selection = |selector: &str| computed.selections[&id(selector)].clone();
+    let selection = |selector: &str| {
+        computed
+            .extras(id(selector))
+            .selection
+            .as_ref()
+            .unwrap()
+            .clone()
+    };
     assert!(Rc::ptr_eq(&selection("#d"), &selection("#a")));
     assert_eq!(selection("#a").get(Prop::COLOR), Some("red"));
     assert_eq!(selection("#s").get(Prop::COLOR), Some("blue"));
@@ -952,8 +962,9 @@ fn text_nodes_that_share_a_cached_style_keep_their_selection_colors() {
         {
             assert_eq!(
                 computed
-                    .selections
-                    .get(&id)
+                    .extras(id)
+                    .selection
+                    .as_ref()
                     .map(|style| style.get(Prop::BACKGROUND_COLOR)),
                 Some(Some("#fc0")),
                 "{}",

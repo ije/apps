@@ -644,7 +644,7 @@ impl Cx<'_> {
         // A box that shrinks to its atom gives percent sizes of the atom nothing to resolve against.
         let atom_style = match atom.pseudo {
             0 => &*styles.values[atom.node],
-            pseudo => &styles.pseudos[&id][usize::from(pseudo - 1)],
+            pseudo => &styles.generated(id).unwrap()[usize::from(pseudo - 1)],
         };
         let rest = [Prop::WIDTH, Prop::MIN_WIDTH, Prop::MAX_WIDTH]
             .iter()

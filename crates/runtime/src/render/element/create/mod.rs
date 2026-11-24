@@ -79,6 +79,7 @@ pub(super) fn create(
     let mark = reads.borrow().len();
     let node = &doc.nodes[id];
     let style = &styles.values[id];
+    let extras = styles.extras(id);
     let display =
         style
             .get(Prop::DISPLAY)
@@ -276,7 +277,7 @@ pub(super) fn create(
                 node.tag.as_str(),
                 "img" | "input" | "textarea" | "select" | "progress" | "meter" | "terminal"
             )
-            || styles.pseudos.get(&id).is_some_and(|pseudos| {
+            || extras.generated.as_ref().is_some_and(|pseudos| {
                 pseudos.iter().any(|pseudo| {
                     pseudo
                         .get(Prop::CONTENT)
@@ -301,7 +302,7 @@ pub(super) fn create(
         || opacity > 0. && opacity < 1. && (!node.children.is_empty() || overlapping())
         || composited)
         .then_some(opacity);
-    let selection_colors = match styles.selections.get(&id) {
+    let selection_colors = match extras.selection.as_ref() {
         Some(selection) => style::selection_colors(style, Some(selection)),
         None => parsed.selection,
     };
@@ -561,7 +562,7 @@ pub(super) fn create(
         && id != 0
         && !broken
         && node.native_control(style).is_none()
-        && !styles.pseudos.contains_key(&id)
+        && extras.generated.is_none()
         && !top_layer.contains(&id)
         && matches!(
             node.tag.as_str(),
@@ -848,7 +849,7 @@ pub(super) fn create(
         reader.log(Query::Theme, 0, hashed(crate::native::theme_state() & 1));
         scrollbar::Look::new(
             style,
-            styles.scrollbars.get(&id).map(|parts| &**parts),
+            extras.scrollbars.as_deref(),
             &units,
             backdrop.map(|(_, ink)| ink),
         )
@@ -976,7 +977,7 @@ pub(super) fn create(
             el = el.mt(px(margin[0])).mb(px(margin[2]));
             // Like Chrome, an empty inline box with inline margins, padding or borders makes a line, so it
             // takes the line height and its baseline.
-            if !styles.pseudos.contains_key(&id)
+            if extras.generated.is_none()
                 && cx.empty_inline()
                 && !crate::render::inline::makes_no_line(doc, styles, id)
             {
@@ -1663,7 +1664,7 @@ pub(super) fn create(
                 size
             }
         });
-    if let Some(pseudos) = styles.pseudos.get(&id).filter(|_| !skipped) {
+    if let Some(pseudos) = extras.generated.as_ref().filter(|_| !skipped) {
         el = match pseudo_elements(&cx, &fr, el, &mut carry, pseudos, own) {
             ControlFlow::Continue(el) => el,
             ControlFlow::Break(done) => return done,

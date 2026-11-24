@@ -275,13 +275,17 @@ pub(crate) fn hit_test(
             break;
         }
         if !state.styles.inert(id)
-            && computed.backdrops.get(&id).is_some_and(|backdrop| {
-                backdrop.get(Prop::POINTER_EVENTS) != Some("none")
-                    && backdrop
-                        .get(Prop::VISIBILITY)
-                        .is_none_or(|value| value == "visible")
-                    && backdrop.get(Prop::DISPLAY) != Some("none")
-            })
+            && computed
+                .extras(id)
+                .backdrop
+                .as_ref()
+                .is_some_and(|backdrop| {
+                    backdrop.get(Prop::POINTER_EVENTS) != Some("none")
+                        && backdrop
+                            .get(Prop::VISIBILITY)
+                            .is_none_or(|value| value == "visible")
+                        && backdrop.get(Prop::DISPLAY) != Some("none")
+                })
             && x >= 0.
             && y >= 0.
             && x < viewport[0]

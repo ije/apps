@@ -260,7 +260,7 @@ pub(crate) fn layout(
         .then(|| super::super::size::legend(doc, styles, id))
         .flatten()
         .map(|(legend, ..)| legend);
-    let pseudos = styles.pseudos.get(&id).filter(|_| !table);
+    let pseudos = styles.generated(id).filter(|_| !table);
     let item_style = |child: usize| match pseudo_item(child) {
         Some((_, index)) => &pseudos.expect("a pseudo-element item")[index],
         None => &*styles.values[child],
