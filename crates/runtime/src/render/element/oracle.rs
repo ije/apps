@@ -4,7 +4,6 @@ use super::kept::Read;
 use super::query::passed;
 use renderer::Child;
 
-#[cfg(debug_assertions)]
 pub(crate) fn same_in_place(fresh: &Child, placed: &[renderer::Node], tree: &renderer::Tree) {
     fn find(child: &Child, id: renderer::NodeKey) -> Option<&renderer::Node> {
         let Child::Node(node) = child else {
@@ -50,11 +49,9 @@ pub(crate) fn same_in_place(fresh: &Child, placed: &[renderer::Node], tree: &ren
     }
 }
 
-#[cfg(debug_assertions)]
 pub(super) static TRACE: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var_os("APPS_TRACE_BUILDS").is_some());
 
-#[cfg(debug_assertions)]
 pub(super) fn check(
     build: &Build<'_>,
     id: usize,
@@ -117,7 +114,6 @@ pub(super) fn check(
     prints.truncate(printed + 1);
 }
 
-#[cfg(debug_assertions)]
 pub(super) fn print(build: &Build<'_>, from: usize, child: &Child) -> u64 {
     use std::hash::Hasher;
     struct Hashed(rustc_hash::FxHasher);

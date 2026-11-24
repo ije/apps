@@ -3,6 +3,7 @@ pub(crate) mod columns;
 pub(crate) mod create;
 pub(crate) mod kept;
 pub(crate) mod margin;
+#[cfg(debug_assertions)]
 pub(crate) mod oracle;
 pub(crate) mod plan;
 pub(crate) mod query;
@@ -11,6 +12,7 @@ pub(crate) mod svg;
 use self::create::create;
 use self::kept::{Call, Kept, Patch, Query, Read, Replay, hashed};
 use self::margin::{definite_line, float_side, margins, shrinks_around};
+#[cfg(debug_assertions)]
 use self::oracle::{TRACE, check, print};
 use self::query::{
     LOOK, backdrop, baselines, box_parent, boxless, collapses, content_editable, insets,
