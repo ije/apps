@@ -737,8 +737,13 @@ impl Scene {
     // The glass layers that Core Animation can draw: plain glass in the window layer that nothing paints over.
     // Later glass draws above earlier glass, so it comes first.
     #[cfg(target_os = "macos")]
-    pub(crate) fn native_glass(&self, mut take: impl FnMut(usize, Rect<f32>, &GlassState)) {
-        let mut taken = Vec::new();
+    // `taken` is a buffer for the layers taken so far.
+    pub(crate) fn native_glass(
+        &self,
+        taken: &mut Vec<usize>,
+        mut take: impl FnMut(usize, Rect<f32>, &GlassState),
+    ) {
+        taken.clear();
         for nested in self.layers[0].nested.iter().rev() {
             let index = nested.layer;
             let layer = &self.layers[index];

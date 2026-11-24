@@ -158,6 +158,8 @@ pub(crate) struct Renderer {
     blank: Texture,
     pool: Pool<Texture>,
     frame: RenderFrame,
+    // A buffer for `Scene::native_glass`.
+    glass_taken: Vec<usize>,
     // The layers that Core Animation draws, which the frame skips, and those of them whose content it draws.
     skip: Vec<usize>,
     content: Vec<usize>,
@@ -428,6 +430,7 @@ impl Renderer {
             blank,
             pool: Pool::default(),
             frame: RenderFrame::default(),
+            glass_taken: Vec::new(),
             skip: Vec::new(),
             content: Vec::new(),
             regioned: false,
@@ -564,7 +567,7 @@ impl Renderer {
         let mut glass: Vec<NativeGlass> = Vec::new();
         if super::glass::available() {
             // Later glass draws above earlier glass, so it is checked first.
-            scene.native_glass(|index, bounds, config| {
+            scene.native_glass(&mut self.glass_taken, |index, bounds, config| {
                 let region = crate::geometry::region(bounds);
                 let sublayer = match self
                     .glass
