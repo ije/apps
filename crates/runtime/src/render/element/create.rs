@@ -2676,7 +2676,7 @@ pub(super) fn create(
                     && value == "fit-content"
                 {
                     // The grid's measure child gives the content sizes, and these bounds clamp a stretched width.
-                    let [min, max, ..] = super::super::layout::grid::intrinsic(
+                    let [min, max, ..] = super::super::layout::grid::intrinsic::intrinsic(
                         doc,
                         id,
                         styles,
@@ -2701,7 +2701,7 @@ pub(super) fn create(
                 } else if matches!(value, "fit-content" | "max-content" | "min-content")
                     && axis == 0
                 {
-                    let [min, max, ..] = super::super::layout::grid::intrinsic(
+                    let [min, max, ..] = super::super::layout::grid::intrinsic::intrinsic(
                         doc,
                         id,
                         styles,
@@ -5237,7 +5237,7 @@ pub(super) fn create(
             if atom.pseudo != 0 {
                 return pseudo();
             }
-            let [_, max, _, height] = super::super::layout::grid::intrinsic(
+            let [_, max, _, height] = super::super::layout::grid::intrinsic::intrinsic(
                 doc,
                 atom.node,
                 styles,
@@ -5354,7 +5354,7 @@ pub(super) fn create(
                     };
                 }
                 atom_slot(atom, child, containing[0], &|| {
-                    super::super::layout::grid::pseudo_atom(
+                    super::super::layout::grid::intrinsic::pseudo_atom(
                         doc,
                         id,
                         usize::from(atom.pseudo - 1),
@@ -5684,7 +5684,7 @@ pub(super) fn create(
             {
                 let extent =
                     padding[1] + padding[3] + borders[1] + borders[3] + margin[1] + margin[3];
-                let [min, max, ..] = super::super::layout::grid::intrinsic(
+                let [min, max, ..] = super::super::layout::grid::intrinsic::intrinsic(
                     doc,
                     id,
                     styles,
@@ -5699,7 +5699,7 @@ pub(super) fn create(
             let vertical = padding[0] + padding[2] + borders[0] + borders[2];
             let mut tracked = [None; 2];
             if shrunk {
-                let [min, max, ..] = super::super::layout::grid::intrinsic(
+                let [min, max, ..] = super::super::layout::grid::intrinsic::intrinsic(
                     doc,
                     id,
                     styles,
@@ -5743,7 +5743,7 @@ pub(super) fn create(
                 if matches!(style::role(styles, id), 1 | 2 | 10..=12)
                     && style.get(Prop::MIN_WIDTH).is_none()
                 {
-                    let [min, ..] = super::super::layout::grid::intrinsic(
+                    let [min, ..] = super::super::layout::grid::intrinsic::intrinsic(
                         doc,
                         id,
                         styles,
@@ -5844,7 +5844,7 @@ pub(super) fn create(
                 })
                 .map(|(_, _, _, grid)| grid.clone());
             Some(cached.unwrap_or_else(|| {
-                let grid = super::super::layout::grid::layout(
+                let grid = super::super::layout::grid::layout::layout(
                     doc,
                     id,
                     styles,
@@ -5990,7 +5990,7 @@ pub(super) fn create(
             // Absolute grid items need an in-flow content-height box for flex basis and min-height: auto.
             // Previously stretched rows cannot provide it.
             if flexed {
-                let [.., height] = super::super::layout::grid::intrinsic(
+                let [.., height] = super::super::layout::grid::intrinsic::intrinsic(
                     doc,
                     id,
                     styles,
@@ -6286,7 +6286,7 @@ pub(super) fn create(
         if let (Some(grid), Some(zone)) = (&grid, &build.zone) {
             if let Some(dom) = view.host.borrow().page_state(view.id) {
                 for &(child, _, [x, y, width, height], _) in &grid.cells {
-                    if super::super::layout::grid::pseudo_item(child).is_some() {
+                    if super::super::layout::grid::intrinsic::pseudo_item(child).is_some() {
                         continue;
                     }
                     let placed = dom
@@ -7088,7 +7088,7 @@ pub(super) fn create(
                                         + gap * line as f32
                                 };
                                 // Lines past the explicit grid are `auto`.
-                                let (line, span) = super::super::layout::grid::placement(
+                                let (line, span) = super::super::layout::grid::track::placement(
                                     start,
                                     end,
                                     &[],
@@ -7099,7 +7099,7 @@ pub(super) fn create(
                                 let last = match (line, end) {
                                     (_, "auto") => None,
                                     (Some(line), _) => Some(edge(line + span) - gap),
-                                    (None, _) => super::super::layout::grid::placement(
+                                    (None, _) => super::super::layout::grid::track::placement(
                                         end,
                                         "auto",
                                         &[],
@@ -7601,7 +7601,7 @@ pub(super) fn create(
         .filter(|_| id != 0 && !node.tag.starts_with('#') && slot.is_none());
     let mut el = match vertical {
         Some(mode) => {
-            let [_, widest, ..] = super::super::layout::grid::intrinsic(
+            let [_, widest, ..] = super::super::layout::grid::intrinsic::intrinsic(
                 doc,
                 id,
                 styles,
@@ -7616,7 +7616,7 @@ pub(super) fn create(
                 .map(|height| height + extra[1])
                 .unwrap_or_else(|| widest.min(units.viewport[1]))
                 .max(1.);
-            let block = super::super::layout::grid::intrinsic(
+            let block = super::super::layout::grid::intrinsic::intrinsic(
                 doc,
                 id,
                 styles,
