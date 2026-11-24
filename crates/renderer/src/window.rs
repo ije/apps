@@ -435,9 +435,9 @@ pub struct Window {
     volatile: u32,
     // The next paint draws all boxes again.
     repaint: bool,
-    pub(crate) unsettled: u32,
+    unsettled: u32,
     // The count of hit transforms that prepaint made.
-    pub(crate) transforms: u32,
+    transforms: u32,
     generation: usize,
     under: Vec<u64>,
     hovered: usize,
@@ -448,7 +448,7 @@ pub struct Window {
     // The viewports of the scrolls whose content paints in a larger interest area, or `None` for other scrolls.
     viewports: Vec<Option<Rect<Pixels>>>,
     offsets: Vec<Point<Pixels>>,
-    pub(crate) font_smoothing: bool,
+    font_smoothing: bool,
     hit_transform: Option<Rc<HitTransform>>,
     // The transforms and the clip of each `with_hit_base` around the current box.
     hit_bases: Vec<(Option<Rc<HitTransform>>, Rect)>,
@@ -481,7 +481,7 @@ pub struct Window {
     patches: Vec<crate::Node>,
     // The boxes whose style moved or sized them since the last layout, which keeps the offset for scroll anchors in
     // or below them.
-    pub(crate) unanchored: rustc_hash::FxHashSet<u64>,
+    unanchored: rustc_hash::FxHashSet<u64>,
     pub(crate) pointer: Point<Pixels>,
     pub(crate) closed: bool,
     cursor: Option<Cursor>,
@@ -1446,6 +1446,23 @@ impl Window {
         self.repaint = true;
     }
 
+    // The boxes whose style moved or sized them since the last layout.
+    pub(crate) fn take_unanchored(&mut self) -> rustc_hash::FxHashSet<u64> {
+        mem::take(&mut self.unanchored)
+    }
+
+    // The counts of `unsettle` calls and of hit transforms, which prepaint compares around a box.
+    pub(crate) fn prepaint_mark(&self) -> [u32; 2] {
+        [self.unsettled, self.transforms]
+    }
+
+    pub(crate) fn with_font_smoothing<R>(&mut self, on: bool, f: impl FnOnce(&mut Self) -> R) -> R {
+        let smoothing = mem::replace(&mut self.font_smoothing, on);
+        let result = f(self);
+        self.font_smoothing = smoothing;
+        result
+    }
+
     // Whether the next paint can copy spans of the last one.
     pub(crate) fn copies(&self) -> bool {
         !self.repaint
@@ -1802,14 +1819,18 @@ impl Window {
     }
 
     // Stops the cuts of the scroll viewports inside the first `depth` until `resume_cuts`.
-    pub(crate) fn pause_cuts(&mut self, depth: usize) -> Vec<Option<Rect<Pixels>>> {
+    // An out-of-flow box paints in `f` outside the cuts and viewports of the scrolls inside the first `depth`.
+    pub(crate) fn with_cuts_paused<R>(
+        &mut self,
+        depth: usize,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
         self.scene.pause_cuts(depth);
-        self.hide_viewports(depth)
-    }
-
-    pub(crate) fn resume_cuts(&mut self, paused: Vec<Option<Rect<Pixels>>>) {
+        let paused = self.hide_viewports(depth);
+        let result = f(self);
         self.show_viewports(paused);
         self.scene.resume_cuts();
+        result
     }
 
     // Takes the scroll viewports inside the first `depth` out of the clips until `show_viewports`.

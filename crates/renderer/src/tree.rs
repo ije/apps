@@ -1074,7 +1074,7 @@ impl Tree {
     // Before a layout, the boxes are where the last one put them. A scroll container that a scroll moved since it
     // chose its scroll anchor chooses again there when the content inside lays out again, as in Chrome.
     fn choose_anchors(&mut self, window: &mut Window) {
-        let unanchored = mem::take(&mut window.unanchored);
+        let unanchored = window.take_unanchored();
         let scale = window.scale_factor();
         for at in 0..self.anchoring.len() {
             let Some(&index) = self.keys.get(&self.anchoring[at]) else {
@@ -1421,7 +1421,7 @@ impl Tree {
         let [bounds, exact] = self.bounds(index, origin, window);
         let slot = &mut self.slots[index as usize];
         (slot.bounds, slot.exact) = (bounds, exact);
-        let (listed, transforms) = (self.stacks.last().map(Vec::len), window.transforms);
+        let (listed, [_, transforms]) = (self.stacks.last().map(Vec::len), window.prepaint_mark());
         let shifting = mem::replace(&mut self.shifting, true);
         self.visit(
             index,
@@ -1493,7 +1493,7 @@ impl Tree {
     fn flatten(&mut self, index: u32, transforms: u32, outer: bool, window: &Window) {
         let slot = &mut self.slots[index as usize];
         slot.flat = mem::replace(&mut self.shifting, outer)
-            && window.transforms == transforms
+            && window.prepaint_mark()[1] == transforms
             && slot.hooks.as_ref().is_none_or(|hooks| hooks.shifts());
         self.shifting &= slot.flat;
     }
@@ -1594,19 +1594,16 @@ impl Tree {
                         window.depth() as u32,
                     ));
                 }
+                let interest = scroll.map(|_| (bounds.origin, offset));
                 window.scope(Scope::Offset(offset), |window| {
-                    if scroll.is_some() {
-                        window.begin_interest(bounds.origin, offset);
-                    }
-                    for child in 0..self.slots[index as usize].children.len() {
-                        let child = index_of(self.slots[index as usize].children[child]);
-                        if self.slots[child as usize].style.escape != Escape::OUTLINE {
-                            self.prepaint_node(child, origin, covered, window);
+                    window.with_interest(interest, |window| {
+                        for child in 0..self.slots[index as usize].children.len() {
+                            let child = index_of(self.slots[index as usize].children[child]);
+                            if self.slots[child as usize].style.escape != Escape::OUTLINE {
+                                self.prepaint_node(child, origin, covered, window);
+                            }
                         }
-                    }
-                    if scroll.is_some() {
-                        window.end_interest();
-                    }
+                    })
                 });
                 // Outlines don't scroll with the content.
                 for child in 0..self.slots[index as usize].children.len() {
@@ -2027,11 +2024,8 @@ impl Tree {
             ),
         );
         let (regions, listed) = (window.regions_len(), self.stacks.last().map(Vec::len));
-        let (touched, unsettled, transforms) = (
-            self.touched.len() as u32,
-            window.unsettled,
-            window.transforms,
-        );
+        let (touched, [unsettled, transforms]) =
+            (self.touched.len() as u32, window.prepaint_mark());
         let shifting = mem::replace(&mut self.shifting, true);
         self.visit(
             index,
@@ -2040,7 +2034,7 @@ impl Tree {
             |tree, style, window| tree.keep_box(index, style, moved, window),
         );
         self.flatten(index, transforms, shifting, window);
-        self.still &= window.unsettled == unsettled;
+        self.still &= window.prepaint_mark()[0] == unsettled;
         // The volatile boxes inside can reach elsewhere.
         if moved || self.slots[index as usize].lively {
             self.reach(index, window.scale_factor());
@@ -2111,14 +2105,11 @@ impl Tree {
                     };
                     handle.clamp(style, bounds, client, content, scale)
                 });
+                let interest = offset.map(|offset| (bounds.origin, offset));
                 window.scope(Scope::Offset(offset.unwrap_or_default()), |window| {
-                    if let Some(offset) = offset {
-                        window.begin_interest(bounds.origin, offset);
-                    }
-                    self.keep_children(index, origin, false, window);
-                    if offset.is_some() {
-                        window.end_interest();
-                    }
+                    window.with_interest(interest, |window| {
+                        self.keep_children(index, origin, false, window)
+                    })
                 });
                 self.keep_children(index, origin, true, window);
                 if style.contains != 0 {
@@ -2250,9 +2241,8 @@ impl Tree {
     fn paint_node(&mut self, index: u32, listed: bool, window: &mut Window) {
         let slot = &self.slots[index as usize];
         if slot.escaped.is_some() && (slot.cut as usize) < window.depth() {
-            let paused = window.pause_cuts(slot.cut as usize);
-            self.paint_box_node(index, listed, window);
-            window.resume_cuts(paused);
+            let depth = slot.cut as usize;
+            window.with_cuts_paused(depth, |window| self.paint_box_node(index, listed, window));
             return;
         }
         self.paint_box_node(index, listed, window);
@@ -2363,17 +2353,17 @@ impl Tree {
         // Below a transform or an effect, boxes paint elsewhere than their bounds, so none is skipped.
         let unbounded = slot.hooks.as_ref().is_some_and(|hooks| !hooks.bounded());
         self.unbounded += u32::from(unbounded);
-        let smoothing = mem::replace(&mut window.font_smoothing, slot.text.font_smoothing);
         self.masks.push(mask);
-        self.visit(
-            index,
-            window,
-            |hooks, cx, inner| hooks.paint(cx, inner),
-            |tree, style, window| tree.paint_box(index, style, window),
-        );
+        window.with_font_smoothing(slot.text.font_smoothing, |window| {
+            self.visit(
+                index,
+                window,
+                |hooks, cx, inner| hooks.paint(cx, inner),
+                |tree, style, window| tree.paint_box(index, style, window),
+            )
+        });
         self.masks.pop();
         self.unbounded -= u32::from(unbounded);
-        window.font_smoothing = smoothing;
         if escaped.is_some() {
             window.pop_content_mask();
         }
@@ -2521,43 +2511,41 @@ impl Tree {
                     let scroll = (slot.events.as_ref())
                         .and_then(|events| events.scroll.as_ref())
                         .map(|handle| handle.painted());
-                    if let Some(offset) = scroll {
-                        window.begin_scroll(u64::from(index), slot.painted.origin, offset);
-                    }
-                    if style.stacking {
-                        self.painting.push(index);
-                    }
-                    let mark = self.deferred.len();
-                    for child in 0..self.slots[index as usize].children.len() {
-                        let child = index_of(self.slots[index as usize].children[child]);
-                        let slot = &self.slots[child as usize];
-                        if slot.style.flow & Flow::FLOAT != 0 && slot.style.z_index.is_none() {
-                            self.deferred.push(child);
-                        } else {
-                            self.paint_node(child, false, window);
+                    let scroll =
+                        scroll.map(|offset| (u64::from(index), slot.painted.origin, offset));
+                    window.with_scroll(scroll, |window| {
+                        if style.stacking {
+                            self.painting.push(index);
                         }
-                    }
-                    // A plain block passes its floats up. Other boxes paint them above their blocks, with their
-                    // clip, scroll offset and effects.
-                    if style.flow & Flow::BLOCK == 0
-                        || style.stacking
-                        || style.z_index.is_some()
-                        || style.opacity.is_some()
-                        || style.overflow.x != Overflow::Visible
-                        || style.overflow.y != Overflow::Visible
-                    {
-                        // A float catches the floats inside it, so painting one doesn't grow the list.
-                        for at in mark..self.deferred.len() {
-                            self.paint_node(self.deferred[at], false, window);
+                        let mark = self.deferred.len();
+                        for child in 0..self.slots[index as usize].children.len() {
+                            let child = index_of(self.slots[index as usize].children[child]);
+                            let slot = &self.slots[child as usize];
+                            if slot.style.flow & Flow::FLOAT != 0 && slot.style.z_index.is_none() {
+                                self.deferred.push(child);
+                            } else {
+                                self.paint_node(child, false, window);
+                            }
                         }
-                        self.deferred.truncate(mark);
-                    }
-                    if style.stacking {
-                        self.painting.pop();
-                    }
-                    if scroll.is_some() {
-                        window.end_scroll();
-                    }
+                        // A plain block passes its floats up. Other boxes paint them above their blocks, with their
+                        // clip, scroll offset and effects.
+                        if style.flow & Flow::BLOCK == 0
+                            || style.stacking
+                            || style.z_index.is_some()
+                            || style.opacity.is_some()
+                            || style.overflow.x != Overflow::Visible
+                            || style.overflow.y != Overflow::Visible
+                        {
+                            // A float catches the floats inside it, so painting one doesn't grow the list.
+                            for at in mark..self.deferred.len() {
+                                self.paint_node(self.deferred[at], false, window);
+                            }
+                            self.deferred.truncate(mark);
+                        }
+                        if style.stacking {
+                            self.painting.pop();
+                        }
+                    });
                 }
             });
         });

@@ -92,8 +92,23 @@ impl Window {
         self.content_mask().radii == Default::default()
     }
 
-    // `origin` is a point of the box in the window, so the area moves with the box when an outer scroll moves it.
-    pub(crate) fn begin_interest(&mut self, origin: Point<Pixels>, offset: Point<Pixels>) -> bool {
+    // Runs `f` in the interest area of a scroll at `at`: a point of the box in the window, so the area moves with
+    // the box when an outer scroll moves it, and the scroll offset.
+    pub(crate) fn with_interest<R>(
+        &mut self,
+        at: Option<(Point<Pixels>, Point<Pixels>)>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some((origin, offset)) = at else {
+            return f(self);
+        };
+        self.begin_interest(origin, offset);
+        let result = f(self);
+        self.end_interest();
+        result
+    }
+
+    fn begin_interest(&mut self, origin: Point<Pixels>, offset: Point<Pixels>) -> bool {
         let mask = self.content_mask();
         let open = self.opens_interest();
         self.viewports.push(open.then_some(mask.bounds));
@@ -112,14 +127,21 @@ impl Window {
         open
     }
 
-    pub(crate) fn end_interest(&mut self) {
+    fn end_interest(&mut self) {
         if self.viewports.pop().flatten().is_some() {
             self.pop_content_mask();
         }
     }
 
-    // The content of a scroll container, which `offset` moved, paints between these two calls.
-    pub(crate) fn begin_scroll(&mut self, id: u64, origin: Point<Pixels>, offset: Point<Pixels>) {
+    // The content of a scroll container paints in `f`: its id, a point of its box, and the offset that moved it.
+    pub(crate) fn with_scroll<R>(
+        &mut self,
+        scroll: Option<(u64, Point<Pixels>, Point<Pixels>)>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some((id, origin, offset)) = scroll else {
+            return f(self);
+        };
         let viewport = self.snap_mask(self.content_mask());
         let scale = self.scale_factor;
         let open = self.begin_interest(origin, offset);
@@ -129,11 +151,10 @@ impl Window {
             Point::new(-offset.x.0 * scale, -offset.y.0 * scale),
             open,
         );
-    }
-
-    pub(crate) fn end_scroll(&mut self) {
+        let result = f(self);
         self.end_interest();
         self.scene.end_scroll();
+        result
     }
 
     pub(super) fn snap_mask(&self, mask: Clip<Pixels>) -> Clip<f32> {
