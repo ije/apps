@@ -37,7 +37,7 @@ pub(super) fn lint(
         if node.tag.starts_with('#') {
             continue;
         }
-        let pseudos = styles.text_pseudos.get(&id);
+        let pseudos = styles.extras(id).text.as_ref();
         for (index, (pseudo, values)) in [
             ("", Some(&**style)),
             (

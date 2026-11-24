@@ -332,7 +332,7 @@ pub(super) fn control_layer(
         .or(resizer)
     {
         el = el.child(if look.plain {
-            let parts = styles.scrollbars.get(&id);
+            let parts = styles.extras(id).scrollbars.as_ref();
             let range = look.control == crate::render::paint::control::Control::Range;
             let ink = css::value::color::rgba(
                 style

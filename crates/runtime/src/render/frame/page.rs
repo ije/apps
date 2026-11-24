@@ -126,9 +126,9 @@ pub(super) fn viewport(
         .filter(|_| page_scrolls || page_scrolls_x)
         .and_then(|html| {
             let parts = body
-                .and_then(|body| styles.scrollbars.get(&body))
+                .and_then(|body| styles.extras(body).scrollbars.as_ref())
                 .filter(|parts| parts[0].is_some())
-                .or_else(|| styles.scrollbars.get(&html));
+                .or_else(|| styles.extras(html).scrollbars.as_ref());
             let mut look = scrollbar::Look::new(
                 &styles.values[html],
                 parts.map(|parts| &**parts),
@@ -288,7 +288,7 @@ pub(super) fn overlay(
         if let Some(backdrop) = backdrops
             .iter()
             .find_map(|(node, style)| (*node == id).then_some(style))
-            .or_else(|| build.styles.backdrops.get(&id))
+            .or_else(|| build.styles.extras(id).backdrop.as_ref())
             .filter(|style| style.get(Prop::DISPLAY) != Some("none"))
         {
             let units = build.styles.lengths[id];

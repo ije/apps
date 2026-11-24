@@ -193,10 +193,12 @@ fn text_pseudo_elements_restyle_runs_and_parse_shadows() {
         &mut StyleCache::default(),
         None,
     );
-    let marker = computed.text_pseudos[&li][0].as_ref().unwrap();
+    let marker = computed.extras(li).text.as_ref().unwrap()[0]
+        .as_ref()
+        .unwrap();
     assert_eq!(&marker["color"], "blue");
     assert!(marker.contains(Prop::CONTENT) && marker.contains(Prop::FONT_SIZE));
-    assert!(computed.text_pseudos[&p][0].is_none());
+    assert!(computed.extras(p).text.as_ref().unwrap()[0].is_none());
     let inline = inline_text(&doc, &computed, p, &[], &[], [true; 2]).unwrap();
     assert_eq!(&*inline.text, "\"Hi there x");
     assert_eq!(

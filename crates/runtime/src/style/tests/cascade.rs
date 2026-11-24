@@ -81,7 +81,10 @@ fn custom_property_changes_keep_the_styles_that_dont_read_them() {
         );
         assert_eq!(cached.values, fresh.values, "step {step}");
         assert_eq!(cached.vars, fresh.vars, "step {step}");
-        assert_eq!(cached.pseudos, fresh.pseudos, "step {step}");
+        assert!(
+            (0..doc.nodes.len()).all(|id| cached.generated(id) == fresh.generated(id)),
+            "step {step}"
+        );
         let var = |id: usize, name: &str| {
             let prop = Prop::find(name).unwrap();
             cached.vars[id]
@@ -96,7 +99,7 @@ fn custom_property_changes_keep_the_styles_that_dont_read_them() {
             assert!(kept(span) && kept(b) && kept(i), "step {step}");
             assert_eq!(kept(p), step == 1, "step {step}");
             assert_eq!(
-                Rc::ptr_eq(&last.pseudos[&p], &cached.pseudos[&p]),
+                Rc::ptr_eq(last.generated(p).unwrap(), cached.generated(p).unwrap()),
                 step == 1,
                 "step {step}"
             );
@@ -133,8 +136,11 @@ fn layers_supports_and_generated_content_keep_the_cascade() {
     assert_eq!(&computed.values[id]["width"], "100cqi");
     assert_eq!(&computed.values[id]["cursor"], "pointer");
     assert!(!computed.values[id].contains(Prop::CONTENT));
-    assert_eq!(&computed.pseudos[&id][0]["background-color"], "red");
-    assert_eq!(&computed.pseudos[&id][0]["width"], "4px");
+    assert_eq!(
+        &computed.generated(id).unwrap()[0]["background-color"],
+        "red"
+    );
+    assert_eq!(&computed.generated(id).unwrap()[0]["width"], "4px");
 }
 
 #[test]
@@ -415,7 +421,7 @@ fn generated_content_inherits_every_inherited_property() {
         &mut StyleCache::default(),
         None,
     );
-    let before = &computed.pseudos[&element(&doc, "p")][0];
+    let before = &computed.generated(element(&doc, "p")).unwrap()[0];
     assert_eq!(before.get(Prop::FONT_WEIGHT), Some("700"));
     assert_eq!(before.get(Prop::TEXT_TRANSFORM), Some("uppercase"));
     assert_eq!(before.get(Prop::LETTER_SPACING), Some("2px"));
@@ -478,7 +484,12 @@ fn conditional_rules_keep_their_scope_and_starting_style() {
         None,
     );
     assert_eq!(
-        computed.starting[&element(&doc, "#a")].get(Prop::OPACITY),
+        computed
+            .extras(element(&doc, "#a"))
+            .starting
+            .as_ref()
+            .unwrap()
+            .get(Prop::OPACITY),
         Some("0")
     );
 }
@@ -499,8 +510,7 @@ fn pseudo_elements_match_through_buckets() {
     );
     let content = |selector: &str, index: usize| {
         computed
-            .pseudos
-            .get(&element(&doc, selector))
+            .generated(element(&doc, selector))
             .and_then(|pseudos| pseudos[index].get(Prop::CONTENT).map(str::to_owned))
     };
     assert_eq!(content("div", 0).as_deref(), Some("'a'"));
@@ -539,7 +549,11 @@ fn top_layer_boxes_get_ua_rules_and_backdrops() {
     let closed = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
     assert_eq!(&closed.values[p]["display"], "none");
     assert!(!closed.values[f].contains(Prop::WIDTH));
-    assert!(closed.backdrops.is_empty());
+    assert!(
+        closed
+            .all_extras()
+            .all(|(_, extras)| extras.backdrop.is_none())
+    );
     doc.nodes[d].state = crate::dom::MODAL;
     doc.nodes[p].state = crate::dom::POPOVER;
     doc.nodes[f].state = crate::dom::FULLSCREEN;
@@ -560,7 +574,8 @@ fn top_layer_boxes_get_ua_rules_and_backdrops() {
         ),
         ("block", "100%", "0")
     );
-    let backdrop = |id: usize, prop: &str| open.backdrops[&id][prop].to_string();
+    let backdrop =
+        |id: usize, prop: &str| open.extras(id).backdrop.as_ref().unwrap()[prop].to_string();
     assert_eq!(color(&backdrop(d, "background-color")), Some((0, 26)));
     assert_eq!(
         (
@@ -571,10 +586,10 @@ fn top_layer_boxes_get_ua_rules_and_backdrops() {
     );
     assert_eq!(color(&backdrop(f, "background-color")), Some((0, 255)));
     assert_eq!(color(&backdrop(d, "color")), Some((0xff0000, 255)));
-    assert!(!open.backdrops.contains_key(&n));
+    assert!(open.extras(n).backdrop.is_none());
     doc.nodes[f].state = 0;
     let exited = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
-    assert!(!exited.values[f].contains(Prop::WIDTH) && !exited.backdrops.contains_key(&f));
+    assert!(!exited.values[f].contains(Prop::WIDTH) && exited.extras(f).backdrop.is_none());
 }
 
 #[test]
@@ -598,9 +613,15 @@ fn leaving_top_layer_boxes_keep_their_place_and_backdrop() {
         [d, p].map(|id| open.values[id].get(Prop::OVERLAY)),
         [Some("auto"); 2]
     );
-    assert_eq!(&open.backdrops[&d]["background-color"], "red");
-    assert_eq!(&open.backdrop_starts[&d]["background-color"], "blue");
-    assert!(!open.backdrop_starts.contains_key(&p));
+    assert_eq!(
+        &open.extras(d).backdrop.as_ref().unwrap()["background-color"],
+        "red"
+    );
+    assert_eq!(
+        &open.extras(d).backdrop_start.as_ref().unwrap()["background-color"],
+        "blue"
+    );
+    assert!(open.extras(p).backdrop_start.is_none());
     doc.nodes[d].attrs.remove("open");
     doc.nodes[d].state = crate::dom::MODAL << 5;
     doc.nodes[p].state = crate::dom::POPOVER << 5;
@@ -616,12 +637,12 @@ fn leaving_top_layer_boxes_keep_their_place_and_backdrop() {
         ],
         ["fixed", "none"]
     );
-    assert!(leaving.backdrops.contains_key(&d) && leaving.backdrops.contains_key(&p));
+    assert!(leaving.extras(d).backdrop.is_some() && leaving.extras(p).backdrop.is_some());
     assert!(!crate::dom::matches(&doc, d, ":modal"));
     doc.nodes[d].state = 0;
     let left = styles(&doc);
     assert_eq!(&left.values[d]["position"], "absolute");
-    assert!(!left.backdrops.contains_key(&d));
+    assert!(left.extras(d).backdrop.is_none());
 }
 
 #[test]

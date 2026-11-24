@@ -131,7 +131,7 @@ pub(crate) fn lifts_pseudos(
     id: usize,
     lifted: &mut Vec<(usize, u8)>,
 ) -> bool {
-    let Some(pseudos) = styles.pseudos.get(&id) else {
+    let Some(pseudos) = styles.generated(id) else {
         return true;
     };
     let drawn = |pseudo: &Style| {
@@ -156,7 +156,7 @@ pub(crate) fn lifts_pseudos(
 
 /// Whether the `::after` of `id` is absolute at its static place in the last line.
 pub(crate) fn static_after(styles: &ComputedStyles, id: usize) -> bool {
-    styles.pseudos.get(&id).is_some_and(|pseudos| {
+    styles.generated(id).is_some_and(|pseudos| {
         let after = &pseudos[1];
         static_inline(after)
             && after
@@ -253,7 +253,7 @@ pub(crate) fn makes_no_line(doc: &Document, styles: &ComputedStyles, id: usize) 
     style
         .get(Prop::DISPLAY)
         .is_none_or(|value| value == "inline")
-        && !styles.pseudos.contains_key(&id)
+        && styles.generated(id).is_none()
         && [PADDING, MARGIN].into_iter().all(|edges| {
             let [_, right, _, left] = units.edges(style, edges, 0.);
             right == 0. && left == 0.
@@ -410,15 +410,16 @@ pub(crate) fn groups(style: &Style) -> bool {
 /// Whether `id` has a `::first-letter` or `::first-line` style.
 pub(crate) fn first_text(styles: &ComputedStyles, id: usize) -> bool {
     styles
-        .text_pseudos
-        .get(&id)
+        .extras(id)
+        .text
+        .as_ref()
         .is_some_and(|pseudos| pseudos[1].is_some() || pseudos[2].is_some())
 }
 
 /// Which of `::before` and `::after` of `id` are blocks in the flow, or `None` when one is in the flow of its lines
 /// or out of the flow.
 pub(crate) fn pseudo_blocks(styles: &ComputedStyles, id: usize) -> Option<[bool; 2]> {
-    let Some(pseudos) = styles.pseudos.get(&id) else {
+    let Some(pseudos) = styles.generated(id) else {
         return Some([false; 2]);
     };
     let mut blocks = [false; 2];
@@ -480,8 +481,10 @@ pub(crate) fn own_box(doc: &Document, styles: &ComputedStyles, id: usize) -> boo
                 | "progress"
                 | "meter"
         )
-        || styles.pseudos.contains_key(&id)
-        || styles.animations.contains_key(&id)
+        || {
+            let extras = styles.extras(id);
+            extras.generated.is_some() || extras.animations.is_some()
+        }
     {
         return true;
     }
@@ -780,7 +783,7 @@ pub(crate) fn inline_text(
     let own = doc.nodes[id].tag == "#text";
     // An element with no children is a line of its own only through an in-flow inline pseudo-element.
     let pseudo_line = || {
-        styles.pseudos.get(&id).is_some_and(|pseudos| {
+        styles.generated(id).is_some_and(|pseudos| {
             pseudos.iter().any(|pseudo| {
                 pseudo
                     .get(Prop::CONTENT)
@@ -847,7 +850,7 @@ pub(crate) fn inline_text(
         if index == 1 && markers && static_after(styles, id) {
             return Some((String::new(), true));
         }
-        let pseudo = &styles.pseudos.get(&id).filter(|_| atomic_allowed)?[index];
+        let pseudo = &styles.generated(id).filter(|_| atomic_allowed)?[index];
         let content = pseudo
             .get(Prop::CONTENT)
             .filter(|value| !matches!(*value, "none" | "normal"))?;
@@ -1056,7 +1059,7 @@ pub(crate) fn inline_text(
             Option<usize>,
         ) = 'source: {
             if let Some((index, words, boxed)) = pseudo {
-                let style = &styles.pseudos[&id][index];
+                let style = &styles.generated(id).unwrap()[index];
                 let mut units = styles.lengths[id];
                 if let Some(size) = style
                     .get(Prop::FONT_SIZE)
@@ -1145,8 +1148,8 @@ pub(crate) fn inline_text(
                         && part.is_none()
                         && node.tag != "#text"
                         && display.is_none_or(|value| value == "inline")
-                        && (styles.pseudos.contains_key(&child)
-                            || styles.animations.contains_key(&child)
+                        && (styles.extras(child).generated.is_some()
+                            || styles.extras(child).animations.is_some()
                             || splits(style, parent)))
                 && style
                     .get(Prop::POSITION)
@@ -1179,9 +1182,9 @@ pub(crate) fn inline_text(
                 // The pseudo-elements of a spliced box are blocks beside the text, and the text draws the rest of
                 // its style.
                 || part.is_none()
-                    && (styles.pseudos.contains_key(&child)
+                    && (styles.generated(child).is_some()
                         && !(markers && lifts_pseudos(styles, child, &mut lifted))
-                        || styles.animations.contains_key(&child)
+                        || styles.extras(child).animations.is_some()
                         || splits(style, parent))
             {
                 return None;
@@ -1489,7 +1492,7 @@ pub(crate) fn inline_text(
             .map(rgba);
         run
     };
-    let pseudos = styles.text_pseudos.get(&id).filter(|_| {
+    let pseudos = styles.extras(id).text.as_ref().filter(|_| {
         !own && ends[0]
             && parent
                 .get(Prop::DISPLAY)

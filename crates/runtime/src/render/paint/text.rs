@@ -1787,13 +1787,15 @@ impl renderer::Hooks for InlineText {
                             );
                         }
                     } else if start != end {
-                        let (color, background) =
-                            style::selection_colors(&styles.values[*id], styles.selections.get(id));
+                        let (color, background) = style::selection_colors(
+                            &styles.values[*id],
+                            styles.extras(*id).selection.as_ref(),
+                        );
                         highlights.push(TextHighlight {
                             range: start.min(end)..start.max(end),
                             color: color.map(Color::hex),
                             background: Color::hex(background),
-                            stroke: !styles.selections.contains_key(id),
+                            stroke: styles.extras(*id).selection.is_none(),
                         });
                     }
                 }

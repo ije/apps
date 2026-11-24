@@ -73,8 +73,11 @@ pub(super) fn replaced(
             .page_state(view.id)
             .filter(|_| store.app.features.has(crate::bundle::Feature::Terminal))
         {
-            let look =
-                crate::render::paint::terminal::look(style, styles.selections.get(&id), &units);
+            let look = crate::render::paint::terminal::look(
+                style,
+                styles.extras(id).selection.as_ref(),
+                &units,
+            );
             // The bar of the scrollback.
             *grid_bar = Some(scrollbar::Scrollbar {
                 id,

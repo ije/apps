@@ -311,7 +311,7 @@ pub(crate) fn after(now: Instant, seconds: f64) -> Option<Instant> {
 }
 
 pub(crate) fn drop_important(styles: &ComputedStyles, id: usize, out: &mut Style) {
-    if let Some(props) = styles.important.get(&id) {
+    if let Some(props) = styles.extras(id).important.as_ref() {
         for &prop in props.iter() {
             out.remove(prop);
         }
@@ -383,7 +383,7 @@ impl Scripted {
         let (owner, style): (Rc<dyn std::any::Any>, &Style) = match self.effect.pseudo {
             0 => (styles.values[id].clone(), &*styles.values[id]),
             slot => {
-                let pair = styles.pseudos.get(&id)?;
+                let pair = styles.generated(id)?;
                 (pair.clone(), &pair[usize::from(slot) - 1])
             }
         };

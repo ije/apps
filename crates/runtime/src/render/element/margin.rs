@@ -336,7 +336,7 @@ pub(super) fn margin_collapses_through(
             .is_some_and(|value| matches!(value, "block" | "list-item"))
         && float_side(style).is_none()
         // A pseudo-element in the flow, like a clearfix, holds the margin of its side.
-        && styles.pseudos.get(&id).is_none_or(|pseudos| {
+        && styles.generated(id).is_none_or(|pseudos| {
             let pseudo = &pseudos[side / 2];
             pseudo
                 .get(Prop::CONTENT)

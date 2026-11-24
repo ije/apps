@@ -189,7 +189,7 @@ pub(super) fn detect(
             }
             _ => cull::content(node, style),
         };
-        let pseudos = styles.pseudos.get(&id);
+        let pseudos = styles.generated(id);
         let repseudoed = |old: &crate::render::layout::LayoutNode| match (&old.pseudos, pseudos) {
             (Some(old), Some(new)) => !Rc::ptr_eq(old, new),
             (old, new) => old.is_some() != new.is_some(),

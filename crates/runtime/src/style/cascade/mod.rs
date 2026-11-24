@@ -475,7 +475,10 @@ pub(crate) fn compute_styles(
             let touched =
                 |value: &CachedStyle| {
                     let vars = value.vars.borrow();
-                    value.animations.is_some()
+                    value
+                        .extras
+                        .as_ref()
+                        .is_some_and(|extras| extras.animations.is_some())
                         || value.reads.as_ref().is_none_or(|reads| {
                             reads.iter().any(|(prop, _)| changed.contains(prop))
                         })
@@ -545,20 +548,8 @@ pub(crate) fn compute_styles(
             out.flags.clone_from(&previous.flags);
             out.lengths.clone_from(&previous.lengths);
             out.lengths.grow(count);
-            out.pseudos.clone_from(&previous.pseudos);
-            out.text_pseudos.clone_from(&previous.text_pseudos);
-            out.backdrops.clone_from(&previous.backdrops);
-            out.backdrop_starts.clone_from(&previous.backdrop_starts);
-            out.counting.clone_from(&previous.counting);
-            out.scrollbars.clone_from(&previous.scrollbars);
-            out.selections.clone_from(&previous.selections);
-            out.animations.clone_from(&previous.animations);
-            out.important.clone_from(&previous.important);
-            out.starting.clone_from(&previous.starting);
+            out.extras.clone_from(&previous.extras);
             out.containers.clone_from(&previous.containers);
-            out.slotted.clone_from(&previous.slotted);
-            out.parts.clone_from(&previous.parts);
-            out.exported.clone_from(&previous.exported);
         }
         None => out.lengths.reset(count, Lengths::new(16., width, height)),
     }
@@ -675,23 +666,24 @@ fn check_incremental(
         (a, b) => a.is_none() && b.is_none(),
     };
     for id in 0..doc.nodes.len() {
+        let (full_extras, extras) = (full.extras(id), out.extras(id));
         let same = [
-            groups(full.slotted.get(&id), out.slotted.get(&id)),
-            groups(full.parts.get(&id), out.parts.get(&id)),
-            groups(full.exported.get(&id), out.exported.get(&id)),
+            groups(full_extras.slotted.as_ref(), extras.slotted.as_ref()),
+            groups(full_extras.parts.as_ref(), extras.parts.as_ref()),
+            groups(full_extras.exported.as_ref(), extras.exported.as_ref()),
             *full.values[id] == *out.values[id],
             full.vars[id] == out.vars[id],
             full.flags[id] == out.flags[id],
             full.lengths[id] == out.lengths[id],
-            full.pseudos.get(&id) == out.pseudos.get(&id),
-            full.text_pseudos.get(&id) == out.text_pseudos.get(&id),
-            full.backdrops.get(&id) == out.backdrops.get(&id),
-            full.backdrop_starts.get(&id) == out.backdrop_starts.get(&id),
-            full.scrollbars.get(&id) == out.scrollbars.get(&id),
-            full.selections.get(&id) == out.selections.get(&id),
-            format!("{:?}", full.animations.get(&id)) == format!("{:?}", out.animations.get(&id)),
-            full.important.get(&id) == out.important.get(&id),
-            full.starting.get(&id) == out.starting.get(&id),
+            full_extras.generated == extras.generated,
+            full_extras.text == extras.text,
+            full_extras.backdrop == extras.backdrop,
+            full_extras.backdrop_start == extras.backdrop_start,
+            full_extras.scrollbars == extras.scrollbars,
+            full_extras.selection == extras.selection,
+            format!("{:?}", full_extras.animations) == format!("{:?}", extras.animations),
+            full_extras.important == extras.important,
+            full_extras.starting == extras.starting,
             full.containers[id] == out.containers[id],
         ];
         assert!(

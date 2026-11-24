@@ -218,7 +218,7 @@ pub(super) fn client(
         .and_then(|handle| {
             let look = crate::render::paint::scrollbar::Look::new(
                 style,
-                computed.scrollbars.get(&id).map(|parts| &**parts),
+                computed.extras(id).scrollbars.as_deref(),
                 units,
                 None,
             )?;

@@ -151,8 +151,7 @@ fn composite(view: Rc<ViewState>, window: &mut Window, cx: &mut App) {
     let eligible = custom.is_empty()
         && pseudos.iter().all(|(id, pair)| {
             styles
-                .pseudos
-                .get(id)
+                .generated(*id)
                 .is_some_and(|base| fades_only(base, pair))
         })
         && backdrops.is_empty()
@@ -341,7 +340,7 @@ fn composite(view: Rc<ViewState>, window: &mut Window, cx: &mut App) {
                         && dom.styles.motion.period(*id, 0, &styles, now).is_none()
                         || promote(*id as u64, id, 0, base, composited_transforms.get(id))
                 }) && pseudos.iter().all(|(id, _)| {
-                    styles.pseudos.get(id).is_some_and(|pair| {
+                    styles.generated(*id).is_some_and(|pair| {
                         pair.iter().zip(1..).all(|(base, slot)| {
                             base.get(Prop::CONTENT)
                                 .is_none_or(|content| matches!(content, "none" | "normal"))
@@ -526,8 +525,7 @@ pub(super) fn layers(
         .iter()
         .filter(|(id, pair)| {
             styles
-                .pseudos
-                .get(id)
+                .generated(*id)
                 .is_some_and(|base| fades_only(base, pair))
         })
         .map(|(id, _)| *id)
@@ -550,38 +548,18 @@ pub(super) fn swap(
     pseudos: Vec<(usize, Rc<[css::properties::Style; 2]>)>,
     lengths: &mut [(usize, Lengths)],
 ) -> Swapped {
-    // Restore cascade values and pseudos after the frame: animations replace them temporarily.
-    let mut restore = Vec::new();
-    let mut restore_pseudos = Vec::new();
-    if !pseudos.is_empty() {
+    let (mut restore, mut paint) = (Vec::new(), Vec::new());
+    let mut restore_pseudos = pseudos;
+    if !animated.is_empty() || !restore_pseudos.is_empty() || !lengths.is_empty() {
         dom.styles.computed = None;
-        let map = &mut Rc::make_mut(styles).pseudos;
-        for (id, pair) in pseudos {
-            if let Some(old) = map.insert(id, pair) {
-                restore_pseudos.push((id, old));
-            }
-        }
-    }
-    let mut paint = Vec::new();
-    if !animated.is_empty() {
-        dom.styles.computed = None;
-        let values = &mut Rc::make_mut(styles).values;
         for (id, style, layout) in animated {
-            if layout {
-                restore.push((id, std::mem::replace(&mut values[id], style)));
-            } else {
-                paint.push((id, style));
+            match layout {
+                true => restore.push((id, style)),
+                false => paint.push((id, style)),
             }
         }
         paint.sort_unstable_by_key(|(id, _)| *id);
-    }
-    if !lengths.is_empty() {
-        dom.styles.computed = None;
-        let units = &mut Rc::make_mut(styles).lengths;
-        for (id, new) in lengths.iter_mut() {
-            let old = *units.get(*id).unwrap_or(new);
-            units.set(*id, std::mem::replace(new, old));
-        }
+        Rc::make_mut(styles).swap_frame(&mut restore, &mut restore_pseudos, lengths);
     }
     (restore, restore_pseudos, paint)
 }
@@ -590,9 +568,9 @@ pub(super) fn swap(
 pub(super) fn restore(
     dom: &mut PageState,
     styles: &mut Rc<ComputedStyles>,
-    restore: Vec<(usize, Rc<css::properties::Style>)>,
-    restore_pseudos: Vec<(usize, Rc<[css::properties::Style; 2]>)>,
-    lengths: Vec<(usize, Lengths)>,
+    mut restore: Vec<(usize, Rc<css::properties::Style>)>,
+    mut restore_pseudos: Vec<(usize, Rc<[css::properties::Style; 2]>)>,
+    mut lengths: Vec<(usize, Lengths)>,
     relayouts: usize,
 ) {
     dom.styles.animating.clear();
@@ -609,20 +587,9 @@ pub(super) fn restore(
         dom.geometry.mirror.restyled();
     }
     if restored {
-        let styles = Rc::make_mut(styles);
-        for (id, old) in lengths {
-            styles.lengths.set(id, old);
-        }
-        for (id, style) in restore {
-            dom.styles
-                .animating
-                .insert(id, std::mem::replace(&mut styles.values[id], style));
-        }
-        for (id, pair) in restore_pseudos {
-            if let Some(animated) = styles.pseudos.insert(id, pair) {
-                dom.styles.animating_pseudos.insert(id, animated);
-            }
-        }
+        Rc::make_mut(styles).swap_frame(&mut restore, &mut restore_pseudos, &mut lengths);
+        dom.styles.animating.extend(restore);
+        dom.styles.animating_pseudos.extend(restore_pseudos);
     }
 }
 

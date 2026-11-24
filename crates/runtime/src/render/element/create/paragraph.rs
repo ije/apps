@@ -64,7 +64,7 @@ pub(super) fn paragraph(
     let marker = |atom: &crate::render::inline::Atom| {
         crate::render::inline::static_inline(match atom.pseudo {
             0 => &styles.values[atom.node],
-            pseudo => &styles.pseudos[&id][usize::from(pseudo - 1)],
+            pseudo => &styles.generated(id).unwrap()[usize::from(pseudo - 1)],
         })
     };
     let mut atom_elements: Vec<renderer::Child> = data

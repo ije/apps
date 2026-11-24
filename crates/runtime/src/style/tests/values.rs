@@ -260,7 +260,7 @@ fn declarations_of_one_block_keep_their_order() {
     assert_ne!(get("#i1", Prop::COLOR), Some("red"));
     assert_eq!(get("#i2", Prop::MARGIN_LEFT), Some("10px"));
     assert_eq!(
-        computed.pseudos[&element(&doc, "#p1")][0].get(Prop::MARGIN_LEFT),
+        computed.generated(element(&doc, "#p1")).unwrap()[0].get(Prop::MARGIN_LEFT),
         Some("8px")
     );
     assert_eq!(std::mem::size_of::<CascadeRank>(), 48);
@@ -351,7 +351,10 @@ fn animations_leave_important_declarations() {
         &mut StyleCache::default(),
         None,
     );
-    assert_eq!(styles.important[&id][..], [Prop::WIDTH]);
+    assert_eq!(
+        styles.extras(id).important.as_ref().unwrap()[..],
+        [Prop::WIDTH]
+    );
     let start = std::time::Instant::now();
     let mut motion = animation::Motion::default();
     let visible = vec![true; doc.nodes.len()];

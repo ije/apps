@@ -1343,8 +1343,8 @@ fn variants_reach_pseudo_elements_attributes_and_descendants() {
     );
     let div = id(&doc, "div");
     assert_eq!(&styles.values[div]["background-color"], "#123456");
-    assert_eq!(&styles.pseudos[&div][1]["width"], "3px");
-    assert_eq!(&styles.pseudos[&div][1]["display"], "block");
+    assert_eq!(&styles.generated(div).unwrap()[1]["width"], "3px");
+    assert_eq!(&styles.generated(div).unwrap()[1]["display"], "block");
     let svg = &styles.values[id(&doc, "svg")];
     assert_eq!(length(&svg["width"], 0., 16., 800., 600.), 16.);
     let (doc, styles) = computed(
@@ -1493,7 +1493,7 @@ fn tw_properties_get_initial_values_without_leaking() {
     let ring = "0 0 #0000, 0 0 #0000, 0 0 #0000,  0 0 0 calc(2px + 0px) #000000, 0 0 #0000";
     assert_eq!(&styles.values[id(&doc, "i")]["box-shadow"], ring);
     let b = id(&doc, "b");
-    assert_eq!(&styles.pseudos[&b][0]["box-shadow"], ring);
+    assert_eq!(&styles.generated(b).unwrap()[0]["box-shadow"], ring);
     assert_eq!(&styles.values[b]["translate"], "calc(0.25rem * 4) 0");
     let vars = &styles.vars[id(&doc, "p")];
     assert!(

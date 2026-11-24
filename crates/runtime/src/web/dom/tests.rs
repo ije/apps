@@ -500,7 +500,7 @@ fn incremental_styles_renumber_counters() {
         let computed = host.pages[&1].state.styles.computed.as_ref().unwrap();
         ids.split(',')
             .map(|id| {
-                let pseudos = &computed.pseudos[&id.parse::<usize>().unwrap()];
+                let pseudos = &computed.generated(id.parse::<usize>().unwrap()).unwrap();
                 pseudos
                     .iter()
                     .map(|style| style.get(Prop::CONTENT).unwrap_or_default())

@@ -231,8 +231,9 @@ pub(crate) fn intrinsic(
     } else if node.tag == "input"
         && node.input_type().eq_ignore_ascii_case("file")
         && let Some(button) = styles
+            .extras(id)
             .scrollbars
-            .get(&id)
+            .as_ref()
             .and_then(|parts| parts[1].as_ref())
     {
         let [width, height] =
@@ -1055,7 +1056,7 @@ pub(crate) fn intrinsic(
             ) else {
                 continue;
             };
-            let pseudo = &styles.pseudos[&id][index];
+            let pseudo = &styles.generated(id).unwrap()[index];
             if matches!(display, "flex" | "inline-flex")
                 && style
                     .get(Prop::FLEX_DIRECTION)
@@ -1360,7 +1361,7 @@ pub(super) fn pseudo_size(
     pixel_ratio: f32,
 ) -> Option<[f32; 4]> {
     let style = &styles.values[id];
-    let pseudo = &styles.pseudos.get(&id)?[index];
+    let pseudo = &styles.generated(id)?[index];
     let value = pseudo
         .get(Prop::CONTENT)
         .filter(|value| !matches!(*value, "none" | "normal"))?;
@@ -1476,7 +1477,7 @@ pub(crate) fn pseudo_atom(
 ) -> Option<[f32; 3]> {
     let [_, max, used, height] =
         pseudo_size(doc, id, index, styles, base, None, text, pixel_ratio)?;
-    let pseudo = &styles.pseudos[&id][index];
+    let pseudo = &styles.generated(id).unwrap()[index];
     let units = super::super::size::pseudo_lengths(
         &styles.lengths[id],
         &styles.values[id],

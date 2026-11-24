@@ -34,8 +34,9 @@ pub(super) fn list_marker(cx: &Cx<'_>, fr: &Frame, mut el: renderer::Node) -> re
         padding, borders, ..
     } = *fr;
     let marker_style = styles
-        .text_pseudos
-        .get(&id)
+        .extras(id)
+        .text
+        .as_ref()
         .and_then(|pseudos| pseudos[0].as_ref());
     let content = marker_style
         .and_then(|marker| marker.get(Prop::CONTENT))

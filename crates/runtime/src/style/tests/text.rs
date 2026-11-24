@@ -30,14 +30,24 @@ fn selection_colors_follow_highlight_inheritance() {
     ] {
         let id = element(&doc, selector);
         assert_eq!(
-            selection_colors(&computed.values[id], computed.selections.get(&id)),
+            selection_colors(&computed.values[id], computed.extras(id).selection.as_ref()),
             expected,
             "{selector}"
         );
-        assert!(!computed.selections[&id].contains(Prop::FONT_SIZE));
+        assert!(
+            !computed
+                .extras(id)
+                .selection
+                .as_ref()
+                .unwrap()
+                .contains(Prop::FONT_SIZE)
+        );
         for child in &doc.nodes[id].children {
             assert_eq!(
-                selection_colors(&computed.values[*child], computed.selections.get(child)),
+                selection_colors(
+                    &computed.values[*child],
+                    computed.extras(*child).selection.as_ref()
+                ),
                 expected,
                 "{selector} text"
             );
@@ -74,7 +84,7 @@ fn selection_colors_do_not_copy_element_backgrounds() {
         );
         let id = element(&doc, "div");
         assert_eq!(
-            selection_colors(&computed.values[id], computed.selections.get(&id)),
+            selection_colors(&computed.values[id], computed.extras(id).selection.as_ref()),
             expected,
             "{rule}"
         );
@@ -111,9 +121,12 @@ fn editor_media_caret_and_selection_styles() {
     );
     assert_eq!(&narrow.values[id]["caret-color"], "red");
     assert_eq!(&wide.values[id]["caret-color"], "#0000");
-    assert_eq!(&wide.selections[&id]["background-color"], "#0000");
     assert_eq!(
-        selection_colors(&wide.values[id], wide.selections.get(&id)),
+        &wide.extras(id).selection.as_ref().unwrap()["background-color"],
+        "#0000"
+    );
+    assert_eq!(
+        selection_colors(&wide.values[id], wide.extras(id).selection.as_ref()),
         (None, 0)
     );
     let div = doc.nodes[id]
@@ -393,7 +406,7 @@ fn inherited_lengths_blockification_and_counters_compute_like_browsers() {
     );
     assert_eq!(get("#x", Prop::FLOAT), None);
     let pseudo = |selector: &str, slot: usize, prop: Prop| {
-        out.pseudos[&element(&doc, selector)][slot]
+        out.generated(element(&doc, selector)).unwrap()[slot]
             .get(prop)
             .map(str::to_owned)
     };
@@ -513,7 +526,7 @@ fn counters_number_generated_content_and_list_items() {
         None,
     );
     let before = |selector| {
-        computed.pseudos[&element(&doc, selector)][0]
+        computed.generated(element(&doc, selector)).unwrap()[0]
             .get(Prop::CONTENT)
             .map(str::to_owned)
     };
@@ -532,10 +545,9 @@ fn counters_number_generated_content_and_list_items() {
         &mut HashMap::new(),
         &mut StyleCache::default(),
         None,
-    )
-    .pseudos;
+    );
     let text = |selector, index: usize| {
-        pseudo[&element(&own, selector)][index]
+        pseudo.generated(element(&own, selector)).unwrap()[index]
             .get(Prop::CONTENT)
             .map(str::to_owned)
     };
@@ -573,7 +585,7 @@ fn counters_stay_right_after_unrelated_and_list_changes() {
     let mut check = |doc: &Document, cache: &mut StyleCache, number: &str, items: [i64; 2]| {
         let out = incremental(doc, cache, &mut last, [800., 600.]);
         assert_eq!(
-            out.pseudos[&b][0].get(Prop::CONTENT),
+            out.generated(b).unwrap()[0].get(Prop::CONTENT),
             Some(format!("\"{number}\"").as_str())
         );
         assert_eq!([out.list_items[&l1], out.list_items[&l2]], items);
