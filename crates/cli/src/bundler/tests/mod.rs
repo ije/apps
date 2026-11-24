@@ -1,7 +1,6 @@
 use super::*;
 use super::{
-    css::css,
-    html::urls,
+    css::{css, urls},
     resolve::{BUILTINS, PACKAGES},
 };
 

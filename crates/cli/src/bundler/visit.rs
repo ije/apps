@@ -2,9 +2,9 @@ use super::*;
 use super::{
     css::css,
     emit::{Awaits, Export, Import, Imports, Module, TopLevelAwait, Writes},
-    html::{html, is_remote},
+    html::html,
     link::Linker,
-    resolve::{ELECTRON, PACKAGES, in_packages, native_specifier},
+    resolve::{ELECTRON, PACKAGES, in_packages, is_remote, native_specifier},
 };
 
 impl Builder {

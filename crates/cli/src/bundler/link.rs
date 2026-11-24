@@ -1,8 +1,5 @@
+use super::resolve::{entry_fields, in_packages, is_remote, resolve_file};
 use super::*;
-use super::{
-    html::is_remote,
-    resolve::{entry_fields, in_packages, resolve_file},
-};
 
 pub(super) struct Linker<'a, 'b> {
     pub(super) builder: &'b mut Builder,
@@ -636,8 +633,8 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                 // Unresolved require() calls throw MODULE_NOT_FOUND at run time, like esbuild.
                 let dep = if name == "$appsImport" {
                     self.builder.resolve(base, specifier, false)?
-                } else if let Ok((path, inline)) = self.builder.locate(base, specifier, true) {
-                    self.builder.visit(path, inline)?
+                } else if let Some(dep) = self.builder.require(base, specifier)? {
+                    dep
                 } else {
                     self.cacheable = false;
                     walk_mut::walk_expression(self, expression);

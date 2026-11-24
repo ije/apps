@@ -1,8 +1,5 @@
+use super::resolve::{exported, remote};
 use super::*;
-use super::{
-    html::{remote, urls},
-    resolve::exported,
-};
 
 pub(super) fn css_package(directory: &Path, name: &str) -> Result<PathBuf> {
     let count = if name.starts_with('@') { 2 } else { 1 };
@@ -224,4 +221,48 @@ pub(super) fn css(
     );
     stack.pop();
     Ok(result)
+}
+
+pub(super) fn urls(source: &str, directory: &Path, shared: &Shared) -> String {
+    let bytes = source.as_bytes();
+    let string = |start: usize| {
+        let mut end = start + 1;
+        while end < bytes.len() && bytes[end] != bytes[start] && bytes[end] != b'\n' {
+            end += if bytes[end] == b'\\' { 2 } else { 1 };
+        }
+        (end + 1).min(bytes.len())
+    };
+    let (mut result, mut copied, mut pos) = (String::with_capacity(source.len()), 0, 0);
+    while pos < bytes.len() {
+        if bytes[pos..].starts_with(b"/*") {
+            pos = source[pos + 2..]
+                .find("*/")
+                .map_or(bytes.len(), |end| pos + end + 4);
+        } else if matches!(bytes[pos], b'"' | b'\'') {
+            pos = string(pos);
+        } else if bytes[pos..].len() >= 4 && bytes[pos..pos + 4].eq_ignore_ascii_case(b"url(") {
+            let start = pos + 4;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_whitespace() {
+                end += 1;
+            }
+            if end < bytes.len() && matches!(bytes[end], b'"' | b'\'') {
+                end = string(end);
+            }
+            pos = source[end..]
+                .find(')')
+                .map_or(bytes.len(), |close| end + close);
+            if let Some(url) = shared.asset(directory, &source[start..pos]) {
+                result.push_str(&source[copied..start]);
+                result.push('"');
+                result.push_str(&url);
+                result.push('"');
+                copied = pos;
+            }
+        } else {
+            pos += 1;
+        }
+    }
+    result.push_str(&source[copied..]);
+    result
 }

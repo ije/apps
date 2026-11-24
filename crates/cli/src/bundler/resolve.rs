@@ -1,4 +1,3 @@
-use super::html::remote;
 use super::*;
 
 pub(super) type Paths = (
@@ -545,4 +544,64 @@ pub(super) fn exported(
         Some(replacement) => value.replace('*', replacement),
         None => value.to_owned(),
     })
+}
+
+thread_local! {
+    static DOWNLOADS: RefCell<HashMap<String, String>> = RefCell::default();
+}
+
+pub(super) fn is_remote(path: &Path) -> bool {
+    path.to_str()
+        .is_some_and(|path| path.starts_with("https://") || path.starts_with("http://"))
+}
+
+pub(super) fn remote_base(directory: &Path) -> Option<url::Url> {
+    is_remote(directory)
+        .then(|| url::Url::parse(&format!("{}/", directory.to_str()?)).ok())
+        .flatten()
+}
+
+pub(super) fn remote(
+    directory: &Path,
+    reference: &str,
+    http: bool,
+) -> Result<Option<(PathBuf, String)>> {
+    let mut url = match remote_base(directory) {
+        Some(base) => {
+            ensure!(
+                reference.contains(':') || reference.starts_with(['.', '/']),
+                "Bare import {reference:?} is not supported in remote files: {base}"
+            );
+            base.join(reference)?
+        }
+        None if reference.contains("://") || reference.starts_with("//") => {
+            url::Url::parse(reference).with_context(|| format!("Invalid URL: {reference}"))?
+        }
+        None => return Ok(None),
+    };
+    ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "Only local files and HTTP URLs can be imported: {url}"
+    );
+    ensure!(
+        http,
+        "Importing {url} needs the httpImport feature. Add \"httpImport\" to \"features\" in package.json"
+    );
+    url.set_fragment(None);
+    let source = match DOWNLOADS.with_borrow(|downloads| downloads.get(url.as_str()).cloned()) {
+        Some(source) => source,
+        None => {
+            let source = String::from_utf8(apps_runtime::download(url.as_str())?)
+                .with_context(|| format!("{url} is not UTF-8"))?;
+            DOWNLOADS
+                .with_borrow_mut(|downloads| downloads.insert(url.to_string(), source.clone()));
+            source
+        }
+    };
+    let mut path = url.to_string();
+    // Keep an empty fragment on directory URLs: `parent()` removes the trailing slash.
+    if url.path().ends_with('/') && url.query().is_none() {
+        path.push('#');
+    }
+    Ok(Some((PathBuf::from(path), source)))
 }
