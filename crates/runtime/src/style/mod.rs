@@ -8,7 +8,8 @@ use crate::css::{
     Declaration, Declarations, Declared, FontUnits, Lengths, MediaQuery, Prop, Registry, Rule,
     Style, Stylesheet, Vars, color, components, computed, expand, fold, syntax_matches,
 };
-use crate::dom::{Document, Selector, SelectorCache, SelectorList};
+use crate::css::{Selector, SelectorList};
+use crate::dom::{Document, SelectorCache};
 use bbtree::unsync::BBTreeMap;
 use rustc_hash::FxHashMap;
 use std::{borrow::Cow, collections::HashMap, rc::Rc};
@@ -942,7 +943,7 @@ impl StyleScope {
                 name.split_ascii_whitespace()
                     .any(|class| classes.contains(class))
             };
-            let lower = crate::dom::lowercase;
+            let lower = crate::css::lowercase;
             if (tags.contains(&*lower(&node.tag))
                 || !attributes.is_empty()
                     && node
@@ -3642,7 +3643,7 @@ pub(crate) fn compute_styles(
                     candidates.extend(&scoped.universal);
                     let classes = node.attrs.get("class").into_iter();
                     // Keys are lowercase. Only SVG names have uppercase letters, so HTML names need no copy.
-                    let lower = crate::dom::lowercase;
+                    let lower = crate::css::lowercase;
                     for (kind, name) in std::iter::once((2, lower(&node.tag)))
                         .chain(node.attrs.get("id").map(|id| (0, id.as_str().into())))
                         .chain(classes.flat_map(|c| {

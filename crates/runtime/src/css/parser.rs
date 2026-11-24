@@ -3,7 +3,7 @@ use super::{
     Declaration, Declarations, MediaQuery, Prop, Rule, Stylesheet, components, computed, supports,
     syntax_matches,
 };
-use crate::dom::{Selector, SelectorList};
+use crate::css::{Selector, SelectorList};
 use cssparser::{
     AtRuleParser, CowRcStr, DeclarationParser, Delimiter, ParseError, Parser, ParserState,
     QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser, StyleSheetParser, Token,

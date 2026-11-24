@@ -6,8 +6,8 @@ use super::Style;
 use super::expand;
 use super::fold;
 use super::supports;
-use crate::dom::Selector;
-use crate::dom::SelectorList;
+use crate::css::Selector;
+use crate::css::SelectorList;
 use std::rc::Rc;
 pub(crate) type Declared = (Prop, Rc<str>, bool, u16);
 

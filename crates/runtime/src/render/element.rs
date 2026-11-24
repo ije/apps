@@ -370,7 +370,7 @@ fn backdrop(doc: &Document, styles: &ComputedStyles, id: usize) -> Option<(usize
     })
 }
 
-const LOOK: u16 = crate::dom::HOVER | crate::dom::ACTIVE;
+const LOOK: u16 = crate::css::HOVER | crate::css::ACTIVE;
 
 fn boxless(doc: &Document, id: usize) -> Option<(usize, bool)> {
     std::iter::successors(doc.nodes[id].parent, |&parent| doc.nodes[parent].parent)
@@ -3727,8 +3727,8 @@ fn create(
                 plain,
                 checked: node.checked(),
                 disabled: node.attrs.contains_key("disabled"),
-                hover: node.state & crate::dom::HOVER != 0,
-                active: node.state & crate::dom::ACTIVE != 0,
+                hover: node.state & crate::css::HOVER != 0,
+                active: node.state & crate::css::ACTIVE != 0,
                 dark,
                 accent,
                 ink: style

@@ -307,7 +307,7 @@ impl Grid {
             host.pages
                 .get(&self.view.id)
                 .and_then(|page| page.doc.nodes.get(self.id))
-                .is_some_and(|node| node.state & crate::dom::FOCUS != 0)
+                .is_some_and(|node| node.state & crate::css::FOCUS != 0)
         });
         let scale = cx.window.scale_factor();
         if terminal

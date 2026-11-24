@@ -22,7 +22,7 @@ fn glass_variants_follow_native_support_and_cached_states() {
     let mut sheets = HashMap::new();
     let mut cache = StyleCache::default();
     for (width, hovered) in [(800., false), (800., true), (600., true), (800., false)] {
-        doc.nodes[button].state = if hovered { crate::dom::HOVER } else { 0 };
+        doc.nodes[button].state = if hovered { crate::css::HOVER } else { 0 };
         let cached = compute_styles(&doc, width, 600., None, &mut sheets, &mut cache, None);
         let fresh = compute_styles(
             &doc,
@@ -144,9 +144,9 @@ fn glass_tints_follow_theme_changes_and_color_utilities() {
         doc.nodes[host]
             .attrs
             .set("class", if dark { "theme dark" } else { "theme" });
-        doc.nodes[variant].state = if dark { crate::dom::HOVER } else { 0 };
+        doc.nodes[variant].state = if dark { crate::css::HOVER } else { 0 };
         let hoveronly = element(&doc, "#hoveronly");
-        doc.nodes[hoveronly].state = if dark { crate::dom::HOVER } else { 0 };
+        doc.nodes[hoveronly].state = if dark { crate::css::HOVER } else { 0 };
         let cached = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
         let fresh = compute_styles(
             &doc,
@@ -2106,7 +2106,7 @@ fn tailwind_state_variants_follow_interaction_states() {
     let mut sheets = HashMap::new();
     let mut cache = StyleCache::default();
     for hovered in [false, true, false] {
-        doc.nodes[card].state = if hovered { crate::dom::HOVER } else { 0 };
+        doc.nodes[card].state = if hovered { crate::css::HOVER } else { 0 };
         let cached = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
         let fresh = compute_styles(
             &doc,
@@ -2472,10 +2472,10 @@ fn passes_drop_unused_scopes_and_report_interaction_states() {
     let mut sheets = HashMap::new();
     let mut cache = StyleCache::default();
     for (source, states) in [
-        (".a:hover{color:red}", crate::dom::HOVER),
+        (".a:hover{color:red}", crate::css::HOVER),
         (
             ".a{color:blue} .b:active{&>i{color:red}}",
-            crate::dom::ACTIVE,
+            crate::css::ACTIVE,
         ),
         (".a{color:green}", 0),
     ] {
@@ -2489,7 +2489,7 @@ fn passes_drop_unused_scopes_and_report_interaction_states() {
                 .keys()
                 .all(|key| key.scope == cache.scopes[0].id)
         );
-        assert_eq!(cache.states & !crate::dom::FOCUS, states, "{source}");
+        assert_eq!(cache.states & !crate::css::FOCUS, states, "{source}");
     }
 }
 
@@ -4435,7 +4435,7 @@ fn hosts_take_pseudo_elements_from_their_shadow_tree() {
     doc.nodes[host].attrs.set("class", "on");
     let out = shadowed(&doc, &shadows, &mut cache, &mut last);
     assert_eq!(out.pseudos[&host][1].get(Prop::CONTENT), Some("'B'"));
-    doc.nodes[host].state = crate::dom::HOVER;
+    doc.nodes[host].state = crate::css::HOVER;
     let out = shadowed(&doc, &shadows, &mut cache, &mut last);
     assert_eq!(out.pseudos[&host][1].get(Prop::COLOR), Some("purple"));
     #[cfg(debug_assertions)]
@@ -4668,8 +4668,8 @@ fn slotted_and_part_rules_style_pseudo_elements() {
     assert_eq!(out.starting[&a].get(Prop::OPACITY), Some("0"));
     assert_eq!(out.starting[&p].get(Prop::OPACITY), Some("0.5"));
     assert!(!out.starting.contains_key(&b));
-    doc.nodes[a].state = crate::dom::HOVER;
-    doc.nodes[p].state = crate::dom::HOVER;
+    doc.nodes[a].state = crate::css::HOVER;
+    doc.nodes[p].state = crate::css::HOVER;
     doc.nodes[p].attrs.set("class", "x");
     let out = shadowed(&doc, &shadows, &mut cache, &mut last);
     assert_eq!(out.values[a].get(Prop::COLOR), Some("green"));
@@ -4727,7 +4727,7 @@ fn parts_take_pseudo_classes_names_and_their_own_trees_host_rules() {
         assert_eq!(get(t, Prop::MARGIN_BOTTOM).as_deref(), Some("9px"));
     };
     step(&doc, false, true);
-    doc.nodes[p].state = crate::dom::HOVER;
+    doc.nodes[p].state = crate::css::HOVER;
     step(&doc, true, true);
     doc.nodes[host].attrs.set("class", "off");
     step(&doc, true, false);
@@ -4840,7 +4840,7 @@ fn cousins_share_matches_only_with_the_same_ancestors() {
             groups.replace('R', rows)
         ));
         if let Some(hovered) = (0..doc.nodes.len()).find(|&id| doc.matches(id, "#hovered")) {
-            doc.nodes[hovered].state = crate::dom::HOVER;
+            doc.nodes[hovered].state = crate::css::HOVER;
         }
         let pass = |unshared: bool| {
             compute_styles(

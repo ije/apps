@@ -1,12 +1,15 @@
+use crate::css::ACTIVE;
+use crate::css::FOCUS;
+use crate::css::FOCUS_VISIBLE;
+use crate::css::FOCUS_WITHIN;
+use crate::css::HOVER;
+use crate::css::Selector;
 mod document;
 mod entities;
 mod selector;
 
 pub use document::{Document, Node, escape};
-pub(crate) use selector::{
-    ACTIVE, Dependency, FOCUS, FOCUS_VISIBLE, FOCUS_WITHIN, HOVER, Named, Selector, SelectorCache,
-    SelectorList, lowercase,
-};
+pub(crate) use selector::{Dependency, Named, SelectorCache};
 
 use crate::css;
 use crate::css::Prop;

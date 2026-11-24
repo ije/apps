@@ -9,6 +9,7 @@ mod media;
 mod parser;
 mod properties;
 mod resolved;
+mod selector;
 mod sheet;
 mod shorthand;
 mod specified;
@@ -27,6 +28,10 @@ pub(crate) use parser::{DROPPED, FONT_FORMATS, FONT_TECHS, invalid};
 pub use properties::Style;
 pub(crate) use properties::{LOGICAL, Prop, PropSet, Registry, Vars};
 pub(crate) use resolved::{percent_sum, percent_text, physical_name, resolved, shortest};
+pub(crate) use selector::{
+    ACTIVE, Ancestry, BLOOM, Bloom, FOCUS, FOCUS_VISIBLE, FOCUS_WITHIN, HOVER, Selector,
+    SelectorList, SimpleSelector, feature, lowercase,
+};
 pub(crate) use sheet::{
     Declaration, Declarations, Declared, Edit, MediaQuery, Rule, Stylesheet, declarations, declare,
 };
