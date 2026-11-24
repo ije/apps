@@ -1,7 +1,10 @@
-use crate::desktop::link::Target;
+pub(crate) mod link;
+pub(crate) mod window;
+
 use crate::dom::{Document, Node};
 use crate::jsc::Role;
 use anyhow::{Context, Result, bail, ensure};
+use link::Target;
 use serde_json::{Value, json};
 use std::{collections::HashMap, io::Write, path::PathBuf};
 
@@ -39,7 +42,7 @@ pub struct Page {
 
 #[derive(Default)]
 pub struct Host {
-    pub(crate) link: Option<crate::desktop::link::Link>,
+    pub(crate) link: Option<link::Link>,
     pub rust_main: bool,
     pub app_name: Option<String>,
     pub app_version: Option<String>,
@@ -89,7 +92,7 @@ impl Host {
     }
 
     pub(crate) fn command(&mut self, target: Target, command: Value) {
-        use crate::desktop::link::{ToMain, ToPage};
+        use link::{ToMain, ToPage};
         let Some(link) = &self.link else {
             return self.commands.push(command);
         };
@@ -1009,15 +1012,7 @@ impl Host {
                         Target::Main
                     }
                     "focus" => Target::Main,
-                    _ => {
-                        crate::desktop::validate(args)?;
-                        let id = args[1].as_u64().context("Expected a window id")?;
-                        if crate::desktop::link::native_action(args[0].as_str().unwrap_or("")) {
-                            Target::Main
-                        } else {
-                            Target::Window(id)
-                        }
-                    }
+                    _ => window::route(args)?,
                 };
                 self.command(target, json!({"op": op, "args": args}));
                 Ok(Value::Null)

@@ -3,7 +3,7 @@ use crate::style::Prop;
 use crate::{
     desktop::{
         Desktop,
-        link::{Tool, tool},
+        panel::{Tool, tool},
     },
     style,
 };
@@ -586,7 +586,7 @@ impl renderer::View for PageView {
                 };
                 if !args.is_null() {
                     self.host.borrow_mut().command(
-                        crate::desktop::link::Target::Window(id),
+                        crate::host::link::Target::Window(id),
                         serde_json::json!({"op":"window","args":args}),
                     );
                     self.drive(cx);

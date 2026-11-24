@@ -1,4 +1,12 @@
-use crate::{host::Host, jsc::JavaScriptCore, jsc::JsContext, jsc::payload::Payload};
+use super::panel::tool;
+use crate::{
+    host::{
+        Host,
+        link::{Link, PageQueue, ToMain, ToPage},
+    },
+    jsc::{JavaScriptCore, JsContext},
+    native::browser::Parent,
+};
 use anyhow::{Context, Result};
 use raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle, WindowHandle};
 use renderer::{Rect, WindowChange, WindowControl, WindowId, native::WindowEvent, point, px, size};
@@ -7,18 +15,13 @@ use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
     rc::{Rc, Weak},
-    sync::{
-        Arc, Mutex, OnceLock, PoisonError,
-        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
-        mpsc,
-    },
+    sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
 
-type Answer = mpsc::SyncSender<Result<Payload>>;
 type Job = Box<dyn FnOnce() + Send>;
-type Wake = Box<dyn Fn() + Send + Sync>;
 type Spawner = Box<dyn Fn(u64, Arc<PageQueue>)>;
+pub(crate) type Handler = Arc<dyn Fn(u64, Vec<Value>) -> Result<Value> + Send + Sync>;
 
 #[derive(Clone, Copy)]
 struct NativeHandle(RawWindowHandle);
@@ -30,343 +33,17 @@ impl HasWindowHandle for NativeHandle {
     }
 }
 
-pub(crate) enum ToMain {
-    Event(&'static str, Vec<String>, &'static str),
-    Bridge(Payload),
-    Sync(Payload, Answer),
-    Open(u64, Value, Answer),
-    Spawn(u64),
-    Window(u64, WindowId, WindowControl),
-    Native(Value),
-    OpenTools,
-}
-
-pub(crate) enum Target {
-    Window(u64),
-    All,
-    Main,
-}
-
-pub(crate) enum ToPage {
-    Window(u64, Value),
-    All(Value),
-    Bridge(u64, Payload),
-}
-
-#[derive(Default)]
-pub(crate) struct PageQueue {
-    queue: Mutex<VecDeque<ToPage>>,
-    wake: OnceLock<Wake>,
-}
-
-impl PageQueue {
-    fn push(&self, message: ToPage) {
-        self.queue
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push_back(message);
-        self.wake();
-    }
-
-    pub(crate) fn take(&self) -> VecDeque<ToPage> {
-        std::mem::take(&mut self.queue.lock().unwrap_or_else(PoisonError::into_inner))
-    }
-
-    pub(crate) fn pending(&self) -> bool {
-        !self
-            .queue
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_empty()
-    }
-
-    pub(crate) fn set_wake(&self, wake: impl Fn() + Send + Sync + 'static) {
-        let _ = self.wake.set(Box::new(wake));
-    }
-
-    pub(crate) fn wake(&self) {
-        if let Some(wake) = self.wake.get() {
-            wake();
-        }
-    }
-}
-
-struct Queues {
-    main: Mutex<VecDeque<ToMain>>,
-    page: Arc<PageQueue>,
-    // Hold this lock on pushes so set_per_window cannot leave messages in the old shared queue. None uses
-    // `page`.
-    pages: Mutex<Option<HashMap<u64, Arc<PageQueue>>>>,
-    created: AtomicU64,
-    wake_main: OnceLock<Wake>,
-    quit: AtomicBool,
-    exit_code: AtomicI32,
-}
-
-#[derive(Clone)]
-pub(crate) struct Link(Arc<Queues>);
-
-impl Link {
-    pub(crate) fn new() -> Self {
-        Self(Arc::new(Queues {
-            main: Mutex::default(),
-            page: Arc::default(),
-            pages: Mutex::default(),
-            created: AtomicU64::new(0),
-            wake_main: OnceLock::new(),
-            quit: AtomicBool::new(false),
-            exit_code: AtomicI32::new(0),
-        }))
-    }
-
-    pub(crate) fn set_wake_main(&self, wake: impl Fn() + Send + Sync + 'static) {
-        let _ = self.0.wake_main.set(Box::new(wake));
-    }
-
-    pub(crate) fn wake_main(&self) {
-        if let Some(wake) = self.0.wake_main.get() {
-            wake();
-        }
-    }
-
-    pub(crate) fn shared_queue(&self) -> Arc<PageQueue> {
-        self.0.page.clone()
-    }
-
-    fn pages(&self) -> std::sync::MutexGuard<'_, Option<HashMap<u64, Arc<PageQueue>>>> {
-        self.0.pages.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn queue_of(&self, window: u64) -> Option<Arc<PageQueue>> {
-        match &*self.pages() {
-            None => Some(self.0.page.clone()),
-            Some(pages) => pages.get(&window).cloned(),
-        }
-    }
-
-    pub(crate) fn set_per_window(&self) {
-        let mut pages = self.pages();
-        let created = self.0.created.load(Ordering::Acquire);
-        let mut queues = HashMap::<u64, Arc<PageQueue>>::new();
-        for message in self.0.page.take() {
-            if let ToPage::Window(id, _) | ToPage::Bridge(id, _) = message
-                && id <= created
-            {
-                queues.entry(id).or_default().push(message);
-            }
-        }
-        *pages = Some(queues);
-    }
-
-    pub(crate) fn create_window(&self, id: u64, command: Value) {
-        self.0.created.fetch_max(id, Ordering::AcqRel);
-        let options = &command["args"][2];
-        if let Some(parent) = options["parent"].as_u64() {
-            self.main(ToMain::Native(json!({"op":"window","args":[
-                "parent", id, parent, options["modal"] == true, options["show"] != false,
-            ]})));
-        }
-        match &mut *self.pages() {
-            Some(pages) => pages
-                .entry(id)
-                .or_default()
-                .push(ToPage::Window(id, command)),
-            None => self.0.page.push(ToPage::Window(id, command)),
-        }
-        self.main(ToMain::Spawn(id));
-    }
-
-    pub(crate) fn wake_page(&self, window: u64) {
-        match &*self.pages() {
-            None => self.0.page.wake(),
-            Some(pages) => pages
-                .get(&window)
-                .into_iter()
-                .for_each(|queue| queue.wake()),
-        }
-    }
-
-    pub(crate) fn wake_pages(&self) {
-        match &*self.pages() {
-            None => self.0.page.wake(),
-            Some(pages) => pages.values().for_each(|queue| queue.wake()),
-        }
-    }
-
-    pub(crate) fn main(&self, message: ToMain) {
-        self.0
-            .main
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push_back(message);
-        self.wake_main();
-    }
-
-    // Main calls the function with these JSON arguments.
-    pub(crate) fn call(&self, function: &'static str, args: Vec<String>, url: &'static str) {
-        self.main(ToMain::Event(function, args, url));
-    }
-
-    pub(crate) fn event(&self, name: &str, id: u64, data: Option<Value>, url: &'static str) {
-        let mut args = vec![Value::from(name).to_string(), id.to_string()];
-        args.extend(data.map(|data| data.to_string()));
-        self.call("__appsEvent", args, url);
-    }
-
-    pub(crate) fn page(&self, message: ToPage) {
-        let pages = self.pages();
-        let Some(pages) = &*pages else {
-            return self.0.page.push(message);
-        };
-        match message {
-            ToPage::All(command) => {
-                for queue in pages.values() {
-                    queue.push(ToPage::All(command.clone()));
-                }
-            }
-            ToPage::Window(id, _) | ToPage::Bridge(id, _) => match pages.get(&id) {
-                Some(queue) => queue.push(message),
-                None => debug_assert!(
-                    matches!(message, ToPage::Bridge(..))
-                        || id <= self.0.created.load(Ordering::Acquire),
-                    "No window {id} for a page command"
-                ),
-            },
-        }
-    }
-
-    pub(crate) fn main_pending(&self) -> bool {
-        !self
-            .0
-            .main
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_empty()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn native_commands(&self) -> Vec<Value> {
-        self.0
-            .main
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|message| match message {
-                ToMain::Native(command) => Some(command["args"].clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    pub(crate) fn quit(&self, code: i32) {
-        self.0.exit_code.store(code, Ordering::Release);
-        self.0.quit.store(true, Ordering::Release);
-        self.wake_main();
-    }
-
-    pub(crate) fn fail(&self) {
-        let _ = self
-            .0
-            .exit_code
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
-        self.0.quit.store(true, Ordering::Release);
-        self.wake_main();
-    }
-
-    pub(crate) fn quitting(&self) -> bool {
-        self.0.quit.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn exit_code(&self) -> i32 {
-        self.0.exit_code.load(Ordering::Acquire)
-    }
-
-    // Blocks on main. Main must not wait on a page this way, or both can deadlock.
-    pub(crate) fn ask(&self, message: impl FnOnce(Answer) -> ToMain) -> Result<Payload> {
-        let (answer, reply) = mpsc::sync_channel(1);
-        self.main(message(answer));
-        // Without a render thread, run main's work here to avoid waiting on this same thread.
-        if let Some(main) = MAIN.with_borrow(Weak::upgrade) {
-            main.receive_with(true);
-        }
-        reply.recv().context("The main process is unavailable")?
-    }
-}
-
 thread_local! { static MAIN: RefCell<Weak<Main>> = RefCell::default(); }
+
+fn receive_main() {
+    if let Some(main) = MAIN.with_borrow(Weak::upgrade) {
+        main.receive_with(true);
+    }
+}
 
 pub(crate) fn drive_main() {
     if let Some(main) = MAIN.with_borrow(Weak::upgrade) {
         main.drive();
-    }
-}
-
-pub(crate) fn native_action(action: &str) -> bool {
-    matches!(
-        action,
-        "close"
-            | "show"
-            | "title"
-            | "bounds"
-            | "center"
-            | "minimize"
-            | "maximize"
-            | "unmaximize"
-            | "restore"
-            | "fullscreen"
-            | "focus"
-            | "blur"
-            | "hide"
-            | "showInactive"
-            | "limits"
-            | "resizable"
-            | "minimizable"
-            | "maximizable"
-            | "closable"
-            | "movable"
-            | "alwaysOnTop"
-            | "buttons"
-            | "buttonPosition"
-            | "opacity"
-            | "shadow"
-            | "ignoreMouse"
-            | "workspaces"
-            | "contentProtection"
-            | "focusable"
-            | "edited"
-            | "aspectRatio"
-            | "parent"
-            | "input"
-            | "willChange"
-    )
-}
-
-pub(crate) enum Tool {
-    Hud,
-    DevTools,
-    Console,
-    Pick,
-}
-
-pub(crate) fn tool(key: &str, modifiers: renderer::Modifiers) -> Option<Tool> {
-    let primary = if cfg!(target_os = "macos") {
-        modifiers.command()
-    } else {
-        modifiers.ctrl()
-    };
-    // The modifiers of the developer tools shortcuts in Chrome.
-    let chrome =
-        (modifiers.command() && modifiers.alt()) || (modifiers.ctrl() && modifiers.shift());
-    if key == "f" && modifiers.alt() && primary {
-        Some(Tool::Hud)
-    } else if key == "f12" || (key == "i" && chrome) {
-        Some(Tool::DevTools)
-    } else if key == "j" && chrome {
-        Some(Tool::Console)
-    } else if key == "c" && (chrome || (modifiers.shift() && primary)) {
-        Some(Tool::Pick)
-    } else {
-        None
     }
 }
 
@@ -393,7 +70,7 @@ struct Window {
 pub(crate) struct Main {
     pub(crate) engine: Option<JsContext>,
     pub(crate) host: Rc<RefCell<Host>>,
-    pub(crate) handlers: RefCell<HashMap<String, super::app::Handler>>,
+    handlers: RefCell<HashMap<String, Handler>>,
     api: Rc<JavaScriptCore>,
     link: Link,
     pool: RefCell<Option<mpsc::Sender<Job>>>,
@@ -401,7 +78,7 @@ pub(crate) struct Main {
     spawner: RefCell<Option<Spawner>>,
     waiting: RefCell<Vec<Value>>,
     changed: RefCell<Vec<u64>>,
-    tools: RefCell<Option<super::devtools::DevTools>>,
+    tools: RefCell<Option<super::panel::DevTools>>,
     wake: Cell<Option<Instant>>,
     driving: Cell<bool>,
     ended: Cell<bool>,
@@ -433,7 +110,18 @@ impl Main {
             quiet: Cell::new(false),
         });
         MAIN.set(Rc::downgrade(&main));
+        crate::host::link::set_receive_main(receive_main);
         main
+    }
+
+    pub(crate) fn handle(&self, channel: &str, handler: Handler) -> Result<()> {
+        let mut handlers = self.handlers.borrow_mut();
+        anyhow::ensure!(
+            !handlers.contains_key(channel),
+            "Duplicate Rust handler {channel:?}"
+        );
+        handlers.insert(channel.to_owned(), handler);
+        Ok(())
     }
 
     pub(crate) fn link(&self) -> &Link {
@@ -454,14 +142,7 @@ impl Main {
 
     // Nested AppKit loops must defer script messages until the outer script returns. Other messages can run.
     pub(crate) fn receive_with(&self, scripts: bool) -> bool {
-        let messages = std::mem::take(
-            &mut *self
-                .link
-                .0
-                .main
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        );
+        let messages = self.link.take_main();
         let busy = !messages.is_empty();
         let mut later = VecDeque::new();
         for message in messages {
@@ -531,11 +212,10 @@ impl Main {
                 }
                 (ToMain::Native(command), _) => self.native(command),
                 (ToMain::OpenTools, Some(engine)) => {
-                    let tools =
-                        super::devtools::DevTools::new("Main", crate::jsc::Role::Main, None);
+                    let tools = super::panel::DevTools::new("Main", crate::jsc::Role::Main, None);
                     // The agent keeps the logged values from now on, so their rows can expand.
                     match tools.and_then(|tools| {
-                        super::devtools::agent(engine, "poll", &Value::Null)?;
+                        super::panel::agent(engine, "poll", &Value::Null)?;
                         Ok(tools)
                     }) {
                         Ok(tools) => *self.tools.borrow_mut() = Some(tools),
@@ -550,52 +230,27 @@ impl Main {
             }
         }
         if !later.is_empty() {
-            let mut queue = self
-                .link
-                .0
-                .main
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            later.append(&mut queue);
-            *queue = later;
+            self.link.defer_main(later);
         }
         // A nested loop can run this inside a host call of the main script, so attaches wait for that call.
         if let Ok(mut host) = self.host.try_borrow_mut() {
-            for (browser, parent) in host.browsers.take_attaches() {
-                let window = self
-                    .windows
-                    .borrow()
+            host.browsers.attach_pending(|parent| {
+                let windows = self.windows.borrow();
+                match windows
                     .get(&parent)
                     .and_then(|window| window.native.as_ref())
-                    .and_then(|(_, control)| control.raw_window_handle().ok());
-                match window {
-                    Some(window) => {
-                        if let Err(error) = host.browsers.attach(browser, &NativeHandle(window)) {
-                            eprintln!("apps: {error:#}");
-                        }
-                    }
-                    None if self.windows.borrow().contains_key(&parent)
-                        || self
-                            .link
-                            .0
-                            .main
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .iter()
-                            .any(
-                                |message| matches!(message, ToMain::Spawn(id) if *id == parent),
-                            ) =>
-                    {
-                        host.browsers.defer_attach(browser, parent)
-                    }
+                {
+                    Some((_, control)) => match control.raw_window_handle() {
+                        Ok(window) => Parent::Ready(NativeHandle(window)),
+                        Err(_) => Parent::Waiting,
+                    },
                     // The parent closed, so the attach would wait forever.
-                    None => {
-                        if let Err(error) = host.browsers.close_window(parent) {
-                            eprintln!("apps: {error:#}");
-                        }
+                    None if windows.contains_key(&parent) || self.link.spawning(parent) => {
+                        Parent::Waiting
                     }
+                    None => Parent::Gone,
                 }
-            }
+            });
         }
         if !scripts {
             return busy;
@@ -799,9 +454,7 @@ impl Main {
                 eprintln!("apps: {error:#}");
             }
             self.link.page(ToPage::Window(id, command));
-            if let Some(pages) = &mut *self.link.pages() {
-                pages.remove(&id);
-            }
+            self.link.forget_window(id);
             self.link.event("closed", id, None, "apps:closed");
             let mut windows = self.windows.borrow_mut();
             windows.remove(&id);
@@ -1034,14 +687,14 @@ impl Main {
                 tools.events(&logs)?;
             }
             if !logs.is_empty() {
-                super::mcp::logs(&logs);
-                if super::devtools::pages_open() {
+                crate::devtools::logs(&logs);
+                if super::panel::pages_open() {
                     self.link
                         .page(ToPage::All(json!({"op":"logs","args":logs})));
                 }
             }
         }
-        if super::mcp::poll_main() {
+        if crate::devtools::poll_main() {
             delay = delay.min(0);
         }
         if let Some(engine) = &self.engine {
@@ -1056,7 +709,7 @@ impl Main {
         }
         let closed = self.tools.borrow_mut().take_if(|tools| tools.is_closed());
         if let (Some(_), Some(engine)) = (closed, &self.engine) {
-            super::devtools::release(engine)?;
+            super::panel::release(engine)?;
         }
         if self.link.main_pending() {
             delay = delay.min(0);
@@ -1085,44 +738,6 @@ impl Main {
 mod tests {
     use super::*;
     use crate::jsc::Role;
-
-    #[test]
-    fn commands_route_by_target_before_and_after_windows_get_threads() {
-        let link = Link::new();
-        link.create_window(1, json!({"op":"window","args":["create",1,{}]}));
-        link.page(ToPage::Bridge(1, json!("early").into()));
-        link.page(ToPage::Bridge(9, json!("nobody").into()));
-        link.set_per_window();
-        link.create_window(2, json!({"op":"window","args":["create",2,{}]}));
-        let mut host = Host {
-            link: Some(link.clone()),
-            ..Host::default()
-        };
-        host.command(Target::All, json!({"op":"theme"}));
-        host.command(
-            Target::Window(2),
-            json!({"op":"window","args":["zoom",2,2]}),
-        );
-        let kinds = |id| {
-            link.queue_of(id)
-                .unwrap()
-                .take()
-                .into_iter()
-                .map(|message| match message {
-                    ToPage::Window(window, command) => format!("{window}:{}", command["args"][0]),
-                    ToPage::All(command) => format!("all:{}", command["op"]),
-                    ToPage::Bridge(window, payload) => format!("{window}:{}", payload.value),
-                })
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        assert_eq!(kinds(1), r#"1:"create",1:"early",all:"theme""#);
-        assert_eq!(kinds(2), r#"2:"create",all:"theme",2:"zoom""#);
-        assert!(link.queue_of(9).is_none());
-        host.call(Role::Main, "quit", json!([3])).unwrap();
-        assert!(link.quitting() && link.exit_code() == 3);
-        assert!(link.queue_of(1).unwrap().take().is_empty());
-    }
 
     #[test]
     fn events_call_main_with_their_values_and_drain_microtasks_after_each() {

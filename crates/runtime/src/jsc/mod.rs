@@ -878,8 +878,23 @@ unsafe extern "C" fn inspector_message(ctx: Ptr, message: *const c_char, length:
     INSPECTOR_MESSAGES.with_borrow_mut(|messages| messages.push((ctx as usize, message)));
 }
 
+type PauseHandler = unsafe extern "C" fn(usize, *mut bool);
+
+static PAUSE_HANDLER: std::sync::OnceLock<PauseHandler> = std::sync::OnceLock::new();
+
+// The handler runs while JSC is paused in a context. It must dispatch protocol messages until `done` is set.
+pub(crate) fn set_pause_handler(handler: PauseHandler) {
+    let _ = PAUSE_HANDLER.set(handler);
+}
+
 unsafe extern "C" fn inspector_pause(ctx: Ptr, done: *mut bool) {
-    crate::desktop::mcp::paused(ctx as usize, done);
+    match PAUSE_HANDLER.get() {
+        Some(handler) => unsafe { handler(ctx as usize, done) },
+        None => drop(inspect(
+            ctx as usize,
+            r#"{"id":0,"method":"Debugger.resume"}"#,
+        )),
+    }
 }
 
 unsafe extern "C" fn compile(
@@ -1416,7 +1431,7 @@ fn dispatch(
             let mut host = host.borrow_mut();
             host.sync_theme();
             host.command(
-                crate::desktop::link::Target::All,
+                crate::host::link::Target::All,
                 serde_json::json!({"op":"theme"}),
             );
         }
@@ -1491,7 +1506,7 @@ fn dispatch(
             (host.link.clone(), host.rust_main)
         };
         if let Some(link) = link {
-            use crate::desktop::link::{ToMain, ToPage};
+            use crate::host::link::{ToMain, ToPage};
             use payload::Payload;
             match (role, target) {
                 (Role::Main, Some(Role::Preload(id))) => {
@@ -1593,7 +1608,7 @@ fn dispatch(
         Ok(serde_json::Value::Null)
     } else if let (Role::Renderer(id), "dom.endComposition") = (role, op) {
         host.try_borrow_mut().context("Host is busy")?.command(
-            crate::desktop::link::Target::Main,
+            crate::host::link::Target::Main,
             serde_json::json!({"op":"window","args":["composition",id]}),
         );
         Ok(serde_json::Value::Null)
@@ -1684,7 +1699,7 @@ fn dispatch(
         let link = host.try_borrow().context("Host is busy")?.link.clone();
         Ok(link
             .context("The main process is unavailable")?
-            .ask(|answer| crate::desktop::link::ToMain::Open(id, args.clone(), answer))?
+            .ask(|answer| crate::host::link::ToMain::Open(id, args.clone(), answer))?
             .into_value())
     } else if let (Role::Renderer(_), "dom.clipboard") = (role, op) {
         // `execCommand` checks for user input before it calls this.

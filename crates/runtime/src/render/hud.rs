@@ -94,7 +94,7 @@ impl Drop for Hud {
 }
 
 fn load() -> Result<Library> {
-    let library = crate::desktop::devtools::load()?;
+    let library = crate::devtools::load()?;
     unsafe {
         Ok(Library {
             new: *library.get(b"apps_devtools_hud_new\0")?,

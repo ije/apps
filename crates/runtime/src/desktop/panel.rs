@@ -21,44 +21,13 @@ pub(crate) fn pages_open() -> bool {
     PAGE_TOOLS.load(Ordering::Relaxed) > 0
 }
 
-const ABI: u32 = 4;
-
-// The developer tools library, with the panel page, the MCP server and the FPS HUD. Built apps ship without
-// it. It is never unloaded: its threads run and the panel uses its texts until the app quits.
-pub(crate) fn load() -> Result<&'static libloading::Library> {
-    static LOADED: OnceLock<&libloading::Library> = OnceLock::new();
-    if let Some(library) = LOADED.get() {
-        return Ok(library);
-    }
-    let name = libloading::library_filename("apps_devtools");
-    let library = crate::library::load(
-        &name.to_string_lossy(),
-        "developer tools",
-        b"apps_devtools_abi\0",
-        ABI,
-    )
-    .context("Build the workspace with cargo build --workspace")?;
-    Ok(LOADED.get_or_init(|| library))
-}
-
-// The page of the panel, or the script that inspects a context for it.
-fn text(agent: bool) -> Result<&'static str> {
-    let panel: libloading::Symbol<extern "C" fn(bool, &mut usize) -> *const u8> =
-        unsafe { load()?.get(b"apps_devtools_panel\0")? };
-    let mut len = 0;
-    let text = panel(agent, &mut len);
-    Ok(std::str::from_utf8(unsafe {
-        std::slice::from_raw_parts(text, len)
-    })?)
-}
-
 // The page of the panel. Its style is Tailwind, compiled for the classes that the page has.
 fn page() -> Result<&'static str> {
     static PAGE: OnceLock<String> = OnceLock::new();
     if let Some(page) = PAGE.get() {
         return Ok(page);
     }
-    let html = text(false)?;
+    let html = crate::devtools::text(false)?;
     let (head, rest) = html.split_once("<style>").unwrap_or((html, ""));
     let (css, body) = rest.split_once("</style>").unwrap_or_default();
     let css = crate::style::tailwind(css, body);
@@ -205,7 +174,7 @@ impl DevTools {
             Some("Hud.toggle") => {
                 if let Some(page) = page {
                     host.borrow_mut().command(
-                        crate::desktop::link::Target::Window(page.id),
+                        crate::host::link::Target::Window(page.id),
                         json!({"op":"window","args":["hud",page.id]}),
                     );
                 }
@@ -280,10 +249,39 @@ impl Drop for DevTools {
     }
 }
 
+pub(crate) enum Tool {
+    Hud,
+    DevTools,
+    Console,
+    Pick,
+}
+
+pub(crate) fn tool(key: &str, modifiers: renderer::Modifiers) -> Option<Tool> {
+    let primary = if cfg!(target_os = "macos") {
+        modifiers.command()
+    } else {
+        modifiers.ctrl()
+    };
+    // The modifiers of the developer tools shortcuts in Chrome.
+    let chrome =
+        (modifiers.command() && modifiers.alt()) || (modifiers.ctrl() && modifiers.shift());
+    if key == "f" && modifiers.alt() && primary {
+        Some(Tool::Hud)
+    } else if key == "f12" || (key == "i" && chrome) {
+        Some(Tool::DevTools)
+    } else if key == "j" && chrome {
+        Some(Tool::Console)
+    } else if key == "c" && (chrome || (modifiers.shift() && primary)) {
+        Some(Tool::Pick)
+    } else {
+        None
+    }
+}
+
 // Calls the script that inspects a context from inside it. A new context gets the script on its first call.
 pub(crate) fn agent(engine: &JsContext, method: &str, params: &Value) -> Result<Value> {
     if engine.eval_page("typeof this.__appsAgent", "apps:devtools")? != "function" {
-        let source = format!("this.__appsAgent={}", text(true)?);
+        let source = format!("this.__appsAgent={}", crate::devtools::text(true)?);
         engine.eval_page(&source, "apps:devtools")?;
     }
     let call = format!(

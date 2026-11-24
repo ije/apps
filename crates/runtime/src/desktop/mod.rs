@@ -1,8 +1,9 @@
 pub mod app;
-pub(crate) mod devtools;
-pub(crate) mod link;
+pub(crate) mod main;
 pub(crate) mod mcp;
+pub(crate) mod panel;
 
+use crate::host::link::{Link, PageQueue, ToMain, ToPage};
 use crate::{
     dom::Document,
     host::{Host, Page},
@@ -12,7 +13,7 @@ use crate::{
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use bbtree::unsync::BBTreeMap;
-use link::{Link, Main, PageQueue, ToMain, ToPage};
+use main::Main;
 use renderer::{App, Rect, WindowChange, WindowId, WindowOptions, point, px, size};
 use std::{
     borrow::Cow,
@@ -52,7 +53,7 @@ pub struct Desktop {
     pub(crate) link: Link,
     queue: Arc<PageQueue>,
     pub(crate) views: HashMap<u64, View>,
-    devtools: HashMap<u64, devtools::DevTools>,
+    devtools: HashMap<u64, panel::DevTools>,
     main_logs: Vec<serde_json::Value>,
     files: Arc<HashMap<String, String>>,
     template: Arc<Template>,
@@ -722,7 +723,7 @@ impl Desktop {
                                 state.pixel_ratio = window.scale_factor();
                                 state.window = window.window_state();
                                 // Like Playwright, pages count as focused while the devtools MCP server runs, so tests in hidden windows get focus events.
-                                view.focused = window.is_active() || mcp::enabled();
+                                view.focused = window.is_active() || crate::devtools::enabled();
                             });
                         }
                         view.preload = None;
@@ -894,7 +895,7 @@ impl Desktop {
                                 .and_then(|view| view.handle)
                                 .and_then(|handle| {
                                     cx.update_window(handle, |window, _| {
-                                        devtools::DevTools::new(
+                                        panel::DevTools::new(
                                             &title,
                                             Role::Renderer(id),
                                             Some(window),
@@ -902,13 +903,13 @@ impl Desktop {
                                     })
                                 })
                                 .unwrap_or_else(|| {
-                                    devtools::DevTools::new(&title, Role::Renderer(id), None)
+                                    panel::DevTools::new(&title, Role::Renderer(id), None)
                                 })?;
                             self.devtools.insert(id, tools);
                         } else if !open {
                             self.devtools.remove(&id);
                             if let Some(engine) = view.and_then(|view| view.renderer.as_deref()) {
-                                devtools::release(engine)?;
+                                panel::release(engine)?;
                             }
                         }
                         if let Some(data) = view.and_then(|view| view.data.upgrade()) {
@@ -971,7 +972,7 @@ impl Desktop {
                         if args[2].is_number() {
                             let at = serde_json::json!({"x":args[2],"y":args[3]});
                             let node = crate::render::scripted(cx, None, || {
-                                devtools::agent(engine, "pick", &at)
+                                panel::agent(engine, "pick", &at)
                             })?
                             .as_u64()
                             .map(|node| node as usize);
@@ -1012,7 +1013,7 @@ impl Desktop {
                             crate::jsc::page_stopped(id);
                             self.ended = self.owner == Some(id);
                             if self.ended {
-                                mcp::uninstall();
+                                crate::devtools::uninstall();
                             }
                         }
                     }
@@ -1225,7 +1226,7 @@ impl Desktop {
                 let Some(view) = app.views.get_mut(&id) else {
                     continue;
                 };
-                let focused = focused || mcp::enabled();
+                let focused = focused || crate::devtools::enabled();
                 if view.focused != focused
                     && let Some(renderer) = &view.renderer
                 {
@@ -1312,7 +1313,7 @@ impl Desktop {
                     }
                     delay = delay.min(tools.poll(engine)?);
                     if tools.is_closed() {
-                        devtools::release(engine)?;
+                        panel::release(engine)?;
                     }
                     Ok(())
                 })?;
@@ -1324,7 +1325,7 @@ impl Desktop {
                 }
             }
             app.devtools.retain(|_, tools| !tools.is_closed());
-            let mcp = mcp::enabled();
+            let mcp = crate::devtools::enabled();
             if !app.devtools.is_empty() || mcp {
                 let logs: Vec<_> = app.host.borrow_mut().logs.drain(..).collect();
                 let main_logs = std::mem::take(&mut app.main_logs);
@@ -1332,7 +1333,7 @@ impl Desktop {
                     tools.events(&logs)?;
                     tools.events(&main_logs)?;
                 }
-                mcp::logs(&logs);
+                crate::devtools::logs(&logs);
             }
             // Page scripts that the tools run can force a layout, like other page tasks.
             let raw: *mut App = cx;
@@ -1574,7 +1575,7 @@ impl Desktop {
                     let pending = pending.clone();
                     renderer::native::post(Box::new(move || {
                         pending.store(false, Ordering::Release);
-                        link::drive_main();
+                        main::drive_main();
                     }));
                 }
             });
@@ -1738,7 +1739,7 @@ impl Desktop {
         crate::jsc::NATIVE.set(Some(|op, args| {
             renderer::native::sync(|| crate::native::native_call(op, args))
         }));
-        mcp::install(owner.unwrap_or(0));
+        crate::devtools::install(owner.unwrap_or(0));
         let runtime = Rc::new(RefCell::new(Self {
             api,
             host: Rc::new(RefCell::new(template.host(&link))),
@@ -1847,135 +1848,6 @@ fn shrink_when_quiet(runtime: Rc<RefCell<Desktop>>, cx: &mut App) {
     .detach();
 }
 
-pub(crate) fn validate(args: &serde_json::Value) -> Result<()> {
-    let number = |value: &serde_json::Value, low: f64, high: f64| {
-        value
-            .as_f64()
-            .is_some_and(|value| (low..=high).contains(&value))
-    };
-    let position = |value: &serde_json::Value| number(value, -1e6, 1e6);
-    let size = |value: &serde_json::Value| number(value, 1., 16384.);
-    match args[0].as_str().unwrap_or("") {
-        "create" => {
-            let options = &args[2];
-            for (key, value) in options.as_object().into_iter().flatten() {
-                let valid = match key.as_str() {
-                    "width" | "height" => size(value),
-                    "minWidth" | "minHeight" | "maxWidth" | "maxHeight" => {
-                        number(value, 0., 16384.)
-                    }
-                    "x" | "y" => position(value),
-                    "useContentSize" | "center" | "resizable" | "movable" | "minimizable"
-                    | "maximizable" | "closable" | "alwaysOnTop" | "fullscreen" | "show"
-                    | "frame" | "transparent" | "hasShadow" | "focusable" | "modal"
-                    | "skipTaskbar" => value.is_boolean(),
-                    "title" | "icon" => value.is_string(),
-                    "opacity" => number(value, 0., 1.),
-                    "parent" => value.is_u64(),
-                    "vibrancy" => number(value, 0., 22.),
-                    "visualEffectState" => number(value, 0., 2.),
-                    "titleBarStyle" => {
-                        matches!(value.as_str(), Some("default" | "hidden" | "hiddenInset"))
-                    }
-                    "backgroundColor" => value.as_str().and_then(crate::style::color).is_some(),
-                    "trafficLightPosition" => position(&value["x"]) && position(&value["y"]),
-                    _ => bail!("Unsupported BrowserWindow option: {key}"),
-                };
-                ensure!(valid, "Invalid BrowserWindow option {key}: {value}");
-            }
-        }
-        "bounds" => ensure!(
-            position(&args[2]) && position(&args[3]) && size(&args[4]) && size(&args[5]),
-            "Invalid window bounds"
-        ),
-        "limits" => ensure!(
-            (2..6).all(|index| number(&args[index], 0., 16384.)),
-            "Window size limits must be between 0 and 16384"
-        ),
-        "fullscreen" | "resizable" | "minimizable" | "maximizable" | "closable" | "movable"
-        | "shadow" | "contentProtection" | "focusable" | "edited" => {
-            ensure!(args[2].is_boolean(), "Expected a boolean")
-        }
-        "alwaysOnTop" => ensure!(
-            args[2]
-                .as_i64()
-                .is_some_and(|level| i32::try_from(level).is_ok()),
-            "Expected a window level"
-        ),
-        "ignoreMouse" | "workspaces" => ensure!(
-            args[2].is_boolean() && args[3].is_boolean(),
-            "Expected booleans"
-        ),
-        "opacity" => ensure!(number(&args[2], 0., 1.), "Opacity must be between 0 and 1"),
-        "aspectRatio" => ensure!(
-            number(&args[2], 0., 1e6)
-                && number(&args[3], 0., 16384.)
-                && number(&args[4], 0., 16384.),
-            "Invalid aspect ratio"
-        ),
-        "parent" => ensure!(
-            args[2].is_null() || args[2].as_u64().is_some_and(|parent| parent != args[1]),
-            "Invalid parent window"
-        ),
-        "vibrancy" => ensure!(
-            (args[2].is_null() || number(&args[2], 0., 22.)) && number(&args[3], 0., 2.),
-            "Invalid vibrancy"
-        ),
-        "background" => ensure!(
-            args[2].as_str().and_then(crate::style::color).is_some(),
-            "Invalid background color"
-        ),
-        "load" | "loadFile" => ensure!(
-            args[2].is_string() && (args[3].is_null() || args[3].is_u64()),
-            "Invalid page load"
-        ),
-        "execute" => ensure!(
-            args[2].is_u64() && args[3].is_string(),
-            "Invalid script request"
-        ),
-        "capture" => ensure!(args[2].is_u64(), "Invalid capture request"),
-        "zoom" => ensure!(
-            number(&args[2], 0.25, 5.),
-            "Zoom must be between 0.25 and 5"
-        ),
-        "insertCSS" => ensure!(
-            args[2].is_string() && args[3].is_string() && args[4].is_boolean(),
-            "Invalid CSS"
-        ),
-        "removeInsertedCSS" => ensure!(args[2].is_string(), "Invalid CSS key"),
-        "edit" => ensure!(
-            matches!(
-                args[2].as_str(),
-                Some(
-                    "undo"
-                        | "redo"
-                        | "cut"
-                        | "copy"
-                        | "paste"
-                        | "pasteAndMatchStyle"
-                        | "delete"
-                        | "selectAll"
-                        | "unselect"
-                        | "replace"
-                        | "insertText"
-                )
-            ) && (args[3].is_null() || args[3].is_string()),
-            "Invalid edit command"
-        ),
-        "input" | "willChange" => ensure!(args[2].is_boolean(), "Expected a boolean"),
-        "deliver" => ensure!(
-            matches!(
-                args[2].as_str(),
-                Some("webviewEvent" | "webviewReply" | "filesPicked" | "selectPicked")
-            ) && args[3].is_array(),
-            "Invalid page delivery"
-        ),
-        "executed" => bail!("Unsupported window action: executed"),
-        _ => {}
-    }
-    Ok(())
-}
-
 fn png(
     ([width, height], pixels): ([u32; 2], Vec<u8>),
     scale: f32,
@@ -2031,6 +1903,7 @@ fn png(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::link::Target;
 
     impl Desktop {
         fn js(&self) -> &JsContext {
@@ -2039,11 +1912,10 @@ mod tests {
 
         fn command(&self, command: serde_json::Value) {
             let args = &command["args"];
-            if link::native_action(args[0].as_str().unwrap()) {
-                self.link.main(ToMain::Native(command));
-            } else {
-                let id = args[1].as_u64().unwrap();
-                self.link.page(ToPage::Window(id, command));
+            match crate::host::window::route(args).unwrap() {
+                Target::Main => self.link.main(ToMain::Native(command)),
+                Target::Window(id) => self.link.page(ToPage::Window(id, command)),
+                Target::All => unreachable!(),
             }
         }
 
@@ -3000,7 +2872,7 @@ mod tests {
             serde_json::json!(["deliver", 1, "filesPicked", "[7]"]),
             serde_json::json!(["input", 1, 1]),
         ] {
-            assert!(validate(&args).is_err(), "{args}");
+            assert!(crate::host::window::route(&args).is_err(), "{args}");
         }
     }
 }

@@ -516,7 +516,7 @@ impl PageView {
                         _ => return,
                     };
                     view.host.borrow_mut().command(
-                        crate::desktop::link::Target::Window(view.id),
+                        crate::host::link::Target::Window(view.id),
                         serde_json::json!({"op":"window","args":["inspect",view.id,f32::from(at.x),f32::from(at.y),click]}),
                     );
                     let runtime = view.runtime.clone();
@@ -2643,12 +2643,12 @@ impl PageView {
                 origin: [0.; 2],
                 quiet: false,
             }))
-            .children(crate::desktop::mcp::profiling().then(|| {
+            .children(crate::devtools::profiling().then(|| {
                 renderer::canvas(
                     |_, _| (),
                     move |_, _, window| {
                         window.paint_volatile();
-                        crate::desktop::mcp::frame(id, started)
+                        crate::devtools::frame(id, started)
                     },
                 )
                 .absolute()
@@ -3132,8 +3132,8 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
     };
     animate(&view, dom, next, now, true, window, cx);
     drop(host);
-    if patched && !promoted && crate::desktop::mcp::profiling() {
-        crate::desktop::mcp::frame(view.id, started);
+    if patched && !promoted && crate::devtools::profiling() {
+        crate::devtools::frame(view.id, started);
     }
     if !patched || (!promoted || fresh) && !window.present() {
         window.refresh();

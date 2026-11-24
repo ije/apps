@@ -1,14 +1,10 @@
-use super::{
-    Desktop,
-    link::{Link, state_json},
-    png,
-};
-use crate::{jsc, jsc::Role};
-use anyhow::{Context as _, Result, anyhow, bail, ensure};
+use super::{Desktop, main::state_json, png};
+use crate::{host::link::Link, jsc, jsc::Role};
+use anyhow::{Context as _, Result, anyhow, bail};
 use renderer::{App, Button, Event, Key, Modifiers, WheelPhase, WindowId, point, px};
 use serde_json::{Value, json};
 use std::{
-    ffi::{CStr, c_char, c_void},
+    ffi::c_void,
     sync::{Arc, Mutex, OnceLock, PoisonError},
     time::Instant,
 };
@@ -26,17 +22,6 @@ struct Host {
     call: extern "C" fn(*mut c_void, *const u8, usize, *const u8, usize, *mut c_void, Done),
 }
 
-struct Library {
-    install: extern "C" fn(u64),
-    uninstall: extern "C" fn(),
-    poll: extern "C" fn(*mut c_void) -> bool,
-    paused: unsafe extern "C" fn(usize, *mut bool),
-    logs: unsafe extern "C" fn(*const u8, usize),
-    profiling: extern "C" fn() -> bool,
-    frame: extern "C" fn(u64, u64),
-}
-
-static LIBRARY: OnceLock<Library> = OnceLock::new();
 static LINK: OnceLock<Link> = OnceLock::new();
 static HOST: Host = Host {
     connect,
@@ -48,85 +33,13 @@ static HOST: Host = Host {
 };
 
 pub(crate) fn start(port: u16, link: Link) -> Result<()> {
-    let library = super::devtools::load()?;
-    let (start, library) = unsafe {
-        let start: extern "C" fn(u16, &'static Host) -> *const c_char =
-            *library.get(b"apps_devtools_mcp_start\0")?;
-        let functions = Library {
-            install: *library.get(b"apps_devtools_mcp_install\0")?,
-            uninstall: *library.get(b"apps_devtools_mcp_uninstall\0")?,
-            poll: *library.get(b"apps_devtools_mcp_poll\0")?,
-            paused: *library.get(b"apps_devtools_mcp_paused\0")?,
-            logs: *library.get(b"apps_devtools_mcp_logs\0")?,
-            profiling: *library.get(b"apps_devtools_mcp_profiling\0")?,
-            frame: *library.get(b"apps_devtools_mcp_frame\0")?,
-        };
-        (start, functions)
-    };
     let _ = LINK.set(link);
-    let error = start(port, &HOST);
-    ensure!(
-        error.is_null(),
-        "{}",
-        unsafe { CStr::from_ptr(error) }.to_string_lossy()
-    );
-    let _ = LIBRARY.set(library);
-    Ok(())
-}
-
-pub(crate) fn enabled() -> bool {
-    LIBRARY.get().is_some()
-}
-
-pub(crate) fn install(key: u64) {
-    if let Some(library) = LIBRARY.get() {
-        (library.install)(key);
-    }
-}
-
-pub(crate) fn uninstall() {
-    if let Some(library) = LIBRARY.get() {
-        (library.uninstall)();
-    }
-}
-
-pub(crate) fn poll_main() -> bool {
-    LIBRARY
-        .get()
-        .is_some_and(|library| (library.poll)(std::ptr::null_mut()))
+    crate::devtools::start(port, &HOST)
 }
 
 pub(crate) fn poll(desktop: &Desktop, cx: &mut App) -> bool {
     let mut app = (desktop, cx);
-    LIBRARY
-        .get()
-        .is_some_and(|library| (library.poll)((&raw mut app).cast()))
-}
-
-pub(crate) fn logs(logs: &[Value]) {
-    if let Some(library) = LIBRARY.get()
-        && let Ok(logs) = serde_json::to_vec(logs)
-    {
-        unsafe { (library.logs)(logs.as_ptr(), logs.len()) };
-    }
-}
-
-pub(crate) fn profiling() -> bool {
-    LIBRARY.get().is_some_and(|library| (library.profiling)())
-}
-
-pub(crate) fn frame(window: u64, started: Instant) {
-    if let Some(library) = LIBRARY.get() {
-        (library.frame)(window, started.elapsed().as_nanos() as u64);
-    }
-}
-
-// Runs while JSC is paused in `ctx`. It must dispatch protocol messages until `done` is set.
-pub(crate) fn paused(ctx: usize, done: *mut bool) {
-    match LIBRARY.get() {
-        Some(library) => unsafe { (library.paused)(ctx, done) },
-        None => drop(jsc::inspect(ctx, r#"{"id":0,"method":"Debugger.resume"}"#)),
-    }
+    crate::devtools::poll((&raw mut app).cast())
 }
 
 extern "C" fn connect(ctx: usize) -> i32 {

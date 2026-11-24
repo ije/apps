@@ -3,6 +3,12 @@ use apps_webview::Browser;
 use serde_json::Value;
 use std::collections::HashMap;
 
+pub enum Parent<W> {
+    Ready(W),
+    Waiting,
+    Gone,
+}
+
 #[derive(Default)]
 pub struct State {
     views: HashMap<u64, Browser>,
@@ -96,17 +102,28 @@ impl State {
         }
     }
 
-    pub fn take_attaches(&mut self) -> Vec<(u64, u64)> {
-        std::mem::take(&mut self.attaches)
-    }
-    pub fn defer_attach(&mut self, id: u64, window: u64) {
-        self.attaches.push((id, window));
-    }
-    pub fn attach(&self, id: u64, window: &impl raw_window_handle::HasWindowHandle) -> Result<()> {
-        self.views
-            .get(&id)
-            .context("Browser is destroyed")?
-            .attach(window)
+    // Attaches the views that wait for a window, or keeps them waiting, or drops them when the window is gone.
+    pub fn attach_pending<W: raw_window_handle::HasWindowHandle>(
+        &mut self,
+        parent: impl Fn(u64) -> Parent<W>,
+    ) {
+        for (id, window) in std::mem::take(&mut self.attaches) {
+            let result = match parent(window) {
+                Parent::Ready(handle) => self
+                    .views
+                    .get(&id)
+                    .context("Browser is destroyed")
+                    .and_then(|browser| browser.attach(&handle)),
+                Parent::Waiting => {
+                    self.attaches.push((id, window));
+                    Ok(())
+                }
+                Parent::Gone => self.close_window(window),
+            };
+            if let Err(error) = result {
+                eprintln!("apps: {error:#}");
+            }
+        }
     }
     pub fn close_window(&mut self, window: u64) -> Result<()> {
         for (&id, &parent) in &self.parents {

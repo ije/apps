@@ -25,6 +25,7 @@ static ALLOCATOR: malloc::Allocator = malloc::Allocator;
 
 pub mod bundle;
 pub mod desktop;
+mod devtools;
 pub mod dom;
 pub mod host;
 pub mod jsc;

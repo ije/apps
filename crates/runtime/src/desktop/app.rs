@@ -1,8 +1,6 @@
-use super::{
-    Desktop,
-    link::{Link, Main, ToPage},
-};
+use super::{Desktop, main::Main};
 use crate::bundle::Bundle;
+use crate::host::link::{Link, ToPage};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -11,8 +9,6 @@ use std::{
     rc::{Rc, Weak},
     sync::Arc,
 };
-
-pub(crate) type Handler = Arc<dyn Fn(u64, Vec<Value>) -> Result<Value> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct App(Rc<State>);
@@ -33,13 +29,7 @@ impl App {
         handler: impl Fn(u64, Vec<Value>) -> Result<Value> + Send + Sync + 'static,
     ) -> Result<()> {
         let main = self.0.main.upgrade().context("App has exited")?;
-        let mut handlers = main.handlers.borrow_mut();
-        ensure!(
-            !handlers.contains_key(channel),
-            "Duplicate Rust handler {channel:?}"
-        );
-        handlers.insert(channel.to_owned(), Arc::new(handler));
-        Ok(())
+        main.handle(channel, Arc::new(handler))
     }
 
     pub fn app_handle(&self) -> AppHandle {
