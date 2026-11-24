@@ -119,8 +119,8 @@ thread_local! {
 
 // Do not use cx or window inside f: reflow accesses them through pointers.
 pub(crate) fn scripted<R>(cx: &mut App, window: Option<&mut Window>, f: impl FnOnce() -> R) -> R {
-    crate::jsc::REFLOW.set(Some(reflow));
-    crate::jsc::CLIPBOARD.set(Some(clipboard));
+    crate::host::REFLOW.set(Some(reflow));
+    crate::host::CLIPBOARD.set(Some(clipboard));
     let previous = SCRIPTS.replace(Some((cx, window.map(|window| window as *mut Window))));
     let result = f();
     SCRIPTS.set(previous);
@@ -141,7 +141,7 @@ fn clipboard(text: Option<String>) -> Option<String> {
 }
 
 pub(crate) fn edit(
-    renderer: &crate::jsc::JsContext,
+    renderer: &crate::host::JsContext,
     app: Option<(&mut App, Option<&mut Window>)>,
     command: &str,
     text: &str,

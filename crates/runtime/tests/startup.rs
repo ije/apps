@@ -141,10 +141,7 @@ fn rejects_invalid_streamed_bundles_and_conflicting_arguments() {
 #[test]
 #[ignore = "release performance measurement"]
 fn engine_launch() {
-    use apps_runtime::{
-        jsc::Role,
-        jsc::{JavaScriptCore, JsContext},
-    };
+    use apps_runtime::{host::JsContext, jsc::JavaScriptCore, jsc::Role};
     let api = JavaScriptCore::load().unwrap();
     let host: std::rc::Rc<std::cell::RefCell<apps_runtime::host::Host>> = std::rc::Rc::default();
     let mut times = Vec::new();

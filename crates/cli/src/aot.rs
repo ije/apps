@@ -293,7 +293,7 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
             fs::write(directory.path().join(&name), bytes)?;
             wasm_paths.push(name);
         }
-        let engine = apps_runtime::jsc::JsContext::new(
+        let engine = apps_runtime::host::JsContext::new(
             apps_runtime::jsc::JavaScriptCore::load()?,
             Default::default(),
             apps_runtime::jsc::Role::Main,

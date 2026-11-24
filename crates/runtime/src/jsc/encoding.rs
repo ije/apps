@@ -1,4 +1,4 @@
-use super::{Callback, HOSTS, JavaScriptCore, Ptr};
+use super::{Callback, JavaScriptCore, Ptr};
 use anyhow::{Context, Result, bail, ensure};
 use std::ptr;
 
@@ -219,12 +219,7 @@ fn native(
     exception: *mut Ptr,
     action: impl FnOnce(&JavaScriptCore, &dyn Fn(usize) -> Ptr) -> Result<Ptr>,
 ) -> Ptr {
-    let Some(api) = HOSTS.with(|hosts| {
-        hosts
-            .borrow()
-            .get(&(ctx as usize))
-            .map(|binding| binding.api.clone())
-    }) else {
+    let Some(api) = super::engine(ctx) else {
         return ptr::null_mut();
     };
     let args = if count == 0 || args.is_null() {

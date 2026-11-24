@@ -7,9 +7,10 @@ use crate::bundle::Feature;
 use crate::host::link::{Link, PageQueue, ToMain, ToPage};
 use crate::{
     dom::Document,
+    host::JsContext,
     host::{Host, Page},
+    jsc::JavaScriptCore,
     jsc::Role,
-    jsc::{JavaScriptCore, JsContext},
     render::PageView,
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -676,7 +677,7 @@ impl Desktop {
                         .transpose();
                         let renderer =
                             JsContext::new(self.api.clone(), self.host.clone(), Role::Renderer(id));
-                        if (preload.is_err() || renderer.is_err()) && crate::jsc::stopping(id) {
+                        if (preload.is_err() || renderer.is_err()) && crate::host::stopping(id) {
                             continue;
                         }
                         let preload = preload?.map(Rc::new);
@@ -722,7 +723,7 @@ impl Desktop {
                             }
                         };
                         // Run one page script per __appsNext call so JSC drains microtasks between scripts.
-                        use crate::jsc::NEXT;
+                        use crate::host::NEXT;
                         for (mut source, url) in scripts
                             .iter()
                             .filter(|(kind, _)| *kind == "module")
@@ -950,7 +951,7 @@ impl Desktop {
                             host.backgrounds.remove(&id);
                             drop(host);
                             crate::web::storage::forget(id);
-                            crate::jsc::page_stopped(id);
+                            crate::host::page_stopped(id);
                             self.ended = self.owner == Some(id);
                             if self.ended {
                                 crate::devtools::uninstall();
@@ -1558,7 +1559,7 @@ impl Desktop {
                     }
                 };
                 if quit {
-                    crate::jsc::stop_pages();
+                    crate::host::stop_pages();
                 }
                 quit
             });
@@ -1606,8 +1607,8 @@ impl Desktop {
                     std::process::exit(exit.exit_code());
                 }
             });
-            crate::jsc::BEFORE_EXIT.set(Some(|| {
-                crate::jsc::stop_pages();
+            crate::host::BEFORE_EXIT.set(Some(|| {
+                crate::host::stop_pages();
                 renderer::native::before_exit();
             }));
             #[cfg(target_os = "macos")]
@@ -1675,7 +1676,7 @@ impl Desktop {
             main.wake();
             page.wake();
         });
-        crate::jsc::NATIVE.set(Some(|op, args| {
+        crate::host::NATIVE.set(Some(|op, args| {
             renderer::native::sync(|| crate::native::native_call(op, args))
         }));
         crate::devtools::install(owner.unwrap_or(0));
@@ -2697,7 +2698,7 @@ mod tests {
         let code =
             "__apps.app.whenReady().then(() => new __apps.BrowserWindow().loadFile('index.html'));";
         let desktop = app(code, &[], dir.path().to_path_buf());
-        crate::jsc::NATIVE.set(Some(|op, args| {
+        crate::host::NATIVE.set(Some(|op, args| {
             assert_eq!(op, "dialog.message");
             let buttons = args["buttons"].as_array().map_or(0, Vec::len);
             Ok(serde_json::json!({

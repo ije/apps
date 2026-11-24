@@ -1,7 +1,4 @@
-use apps_runtime::{
-    jsc::Role,
-    jsc::{JavaScriptCore, JsContext},
-};
+use apps_runtime::{host::JsContext, jsc::JavaScriptCore, jsc::Role};
 use std::{
     net::{TcpListener, TcpStream},
     rc::Rc,

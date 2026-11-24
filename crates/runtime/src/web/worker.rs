@@ -1,8 +1,9 @@
 use crate::{
     dom::Document,
+    host::JsContext,
     host::{Host, Page},
     jsc::Role,
-    jsc::{JavaScriptCore, JsContext, payload::Payload},
+    jsc::{JavaScriptCore, payload::Payload},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -330,7 +331,7 @@ impl State {
                         let _ = output.send(Event::Online);
                         wake.wake();
                         engine.eval_page(std::str::from_utf8(&source)?, "apps:worker")?;
-                        while engine.eval_page(crate::jsc::NEXT, "apps:worker")? == "true" {}
+                        while engine.eval_page(crate::host::NEXT, "apps:worker")? == "true" {}
                         while !cancelled.load(Ordering::Acquire) {
                             let delay = engine.tick()?;
                             if ends && delay != 0 && engine.call("__appsAlive", &[])? != "true" { break; }
