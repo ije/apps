@@ -30,7 +30,7 @@ use std::{
 
 pub use controls::control_size;
 pub(crate) use glass::available as supports_glass;
-pub(crate) use metal::{Present, prewarm};
+pub(crate) use metal::{Atlas, Present, prewarm};
 pub(crate) use threads::{
     AppThread, app_thread, ask, end_thread, native_after, native_post, native_sync, park_render,
     post, run_after, spawn_render,

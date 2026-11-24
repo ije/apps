@@ -13,7 +13,8 @@ use crate::{
     platform::{Callbacks, events},
 };
 use anyhow::Result;
-use gpu::{Atlas, Capture};
+pub(crate) use gpu::Atlas;
+use gpu::Capture;
 use raw_window_handle::RawWindowHandle;
 use rustc_hash::FxHashMap;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};

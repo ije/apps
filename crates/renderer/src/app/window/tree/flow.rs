@@ -866,7 +866,6 @@ impl LayoutTree<'_> {
                             .collect();
                         let floats = (!floats.is_empty()).then(|| Rc::from(floats));
                         let system = self.window.text_system().clone();
-                        *system.floats.borrow_mut() = floats;
                         self.active = true;
                         // Like a float, a full layout also when the parent only measures: lines beside floats can
                         // measure to another height than they lay out.
@@ -876,8 +875,7 @@ impl LayoutTree<'_> {
                             Some(within),
                             taffy::AvailableSpace::Definite(within),
                         );
-                        let output = self.compute(target, full, None);
-                        *system.floats.borrow_mut() = None;
+                        let output = system.beside(floats, || self.compute(target, full, None));
                         if leaf.is_some() {
                             if perform {
                                 let mut layout = Layout::with_order(0);
@@ -1501,7 +1499,7 @@ impl LayoutTree<'_> {
     pub(super) fn measure(&mut self, index: usize, inputs: LayoutInput) -> LayoutOutput {
         let scale = self.scale;
         let window = &mut *self.window;
-        let banded = window.text_system().floats.borrow().is_some();
+        let banded = window.text_system().floats().is_some();
         let Slot {
             stretched,
             measure,

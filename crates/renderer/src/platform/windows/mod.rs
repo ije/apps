@@ -21,6 +21,7 @@ use windows::Win32::System::{DataExchange::*, Memory::*, Ole::*, Threading::GetC
 use windows::Win32::UI::{HiDpi::*, WindowsAndMessaging::*};
 use windows::{Win32::System::LibraryLoader::GetModuleHandleW, core::w};
 
+pub(crate) use d3d::Atlas;
 pub(crate) use window::Window;
 pub use window::WindowControl;
 

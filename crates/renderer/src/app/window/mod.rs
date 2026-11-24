@@ -422,6 +422,8 @@ pub struct Window {
     platform: platform::Window,
     pub(super) view: Option<Box<dyn View>>,
     text_system: Rc<TextSystem>,
+    // The glyph and image tiles that paint takes, which the GPU backend of the window holds.
+    atlas: Rc<platform::Atlas>,
     scale_factor: f32,
     viewport_size: Size<Pixels>,
     zoom: f32,
@@ -506,11 +508,13 @@ impl Window {
         text_system: Rc<TextSystem>,
     ) -> Self {
         let (scale_factor, viewport_size) = (platform.scale_factor(), platform.content_size());
+        let atlas = platform.atlas().clone();
         Self {
             id,
             platform,
             view: None,
             text_system,
+            atlas,
             scale_factor,
             viewport_size,
             zoom: 1.,
@@ -681,7 +685,7 @@ impl Window {
 
     pub fn demote(&mut self) {
         #[cfg(target_os = "macos")]
-        self.platform.renderer.demote();
+        self.platform.demote();
         self.tracks.clear();
     }
 
@@ -763,7 +767,7 @@ impl Window {
                 })
                 .collect();
             let begin = start.elapsed().as_secs_f64();
-            self.platform.renderer.promote(
+            self.platform.promote(
                 key,
                 index,
                 region,
@@ -804,6 +808,9 @@ impl Window {
     pub(crate) fn draw_patch(&mut self) {
         if mem::take(&mut self.patch) {
             // The atlas and text caches keep their frame, so the tiles this scene reads stay.
+            #[cfg(target_os = "macos")]
+            let _ = self.platform.draw(&self.scene, None, false);
+            #[cfg(not(target_os = "macos"))]
             let _ = self.platform.draw(&self.scene, false);
             self.scene.drawn();
         }
@@ -932,7 +939,7 @@ impl Window {
     // A display tick at `at`. False when the GPU queue is full, and the tick draws no frame.
     #[cfg(target_os = "macos")]
     pub(crate) fn start_tick(&mut self, at: Instant) -> bool {
-        let free = !self.platform.renderer.take_congested();
+        let free = !self.platform.take_congested();
         self.frame_at = free.then_some(at);
         free
     }
@@ -945,15 +952,12 @@ impl Window {
     // A live resize presents the next frame inside the transaction of AppKit when `visible`.
     #[cfg(target_os = "macos")]
     pub(crate) fn live_resize(&mut self, visible: bool) {
-        self.platform
-            .renderer
-            .set_presents_with_transaction(visible);
+        self.platform.live_resize(visible);
     }
 
     #[cfg(target_os = "macos")]
     pub(crate) fn end_live_resize(&mut self) -> Option<platform::Present> {
-        self.platform.renderer.set_presents_with_transaction(false);
-        self.platform.renderer.take_present()
+        self.platform.end_live_resize()
     }
 
     pub(crate) fn wants_frame(&self) -> bool {
@@ -1090,7 +1094,7 @@ impl Window {
                 self.refresh();
             }
             self.caret_covered = covered;
-            self.platform.renderer.set_caret(
+            self.platform.set_caret(
                 caret
                     .filter(|caret| caret.overlay && !covered)
                     .map(|caret| (caret.bounds, caret.color, caret.since)),
@@ -1100,21 +1104,24 @@ impl Window {
                 .set_controls(controls, self.controls.1.clone());
         }
         let captures = mem::take(&mut self.captures);
-        #[cfg(target_os = "macos")]
-        self.platform
-            .set_drawable_size(self.native.0, self.native.1);
         self.scene.read_shots(&mut self.shots);
-        let fresh = self.platform.atlas().take_fresh();
+        let fresh = self.atlas.take_fresh();
         self.scene.diff(fresh.as_deref());
-        let mut frame = self.platform.draw(&self.scene, !captures.is_empty());
+        #[cfg(target_os = "macos")]
+        let (mut frame, snapshots) =
+            (self.platform).draw(&self.scene, Some(self.native), !captures.is_empty());
+        #[cfg(not(target_os = "macos"))]
+        let (mut frame, snapshots) = (
+            self.platform.draw(&self.scene, !captures.is_empty()),
+            self.platform.take_snapshots(),
+        );
         self.scene.drawn();
-        let snapshots = self.platform.take_snapshots();
         self.scene.keep_unread(&snapshots, &mut self.shots);
         if let Some(tree) = &mut self.tree {
             tree.bury();
         }
         self.text_system.end_frame();
-        self.platform.atlas().finish_frame(self.scene.texels());
+        self.atlas.finish_frame(self.scene.texels());
         let last = captures.len().wrapping_sub(1);
         for (index, capture) in captures.into_iter().enumerate() {
             let result = match &mut frame {

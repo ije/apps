@@ -172,7 +172,7 @@ pub(crate) struct Renderer {
     restacked: bool,
     committed: u64,
     completed: Arc<AtomicU64>,
-    pub snapshots: Vec<crate::Snapshot>,
+    snapshots: Vec<crate::Snapshot>,
     // Copies of the snapshot layers of the last frame that read them, for the next one with the same sizes.
     shot_copies: Vec<Texture>,
     // The drawable of the last frame, which a frame with a damage region copies.
@@ -476,6 +476,10 @@ impl Renderer {
         let congested = self.waits >= 2;
         self.waits = self.waits.min(1);
         congested
+    }
+
+    pub fn take_snapshots(&mut self) -> Vec<crate::Snapshot> {
+        mem::take(&mut self.snapshots)
     }
 
     pub fn take_present(&mut self) -> Option<Present> {

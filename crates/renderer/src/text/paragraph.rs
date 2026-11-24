@@ -126,7 +126,7 @@ impl TextState {
         system: &TextSystem,
         scale: f32,
     ) -> (Size<Pixels>, Option<[Pixels; 2]>) {
-        let floats = system.floats.borrow().clone();
+        let floats = system.floats();
         self.measure_beside(known, available, system, scale, floats)
     }
 

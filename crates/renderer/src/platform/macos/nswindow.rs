@@ -537,11 +537,8 @@ impl AppsWindow {
                 Some(number as u32)
             }
         });
-        let mut pacer = lock(&self.ivars().pacer);
-        pacer.visible = self.on_screen();
         // AppKit can report no screen while displays change.
-        pacer.display = display;
-        pacer.sync();
+        lock(&self.ivars().pacer).place(self.on_screen(), display);
     }
 
     pub fn update_size(&self) {

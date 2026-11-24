@@ -22,7 +22,7 @@ impl Window {
     // Whether the next paint can copy spans of the last one.
     pub(crate) fn copies(&self) -> bool {
         !self.repaint
-            && !self.platform.atlas().evicted()
+            && !self.atlas.evicted()
             && self.text_system.generation() == self.generation
             && self.live.pass.is_some()
             && self.scene.last_pass == self.live.pass
@@ -32,7 +32,7 @@ impl Window {
     pub(crate) fn begin_paint(&mut self) -> (u32, Option<u32>) {
         self.paints = self.paints.wrapping_add(1);
         let generation = self.text_system.generation();
-        let atlas = self.platform.atlas();
+        let atlas = &self.atlas;
         let evicted = (self.scene).begin_paint(self.paints, |removed| atlas.take_removed(removed));
         let fresh = mem::take(&mut self.repaint) || evicted || generation != self.generation;
         self.generation = generation;

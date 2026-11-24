@@ -617,8 +617,7 @@ impl Window {
         };
         let text = &self.text_system;
         let Some((tile, shown)) =
-            self.platform
-                .atlas()
+            self.atlas
                 .get_or_insert_with(&TileKey::Glyph(params), &mut || {
                     Ok(text
                         .raster(&params, crate::gpu::atlas::MAX_GLYPH_SIDE)?
@@ -657,8 +656,7 @@ impl Window {
     }
 
     fn image_tile(&self, image: &RenderImage) -> Option<crate::gpu::atlas::Tile> {
-        self.platform
-            .atlas()
+        self.atlas
             .get_or_insert_with(&TileKey::Image(image.id), &mut || {
                 let size = image.size();
                 Ok(Some((
@@ -728,6 +726,6 @@ impl Window {
     }
 
     pub fn release_image(&mut self, image: Arc<RenderImage>) {
-        self.platform.atlas().remove(&TileKey::Image(image.id));
+        self.atlas.remove(&TileKey::Image(image.id));
     }
 }

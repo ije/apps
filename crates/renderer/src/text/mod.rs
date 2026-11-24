@@ -394,7 +394,7 @@ pub struct TextSystem {
     generation: Cell<usize>,
     spans: Cell<Vec<Span>>,
     /// The floats beside the text box that layout measures now, `[top, bottom, left, right]` in its content box.
-    pub floats: RefCell<Option<Rc<[[f32; 4]]>>>,
+    floats: RefCell<Option<Rc<[[f32; 4]]>>>,
 }
 
 impl std::ops::Deref for TextSystem {
@@ -425,6 +425,19 @@ impl TextSystem {
             self.cache.clear();
         }
         &self.cache
+    }
+
+    /// Text that `f` measures or lays out runs beside `floats`, `[top, bottom, left, right]` in its content box.
+    pub fn beside<R>(&self, floats: Option<Rc<[[f32; 4]]>>, f: impl FnOnce() -> R) -> R {
+        *self.floats.borrow_mut() = floats;
+        let result = f();
+        *self.floats.borrow_mut() = None;
+        result
+    }
+
+    /// The floats of `beside`.
+    pub fn floats(&self) -> Option<Rc<[[f32; 4]]>> {
+        self.floats.borrow().clone()
     }
 
     pub(crate) fn end_frame(&self) {

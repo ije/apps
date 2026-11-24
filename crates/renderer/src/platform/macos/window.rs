@@ -146,7 +146,7 @@ type Controls = (Vec<crate::NativeControl>, Option<crate::ControlSink>);
 pub(crate) struct Window {
     control: WindowControl,
     callbacks: Callbacks,
-    pub(crate) renderer: Renderer,
+    renderer: Renderer,
     pacer: Shared<Pacer>,
     idle: u32,
     quiet: Option<crate::Timer>,
@@ -227,13 +227,11 @@ impl Window {
 
     pub fn request_frame(&mut self) {
         self.idle = 0;
-        let mut pacer = lock(&self.pacer);
-        pacer.wants = true;
-        pacer.sync();
+        lock(&self.pacer).want(true);
     }
 
     pub fn display(&self) -> Option<u32> {
-        lock(&self.pacer).display
+        lock(&self.pacer).display()
     }
 
     pub fn force_frame(&self) {
@@ -249,11 +247,7 @@ impl Window {
         if self.idle < LINGER {
             return;
         }
-        {
-            let mut pacer = lock(&self.pacer);
-            pacer.wants = false;
-            pacer.sync();
-        }
+        lock(&self.pacer).want(false);
         self.renderer.trim();
         let callbacks = self.callbacks;
         let release = crate::platform::timer(QUIET, move || events().release(callbacks));
@@ -264,17 +258,59 @@ impl Window {
         self.renderer.release(scene);
     }
 
-    pub(crate) fn set_drawable_size(&mut self, size: Size<Pixels>, scale: f32) {
-        let pixels = size.to_device(scale);
-        let pixels = CGSize::new(pixels.width.into(), pixels.height.into());
-        self.renderer.set_drawable_size(pixels);
+    // A layer of the scene moves to Core Animation, which animates it without frames.
+    pub(crate) fn promote(
+        &mut self,
+        key: u64,
+        index: usize,
+        region: [i32; 4],
+        timing: [f64; 3],
+        opacities: &[f32],
+        transforms: &[[f64; 16]],
+    ) {
+        self.renderer
+            .promote(key, index, region, timing, opacities, transforms);
     }
 
-    pub fn take_snapshots(&mut self) -> Vec<crate::Snapshot> {
-        std::mem::take(&mut self.renderer.snapshots)
+    pub(crate) fn demote(&mut self) {
+        self.renderer.demote();
     }
 
-    pub fn draw(&mut self, scene: &Scene, capture: bool) -> Option<Result<([u32; 2], Vec<u8>)>> {
+    pub(crate) fn set_caret(
+        &mut self,
+        caret: Option<(crate::Rect<f32>, crate::Color, std::time::Instant)>,
+    ) {
+        self.renderer.set_caret(caret);
+    }
+
+    pub(crate) fn take_congested(&mut self) -> bool {
+        self.renderer.take_congested()
+    }
+
+    // The frames drawn until `end_live_resize` present inside the transaction of a live resize when `visible`.
+    pub(crate) fn live_resize(&mut self, visible: bool) {
+        self.renderer.set_presents_with_transaction(visible);
+    }
+
+    pub(crate) fn end_live_resize(&mut self) -> Option<Present> {
+        self.renderer.set_presents_with_transaction(false);
+        self.renderer.take_present()
+    }
+
+    // Draws `scene`, at a new `size` in points and scale when given, and returns the capture and the snapshot layers
+    // that it read.
+    #[allow(clippy::type_complexity)]
+    pub fn draw(
+        &mut self,
+        scene: &Scene,
+        size: Option<(Size<Pixels>, f32)>,
+        capture: bool,
+    ) -> (Option<Result<([u32; 2], Vec<u8>)>>, Vec<crate::Snapshot>) {
+        if let Some((size, scale)) = size {
+            let pixels = size.to_device(scale);
+            let pixels = CGSize::new(pixels.width.into(), pixels.height.into());
+            self.renderer.set_drawable_size(pixels);
+        }
         self.control.native.wait();
         self.quiet = None;
         let renderer = &mut self.renderer;
@@ -295,7 +331,7 @@ impl Window {
                 drop(present);
             });
         }
-        frame
+        (frame, self.renderer.take_snapshots())
     }
 
     pub fn set_controls(

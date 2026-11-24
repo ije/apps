@@ -154,9 +154,9 @@ impl Pulse {
 pub(crate) struct Pacer {
     pulse: Arc<Pulse>,
     on: Option<&'static Screen>,
-    pub wants: bool,
-    pub visible: bool,
-    pub display: Option<u32>,
+    wants: bool,
+    visible: bool,
+    display: Option<u32>,
     closed: bool,
 }
 
@@ -175,12 +175,28 @@ impl Pacer {
         }))
     }
 
+    // Whether the window wants display ticks.
+    pub fn want(&mut self, on: bool) {
+        self.wants = on;
+        self.sync();
+    }
+
+    // Where the window is: shown on a screen, and the display that it is on.
+    pub fn place(&mut self, visible: bool, display: Option<u32>) {
+        (self.visible, self.display) = (visible, display);
+        self.sync();
+    }
+
+    pub fn display(&self) -> Option<u32> {
+        self.display
+    }
+
     pub fn close(&mut self) {
         self.closed = true;
         self.sync();
     }
 
-    pub fn sync(&mut self) {
+    fn sync(&mut self) {
         let target = self
             .display
             .filter(|_| self.wants && self.visible && !self.closed);

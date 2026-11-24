@@ -783,12 +783,8 @@ impl From<InlineText> for renderer::Node {
                         min_content,
                         room.filter(|_| style.text_indent_percent != 0.).or(width),
                     );
-                    let floats = window
-                        .text_system()
-                        .floats
-                        .borrow()
-                        .clone()
-                        .filter(|_| room.is_some() && !min_content);
+                    let floats =
+                        (window.text_system().floats()).filter(|_| room.is_some() && !min_content);
                     // Only a layout with a width keeps its floats for prepaint. The cache holds results with them.
                     if room.is_some() && *kept_floats.borrow() != floats {
                         cached.set(None);
@@ -1008,18 +1004,10 @@ impl renderer::Hooks for InlineText {
             let placed = renderer::Rect::new(exact.origin, bounds.size);
             let floats = cx_floats;
             let system = window.text_system().clone();
-            *system.floats.borrow_mut() = floats;
             let scale = window.scale_factor();
-            let layout = renderer::Paragraph::shape(
-                text,
-                runs.clone(),
-                &style,
-                wrap,
-                placed,
-                &system,
-                scale,
-            );
-            *system.floats.borrow_mut() = None;
+            let layout = system.beside(floats, || {
+                renderer::Paragraph::shape(text, runs.clone(), &style, wrap, placed, &system, scale)
+            });
             *self.shaped.borrow_mut() = Some((layout, runs));
         }
         let shaped = self.shaped.borrow();
