@@ -69,8 +69,8 @@ struct Window {
 }
 
 pub(crate) struct Main {
-    pub(crate) engine: Option<JsContext>,
-    pub(crate) host: Rc<RefCell<Host>>,
+    engine: Option<JsContext>,
+    host: Rc<RefCell<Host>>,
     handlers: RefCell<HashMap<String, Handler>>,
     api: Rc<JavaScriptCore>,
     link: Link,
@@ -123,12 +123,84 @@ impl Main {
         Ok(())
     }
 
-    pub(crate) fn link(&self) -> &Link {
-        &self.link
+    // Starts each window on a page thread of its own.
+    pub(crate) fn thread_per_window(&self, spawner: Spawner) {
+        self.link.set_per_window();
+        *self.spawner.borrow_mut() = Some(spawner);
     }
 
-    pub(crate) fn set_spawner(&self, spawner: Spawner) {
-        *self.spawner.borrow_mut() = Some(spawner);
+    pub(crate) fn ready(&self) -> Result<()> {
+        if self.engine.is_some() {
+            self.eval("__appsEvent('ready')", "apps:ready")?;
+        }
+        Ok(())
+    }
+
+    // Runs the due timers and tasks of the main script, for a check without windows.
+    pub(crate) fn tick(&self) -> Result<()> {
+        if let Some(engine) = &self.engine {
+            engine.tick()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pending(&self) -> Result<bool> {
+        Ok(match &self.engine {
+            Some(engine) => engine.eval("__appsPending()", "apps:startup")? == "true",
+            None => false,
+        })
+    }
+
+    // An app event, like `activate` or `open-url`.
+    pub(crate) fn event(&self, name: &str, data: Value, url: &'static str) {
+        self.link.event(name, 0, Some(data), url);
+    }
+
+    // Asks the main script with `before-quit`, which can prevent it.
+    pub(crate) fn should_quit(self: &Rc<Self>) -> bool {
+        if self.engine.is_none() || self.link.quitting() {
+            return true;
+        }
+        match self.eval("__appsEvent('before-quit')", "apps:quit") {
+            Err(error) => {
+                eprintln!("apps: {error}");
+                true
+            }
+            Ok(_) => {
+                self.drive();
+                self.link.quitting()
+            }
+        }
+    }
+
+    // Starts the command that `app.relaunch()` asked for, after this process ends.
+    pub(crate) fn relaunch(&self) {
+        if let Ok(host) = self.host.try_borrow()
+            && let Some(command) = &host.relaunch
+        {
+            #[cfg(unix)]
+            let _ = std::os::unix::process::CommandExt::process_group(
+                std::process::Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        r#"while kill -0 "$0" 2>/dev/null; do sleep 0.1; done; exec "$@""#,
+                        &std::process::id().to_string(),
+                    ])
+                    .args(command),
+                0,
+            )
+            .stdin(std::process::Stdio::null())
+            .spawn();
+            #[cfg(not(unix))]
+            let _ = std::process::Command::new(&command[0])
+                .args(&command[1..])
+                .spawn();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn engine(&self) -> Option<&JsContext> {
+        self.engine.as_ref()
     }
 
     pub(crate) fn first_window(&self) -> Option<u64> {

@@ -926,26 +926,17 @@ impl Desktop {
 
     pub fn check(mut self) -> Result<i32> {
         let main = self.main.clone().context("Missing the main side")?;
-        if let Some(main) = &main.engine {
-            main.eval("__appsEvent('ready')", "apps:ready")?;
-        }
+        main.ready()?;
         self.pump(None, None)?;
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
-            for engine in main
-                .engine
-                .iter()
-                .chain(self.views.values().flat_map(View::engines))
-            {
+            main.tick()?;
+            for engine in self.views.values().flat_map(View::engines) {
                 engine.tick()?;
             }
             self.pump(None, None)?;
-            let mut pending = false;
-            for engine in main
-                .engine
-                .iter()
-                .chain(self.views.values().flat_map(View::engines))
-            {
+            let mut pending = main.pending()?;
+            for engine in self.views.values().flat_map(View::engines) {
                 pending |= engine.eval("__appsPending()", "apps:startup")? == "true";
             }
             pending |= self.queue.pending() || self.link.main_pending();
@@ -993,9 +984,8 @@ impl Desktop {
             mcp::start(port, link.clone())?;
         }
         if renderer::THREAD_PER_APP {
-            link.set_per_window();
             let (template, link) = (template.clone(), link.clone());
-            main.set_spawner(Box::new(move |id, queue| {
+            main.thread_per_window(Box::new(move |id, queue| {
                 let (template, link) = (template.clone(), link.clone());
                 renderer::spawn(move |cx| Self::start(template, link, queue, Some(id), cx));
             }));
@@ -1029,27 +1019,12 @@ impl Desktop {
             });
             let reopen = main.clone();
             renderer::native::on_reopen(move |visible| {
-                reopen
-                    .link()
-                    .event("activate", 0, Some(visible.into()), "apps:activate");
+                reopen.event("activate", visible.into(), "apps:activate");
                 reopen.drive();
             });
             let terminate = main.clone();
             renderer::native::on_should_quit(move || {
-                let quit = if terminate.engine.is_none() || terminate.link().quitting() {
-                    true
-                } else {
-                    match terminate.eval("__appsEvent('before-quit')", "apps:quit") {
-                        Err(error) => {
-                            eprintln!("apps: {error}");
-                            true
-                        }
-                        Ok(_) => {
-                            terminate.drive();
-                            terminate.link().quitting()
-                        }
-                    }
-                };
+                let quit = terminate.should_quit();
                 if quit {
                     crate::host::stop_pages();
                 }
@@ -1066,34 +1041,14 @@ impl Desktop {
                         Some(path) => ("open-file", serde_json::json!(path)),
                         None => ("open-url", serde_json::json!(url)),
                     };
-                    opened.link().event(name, 0, Some(data), "apps:open");
+                    opened.event(name, data, "apps:open");
                 }
                 opened.drive();
             });
-            let host = main.host.clone();
+            let relaunch = main.clone();
             let exit = link.clone();
             renderer::native::on_quit(move || {
-                if let Ok(host) = host.try_borrow()
-                    && let Some(command) = &host.relaunch
-                {
-                    #[cfg(unix)]
-                    let _ = std::os::unix::process::CommandExt::process_group(
-                        std::process::Command::new("/bin/sh")
-                            .args([
-                                "-c",
-                                r#"while kill -0 "$0" 2>/dev/null; do sleep 0.1; done; exec "$@""#,
-                                &std::process::id().to_string(),
-                            ])
-                            .args(command),
-                        0,
-                    )
-                    .stdin(std::process::Stdio::null())
-                    .spawn();
-                    #[cfg(not(unix))]
-                    let _ = std::process::Command::new(&command[0])
-                        .args(&command[1..])
-                        .spawn();
-                }
+                relaunch.relaunch();
                 // AppKit exits with 0 after this hook, so a failure code must exit here.
                 if exit.exit_code() != 0 {
                     std::process::exit(exit.exit_code());
@@ -1105,9 +1060,7 @@ impl Desktop {
             }));
             #[cfg(target_os = "macos")]
             crate::native::observe();
-            if main.engine.is_some()
-                && let Err(error) = main.eval("__appsEvent('ready')", "apps:ready")
-            {
+            if let Err(error) = main.ready() {
                 eprintln!("apps: {error}");
                 link.fail();
             }

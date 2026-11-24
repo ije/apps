@@ -3,7 +3,7 @@ use crate::host::link::Target;
 
 impl Desktop {
     fn js(&self) -> &JsContext {
-        self.main.as_ref().unwrap().engine.as_ref().unwrap()
+        self.main.as_ref().unwrap().engine().unwrap()
     }
 
     fn command(&self, command: serde_json::Value) {

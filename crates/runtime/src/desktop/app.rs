@@ -200,7 +200,7 @@ mod tests {
             assert!(window.load_file("missing.html").is_err());
             window.load_file("index.html")
         })?;
-        assert!(desktop.main.as_ref().unwrap().engine.is_none());
+        assert!(desktop.main.as_ref().unwrap().engine().is_none());
         desktop.pump(None, None)?;
         let handle = handle.unwrap();
         std::thread::spawn(move || {
