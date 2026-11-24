@@ -31,6 +31,8 @@ pub(crate) struct Styles {
     // The values in `checked` by address. Each holds its value, so no other value takes the address.
     pub(crate) checked_values: FxHashMap<(usize, u8, Prop), Rc<str>>,
     pub(crate) motion: Motion,
+    // The timer that wakes the page for the next animation frame.
+    pub(crate) wake: Option<(std::time::Instant, renderer::Timer)>,
     pub(crate) animated: HashMap<usize, Style>,
     pub(crate) animating: HashMap<usize, Rc<Style>>,
     pub(crate) animating_pseudos: HashMap<usize, Rc<[Style; 2]>>,

@@ -269,7 +269,11 @@ fn animated_styles_drop_values_that_stop_animating() {
     let start = Instant::now();
     let mut motion = Motion::default();
     let mut style = |seconds: f64| {
-        let (animated, _) = motion.update(
+        let Frame {
+            animated,
+            pseudos: _,
+            ..
+        } = motion.update(
             &doc,
             &styles,
             &visible,
@@ -301,7 +305,7 @@ fn transitions_start_reverse_and_finish() {
     let mut motion = Motion::default();
     let mut events = Vec::new();
     let mut update = |motion: &mut Motion, doc: &Document, styles: &ComputedStyles, time: f64| {
-        let (animated, next) = motion.update(
+        let Frame { animated, next, .. } = motion.update(
             doc,
             styles,
             &visible,
@@ -368,7 +372,7 @@ fn registered_custom_properties_animate_and_transition() {
         &mut Vec::new(),
     );
     let at = start + Duration::from_millis(500);
-    motion.update(
+    let frame = motion.update(
         &doc,
         &styles,
         &visible,
@@ -378,7 +382,7 @@ fn registered_custom_properties_animate_and_transition() {
         false,
         &mut Vec::new(),
     );
-    assert_eq!(motion.custom[&div].get(Prop::new("--w")), Some("50px"));
+    assert_eq!(frame.custom[&div].get(Prop::new("--w")), Some("50px"));
     let restyle = |doc: &Document, animated: HashMap<usize, Style>| {
         super::super::compute_styles(
             doc,
@@ -393,7 +397,7 @@ fn registered_custom_properties_animate_and_transition() {
             }),
         )
     };
-    let restyled = restyle(&doc, motion.custom.clone());
+    let restyled = restyle(&doc, frame.custom.clone());
     assert_eq!(restyled.values[div].get(Prop::WIDTH), Some("50px"));
     assert_eq!(restyled.values[span].get(Prop::WIDTH), Some("50px"));
     assert_eq!(styles.values[div].get(Prop::WIDTH), Some("0px"));
@@ -409,7 +413,7 @@ fn registered_custom_properties_animate_and_transition() {
         false,
         &mut Vec::new(),
     );
-    motion.update(
+    let frame = motion.update(
         &doc,
         &on,
         &visible,
@@ -419,10 +423,10 @@ fn registered_custom_properties_animate_and_transition() {
         false,
         &mut Vec::new(),
     );
-    let values = &motion.custom[&p];
+    let values = &frame.custom[&p];
     assert_eq!(values.get(Prop::new("--c")), Some("#008080ff"));
     assert_eq!(values.get(Prop::new("--u")), None);
-    let restyled = restyle(&doc, motion.custom.clone());
+    let restyled = restyle(&doc, frame.custom.clone());
     assert_eq!(restyled.values[p].get(Prop::COLOR), Some("#008080ff"));
 }
 
@@ -448,7 +452,11 @@ fn starting_styles_transition_new_and_shown_elements() {
         false,
         &mut events,
     );
-    let (animated, _) = motion.update(
+    let Frame {
+        animated,
+        pseudos: _,
+        ..
+    } = motion.update(
         &doc,
         &styles,
         &visible,
@@ -487,7 +495,11 @@ fn starting_styles_transition_new_and_shown_elements() {
         false,
         &mut events,
     );
-    let (animated, _) = motion.update(
+    let Frame {
+        animated,
+        pseudos: _,
+        ..
+    } = motion.update(
         &doc,
         &computed_styles(&doc),
         &visible,
@@ -570,7 +582,9 @@ fn frames(html: &str, seconds: f64) -> (usize, Vec<Option<f64>>) {
     let (mut frame, mut count, mut wakes) = (0, 0, Vec::new());
     while frame < (seconds * 120.).round() as u64 {
         let now = start + Duration::from_nanos(frame * 1_000_000_000 / 120);
-        let (_, next) = motion.update(
+        let Frame {
+            animated: _, next, ..
+        } = motion.update(
             &doc,
             &styles,
             &visible,
@@ -674,7 +688,9 @@ fn animations_of_unshown_boxes_wait_unless_they_move_the_box() {
         let visible = vec![true; doc.nodes.len()];
         let p = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
         let mut motion = Motion::default();
-        let (_, next) = motion.update(
+        let Frame {
+            animated: _, next, ..
+        } = motion.update(
             &doc,
             &styles,
             &visible,
@@ -705,7 +721,7 @@ fn animations_of_unshown_boxes_wait_unless_they_move_the_box() {
         &mut Vec::new(),
     );
     let later = start + Duration::from_millis(250);
-    let (animated, next) = motion.update(
+    let Frame { animated, next, .. } = motion.update(
         &doc,
         &styles,
         &visible,
@@ -742,7 +758,7 @@ fn inherited_colors_animate_without_layout() {
                 false,
                 &mut Vec::new(),
             )
-            .0
+            .animated
     };
     update(&doc, 0);
     doc.nodes[body].attrs.insert("class".into(), "on".into());
@@ -787,7 +803,7 @@ fn inherited_transitions_skip_children_that_declare_the_value() {
                 false,
                 &mut Vec::new(),
             )
-            .0
+            .animated
     };
     update(&doc, 0);
     doc.nodes[body].attrs.insert("class".into(), "on".into());
@@ -812,7 +828,11 @@ fn filled_animations_keep_one_style_while_unchanged() {
     let mut motion = Motion::default();
     let mut style = |time: f64| {
         let now = start + Duration::from_secs_f64(time);
-        let (animated, _) = motion.update(
+        let Frame {
+            animated,
+            pseudos: _,
+            ..
+        } = motion.update(
             &doc,
             &styles,
             &visible,
@@ -902,7 +922,7 @@ fn script_animations_follow_web_animations_timing() {
         None,
     );
     let visible = vec![true; doc.nodes.len()];
-    let (animated, next) = motion.update(
+    let Frame { animated, next, .. } = motion.update(
         &doc,
         &styles,
         &visible,
@@ -926,7 +946,7 @@ fn script_animations_follow_web_animations_timing() {
         None,
         None,
     );
-    let (animated, next) = motion.update(
+    let Frame { animated, next, .. } = motion.update(
         &doc,
         &styles,
         &visible,
@@ -989,7 +1009,9 @@ fn css_animations_of_elements_and_pseudo_elements_answer_script() {
     let visible = vec![true; doc.nodes.len()];
     let mut motion = Motion::default();
     let mut events = Vec::new();
-    let (animated, _) = motion.update(
+    let Frame {
+        animated, pseudos, ..
+    } = motion.update(
         &doc,
         &styles,
         &visible,
@@ -1001,7 +1023,7 @@ fn css_animations_of_elements_and_pseudo_elements_answer_script() {
     );
     let own = animated.iter().find(|(id, ..)| *id == div).unwrap();
     assert_eq!(own.1.get(Prop::new("--x")), Some("b"));
-    let pair = &motion.pseudos.iter().find(|(id, _)| *id == p).unwrap().1;
+    let pair = &pseudos.iter().find(|(id, _)| *id == p).unwrap().1;
     assert_eq!(pair[0].get(Prop::OPACITY), Some("0.5"));
     assert!(animated.iter().any(|(id, ..)| *id == p));
     let list = motion.css(&[div, p], false, &styles);
@@ -1132,12 +1154,17 @@ type Step = (
     Vec<(usize, &'static str, String, f64)>,
 );
 
-fn step(motion: &mut Motion, doc: &Document, styles: &ComputedStyles, at: Instant) -> Step {
+fn frame(
+    motion: &mut Motion,
+    doc: &Document,
+    styles: &ComputedStyles,
+    at: Instant,
+    events: &mut Events,
+) -> Frame {
     let visible: Vec<bool> = (0..doc.nodes.len())
         .map(|id| styles.values[id].get(Prop::DISPLAY) != Some("none"))
         .collect();
-    let mut events = Vec::new();
-    let (animated, next) = motion.update(
+    motion.update(
         doc,
         styles,
         &visible,
@@ -1145,8 +1172,13 @@ fn step(motion: &mut Motion, doc: &Document, styles: &ComputedStyles, at: Instan
         &|_| f32::INFINITY,
         at,
         false,
-        &mut events,
-    );
+        events,
+    )
+}
+
+fn step(motion: &mut Motion, doc: &Document, styles: &ComputedStyles, at: Instant) -> Step {
+    let mut events = Vec::new();
+    let Frame { animated, next, .. } = frame(motion, doc, styles, at, &mut events);
     let animated = animated
         .into_iter()
         .map(|(id, style, layout)| (id, (style, layout)))
@@ -1396,9 +1428,9 @@ fn content_and_font_size_keyframes_animate() {
     let at = |seconds: f64| start + Duration::from_secs_f64(seconds);
     let mut motion = Motion::default();
     let mut sample = |seconds: f64| {
-        step(&mut motion, &doc, &styles, at(seconds));
-        let pair = &motion.pseudos.iter().find(|(id, _)| *id == i).unwrap().1;
-        let sizes = motion.custom.get(&em).map(|values| {
+        let frame = frame(&mut motion, &doc, &styles, at(seconds), &mut Vec::new());
+        let pair = &frame.pseudos.iter().find(|(id, _)| *id == i).unwrap().1;
+        let sizes = frame.custom.get(&em).map(|values| {
             [Prop::FONT_SIZE, Prop::LINE_HEIGHT].map(|prop| values.get(prop).unwrap().to_owned())
         });
         (pair[1].get(Prop::CONTENT).unwrap().to_owned(), sizes)
@@ -1525,8 +1557,15 @@ fn backdrops_transition_from_their_starting_style_and_out() {
     doc.nodes[d].attrs.insert("open".into(), String::new());
     doc.nodes[d].state = crate::dom::MODAL;
     let mut opacity = |seconds: f64, doc: &Document| {
-        let (_, _, events) = step(&mut motion, doc, &computed_styles(doc), at(seconds));
-        let opacity = motion
+        let mut events = Vec::new();
+        let frame = frame(
+            &mut motion,
+            doc,
+            &computed_styles(doc),
+            at(seconds),
+            &mut events,
+        );
+        let opacity = frame
             .backdrops
             .iter()
             .find(|(id, _)| *id == d)
@@ -1585,7 +1624,12 @@ fn script_animations_that_set_display_show_hidden_boxes() {
     let start = Instant::now();
     let mut update = |seconds: f64| {
         let mut events = Vec::new();
-        let (animated, next) = motion.update(
+        let Frame {
+            animated,
+            next,
+            painted,
+            ..
+        } = motion.update(
             &doc,
             &styles,
             &visible,
@@ -1595,7 +1639,7 @@ fn script_animations_that_set_display_show_hidden_boxes() {
             false,
             &mut events,
         );
-        (animated, motion.painted.take(), next, events)
+        (animated, painted, next, events)
     };
     let (animated, painted, next, events) = update(0.5);
     let painted = painted.unwrap();
@@ -1689,7 +1733,12 @@ fn exits_keep_their_subtree_painted_until_they_end() {
             }
         }
         let mut events = Vec::new();
-        let (animated, next) = motion.update(
+        let Frame {
+            animated,
+            next,
+            painted,
+            ..
+        } = motion.update(
             doc,
             &styles,
             &visible,
@@ -1699,7 +1748,6 @@ fn exits_keep_their_subtree_painted_until_they_end() {
             false,
             &mut events,
         );
-        let painted = motion.painted.take();
         let shown = painted.clone().unwrap_or(visible);
         let animated: HashMap<usize, Rc<Style>> = animated
             .into_iter()

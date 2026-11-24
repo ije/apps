@@ -22,21 +22,40 @@ pub(crate) struct Motion {
     clocks: FxHashMap<usize, Vec<Clock>>,
     transitions: FxHashMap<usize, Vec<Transition>>,
     styled: FxHashMap<usize, (Rc<Style>, Style, Rc<Style>)>,
-    pub custom: HashMap<usize, Style>,
-    pub wake: Option<(Instant, renderer::Timer)>,
-    pub parked: Vec<usize>,
+    parked: Vec<usize>,
     scripted: FxHashMap<usize, Vec<Scripted>>,
     script_nodes: FxHashMap<u32, usize>,
     serial: u32,
     queued: Events,
-    pub pseudos: Vec<(usize, Rc<[Style; 2]>)>,
-    pub painted: Option<Vec<bool>>,
     backdrop: FxHashMap<usize, (Rc<Style>, Vec<Transition>)>,
-    pub backdrops: Vec<(usize, Rc<Style>)>,
-    pub iterations: bool,
+    iterations: bool,
+}
+
+// What one `update` of the animations gives the frame.
+#[derive(Default)]
+pub(crate) struct Frame {
+    // The nodes with animated values: their style, and whether it changes layout.
+    pub(crate) animated: Animated,
+    pub(crate) next: Option<Instant>,
+    // Animated custom properties, which need a style pass.
+    pub(crate) custom: HashMap<usize, Style>,
+    pub(crate) pseudos: Vec<(usize, Rc<[Style; 2]>)>,
+    pub(crate) backdrops: Vec<(usize, Rc<Style>)>,
+    // The visibility of each node when animations changed it.
+    pub(crate) painted: Option<Vec<bool>>,
 }
 
 impl Motion {
+    // Fires `animationiteration` events from now on: a page that never listened for them is not woken for them.
+    pub(crate) fn listen_iterations(&mut self) {
+        self.iterations = true;
+    }
+
+    // The nodes whose animations paused because they are out of view.
+    pub(crate) fn parked(&self) -> &[usize] {
+        &self.parked
+    }
+
     // Clocks line up with the effects only after `update`, so a style change before it skips them.
     fn pairs<'a>(
         &'a self,
@@ -558,7 +577,8 @@ impl Motion {
         now: Instant,
         repass: bool,
         events: &mut Events,
-    ) -> (Animated, Option<Instant>) {
+    ) -> Frame {
+        let mut frame = Frame::default();
         let registry = &*styles.registry;
         let coarse = |id: usize| f64::from((48. / side(id).max(1.)).clamp(1., 4.));
         events.append(&mut self.queued);
@@ -923,7 +943,7 @@ impl Motion {
             let out = animated.entry(id).or_default();
             advance(list, (id, ""), now, out, events, &mut wakes);
         }
-        self.backdrops.clear();
+        frame.backdrops.clear();
         for (&id, (base, list)) in &mut self.backdrop {
             if !list.is_empty() {
                 let mut out = (**base).clone();
@@ -936,7 +956,7 @@ impl Motion {
                     &mut wakes,
                 );
                 if !list.is_empty() {
-                    self.backdrops.push((id, Rc::new(out)));
+                    frame.backdrops.push((id, Rc::new(out)));
                 }
             }
         }
@@ -960,13 +980,13 @@ impl Motion {
                 }
             }
         }
-        self.custom.clear();
+        frame.custom.clear();
         if animated.values().any(|values| {
             !values.vars().is_empty()
                 || values.contains(Prop::FONT_SIZE)
                 || values.contains(Prop::LINE_HEIGHT)
         }) {
-            self.custom = animated
+            frame.custom = animated
                 .iter()
                 .map(|(&id, values)| (id, values.clone()))
                 .collect();
@@ -1063,7 +1083,7 @@ impl Motion {
             }
             next = next.min(if unseen || parked { end } else { change });
         }
-        self.painted = match painted {
+        frame.painted = match painted {
             Cow::Owned(painted) => Some(painted),
             Cow::Borrowed(_) => None,
         };
@@ -1122,11 +1142,13 @@ impl Motion {
             only.into_iter()
                 .map(|id| (id, styles.values[id].clone(), layout.contains(&id))),
         );
-        self.pseudos = pairs
+        frame.pseudos = pairs
             .into_iter()
             .map(|(id, pair)| (id, Rc::new(pair)))
             .collect();
-        (animated, after(now, next))
+        frame.animated = animated;
+        frame.next = after(now, next);
+        frame
     }
 }
 

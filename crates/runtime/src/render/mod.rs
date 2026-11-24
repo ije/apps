@@ -847,7 +847,14 @@ impl PageView {
                 .get(&id)
                 .map_or(f32::INFINITY, |rect| rect[2].min(rect[3]))
         };
-        let (mut animated, next) = dom.styles.motion.update(
+        let crate::style::Frame {
+            mut animated,
+            next,
+            custom,
+            pseudos,
+            backdrops,
+            mut painted,
+        } = dom.styles.motion.update(
             &doc,
             &styles,
             &visible,
@@ -880,7 +887,7 @@ impl PageView {
                 window.release_image(old);
             }
         }
-        if let Some(painted) = dom.styles.motion.painted.take() {
+        if let Some(painted) = painted.take() {
             previous.get_or_insert(std::mem::replace(&mut visible, painted));
             dom.cull.cascaded = false;
         }
@@ -896,18 +903,17 @@ impl PageView {
                 dom.bounds.hide(&visible, &previous, 0..visible.len());
             }
         }
-        let backdrops = std::mem::take(&mut dom.styles.motion.backdrops);
         *self.parked.borrow_mut() = dom
             .styles
             .motion
-            .parked
+            .parked()
             .iter()
             .map(|&id| (id, clips(&doc, &styles, id).collect()))
             .collect();
         // Units of nodes whose font size animates, like `em` lengths, swapped in for this frame.
         let mut lengths = Vec::new();
-        if !dom.styles.motion.custom.is_empty() {
-            dom.styles.animated = std::mem::take(&mut dom.styles.motion.custom);
+        if !custom.is_empty() {
+            dom.styles.animated = custom;
             // Styles match the light tree, so the composed children step aside for this pass.
             for (node, light) in children.iter_mut().rev() {
                 *light = doc.nodes.compose_children(*node, std::mem::take(light));
@@ -970,10 +976,7 @@ impl PageView {
             .collect();
         drop(flat);
         // Pseudo-elements that animate only their opacity keep keyed layers, which frames patch.
-        let pseudo_layers: Vec<usize> = dom
-            .styles
-            .motion
-            .pseudos
+        let pseudo_layers: Vec<usize> = pseudos
             .iter()
             .filter(|(id, pair)| {
                 styles
@@ -985,13 +988,12 @@ impl PageView {
             .collect();
         let compositing = !animated.is_empty()
             && composited.len() == animated.len()
-            && pseudo_layers.len() == dom.styles.motion.pseudos.len()
+            && pseudo_layers.len() == pseudos.len()
             && backdrops.is_empty();
         animate(&self.0, dom, next, now, compositing, window, cx);
         // Restore cascade values and pseudos after the frame: animations replace them temporarily.
         let mut restore = Vec::new();
         let mut restore_pseudos = Vec::new();
-        let pseudos = std::mem::take(&mut dom.styles.motion.pseudos);
         // Paint and the next frame read the cascade values, so they go back to `computed` after the frame.
         let taken = !pseudos.is_empty() || !animated.is_empty() || !lengths.is_empty();
         if !pseudos.is_empty() {
@@ -2771,7 +2773,7 @@ fn animate(
 ) {
     match next {
         Some(at) if at <= now + std::time::Duration::from_millis(8) => {
-            dom.styles.motion.wake = None;
+            dom.styles.wake = None;
             // Paint and composite both ask for the next frame, and two callbacks would each ask again.
             let queued = view.motion_frame.replace(Some(composite));
             if let Some(queued) = queued {
@@ -2787,7 +2789,6 @@ fn animate(
         Some(at) => {
             if dom
                 .styles
-                .motion
                 .wake
                 .as_ref()
                 .is_none_or(|(old, _)| *old <= now || at < *old)
@@ -2802,10 +2803,10 @@ fn animate(
                         cx.refresh_window(window_id);
                     }
                 });
-                dom.styles.motion.wake = Some((at, task));
+                dom.styles.wake = Some((at, task));
             }
         }
-        None => dom.styles.motion.wake = None,
+        None => dom.styles.wake = None,
     }
 }
 
@@ -2873,7 +2874,14 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
             .get(&id)
             .map_or(f32::INFINITY, |rect| rect[2].min(rect[3]))
     };
-    let (animated, next) = dom.styles.motion.update(
+    let crate::style::Frame {
+        animated,
+        next,
+        custom,
+        pseudos,
+        backdrops,
+        ..
+    } = dom.styles.motion.update(
         doc,
         &styles,
         &dom.cull.visible,
@@ -2886,21 +2894,20 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
     *view.parked.borrow_mut() = dom
         .styles
         .motion
-        .parked
+        .parked()
         .iter()
         .map(|&id| (id, clips(doc, &styles, id).collect()))
         .collect();
     let composited_transforms = view.composited_transforms.borrow();
     let mut changes = Vec::new();
-    let pseudos = std::mem::take(&mut dom.styles.motion.pseudos);
-    let eligible = dom.styles.motion.custom.is_empty()
+    let eligible = custom.is_empty()
         && pseudos.iter().all(|(id, pair)| {
             styles
                 .pseudos
                 .get(id)
                 .is_some_and(|base| fades_only(base, pair))
         })
-        && dom.styles.motion.backdrops.is_empty()
+        && backdrops.is_empty()
         && animated.len() == dom.styles.animating.len()
         && animated.iter().all(|(id, style, layout)| {
             let Some(old) = dom.styles.animating.get(id) else {
@@ -3676,7 +3683,7 @@ mod tests {
                         && styles.values[id].get(Prop::DISPLAY) != Some("none");
                 }
                 let at = start + std::time::Duration::from_secs_f64(seconds);
-                dom.styles.motion.update(
+                let frame = dom.styles.motion.update(
                     doc,
                     &styles,
                     &visible,
@@ -3686,7 +3693,7 @@ mod tests {
                     false,
                     &mut Vec::new(),
                 );
-                let visible = dom.styles.motion.painted.take().unwrap_or(visible);
+                let visible = frame.painted.unwrap_or(visible);
                 drop_hidden_images(dom, &visible, &styles, |image| released.push(image.id));
                 visible[span]
             };

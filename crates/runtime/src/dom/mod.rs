@@ -1535,7 +1535,7 @@ pub fn call(
         return Ok(Value::Null);
     }
     if op == "dom.iterations" {
-        state.styles.motion.iterations = true;
+        state.styles.motion.listen_iterations();
         return Ok(Value::Null);
     }
     if op == "dom.cssControl" {

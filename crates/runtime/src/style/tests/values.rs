@@ -356,16 +356,18 @@ fn animations_leave_important_declarations() {
     let mut motion = animation::Motion::default();
     let visible = vec![true; doc.nodes.len()];
     let sample = |motion: &mut animation::Motion, seconds: f64| {
-        let (animated, _) = motion.update(
-            &doc,
-            &styles,
-            &visible,
-            &|_| true,
-            &|_| f32::INFINITY,
-            start + std::time::Duration::from_secs_f64(seconds),
-            false,
-            &mut Vec::new(),
-        );
+        let animated = motion
+            .update(
+                &doc,
+                &styles,
+                &visible,
+                &|_| true,
+                &|_| f32::INFINITY,
+                start + std::time::Duration::from_secs_f64(seconds),
+                false,
+                &mut Vec::new(),
+            )
+            .animated;
         let style = animated.into_iter().find(|entry| entry.0 == id).unwrap().1;
         [Prop::WIDTH, Prop::OPACITY].map(|prop| style.get(prop).map(str::to_owned))
     };
