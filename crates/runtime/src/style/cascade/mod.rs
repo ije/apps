@@ -22,6 +22,7 @@ pub(crate) mod computed;
 mod container;
 mod counters;
 mod memo;
+mod moves;
 mod node;
 pub(super) mod rank;
 pub(super) mod scope;

@@ -12,6 +12,7 @@ use crate::style::cascade::computed::{
 use crate::style::cascade::container::{ContainerQuery, query_containers};
 use crate::style::cascade::counters::{list_item, listed};
 use crate::style::cascade::memo::{CachedNode, CachedStyle, Inputs, Share, StyleKey, StyleRef};
+use crate::style::cascade::moves::mark_moves;
 use crate::style::cascade::rank::{
     AGENT, ANIMATION, AUTHOR, CascadeRank, HINT, UNLAYERED, physical, put,
 };
@@ -117,6 +118,24 @@ impl NodePass<'_> {
         let mut shares: FxHashMap<(usize, [u32; 7]), Share> = FxHashMap::default();
         let no_pseudos: Rc<[usize]> = Rc::new([]);
         let unshared = style_cache.unshared;
+        let mut changed = std::mem::take(&mut style_cache.changed);
+        style_cache.stamp += 1;
+        let stamp = style_cache.stamp << 8;
+        // A fast pass numbers the counters again only when one of their inputs changed.
+        let mut recount = false;
+        if fast {
+            mark_moves(
+                doc,
+                walk,
+                shadows,
+                style_cache.styled.as_ref(),
+                matches,
+                out,
+                &mut changed,
+                &mut recount,
+                (&unstyled, &empty),
+            );
+        }
         let ComputedStyles {
             values: styles,
             vars: custom,
@@ -163,9 +182,6 @@ impl NodePass<'_> {
         }
         const CHANGED: u8 = 1;
         const DEEP: u8 = 2;
-        let mut changed = std::mem::take(&mut style_cache.changed);
-        style_cache.stamp += 1;
-        let stamp = style_cache.stamp << 8;
         macro_rules! changed {
             ($id:expr) => {
                 match changed[$id] ^ stamp {
@@ -175,116 +191,11 @@ impl NodePass<'_> {
             };
         }
         let mut counters = false;
-        // A fast pass numbers the counters again only when one of their inputs changed.
-        let mut recount = false;
         let html: Vec<usize> = walk.special[0]
             .iter()
             .copied()
             .filter(|&id| doc.nodes[id].tag == "html")
             .collect();
-        if fast {
-            if changed.len() < doc.nodes.len() {
-                changed.resize(doc.nodes.len(), 0);
-            }
-            if let Some(old) = style_cache
-                .styled
-                .as_ref()
-                .filter(|old| !Rc::ptr_eq(&old.nodes, &walk.walk.nodes))
-            {
-                // Text and comments that move need no new count.
-                let changed = walk.walk.changed_since(old.serial).map_or(0, <[u32]>::len);
-                recount = walk.walk.since(old.serial).is_none_or(|touched| {
-                    touched[..touched.len() - changed].iter().any(|&id| {
-                        doc.nodes
-                            .get(id as usize)
-                            .is_none_or(|node| !node.tag.starts_with('#'))
-                    })
-                });
-                const GONE: u32 = u32::MAX - 1;
-                const KEPT: u32 = u32::MAX - 2;
-                let root = |tree: &[u32], trees: &[(usize, usize)], id: usize| {
-                    tree.get(id)
-                        .and_then(|&index| trees.get(index as usize))
-                        .map(|tree| tree.0)
-                };
-                macro_rules! leave {
-                    ($id:expr) => {
-                        styles[$id] = unstyled.clone();
-                        custom[$id] = empty.clone();
-                        style_flags[$id] = 0;
-                        lengths.unset($id);
-                        containers[$id] = None;
-                        unstyle!($id);
-                    };
-                }
-                // Without shadow trees, only the nodes that a patched walk touched can have another place.
-                let touched = walk
-                    .walk
-                    .since(old.serial)
-                    .filter(|_| shadows.hosts.is_empty() && old.trees.len() == 1);
-                let mut placed = Vec::new();
-                if touched.is_none() || cfg!(debug_assertions) {
-                    placed.resize(doc.nodes.len(), GONE);
-                    for &(id, up) in old.nodes.iter() {
-                        if let Some(slot) = placed.get_mut(id as usize) {
-                            *slot = up;
-                        }
-                    }
-                }
-                match touched {
-                    Some(touched) => {
-                        // A node with another parent is dirty by its snapshot. A node that joins has no style.
-                        for &id in touched {
-                            let id = id as usize;
-                            if !walk.walk.contains(id) {
-                                leave!(id);
-                            } else if Rc::ptr_eq(&styles[id], &unstyled) {
-                                matches.dirty[id] = true;
-                            }
-                        }
-                        #[cfg(debug_assertions)]
-                        for (nodes, kept) in [(order, true), (&old.nodes[..], false)] {
-                            for &(id, up) in nodes {
-                                let slot = &mut placed[id as usize];
-                                assert!(
-                                    *slot == if kept { up } else { KEPT } || touched.contains(&id),
-                                    "node {id} moved outside the patched walk"
-                                );
-                                assert!(
-                                    !kept
-                                        || *slot == up
-                                        || matches.dirty[id as usize]
-                                        || doc.nodes[id as usize].parent != Some(up as usize),
-                                    "node {id} moved without a dirty mark"
-                                );
-                                *slot = if kept { KEPT } else { *slot };
-                            }
-                        }
-                    }
-                    None => {
-                        for &(id, up) in order {
-                            let id = id as usize;
-                            if placed[id] != up
-                                || root(&old.tree, &old.trees, id)
-                                    != root(&walk.tree, &walk.trees, id)
-                            {
-                                matches.dirty[id] = true;
-                                if let Some(&host) = shadows.hosts.get(&id) {
-                                    matches.dirty[host] = true;
-                                }
-                            }
-                            placed[id] = KEPT;
-                        }
-                        for &(id, _) in old.nodes.iter() {
-                            let id = id as usize;
-                            if placed.get(id).is_some_and(|&slot| slot != KEPT) {
-                                leave!(id);
-                            }
-                        }
-                    }
-                }
-            }
-        }
         // Named `style()` queries put the values of containers into the chain, so all chains change with them.
         let named_queries = style_cache.scopes.iter().any(|scope| scope.named);
         let mut all = std::mem::replace(&mut style_cache.named, named_queries) != named_queries;
