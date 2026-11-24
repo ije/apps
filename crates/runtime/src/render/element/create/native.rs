@@ -1,7 +1,7 @@
-use super::Build;
+use super::super::Build;
+use super::super::kept::{Query, hashed};
+use super::super::query::LOOK;
 use super::cx::{Cx, Frame};
-use super::kept::{Query, hashed};
-use super::query::LOOK;
 use crate::css;
 use crate::css::properties::Prop;
 use renderer::{Color, Rect, point, px, size};
@@ -17,7 +17,7 @@ pub(super) fn native_control(
     borders: &mut [f32; 4],
     border_kinds: &mut [&str; 4],
     border_colors: &mut [Color; 4],
-) -> (renderer::Node, Option<super::super::paint::control::Look>) {
+) -> (renderer::Node, Option<crate::render::paint::control::Look>) {
     let Cx {
         reader,
         id,
@@ -45,7 +45,7 @@ pub(super) fn native_control(
             }
         })
         .flatten();
-    let native = super::super::paint::control::kind(&node.tag, input, list.is_some(), style).map(
+    let native = crate::render::paint::control::kind(&node.tag, input, list.is_some(), style).map(
         |(control, boxed, plain)| {
             let number = |name: &str| {
                 node.attrs
@@ -54,17 +54,17 @@ pub(super) fn native_control(
                     .filter(|value| value.is_finite())
             };
             let [min, max] = match control {
-                super::super::paint::control::Control::Range => {
+                crate::render::paint::control::Control::Range => {
                     [number("min").unwrap_or(0.), number("max").unwrap_or(100.)]
                 }
-                super::super::paint::control::Control::Meter => {
+                crate::render::paint::control::Control::Meter => {
                     [number("min").unwrap_or(0.), number("max").unwrap_or(1.)]
                 }
                 _ => [0., number("max").filter(|&max| max > 0.).unwrap_or(1.)],
             };
             let max = max.max(min);
             let value = match control {
-                super::super::paint::control::Control::Range => {
+                crate::render::paint::control::Control::Range => {
                     let value = node
                         .current_value()
                         .and_then(|value| value.trim().parse::<f32>().ok())
@@ -87,7 +87,7 @@ pub(super) fn native_control(
                     }
                 }
                 _ => number("value").unwrap_or(
-                    if control == super::super::paint::control::Control::Progress {
+                    if control == crate::render::paint::control::Control::Progress {
                         -1.
                     } else {
                         0.
@@ -96,7 +96,7 @@ pub(super) fn native_control(
             };
             let mut dark = cx.dark();
             let accent = match control {
-                super::super::paint::control::Control::Meter => {
+                crate::render::paint::control::Control::Meter => {
                     let low = number("low").unwrap_or(min).clamp(min, max);
                     let high = number("high").unwrap_or(max).clamp(low, max);
                     let region = |value: f32| u8::from(value >= low) + u8::from(value > high);
@@ -119,7 +119,7 @@ pub(super) fn native_control(
                         colors[2]
                     }
                 }
-                super::super::paint::control::Control::Color => node
+                crate::render::paint::control::Control::Color => node
                     .current_value()
                     .and_then(css::value::color::color)
                     .map_or(0, |(color, _)| color),
@@ -129,7 +129,7 @@ pub(super) fn native_control(
                     .and_then(css::value::color::color)
                 {
                     Some((color, _)) => {
-                        dark = super::super::paint::control::accent_dark(
+                        dark = crate::render::paint::control::accent_dark(
                             control,
                             node.checked(),
                             color,
@@ -141,7 +141,7 @@ pub(super) fn native_control(
                     None => 0x0075ff,
                 },
             };
-            super::super::paint::control::Look {
+            crate::render::paint::control::Look {
                 control,
                 boxed,
                 plain,
@@ -156,9 +156,9 @@ pub(super) fn native_control(
                     .and_then(css::value::color::color)
                     .map_or(0, |(color, _)| color),
                 value: if value < min
-                    || max <= min && control != super::super::paint::control::Control::Progress
+                    || max <= min && control != crate::render::paint::control::Control::Progress
                 {
-                    if control == super::super::paint::control::Control::Progress {
+                    if control == crate::render::paint::control::Control::Progress {
                         -1.
                     } else {
                         0.
@@ -189,7 +189,7 @@ pub(super) fn native_control(
     }
     if let Some(look) = &native {
         if look.boxed {
-            let (edge, fill) = super::super::paint::control::box_colors(look);
+            let (edge, fill) = crate::render::paint::control::box_colors(look);
             for side in 0..4 {
                 padding[side] += (borders[side] - 1.).max(0.);
                 borders[side] = borders[side].min(1.);
@@ -219,7 +219,7 @@ pub(super) fn native_control(
                 + borders[0]
                 + borders[2]));
         }
-        if look.control == super::super::paint::control::Control::Menu {
+        if look.control == crate::render::paint::control::Control::Menu {
             padding[1] += 16.;
             padding[3] += 4.;
             if style.get(Prop::WIDTH).is_none_or(|value| value == "auto") {
@@ -303,7 +303,7 @@ pub(super) fn control_layer(
     cx: &Cx<'_>,
     fr: &Frame,
     mut el: renderer::Node,
-    native: Option<super::super::paint::control::Look>,
+    native: Option<crate::render::paint::control::Look>,
 ) -> renderer::Node {
     let Cx {
         reader,
@@ -317,23 +317,23 @@ pub(super) fn control_layer(
     let padding = fr.padding;
     let resizer = (node.tag == "textarea"
         && style.get(Prop::RESIZE).is_none_or(|value| value != "none"))
-    .then_some(super::super::paint::control::Look {
-        control: super::super::paint::control::Control::Resizer,
+    .then_some(crate::render::paint::control::Look {
+        control: crate::render::paint::control::Control::Resizer,
         ..Default::default()
     });
     if let Some(look) = native
         .filter(|look| {
             !matches!(
                 look.control,
-                super::super::paint::control::Control::Button
-                    | super::super::paint::control::Control::Field
+                crate::render::paint::control::Control::Button
+                    | crate::render::paint::control::Control::Field
             )
         })
         .or(resizer)
     {
         el = el.child(if look.plain {
             let parts = styles.scrollbars.get(&id);
-            let range = look.control == super::super::paint::control::Control::Range;
+            let range = look.control == crate::render::paint::control::Control::Range;
             let ink = css::value::color::rgba(
                 style
                     .get(Prop::COLOR)
@@ -450,7 +450,7 @@ pub(super) fn control_layer(
             .size_full()
             .into()
         } else {
-            super::super::paint::control::layer(id, look, view.clone())
+            crate::render::paint::control::layer(id, look, view.clone())
         });
     }
     el

@@ -1,11 +1,11 @@
-use super::super::paint::text::InlineText;
-use super::columns::{column_set, columns};
-use super::create::create;
+use super::super::columns::{column_set, columns};
+use super::super::margin::inline_fade;
+use super::super::query::static_mark;
+use super::super::{Build, element};
+use super::create;
 use super::cx::{Carry, Cx, Frame};
-use super::margin::inline_fade;
-use super::query::static_mark;
-use super::{Build, element};
 use crate::css::properties::Prop;
+use crate::render::paint::text::InlineText;
 use renderer::{px, relative};
 use std::rc::Rc;
 
@@ -58,7 +58,7 @@ pub(super) fn paragraph(
     let content_box = || fr.content_box(cx);
     let made = parsed.made;
     #[cfg(debug_assertions)]
-    reader.extra.set(super::kept::hashed(&*data.text));
+    reader.extra.set(super::super::kept::hashed(&*data.text));
     let atom_containing = content_box();
     // An absolute box at its static place in a line has an empty atom there, which gives it its place.
     let marker = |atom: &crate::render::inline::Atom| {
@@ -79,21 +79,21 @@ pub(super) fn paragraph(
                 .into(),
         })
         .collect();
-    let atom_slots: Rc<[super::super::paint::text::AtomSlot]> = data
+    let atom_slots: Rc<[crate::render::paint::text::AtomSlot]> = data
         .atoms
         .iter()
         .zip(&mut atom_elements)
         .map(|(atom, child)| {
             if marker(atom) {
                 // At the top of its line, as Chrome places the box.
-                return super::super::paint::text::AtomSlot {
+                return crate::render::paint::text::AtomSlot {
                     size: [0.; 3],
                     align: Some(renderer::AlignItems::FlexStart),
                     at: Default::default(),
                 };
             }
             cx.atom_slot(atom, child, containing[0], &|| {
-                super::super::layout::grid::intrinsic::pseudo_atom(
+                crate::render::layout::grid::intrinsic::pseudo_atom(
                     doc,
                     id,
                     usize::from(atom.pseudo - 1),
@@ -192,7 +192,7 @@ pub(super) fn paragraph(
         && matches!(position, "static" | "relative")
         && el.style_ref().overflow.x == renderer::Overflow::Visible
         && el.style_ref().overflow.y == renderer::Overflow::Visible
-        && super::super::effects::TRANSFORM_PROPS
+        && crate::render::effects::TRANSFORM_PROPS
             .iter()
             .all(|&prop| style.get(prop).is_none_or(|value| value == "none"))
         && style
@@ -237,7 +237,7 @@ pub(super) fn paragraph(
     for (index, (atom, child)) in data.atoms.iter().zip(atom_elements).enumerate() {
         let atom_box = cx.atom_box(index, atom, child, &atom_slots, padding);
         el = el.child(match inline_fade(doc, styles, atom.node, id) {
-            fade if fade < 1. => atom_box.hooks(super::super::paint::Effected {
+            fade if fade < 1. => atom_box.hooks(crate::render::paint::Effected {
                 effect: renderer::PaintEffect {
                     opacity: fade,
                     ..Default::default()

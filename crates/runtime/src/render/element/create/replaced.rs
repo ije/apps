@@ -1,12 +1,12 @@
-use super::super::layout::size::{dimension, natural_size};
-use super::super::paint::scrollbar;
-use super::Build;
+use super::super::Build;
+use super::super::kept::Query;
+use super::super::query::{insets, pictured};
+use super::super::svg::svg_layer;
 use super::cx::Cx;
-use super::kept::Query;
-use super::query::{insets, pictured};
-use super::svg::svg_layer;
 use crate::css;
 use crate::css::properties::Prop;
+use crate::render::layout::size::{dimension, natural_size};
+use crate::render::paint::scrollbar;
 use crate::style::{self};
 use renderer::{Child, Color, Rect, point, px, size};
 use std::{cell::RefCell, rc::Rc, sync::Arc};
@@ -41,7 +41,7 @@ pub(super) fn replaced(
         let picture = |source| {
             renderer::node()
                 .size_full()
-                .hooks(super::super::paint::Picture {
+                .hooks(crate::render::paint::Picture {
                     id,
                     view: view.clone(),
                     source,
@@ -54,8 +54,8 @@ pub(super) fn replaced(
                     ),
                 })
         };
-        let mut presented = picture(super::super::paint::Source::Presented)
-            .child(picture(super::super::paint::Source::Drawn).absolute());
+        let mut presented = picture(crate::render::paint::Source::Presented)
+            .child(picture(crate::render::paint::Source::Drawn).absolute());
         presented.style().aspect_ratio = *natural_ratio;
         content_layers.push(presented.into());
     }
@@ -74,7 +74,7 @@ pub(super) fn replaced(
             .filter(|_| host.app.features.has(crate::bundle::Feature::Terminal))
         {
             let look =
-                super::super::paint::terminal::look(style, styles.selections.get(&id), &units);
+                crate::render::paint::terminal::look(style, styles.selections.get(&id), &units);
             // The bar of the scrollback.
             *grid_bar = Some(scrollbar::Scrollbar {
                 id,
@@ -97,7 +97,7 @@ pub(super) fn replaced(
             content_layers.push(
                 renderer::node()
                     .size_full()
-                    .hooks(super::super::paint::terminal::Grid {
+                    .hooks(crate::render::paint::terminal::Grid {
                         id,
                         view: view.clone(),
                         terminals: state.media.terminals.clone(),
@@ -253,7 +253,7 @@ pub(super) fn paint_broken_icon(
     let raster = (16. * window.scale_factor()).ceil() as u32;
     let Some(image) = ICON.with_borrow_mut(|icon| {
         if icon.as_ref().is_none_or(|(size, _)| *size != raster) {
-            *icon = super::super::raster::svg::svg(SVG, raster, raster)
+            *icon = crate::render::raster::svg::svg(SVG, raster, raster)
                 .ok()
                 .map(|image| (raster, image));
         }

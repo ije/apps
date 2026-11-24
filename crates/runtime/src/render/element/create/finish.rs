@@ -1,13 +1,13 @@
-use super::super::{
+use super::super::Build;
+use super::super::kept::{Query, Read, Shared, hashed};
+use super::super::margin::{clear_bits, float_side};
+use super::super::query::{boxless, collapses, insets, padding_start, scroller};
+use super::cx::{Cx, Frame};
+use crate::css::properties::Prop;
+use crate::render::{
     layout::cull,
     paint::{DomBox, Turned, scrollbar},
 };
-use super::Build;
-use super::cx::{Cx, Frame};
-use super::kept::{Query, Read, Shared, hashed};
-use super::margin::{clear_bits, float_side};
-use super::query::{boxless, collapses, insets, padding_start, scroller};
-use crate::css::properties::Prop;
 use crate::style::{self};
 use renderer::px;
 use std::rc::Rc;
@@ -22,7 +22,7 @@ pub(super) fn finish(
     drag: bool,
     replaced: bool,
     bars: Option<scrollbar::Scrollbar>,
-    mut cut_parts: Vec<(usize, usize, super::super::paint::Piece)>,
+    mut cut_parts: Vec<(usize, usize, crate::render::paint::Piece)>,
     plans: u8,
     text_clip: bool,
     pseudo_origin: Option<Rc<std::cell::Cell<renderer::Point<renderer::Pixels>>>>,
@@ -206,7 +206,7 @@ pub(super) fn finish(
                 depth,
                 hashed(block.map(|(parent, insets)| (parent, insets.map(f32::to_bits)))),
             );
-            Some(Box::new(super::super::paint::Sticky {
+            Some(Box::new(crate::render::paint::Sticky {
                 scroll: scrolls.get(&parent)?.clone(),
                 border,
                 block,
@@ -280,7 +280,7 @@ pub(super) fn finish(
         .filter(|_| id != 0 && !node.tag.starts_with('#') && slot.is_none());
     let mut el = match vertical {
         Some(mode) => {
-            let [_, widest, ..] = super::super::layout::grid::intrinsic::intrinsic(
+            let [_, widest, ..] = crate::render::layout::grid::intrinsic::intrinsic(
                 doc,
                 id,
                 styles,
@@ -295,7 +295,7 @@ pub(super) fn finish(
                 .map(|height| height + extra[1])
                 .unwrap_or_else(|| widest.min(units.viewport[1]))
                 .max(1.);
-            let block = super::super::layout::grid::intrinsic::intrinsic(
+            let block = crate::render::layout::grid::intrinsic::intrinsic(
                 doc,
                 id,
                 styles,
@@ -425,7 +425,7 @@ pub(super) fn finish(
             }
             let rows = rows.into_iter().map(|(row, cells)| (row, true, cells));
             let rows = rows.chain(groups.into_iter().map(|(group, rows)| (group, false, rows)));
-            Some(Rc::new(super::super::paint::Parts::Rows(rows.collect())))
+            Some(Rc::new(crate::render::paint::Parts::Rows(rows.collect())))
         } else {
             (!cuts.is_empty()).then(|| {
                 cut_parts.sort_by_key(|&(_, at, _)| at);
@@ -438,7 +438,7 @@ pub(super) fn finish(
                 for (cut, _, piece) in cut_parts {
                     boxes[at[&cut]].1.push(piece);
                 }
-                Rc::new(super::super::paint::Parts::Cuts {
+                Rc::new(crate::render::paint::Parts::Cuts {
                     sides: (!multicol)
                         .then_some([padding[3] + borders[3], padding[1] + borders[1]]),
                     boxes,
@@ -537,7 +537,7 @@ pub(super) fn finish(
     }
     let mut element = el.hooks(hooks);
     if let Some(origin) = pseudo_origin {
-        element = element.hooks(super::super::paint::ElementOrigin(origin));
+        element = element.hooks(crate::render::paint::ElementOrigin(origin));
     }
     // Like Chrome, positioned boxes and stacking contexts with `z-index: auto` or 0 paint after the in-flow
     // boxes of their stacking context, in tree order.
@@ -607,7 +607,7 @@ pub(super) fn finish(
                 plan: Default::default(),
                 ..*reader
             };
-            let fresh = super::create::create(&shadow, id, containing, cx.container, None, None);
+            let fresh = super::create(&shadow, id, containing, cx.container, None, None);
             reader.prints.borrow_mut().truncate(printed);
             let own = |reads: &[Read]| {
                 let mut own: Vec<_> = reads

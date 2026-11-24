@@ -1,32 +1,47 @@
-use super::super::layout::size::{broken_image, field_size, legend, natural_size, text_field};
-use super::super::{
-    layout::cull,
-    paint::{background::css_background, scrollbar},
-};
-use super::align::vertical_align;
-use super::border::{border_canvas, fieldset_border, inset_shadows, outline, shade_border};
-use super::children::children;
+mod align;
+mod children;
+mod controls;
+mod cx;
+mod finish;
+mod grid;
+mod marker;
+mod native;
+mod outline;
+mod paragraph;
+mod props;
+mod pseudos;
+mod replaced;
+mod svg;
+
+use self::align::vertical_align;
+use self::children::children;
+use self::controls::controls;
+use self::cx::{Carry, Cx, Frame, above, viewport};
+use self::finish::finish;
+use self::marker::list_marker;
+use self::native::{control_layer, native_control};
+use self::outline::outline;
+use self::paragraph::paragraph;
+use self::props::natural_box;
+use self::props::{new_box, props};
+use self::pseudos::pseudo_elements;
+use self::replaced::replaced;
+use self::svg::svg_box;
+use super::border::{border_canvas, fieldset_border, inset_shadows, shade_border};
 use super::columns::columns;
-use super::controls::controls;
-use super::cx::{Carry, Cx, Frame, above, viewport};
-use super::finish::finish;
 use super::kept::{Query, Read, Replay, hashed};
 use super::margin::{body_overflow_moves, definite_line, in_flow, margins, overscroll};
-use super::marker::list_marker;
-use super::native::{control_layer, native_control};
-use super::natural::natural_box;
-use super::paragraph::paragraph;
-use super::props::props;
-use super::pseudos::pseudo_elements;
 use super::query::{
-    backdrop, box_parent, content_editable, inset_axes, positioner, row_fill, scrolled,
-    starts_line, text_indent,
+    backdrop, box_parent, content_editable, positioner, row_fill, scrolled, starts_line,
 };
-use super::replaced::replaced;
-use super::svg::svg_box;
 use super::{Build, element};
 use crate::css;
 use crate::css::properties::Prop;
+use crate::render::layout::size::{broken_image, field_size, legend, natural_size, text_field};
+use crate::render::{
+    layout::cull,
+    paint::{background::css_background, scrollbar},
+};
 use crate::style::{self};
 use renderer::{Child, Color, Rect, point, px, relative, size};
 use std::{cell::RefCell, ops::ControlFlow, rc::Rc};
@@ -37,7 +52,7 @@ pub(super) fn create(
     id: usize,
     containing: [f32; 2],
     container: [f32; 2],
-    slot: Option<([f32; 4], super::super::layout::grid::Grid)>,
+    slot: Option<([f32; 4], crate::render::layout::grid::Grid)>,
     pseudo: Option<usize>,
 ) -> Child {
     let reader = build;
@@ -171,7 +186,7 @@ pub(super) fn create(
     let position = style.get(Prop::POSITION).unwrap_or("static");
     let parent = box_parent(doc, styles, id);
     let positioner = positioner(position, ancestors.iter().rev().copied(), |ancestor| {
-        super::super::effects::establishes(&styles.values[ancestor])
+        crate::render::effects::establishes(&styles.values[ancestor])
     });
     if matches!(position, "absolute" | "fixed") {
         let scope = positioner
@@ -332,7 +347,7 @@ pub(super) fn create(
                 });
                 if caret {
                     window.paint_volatile();
-                    super::super::paint::text::paint_caret(
+                    crate::render::paint::text::paint_caret(
                         &painter,
                         [id, 0, 0],
                         Rect::new(bounds.origin, size(px(1.), px(line_height))),
@@ -372,7 +387,7 @@ pub(super) fn create(
         (
             skips && !forced,
             forced,
-            skips.then(|| super::super::layout::grid::intrinsic_size(style, &units, remembered)),
+            skips.then(|| crate::render::layout::grid::intrinsic_size(style, &units, remembered)),
             // The last size is the size without the contents only if the last build skipped them.
             last.filter(|_| was),
         )
@@ -397,7 +412,7 @@ pub(super) fn create(
     // Spliced inline boxes, with the range of their content in `flat`. The end of a box is `!index` in `pending`.
     let mut cuts: Vec<(usize, usize, usize)> = Vec::new();
     // The parts of the spliced boxes: their place in `flat`, and the key of their text or their first and last block.
-    let mut cut_parts: Vec<(usize, usize, super::super::paint::Piece)> = Vec::new();
+    let mut cut_parts: Vec<(usize, usize, crate::render::paint::Piece)> = Vec::new();
     // The block `::before` and `::after` of spliced boxes: their place in `flat` and their index.
     let mut cut_pseudos: Vec<(usize, usize)> = Vec::new();
     while let Some(child) = pending.pop() {
@@ -637,113 +652,7 @@ pub(super) fn create(
     let hit = &cx.hit;
     let mut el = match hit {
         Some(style) => renderer::shared(style.clone()).id(id),
-        None => {
-            let mut el = renderer::node()
-                .id(id)
-                .flex()
-                .flex_col()
-                .text_size(px(units.font.em))
-                .font_family(face.family.clone())
-                .font_weight(face.weight)
-                .line_height(px(line_height));
-            el.style().flex_shrink = if flex_parent { 1. } else { 0. };
-            el.style().baseline = match display {
-                "inline-block" if !flex_parent && slot.is_none() => renderer::Baseline::Last,
-                "flex" | "inline-flex" | "grid" | "inline-grid" => renderer::Baseline::First,
-                _ => renderer::Baseline::Auto,
-            };
-            el.style().block = matches!(
-                display,
-                "block" | "inline-block" | "list-item" | "flow-root"
-            );
-            el.style().contains = (u8::from(made.absolute) * renderer::Escape::ABSOLUTE)
-                | (u8::from(made.fixed) * renderer::Escape::FIXED);
-            el.style().escape = match position {
-                "absolute" => renderer::Escape::ABSOLUTE,
-                "fixed" => renderer::Escape::FIXED,
-                _ => 0,
-            };
-            if position == "absolute" {
-                el.style().placed = inset_axes(style);
-            }
-            el.style().scroll_anchor = (u8::from(style.get(Prop::OVERFLOW_ANCHOR) == Some("none"))
-                * renderer::ScrollAnchor::NONE)
-                | (u8::from(position == "sticky") * renderer::ScrollAnchor::STICKY);
-            // Only boxes in columns break, so others skip these reads.
-            if columned {
-                use renderer::Break;
-                for (props, forced, avoid) in [
-                    (
-                        [Prop::BREAK_BEFORE, Prop::PAGE_BREAK_BEFORE],
-                        Break::BEFORE,
-                        Break::AVOID_BEFORE,
-                    ),
-                    (
-                        [Prop::BREAK_AFTER, Prop::PAGE_BREAK_AFTER],
-                        Break::AFTER,
-                        Break::AVOID_AFTER,
-                    ),
-                    (
-                        [Prop::BREAK_INSIDE, Prop::PAGE_BREAK_INSIDE],
-                        0,
-                        Break::AVOID_INSIDE,
-                    ),
-                ] {
-                    match props.iter().find_map(|&prop| style.get(prop)) {
-                        Some("column") => el.style().breaks |= forced,
-                        Some(value) if value.starts_with("avoid") => el.style().breaks |= avoid,
-                        _ => {}
-                    }
-                }
-                if matches!(
-                    node.tag.as_str(),
-                    "img"
-                        | "svg"
-                        | "canvas"
-                        | "video"
-                        | "audio"
-                        | "iframe"
-                        | "embed"
-                        | "object"
-                        | "input"
-                        | "textarea"
-                        | "select"
-                        | "button"
-                        | "meter"
-                        | "progress"
-                        | "webview"
-                ) || display.starts_with("inline-")
-                {
-                    // Like Chrome, atomic inline boxes are monolithic.
-                    el.style().breaks |= Break::WHOLE;
-                }
-                let kept = [Prop::ORPHANS, Prop::WIDOWS].map(|prop| {
-                    style
-                        .get(prop)
-                        .and_then(|value| value.parse::<u8>().ok())
-                        .unwrap_or(2)
-                });
-                if kept != [2, 2] {
-                    el.text_style().set_lines_kept(kept);
-                }
-            }
-            {
-                let text = el.text_style();
-                text.set_letter_spacing(parsed.spacing[0]);
-                text.set_word_spacing(parsed.spacing[1]);
-                text.set_font_smoothing(!parsed.smoothing);
-                let (indent, percent) = text_indent(style, &units);
-                text.set_text_indent(px(indent));
-                text.set_text_indent_percent(percent);
-            }
-            if face.style != renderer::FontStyle::Normal {
-                el.text_style().set_font_style(face.style);
-            }
-            if face.synthesis != [true; 2] {
-                el.text_style().set_font_synthesis(face.synthesis);
-            }
-            el
-        }
+        None => new_box(&cx),
     };
     if stacking {
         if hit.is_none() {
@@ -795,7 +704,7 @@ pub(super) fn create(
     let input = (node.tag == "input").then(|| node.input_type());
     let appkit = node.native_control(style);
     if appkit.is_some() {
-        super::super::paint::native::register(&view.controls, id);
+        crate::render::paint::native::register(&view.controls, id);
     }
     let check = input.is_some_and(|kind| {
         kind.eq_ignore_ascii_case("checkbox") || kind.eq_ignore_ascii_case("radio")
@@ -832,7 +741,7 @@ pub(super) fn create(
     let mut text_fill = None;
     // The root element paints the background of the canvas, also when it comes from the body.
     let source = matches!(node.tag.as_str(), "html" | "body")
-        .then(|| super::super::paint::background::canvas_source(doc, styles))
+        .then(|| crate::render::paint::background::canvas_source(doc, styles))
         .flatten();
     let propagated = node.tag == "body" && source == Some(id);
     let canvas = source.filter(|_| node.tag == "html" && node.parent == Some(0));
@@ -1100,7 +1009,7 @@ pub(super) fn create(
             let metrics = text.metrics(font);
             let height = metrics.ascent * size_px.0 - metrics.descent * size_px.0;
             let line_height = units.font.lh;
-            let radii = super::super::effects::clip::radii(style, &units, || containing);
+            let radii = crate::render::effects::clip::radii(style, &units, || containing);
             let (sides, pad_y, fill) = (borders, padding[0] + padding[2], inline_fill);
             let dashed = matches!(border_kinds[0], "dashed");
             el = el.child(
@@ -1189,7 +1098,7 @@ pub(super) fn create(
     }
     let border_image = hit
         .is_none()
-        .then(|| super::super::paint::background::border_image(style, units, id, 0, borders, view))
+        .then(|| crate::render::paint::background::border_image(style, units, id, 0, borders, view))
         .flatten();
     if border_image.is_some() {
         border_colors = [renderer::Color::TRANSPARENT; 4];
@@ -1230,7 +1139,7 @@ pub(super) fn create(
                 .all(|side| border_colors[side] == border_colors[first])
         {
             el = el.border_color(border_colors[first]);
-            el.style().border_style = super::super::effects::border_style(border_kinds[first]);
+            el.style().border_style = crate::render::effects::border_style(border_kinds[first]);
         } else {
             el = el.border_color(renderer::Color::TRANSPARENT);
         }
@@ -1296,7 +1205,7 @@ pub(super) fn create(
                 el = el.min_w(px(min));
             }
         } else if percent {
-            el = el.child(super::super::paint::field::natural_width(px(width)));
+            el = el.child(crate::render::paint::field::natural_width(px(width)));
         }
         if auto[1] && (node.tag != "textarea" || style.get(Prop::FIELD_SIZING) != Some("content")) {
             el = el.min_h(px(height + chrome[1]));
@@ -1314,7 +1223,7 @@ pub(super) fn create(
     };
     let radius = parsed
         .radii
-        .unwrap_or_else(|| super::super::effects::clip::radii(style, &units, basis));
+        .unwrap_or_else(|| crate::render::effects::clip::radii(style, &units, basis));
     if hit.is_none() {
         el.style().corner_radii = radius;
     }
@@ -1537,7 +1446,7 @@ pub(super) fn create(
                 .left_0()
                 .size_full()
                 .children(background)
-                .hooks(super::super::paint::Effected {
+                .hooks(crate::render::paint::Effected {
                     effect: renderer::PaintEffect {
                         text_mask: true,
                         ..Default::default()
@@ -1562,10 +1471,10 @@ pub(super) fn create(
         let cropped = matches!(fit, renderer::ObjectFit::Cover | renderer::ObjectFit::None);
         let mut image = renderer::node()
             .size_full()
-            .hooks(super::super::paint::Picture {
+            .hooks(crate::render::paint::Picture {
                 id,
                 view: view.clone(),
-                source: super::super::paint::Source::Element,
+                source: crate::render::paint::Source::Element,
                 fit,
                 cropped: cropped.then_some(corners),
                 position: style
@@ -1678,7 +1587,7 @@ pub(super) fn create(
             bands,
             borders,
             radius,
-            border_kinds.map(super::super::effects::border_style),
+            border_kinds.map(crate::render::effects::border_style),
             false,
         ));
     }
@@ -1861,7 +1770,7 @@ pub(super) fn create(
             .right(px(padding[1]))
             .left(px(padding[3]))
             .children(boxes);
-        el = el.child(holder.hooks(super::super::paint::Undrawn(view.clone())));
+        el = el.child(holder.hooks(crate::render::paint::Undrawn(view.clone())));
     } else if (!node.children.is_empty() || carry.items.iter().any(Option::is_some))
         && !skipped
         && node.tag != "canvas"

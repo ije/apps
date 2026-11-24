@@ -1,13 +1,13 @@
-use super::super::layout::size::{aspect_ratio, pseudo_lengths};
-use super::super::{layout::cull, paint::background::css_background};
-use super::Build;
-use super::border::{border_canvas, inset_shadows};
+use super::super::Build;
+use super::super::border::{border_canvas, inset_shadows};
+use super::super::kept::{Query, hashed};
+use super::super::margin::{clear_bits, float_side, percent_bound, percent_calc};
+use super::super::query::{inset_axes, only_auto_ratio, positioner, static_mark};
 use super::cx::{Carry, Cx, Frame, percentage, viewport};
-use super::kept::{Query, hashed};
-use super::margin::{clear_bits, float_side, percent_bound, percent_calc};
-use super::query::{inset_axes, only_auto_ratio, positioner, static_mark};
 use crate::css;
 use crate::css::properties::{Prop, Style};
+use crate::render::layout::size::{aspect_ratio, pseudo_lengths};
+use crate::render::{layout::cull, paint::background::css_background};
 use crate::style::{self};
 use renderer::{Color, Rect, SharedString, px, relative};
 use std::ops::ControlFlow;
@@ -248,7 +248,7 @@ pub(super) fn pseudo_elements(
             ]
         };
         let pseudo_radius =
-            super::super::effects::clip::radii(pseudo, &pseudo_units, || containing);
+            crate::render::effects::clip::radii(pseudo, &pseudo_units, || containing);
         decoration.style().corner_radii = pseudo_radius;
         let colors = sides.map(|(_, _, color)| {
             pseudo
@@ -256,7 +256,7 @@ pub(super) fn pseudo_elements(
                 .and_then(css::value::color::paint)
                 .unwrap_or(ink)
         });
-        let border_image = super::super::paint::background::border_image(
+        let border_image = crate::render::paint::background::border_image(
             pseudo,
             pseudo_units,
             id,
@@ -273,7 +273,7 @@ pub(super) fn pseudo_elements(
             } else {
                 decoration = decoration.border_color(renderer::Color::TRANSPARENT);
                 let kinds = sides.map(|(_, kind, _)| {
-                    super::super::effects::border_style(pseudo.get(kind).unwrap_or("solid"))
+                    crate::render::effects::border_style(pseudo.get(kind).unwrap_or("solid"))
                 });
                 decoration = decoration.child(border_canvas(
                     vec![([0.; 4], pseudo_borders, colors)],
@@ -299,7 +299,7 @@ pub(super) fn pseudo_elements(
                 false => self::positioner(
                     if fixed { "fixed" } else { "absolute" },
                     ancestors.iter().rev().copied(),
-                    |ancestor| super::super::effects::establishes(&styles.values[ancestor]),
+                    |ancestor| crate::render::effects::establishes(&styles.values[ancestor]),
                 ),
             };
             let scope = block
@@ -484,7 +484,7 @@ pub(super) fn pseudo_elements(
                     }
                 }
                 Prop::OPACITY if !keyed => {
-                    decoration = decoration.opacity(super::super::effects::opacity(pseudo));
+                    decoration = decoration.opacity(crate::render::effects::opacity(pseudo));
                 }
                 Prop::BOX_SHADOW => {
                     decoration.style().box_shadow =
@@ -625,8 +625,8 @@ pub(super) fn pseudo_elements(
             .find_map(|prop| pseudo.get(prop))
             .filter(|value| *value != "none")
         {
-            for effect in super::super::effects::filter::filters(value, &pseudo_units, doc, ids) {
-                decoration = decoration.hooks(super::super::paint::Effected {
+            for effect in crate::render::effects::filter::filters(value, &pseudo_units, doc, ids) {
+                decoration = decoration.hooks(crate::render::paint::Effected {
                     effect,
                     backdrop: None,
                 });
@@ -637,7 +637,7 @@ pub(super) fn pseudo_elements(
             .find_map(|prop| pseudo.get(prop))
             .is_some_and(|value| value != "none")
         {
-            decoration = decoration.hooks(super::super::paint::Masked {
+            decoration = decoration.hooks(crate::render::paint::Masked {
                 view: view.clone(),
                 key: (id, index as u8 + 1),
                 style: Rc::new(pseudo.clone()),
@@ -648,9 +648,9 @@ pub(super) fn pseudo_elements(
             .get(Prop::MIX_BLEND_MODE)
             .filter(|value| *value != "normal")
         {
-            decoration = decoration.hooks(super::super::paint::Effected {
+            decoration = decoration.hooks(crate::render::paint::Effected {
                 effect: renderer::PaintEffect {
-                    blend_mode: super::super::effects::filter::blend_mode(value),
+                    blend_mode: crate::render::effects::filter::blend_mode(value),
                     ..Default::default()
                 },
                 backdrop: None,
@@ -658,10 +658,10 @@ pub(super) fn pseudo_elements(
         }
         // An opacity animation keeps one keyed layer, so its frames only patch the layer's opacity.
         if keyed {
-            decoration = decoration.hooks(super::super::paint::Effected {
+            decoration = decoration.hooks(crate::render::paint::Effected {
                 effect: renderer::PaintEffect {
-                    opacity: super::super::effects::opacity(pseudo),
-                    key: Some(super::super::effects::pseudo_key(id, index as u8 + 1)),
+                    opacity: crate::render::effects::opacity(pseudo),
+                    key: Some(crate::render::effects::pseudo_key(id, index as u8 + 1)),
                     ..Default::default()
                 },
                 backdrop: None,
@@ -675,9 +675,9 @@ pub(super) fn pseudo_elements(
                     .get(Prop::VISIBILITY)
                     .is_none_or(|value| value == "visible")
             })
-            .and_then(|value| super::super::effects::filter::backdrop(value, &pseudo_units))
+            .and_then(|value| crate::render::effects::filter::backdrop(value, &pseudo_units))
         {
-            Some((blur, color_matrix)) => decoration.hooks(super::super::paint::Effected {
+            Some((blur, color_matrix)) => decoration.hooks(crate::render::paint::Effected {
                 effect: renderer::PaintEffect {
                     backdrop: Some(renderer::Backdrop {
                         bounds: Rect::default(),
@@ -691,11 +691,11 @@ pub(super) fn pseudo_elements(
             }),
             None => decoration,
         };
-        let decoration = if super::super::effects::TRANSFORM_PROPS
+        let decoration = if crate::render::effects::TRANSFORM_PROPS
             .iter()
             .any(|&prop| pseudo.get(prop).is_some_and(|value| value != "none"))
         {
-            decoration.hooks(super::super::paint::Transformed {
+            decoration.hooks(crate::render::paint::Transformed {
                 style: Rc::new(pseudo.clone()),
                 units: pseudo_units,
                 matrix: Default::default(),
@@ -739,11 +739,11 @@ pub(super) fn pseudo_elements(
                     renderer::Escape::ABSOLUTE
                 };
                 decoration.style().placed = inset_axes(pseudo);
-                contained = Some(super::super::paint::PseudoBlock {
+                contained = Some(crate::render::paint::PseudoBlock {
                     view: view.clone(),
                     anchor: None,
-                    place: Some(super::super::paint::Contained {
-                        key: super::super::effects::pseudo_key(id, index as u8 + 1) as usize,
+                    place: Some(crate::render::paint::Contained {
+                        key: crate::render::effects::pseudo_key(id, index as u8 + 1) as usize,
                         container,
                         viewport: units.viewport,
                         sized: sized.then_some(size),
@@ -795,7 +795,7 @@ pub(super) fn pseudo_elements(
             match &mut contained {
                 Some(contained) => contained.anchor = anchor,
                 None => {
-                    contained = Some(super::super::paint::PseudoBlock {
+                    contained = Some(crate::render::paint::PseudoBlock {
                         view: view.clone(),
                         place: None,
                         anchor,
@@ -823,7 +823,7 @@ pub(super) fn pseudo_elements(
         let decoration = if matches!(own, "inline" | "none" | "contents") {
             decoration
         } else {
-            decoration.hooks(super::super::paint::PseudoBox {
+            decoration.hooks(crate::render::paint::PseudoBox {
                 view: view.clone(),
                 element: id,
                 origin: pseudo_origin.get_or_insert_default().clone(),
@@ -844,7 +844,7 @@ pub(super) fn pseudo_elements(
         if pseudo_only {
             return ControlFlow::Break(
                 decoration
-                    .hooks(super::super::paint::PseudoPart {
+                    .hooks(crate::render::paint::PseudoPart {
                         view: view.clone(),
                         node: id,
                         key: crate::render::inline::atom_key(id, index as u8 + 1),

@@ -1,13 +1,13 @@
-use super::super::layout::cull;
-use super::super::layout::size::aspect_ratio;
-use super::Build;
-use super::kept::{Query, hashed};
-use super::margin::{edge, float_side, run_cuts};
-use super::plan::Plan;
+use super::super::Build;
+use super::super::kept::{Query, hashed};
+use super::super::margin::{edge, float_side, run_cuts};
+use super::super::plan::Plan;
 use crate::css::properties::{Prop, Style};
 use crate::css::value::units::Lengths;
 use crate::dom::Node;
 use crate::render::inline::InlineText;
+use crate::render::layout::cull;
+use crate::render::layout::size::aspect_ratio;
 use crate::render::paint::text::AtomSlot;
 use crate::style;
 use renderer::{point, px, relative};
@@ -15,7 +15,9 @@ use std::{cell::RefCell, rc::Rc};
 
 /// The facts of one box that the stages of `create` share.
 pub(super) struct Cx<'a> {
+    /// The build of the parent, which logs the reads of this box.
     pub(super) reader: &'a Build<'a>,
+    /// The build of the children of this box.
     pub(super) build: &'a Build<'a>,
     pub(super) id: usize,
     pub(super) node: &'a Node,
@@ -26,7 +28,7 @@ pub(super) struct Cx<'a> {
     pub(super) position: &'a str,
     pub(super) containing: [f32; 2],
     pub(super) container: [f32; 2],
-    pub(super) slot: &'a Option<([f32; 4], super::super::layout::grid::Grid)>,
+    pub(super) slot: &'a Option<([f32; 4], crate::render::layout::grid::Grid)>,
     pub(super) pseudo: Option<usize>,
     pub(super) depth: usize,
     pub(super) multicol: bool,
@@ -95,7 +97,7 @@ pub(super) fn percentage(value: &str) -> Option<f32> {
         .filter(|v| v.is_finite())
 }
 
-/// The edges and sizes of the box, for the stages from its pseudo-elements on.
+/// The edges and sizes of the box, for the stages after its padding, borders and margins are known.
 pub(super) struct Frame {
     pub(super) padding: [f32; 4],
     pub(super) borders: [f32; 4],
@@ -602,7 +604,7 @@ impl Cx<'_> {
             if atom.pseudo != 0 {
                 return pseudo();
             }
-            let [_, max, _, height] = super::super::layout::grid::intrinsic::intrinsic(
+            let [_, max, _, height] = crate::render::layout::grid::intrinsic::intrinsic(
                 doc,
                 atom.node,
                 styles,
@@ -614,7 +616,7 @@ impl Cx<'_> {
             let line = styles.lengths[atom.node].font.lh;
             [max, height.max(line), line * 0.8]
         });
-        super::super::paint::text::AtomSlot {
+        crate::render::paint::text::AtomSlot {
             size,
             align: self.align_of(child),
             at: std::cell::Cell::new(point(px(0.), px(0.))),
@@ -657,7 +659,7 @@ impl Cx<'_> {
             None => wrapper.max_w(renderer::Length::Calc(1., px(-padding[1] - padding[3]))),
         };
         wrapper = wrapper
-            .hooks(super::super::paint::text::AtomBox {
+            .hooks(crate::render::paint::text::AtomBox {
                 slots: slots.clone(),
                 index,
                 node: atom.key(),
@@ -670,7 +672,7 @@ impl Cx<'_> {
                 renderer::node()
                     .flex_1()
                     .min_w(px(0.))
-                    .hooks(super::super::paint::text::AtomRest(rest)),
+                    .hooks(crate::render::paint::text::AtomRest(rest)),
             );
         }
         wrapper

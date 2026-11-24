@@ -1,6 +1,6 @@
-use super::Build;
+use super::super::Build;
+use super::super::query::text_indent;
 use super::cx::{Cx, Frame};
-use super::query::text_indent;
 use crate::css;
 use crate::css::properties::Prop;
 use crate::style::{self};
@@ -150,8 +150,8 @@ pub(super) fn list_marker(cx: &Cx<'_>, fr: &Frame, mut el: renderer::Node) -> re
             let space = text
                 .advance(face, px(size), ' ')
                 .map_or(size / 4., f32::from);
-            let look = super::super::paint::control::Look {
-                control: super::super::paint::control::Control::Disclosure,
+            let look = crate::render::paint::control::Look {
+                control: crate::render::paint::control::Control::Disclosure,
                 checked: kind == "disclosure-open",
                 ink: marker_style
                     .unwrap_or(style)
@@ -165,7 +165,7 @@ pub(super) fn list_marker(cx: &Cx<'_>, fr: &Frame, mut el: renderer::Node) -> re
                 .left_0()
                 .top(px((leading + ascent - side) / pixel_ratio))
                 .size(px(side / pixel_ratio))
-                .child(super::super::paint::control::layer(id, look, view.clone()));
+                .child(crate::render::paint::control::layer(id, look, view.clone()));
             let above = (leading + ascent) / pixel_ratio;
             let marker = renderer::node()
                 .flex_shrink_0()

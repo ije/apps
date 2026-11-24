@@ -1,8 +1,8 @@
-use super::Build;
+use super::super::Build;
+use super::super::kept::{Query, hashed};
+use super::super::margin::{float_side, in_flow};
+use super::super::query::parent_font;
 use super::cx::{Cx, Frame};
-use super::kept::{Query, hashed};
-use super::margin::{float_side, in_flow};
-use super::query::parent_font;
 use crate::css;
 use crate::css::properties::Prop;
 use crate::style::{self};
@@ -18,7 +18,7 @@ pub(super) fn vertical_align(
     replaced: bool,
     check: bool,
     input: Option<&str>,
-    native: &Option<super::super::paint::control::Look>,
+    native: &Option<crate::render::paint::control::Look>,
 ) -> renderer::Node {
     let Cx {
         reader,
@@ -110,7 +110,7 @@ pub(super) fn vertical_align(
     let field = editable && node.tag == "input";
     let swatch = native
         .as_ref()
-        .is_some_and(|look| look.control == super::super::paint::control::Control::Color);
+        .is_some_and(|look| look.control == crate::render::paint::control::Control::Color);
     let parent_style = &styles.values[parent];
     let parent = below(parent_style, line);
     let edge = el.style().align_self.is_none()
@@ -156,7 +156,7 @@ pub(super) fn vertical_align(
     } else if native.as_ref().is_some_and(|look| {
         // Like Chrome, a range sits on the bottom of its border box, a progress bar without its native look
         // on the bottom of its margin box.
-        !look.plain || look.control == super::super::paint::control::Control::Range
+        !look.plain || look.control == crate::render::paint::control::Control::Range
     }) {
         0.
     } else {
