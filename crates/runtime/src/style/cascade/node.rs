@@ -74,7 +74,6 @@ impl NodePass<'_> {
         );
         let order = walk.walk.order();
         // The generation and revision of each dependency key in the list of the current node.
-        let (mut unique, mut generation) = (Vec::<(u32, u32)>::new(), 0u32);
         let mut inheritable = std::mem::take(&mut style_cache.inheritable);
         let mut local: Vec<Prop> = registry
             .iter()
@@ -700,7 +699,6 @@ impl NodePass<'_> {
                         group,
                         &mut shares,
                         &mut candidates,
-                        (&mut unique, &mut generation),
                         &no_pseudos,
                     );
                     let mut applies = |order: usize, passed: bool| {

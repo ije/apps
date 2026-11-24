@@ -1135,7 +1135,6 @@ impl StyleScope {
         group: Option<(usize, [u32; 7])>,
         shares: &mut FxHashMap<(usize, [u32; 7]), Share>,
         candidates: &mut Vec<usize>,
-        (unique, generation): (&mut Vec<(u32, u32)>, &mut u32),
         no_pseudos: &Rc<[usize]>,
     ) -> (Matched, Rc<[usize]>) {
         let node = &doc.nodes[id];
@@ -1260,21 +1259,7 @@ impl StyleScope {
             }
             let style = matches.reads(id, 6);
             matches.depend(id, 6);
-            // Each candidate selector reads the node again, so most entries repeat: drop them before sorting.
-            *generation = generation.wrapping_add(1);
-            if *generation == 0 {
-                unique.fill((0, 0));
-                *generation = 1;
-            }
-            matches.retain_recorded(|&(key, revision)| {
-                let key = key as usize;
-                if key >= unique.len() {
-                    unique.resize(key + 1, (0, 0));
-                }
-                let seen = std::mem::replace(&mut unique[key], (*generation, revision));
-                seen != (*generation, revision)
-            });
-            matches.finish(id);
+            matches.finish_repeated(id);
             let shared = intern(&mut self.lists, &matched);
             let matched_pseudos = if matched_pseudos.is_empty() {
                 no_pseudos.clone()
