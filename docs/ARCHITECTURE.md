@@ -20,7 +20,9 @@
 | [packages](packages) | npm launcher, TypeScript declarations, and packages for each platform and architecture |
 | [scripts](scripts) | JavaScriptCore, FFmpeg, libghostty-vt, and npm package builds |
 
-The runtime separates JavaScript API objects from native state. [js](crates/runtime/js) contains the API implementations and event loop. [src/jsc](crates/runtime/src/jsc) connects them to Rust and checks access by context role. [Host](crates/runtime/src/host.rs) owns app metadata, page documents, native resources, and commands.
+The runtime separates JavaScript API objects from native state. [js](crates/runtime/js) contains the API implementations and event loop. [src/jsc](crates/runtime/src/jsc) binds JavaScriptCore. [src/host](crates/runtime/src/host) connects contexts to Rust, checks access by context role, and owns page documents, native resources, and commands. [bundle.rs](crates/runtime/src/bundle.rs) describes the app package.
+
+The modules of the runtime crate are layers, and a module uses only the ones below it: `desktop` and `script` (the entries), `host`, `node` and `web`, `render`, `dom`, `style` and `bundle`, `devtools` (the binding of the optional library), and at the bottom `jsc`, `native` and `library`. Render reaches the desktop that drives its views through the `render::Pages` trait.
 
 ## Build and startup
 
@@ -98,7 +100,7 @@ On macOS, the main thread owns AppKit and each `BrowserWindow` has a render thre
 
 On Windows and Linux, main code and window pages share the main thread. A busy script can delay all page frames there. The handler pool, blocking pool, network thread, and workers remain separate.
 
-A page and its preload have separate globals but share a VM and host. On macOS, that VM belongs to their render thread. Main and render threads exchange commands and payloads through [desktop/link.rs](crates/runtime/src/desktop/link.rs). JavaScript objects do not cross these queues. The runtime uses threads within one process, so a native crash can end the whole app.
+A page and its preload have separate globals but share a VM and host. On macOS, that VM belongs to their render thread. Main and render threads exchange commands and payloads through [host/link.rs](crates/runtime/src/host/link.rs). JavaScript objects do not cross these queues. The runtime uses threads within one process, so a native crash can end the whole app.
 
 ### Events and communication
 
@@ -116,7 +118,7 @@ Main dispatch uses common run loop modes, so native work continues inside modal 
 
 ## Context roles and feature flags
 
-The runtime defines three [roles](crates/runtime/src/host.rs): main, preload, and renderer. The bundler checks module access, and the native bridge checks each operation again.
+The runtime defines three [roles](crates/runtime/src/jsc/mod.rs): main, preload, and renderer. The bundler checks module access, and the native bridge checks each operation again.
 
 - Main code can use desktop APIs and the supported Node APIs.
 - Preloads can use the supported Node APIs and a limited Electron API. Their `document` proxy accesses the page through the context bridge.
@@ -250,11 +252,11 @@ The allocator belongs to `apps-runtime`, so a Rust app cannot define another glo
 
 `apps run` compiles a development bundle and sends it to the app over stdin as a JSON line. With `--watch`, changes to pages and chunks used only by pages reload the open bundled pages. Main code, shared chunks, and other bundle changes restart the app. Rust source, Cargo manifest, or lockfile changes also rebuild the executable.
 
-`ELECTRON_RUN_AS_NODE=1` selects the [headless script runner](crates/runtime/src/node/script.rs). It runs JavaScript with the supported Node APIs and no desktop windows. This also lets an app launch a bundled server chunk as a child process. `child_process.fork()` and `utilityProcess.fork()` start such a child with a JSON message channel on an extra descriptor.
+`ELECTRON_RUN_AS_NODE=1` selects the [headless script runner](crates/runtime/src/script.rs). It runs JavaScript with the supported Node APIs and no desktop windows. This also lets an app launch a bundled server chunk as a child process. `child_process.fork()` and `utilityProcess.fork()` start such a child with a JSON message channel on an extra descriptor.
 
 The runtime implements Node compatibility through [JavaScript modules](crates/runtime/js/node) and [Rust services](crates/runtime/src/node). Node-API addons and `node:ffi` call native code in the same process. There is no Node.js or libuv runtime.
 
-`--devtools` opens the [developer tools](crates/runtime/src/desktop/devtools.rs): a panel at the left side of the window with a tree of layers and a console. The panel is a system web view beside the page view, so the page gets the rest of the window. Its styles are Tailwind classes that the runtime's own Tailwind compiler turns into CSS when the panel opens. A script in the page reads the DOM and the logged values for the panel, and the renderer draws the box of the selected node. The panel page and this script are in the devtools library, which the runtime loads when the tools first open. On Windows and Linux the panel has a separate window. The shortcuts are those of Chrome, and a button in the panel shows the FPS HUD.
+`--devtools` opens the [developer tools](crates/runtime/src/desktop/panel.rs): a panel at the left side of the window with a tree of layers and a console. The panel is a system web view beside the page view, so the page gets the rest of the window. Its styles are Tailwind classes that the runtime's own Tailwind compiler turns into CSS when the panel opens. A script in the page reads the DOM and the logged values for the panel, and the renderer draws the box of the selected node. The panel page and this script are in the devtools library, which the runtime loads when the tools first open. On Windows and Linux the panel has a separate window. The shortcuts are those of Chrome, and a button in the panel shows the FPS HUD.
 
 `--enable-devtools-mcp` starts the HTTP/MCP server of the same library for inspection, screenshots, input, and CPU profiles. The FPS HUD is in this library too. Production packages omit the library and reject developer tools.
 
