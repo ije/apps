@@ -68,6 +68,87 @@ apps-webgpu = { path = "../webgpu" }
 name = "apps-runtime"
 path = "src/main.rs"
 
+# Tests live in folders by layer, so each one needs an entry.
+[[test]]
+name = "backend"
+path = "tests/app/backend.rs"
+
+[[test]]
+name = "bench"
+path = "tests/app/bench.rs"
+
+[[test]]
+name = "desktop"
+path = "tests/app/desktop.rs"
+
+[[test]]
+name = "startup"
+path = "tests/app/startup.rs"
+
+[[test]]
+name = "child_process"
+path = "tests/node/child_process.rs"
+
+[[test]]
+name = "ffi"
+path = "tests/node/ffi.rs"
+
+[[test]]
+name = "napi"
+path = "tests/node/napi.rs"
+
+[[test]]
+name = "sqlite"
+path = "tests/node/sqlite.rs"
+
+[[test]]
+name = "browser"
+path = "tests/page/browser.rs"
+
+[[test]]
+name = "compatibility"
+path = "tests/page/compatibility.rs"
+
+[[test]]
+name = "dom"
+path = "tests/page/dom/main.rs"
+
+[[test]]
+name = "editor"
+path = "tests/page/editor.rs"
+
+[[test]]
+name = "regressions"
+path = "tests/page/regressions.rs"
+
+[[test]]
+name = "render"
+path = "tests/page/render/main.rs"
+
+[[test]]
+name = "images"
+path = "tests/web/images.rs"
+
+[[test]]
+name = "media"
+path = "tests/web/media.rs"
+
+[[test]]
+name = "serve"
+path = "tests/web/serve.rs"
+
+[[test]]
+name = "terminal"
+path = "tests/web/terminal.rs"
+
+[[test]]
+name = "web"
+path = "tests/web/web.rs"
+
+[[test]]
+name = "webgpu"
+path = "tests/web/webgpu.rs"
+
 [dev-dependencies]
 apps-devtools = { path = "../devtools" }
 apps-media = { path = "../media" }

@@ -76,7 +76,7 @@ fn web_contents_view_matches_electron_api() {
     )
     .unwrap();
     engine
-        .eval(include_str!("../js/browser.js"), "browser")
+        .eval(include_str!("../../js/browser.js"), "browser")
         .unwrap();
     engine
         .eval(include_str!("browser.js"), "browser-tests")

@@ -21,7 +21,7 @@ fn native_calls_callbacks_memory_and_lifecycle() {
         })
         .args(["-fPIC", "-pthread", "-Wall", "-Wextra", "-Werror", "-o"])
         .arg(&library)
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/ffi.c"))
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/node/ffi.c"))
         .output()
         .unwrap();
     assert!(

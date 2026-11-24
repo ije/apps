@@ -17,7 +17,7 @@ fn native_addons_values_callbacks_and_contexts() {
     let output = command
         .args(["-Wall", "-Wextra", "-Werror", "-o"])
         .arg(&library)
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/napi.c"))
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/node/napi.c"))
         .output()
         .unwrap();
     assert!(

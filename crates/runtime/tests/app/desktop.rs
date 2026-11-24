@@ -12,7 +12,7 @@ fn native_desktop_dispatches_application_events() {
     )
     .unwrap();
     engine
-        .eval(include_str!("../js/browser.js"), "browser")
+        .eval(include_str!("../../js/browser.js"), "browser")
         .unwrap();
     engine.eval(include_str!("menu.js"), "menu-tests").unwrap();
     let template = output.path().join("menu.json");
@@ -25,7 +25,7 @@ fn native_desktop_dispatches_application_events() {
     let result = Command::new("xcrun")
         .args(["clang", "-fobjc-arc", "-Wno-incompatible-pointer-types"])
         .arg(root.join("native/desktop.m"))
-        .arg(root.join("tests/desktop_native.m"))
+        .arg(root.join("tests/app/desktop_native.m"))
         .args([
             "-framework",
             "AppKit",
@@ -78,7 +78,7 @@ fn application_menu_defaults_and_overrides() {
     )
     .unwrap();
     engine
-        .eval(include_str!("../js/browser.js"), "browser")
+        .eval(include_str!("../../js/browser.js"), "browser")
         .unwrap();
     engine.eval(include_str!("menu.js"), "menu-tests").unwrap();
 }
@@ -92,7 +92,7 @@ fn native_theme_properties_and_events() {
     )
     .unwrap();
     engine
-        .eval(include_str!("../js/browser.js"), "browser")
+        .eval(include_str!("../../js/browser.js"), "browser")
         .unwrap();
     engine
         .eval(include_str!("native_theme.js"), "native-theme-tests")
@@ -108,7 +108,7 @@ fn power_save_blocker_and_system_preferences() {
     )
     .unwrap();
     engine
-        .eval(include_str!("../js/browser.js"), "browser")
+        .eval(include_str!("../../js/browser.js"), "browser")
         .unwrap();
     engine
         .eval(include_str!("native_shell.js"), "native-shell-tests")

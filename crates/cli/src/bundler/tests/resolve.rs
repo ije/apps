@@ -228,7 +228,7 @@ fn native_addons_copy_package_paths_and_survive_relocation() {
         let output = command
             .arg("-o")
             .arg(&library)
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../runtime/tests/napi.c"))
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../runtime/tests/node/napi.c"))
             .output()
             .unwrap();
         assert!(

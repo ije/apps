@@ -18,16 +18,16 @@ fn web_images_decode_in_the_dom() {
     let mut doc = Document::parse("<body><img></body>");
     let mut state = dom::State::default();
     for (bytes, size) in [
-        (include_bytes!("images/sample.png").as_slice(), [4, 3]),
-        (include_bytes!("images/sample.jpg"), [4, 3]),
-        (include_bytes!("images/sample.gif"), [4, 3]),
-        (include_bytes!("images/sample.webp"), [4, 3]),
-        (include_bytes!("images/sample.bmp"), [4, 3]),
-        (include_bytes!("images/sample.ico"), [16, 12]),
-        (include_bytes!("images/sample.avif"), [4, 3]),
-        (include_bytes!("images/alpha.avif"), [4, 3]),
-        (include_bytes!("images/gray.jpg"), [4, 3]),
-        (include_bytes!("images/cmyk.jpg"), [4, 3]),
+        (include_bytes!("../images/sample.png").as_slice(), [4, 3]),
+        (include_bytes!("../images/sample.jpg"), [4, 3]),
+        (include_bytes!("../images/sample.gif"), [4, 3]),
+        (include_bytes!("../images/sample.webp"), [4, 3]),
+        (include_bytes!("../images/sample.bmp"), [4, 3]),
+        (include_bytes!("../images/sample.ico"), [16, 12]),
+        (include_bytes!("../images/sample.avif"), [4, 3]),
+        (include_bytes!("../images/alpha.avif"), [4, 3]),
+        (include_bytes!("../images/gray.jpg"), [4, 3]),
+        (include_bytes!("../images/cmyk.jpg"), [4, 3]),
     ] {
         dom::call(
             "dom.image",
@@ -42,11 +42,11 @@ fn web_images_decode_in_the_dom() {
     }
     for (bytes, color) in [
         (
-            include_bytes!("images/alpha.avif").as_slice(),
+            include_bytes!("../images/alpha.avif").as_slice(),
             [224, 128, 32, 85],
         ),
-        (include_bytes!("images/gray.jpg"), [110, 110, 110, 255]),
-        (include_bytes!("images/cmyk.jpg"), [224, 128, 32, 255]),
+        (include_bytes!("../images/gray.jpg"), [110, 110, 110, 255]),
+        (include_bytes!("../images/cmyk.jpg"), [224, 128, 32, 255]),
     ] {
         let image = apps_runtime::render::image::decode(bytes).unwrap();
         for pixel in image.bytes().as_chunks::<4>().0 {
@@ -62,10 +62,10 @@ fn svg_raster_images_decode_through_the_runtime() {
     use apps_runtime::render::canvas::{svg_pixels, svg_tree};
     use base64::Engine;
     for (kind, bytes) in [
-        ("png", include_bytes!("images/sample.png").as_slice()),
-        ("jpeg", include_bytes!("images/sample.jpg")),
-        ("gif", include_bytes!("images/sample.gif")),
-        ("webp", include_bytes!("images/sample.webp")),
+        ("png", include_bytes!("../images/sample.png").as_slice()),
+        ("jpeg", include_bytes!("../images/sample.jpg")),
+        ("gif", include_bytes!("../images/sample.gif")),
+        ("webp", include_bytes!("../images/sample.webp")),
     ] {
         let source = format!(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="3"><image href="data:image/{kind};base64,{}" width="4" height="3"/></svg>"#,
@@ -81,7 +81,7 @@ fn svg_raster_images_decode_through_the_runtime() {
     // An image that names a file is read only in SVG that the runtime wrote itself, never in page content.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("sample.png");
-    std::fs::write(&path, include_bytes!("images/sample.png")).unwrap();
+    std::fs::write(&path, include_bytes!("../images/sample.png")).unwrap();
     let source = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="3"><image href="{}" width="4" height="3"/></svg>"#,
         path.display()
@@ -114,7 +114,7 @@ fn web_image_formats_are_enabled() {
 #[test]
 fn avif_rejects_corrupt_data_and_respects_limits() {
     use apps_runtime::render::image::decode;
-    let mut bytes = include_bytes!("images/corrupt-base.avif").to_vec();
+    let mut bytes = include_bytes!("../images/corrupt-base.avif").to_vec();
     assert!(decode(&bytes).is_ok());
     bytes[280] ^= 1;
     assert!(decode(&bytes).is_err() || cfg!(target_os = "macos"));
@@ -131,7 +131,7 @@ fn avif_rejects_corrupt_data_and_respects_limits() {
         }
         assert!(matches!(
             apps_runtime::render::image::avif::decode_avif(
-                include_bytes!("images/sample.avif"),
+                include_bytes!("../images/sample.avif"),
                 limits
             ),
             Err(image::ImageError::Limits(_))
@@ -173,7 +173,7 @@ fn svg_and_bundled_images_load_through_the_host() {
 
     let directory = tempfile::tempdir().unwrap();
     let png = directory.path().join("sample.png");
-    std::fs::write(&png, include_bytes!("images/sample.png")).unwrap();
+    std::fs::write(&png, include_bytes!("../images/sample.png")).unwrap();
     let mut host = Host::default();
     host.assets.insert("assets/sample.png".into(), png.clone());
     host.pages.insert(
