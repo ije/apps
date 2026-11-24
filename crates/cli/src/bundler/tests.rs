@@ -1,5 +1,13 @@
 use super::*;
 
+fn asset_name(root: &Path, path: &Path) -> Option<String> {
+    Shared {
+        root: root.to_owned(),
+        ..Shared::default()
+    }
+    .asset_name(path)
+}
+
 #[test]
 #[ignore = "release bundle size measurement; set APPS_BENCH_ENTRY"]
 fn development_bundle_size() {

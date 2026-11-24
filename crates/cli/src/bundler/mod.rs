@@ -82,6 +82,363 @@ struct Loaders {
 }
 
 impl Shared {
+    fn watch(&self, path: PathBuf) {
+        self.files.borrow_mut().insert(path);
+    }
+
+    fn watch_all(&self, paths: impl IntoIterator<Item = PathBuf>) {
+        self.files.borrow_mut().extend(paths);
+    }
+
+    fn app_file(&self, relative: impl AsRef<Path>) -> PathBuf {
+        self.root.join(relative)
+    }
+
+    fn in_app(&self, path: &Path) -> bool {
+        path.starts_with(&self.root)
+    }
+
+    fn is_preload(&self, path: &Path) -> bool {
+        self.preload.as_deref() == Some(path)
+    }
+
+    fn has_preload(&self) -> bool {
+        self.preload.is_some()
+    }
+
+    // The code of a page that gives the exports of the package preload to the page.
+    fn preload_import(&self) -> Option<String> {
+        let preload = self.preload.as_ref()?;
+        Some(format!(
+            "import * as api from {};globalThis.__appsPublishPreload(api);",
+            json!(preload)
+        ))
+    }
+
+    // `import.meta.env`, or one of its values.
+    fn meta_env(&self, key: Option<&str>) -> String {
+        match key {
+            Some(key) => self.meta_env[key].to_string(),
+            None => self.meta_env.to_string(),
+        }
+    }
+
+    fn is_process_entry(&self, path: &Path) -> bool {
+        self.process_entries.borrow().contains(path)
+    }
+
+    fn add_process_entry(&self, path: PathBuf) {
+        self.process_entries.borrow_mut().insert(path);
+    }
+
+    // A watch build keeps modules and resolutions in its cache.
+    fn watching(&self) -> bool {
+        self.cache.is_some()
+    }
+
+    fn resolution(&self, key: &ResolutionKey) -> Option<Resolved> {
+        self.cache
+            .as_ref()
+            .and_then(|cache| cache.resolutions.borrow().get(key).cloned())
+    }
+
+    fn remember(&self, key: ResolutionKey, resolved: Resolved) {
+        if let Some(cache) = &self.cache {
+            cache.resolutions.borrow_mut().insert(key, resolved);
+        }
+    }
+
+    fn take_graph(&self, key: &(Realm, PathBuf)) -> Graph {
+        self.cache
+            .as_ref()
+            .and_then(|cache| cache.graphs.borrow_mut().remove(key))
+            .unwrap_or_default()
+    }
+
+    fn store_graph(&self, key: (Realm, PathBuf), graph: Graph) {
+        if let Some(cache) = &self.cache {
+            cache.graphs.borrow_mut().insert(key, graph);
+        }
+    }
+
+    // The metadata of a package.json, read once per build.
+    fn manifest(&self, file: &Path) -> Result<Rc<Value>> {
+        if let Some(metadata) = self.manifests.borrow().get(file) {
+            return Ok(metadata.clone());
+        }
+        self.watch(file.to_owned());
+        let metadata = Rc::new(
+            serde_json::from_str::<Value>(
+                &fs::read_to_string(file)
+                    .with_context(|| format!("Cannot read {}", file.display()))?,
+            )
+            .with_context(|| format!("Invalid package metadata in {}", file.display()))?,
+        );
+        self.manifests
+            .borrow_mut()
+            .insert(file.to_owned(), metadata.clone());
+        Ok(metadata)
+    }
+
+    // The nearest package above a file that this build read, with its folder.
+    fn package_of<'p>(&self, path: &'p Path) -> Option<(&'p Path, Rc<Value>)> {
+        let manifests = self.manifests.borrow();
+        path.ancestors()
+            .skip(1)
+            .find_map(|root| Some((root, manifests.get(&root.join("package.json"))?.clone())))
+    }
+
+    // Adds a script chunk. Returns its index.
+    fn script(&self, code: String) -> usize {
+        let mut scripts = self.scripts.borrow_mut();
+        scripts.push(code);
+        scripts.len() - 1
+    }
+
+    // The script chunk of a worker or a script file, built once per realm.
+    fn chunk(self: &Rc<Self>, path: PathBuf, realm: Realm) -> Result<usize> {
+        let key = (path, realm);
+        if let Some(index) = self.workers.borrow().get(&key).copied() {
+            return Ok(index);
+        }
+        // Reserve the index first: the chunk can reach itself again.
+        let index = self.script(String::new());
+        self.workers.borrow_mut().insert(key.clone(), index);
+        let app = bundle(vec![(key.0, None)], key.1, self.clone())?;
+        self.scripts.borrow_mut()[index] =
+            script_source(&BBTreeMap::from([("app.js".into(), app)]), true);
+        Ok(index)
+    }
+
+    // The name of a bundled page.
+    fn page(self: &Rc<Self>, target: PathBuf) -> Result<String> {
+        let known = self
+            .pages
+            .borrow()
+            .get(&target)
+            .map(|(name, _)| name.clone());
+        Ok(match known {
+            Some(name) => name,
+            None => {
+                self.watch(target.clone());
+                // Reserve the name first: the page's own workers can resolve the page again.
+                // Keep the app path, so `location.pathname` is what routers expect.
+                let name = target
+                    .strip_prefix(&self.root)
+                    .ok()
+                    .and_then(|path| path.to_str())
+                    .map(|path| path.replace('\\', "/"))
+                    .filter(|path| {
+                        path.bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"._-/".contains(&byte))
+                            && !path.split('/').any(|part| part.is_empty() || part == "..")
+                    })
+                    // `~` can't be in an app path above, so this name is unique.
+                    .unwrap_or_else(|| format!("page~{}.html", self.pages.borrow().len()));
+                self.pages
+                    .borrow_mut()
+                    .insert(target.clone(), (name.clone(), String::new()));
+                let source = html(&target, self)?;
+                self.pages.borrow_mut().get_mut(&target).unwrap().1 = source;
+                name
+            }
+        })
+    }
+
+    // File names must be unique: they key `require.cache`, `import.meta.url` and `__filename`.
+    fn app_name(&self, path: &Path) -> Result<PathBuf> {
+        let relative = app_relative(&self.root, path);
+        let name = relative.to_string_lossy().replace('\\', "/");
+        let mut names = self.names.borrow_mut();
+        let previous = names.entry(name.clone()).or_insert_with(|| path.to_owned());
+        ensure!(
+            previous == path,
+            "Output name collision at {name}: {} and {}",
+            previous.display(),
+            path.display()
+        );
+        Ok(relative)
+    }
+
+    fn asset_name(&self, path: &Path) -> Option<String> {
+        let extension = path
+            .extension()
+            .filter(|e| is_asset(e))?
+            .to_str()?
+            .to_ascii_lowercase();
+        let hash = app_relative(&self.root, path)
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .map(|&byte| {
+                if byte == std::path::MAIN_SEPARATOR as u8 {
+                    b'/'
+                } else {
+                    byte
+                }
+            })
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+            });
+        Some(format!("assets/{hash:016x}.{extension}"))
+    }
+
+    fn asset(&self, directory: &Path, reference: &str) -> Option<String> {
+        let root = &self.root;
+        let reference = reference.trim().trim_matches(['"', '\'']);
+        if reference.contains(':') || reference.starts_with('#') {
+            return None;
+        }
+        if let Some(base) = remote_base(directory) {
+            return base.join(reference).ok().map(String::from);
+        }
+        let reference = reference.replace('\\', "/");
+        if reference.starts_with("//") {
+            return None;
+        }
+        let file = reference.split(['?', '#']).next()?;
+        let path = match file.strip_prefix('/') {
+            Some(rest) => root.join(rest),
+            None => directory.join(file),
+        }
+        .canonicalize()
+        .ok()
+        .filter(|path| !reference.starts_with('/') || path.starts_with(root))?;
+        let name = self.asset_name(&path)?;
+        self.watch(path);
+        Some(format!("apps:///{name}"))
+    }
+
+    fn local(&self, directory: &Path, reference: &str) -> Result<PathBuf> {
+        let root = &self.root;
+        // Treat `\` as `/`. Root-relative and absolute paths must stay inside the app folder.
+        let reference = reference.replace('\\', "/");
+        let rooted = !matches!(
+            Path::new(&reference).components().next(),
+            Some(
+                std::path::Component::Normal(_)
+                    | std::path::Component::CurDir
+                    | std::path::Component::ParentDir
+            )
+        );
+        let path = match reference.strip_prefix('/') {
+            Some(rest) => root.join(rest),
+            None => directory.join(&reference),
+        };
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("Cannot find {reference} from {}", directory.display()))?;
+        ensure!(
+            !rooted || path.starts_with(root),
+            "{reference} is outside the app folder"
+        );
+        Ok(path)
+    }
+
+    // Adds the pages, script chunks, native addons, assets and package metadata to the output.
+    fn finish(&self, files: &mut BBTreeMap<String, String>, main: Option<&Path>) -> Result<()> {
+        for (_, (name, source)) in self.pages.take() {
+            files.insert(name, source);
+        }
+        for (index, code) in self.scripts.take().into_iter().enumerate() {
+            files.insert(format!("script-{index}.js"), code);
+        }
+        let sources = &mut *self.files.borrow_mut();
+        let mut native = std::collections::BTreeMap::new();
+        for path in sources.iter().filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "node")
+        }) {
+            let name = native_specifier(path)?;
+            if let Some(previous) = native.insert(name.clone(), path.clone()) {
+                ensure!(
+                    previous == *path,
+                    "Native addon output collision at {name}: {} and {}",
+                    previous.display(),
+                    path.display()
+                );
+            }
+        }
+        if !native.is_empty() {
+            files.insert("native.json".into(), serde_json::to_string(&native)?);
+        }
+        let mut assets = std::collections::BTreeMap::new();
+        for path in sources.iter() {
+            if let Some(name) = self.asset_name(path)
+                && let Some(previous) = assets.insert(name.clone(), path.clone())
+            {
+                bail!(
+                    "Asset output collision at {name}: {} and {}",
+                    previous.display(),
+                    path.display()
+                );
+            }
+        }
+        if !assets.is_empty() {
+            files.insert("assets.json".into(), serde_json::to_string(&assets)?);
+        }
+        if let Some(root) = main {
+            let mut package = json!({});
+            for directory in root.ancestors() {
+                let path = directory.join("package.json");
+                if !path.try_exists()? {
+                    continue;
+                }
+                let source = fs::read_to_string(&path)
+                    .with_context(|| format!("Cannot read {}", path.display()))?;
+                package = serde_json::from_str(&source)
+                    .with_context(|| format!("Invalid package metadata in {}", path.display()))?;
+                ensure!(
+                    package.is_object(),
+                    "Expected an object in {}",
+                    path.display()
+                );
+                sources.insert(path);
+                break;
+            }
+            if package.get("name").is_none() {
+                let path = root.join("index.html");
+                if path.try_exists()? {
+                    let source = fs::read_to_string(&path)
+                        .with_context(|| format!("Cannot read {}", path.display()))?;
+                    if let Some(title) = Document::parse(&source)
+                        .title()
+                        .filter(|title| !title.is_empty())
+                    {
+                        for key in ["name", "productName"] {
+                            if package.get(key).is_none() {
+                                let mut candidate = package.clone();
+                                candidate[key] = title.as_str().into();
+                                if apps_runtime::bundle::package_metadata(Some(
+                                    &candidate.to_string(),
+                                ))
+                                .is_ok()
+                                {
+                                    package = candidate;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    sources.insert(path);
+                }
+            }
+            let source = package.to_string();
+            let (name, product_name, version, identifier) =
+                apps_runtime::bundle::package_metadata(Some(&source))?;
+            apps_runtime::bundle::disabled_features(Some(&source))?;
+            let mut metadata = json!({"name":name,"productName":product_name,"version":version,"identifier":identifier});
+            if package["type"] == "rust" {
+                metadata["type"] = "rust".into();
+            }
+            if let Some(features) = package.get("features") {
+                metadata["features"] = features.clone();
+            }
+            files.insert("package.json".into(), metadata.to_string());
+        }
+        Ok(())
+    }
+
     fn enabled(&self, feature: &str) -> bool {
         self.disabled & apps_runtime::bundle::feature_bit(feature) == 0
     }
@@ -119,7 +476,7 @@ impl Shared {
             if let Some(cache) = &self.cache {
                 cache.tsconfigs.borrow_mut().extend(read.iter().cloned());
             }
-            self.files.borrow_mut().extend(read);
+            self.watch_all(read);
             let (paths, base) = result?;
             paths.map(|(directory, paths)| {
                 Rc::new(TsPaths {
@@ -225,12 +582,13 @@ pub struct Cache {
     loaders: RefCell<Option<Rc<Loaders>>>,
     disabled: Cell<u32>,
     env: RefCell<Value>,
-    pub resolutions: RefCell<HashMap<(Realm, PathBuf, String, bool), Resolved>>,
+    pub resolutions: RefCell<HashMap<ResolutionKey, Resolved>>,
     // Cached resolutions skip the tsconfig lookup, so each build watches the configs found before.
     tsconfigs: RefCell<BTreeSet<PathBuf>>,
 }
 
 type Resolved = (PathBuf, Option<PathBuf>, Option<PathBuf>);
+type ResolutionKey = (Realm, PathBuf, String, bool);
 type Entry = (PathBuf, Option<String>);
 
 #[derive(Default)]
@@ -853,39 +1211,7 @@ impl<'a> Visit<'a> for Uses {
 impl<'a> Linker<'a, '_> {
     fn page(&mut self, target: PathBuf) -> Result<&'a str> {
         self.cacheable = false;
-        let shared = &self.builder.shared;
-        let known = shared
-            .pages
-            .borrow()
-            .get(&target)
-            .map(|(name, _)| name.clone());
-        let name = match known {
-            Some(name) => name,
-            None => {
-                shared.files.borrow_mut().insert(target.clone());
-                // Reserve the name first: the page's own workers can resolve the page again.
-                // Keep the app path, so `location.pathname` is what routers expect.
-                let name = target
-                    .strip_prefix(&shared.root)
-                    .ok()
-                    .and_then(|path| path.to_str())
-                    .map(|path| path.replace('\\', "/"))
-                    .filter(|path| {
-                        path.bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || b"._-/".contains(&byte))
-                            && !path.split('/').any(|part| part.is_empty() || part == "..")
-                    })
-                    // `~` can't be in an app path above, so this name is unique.
-                    .unwrap_or_else(|| format!("page~{}.html", shared.pages.borrow().len()));
-                shared
-                    .pages
-                    .borrow_mut()
-                    .insert(target.clone(), (name.clone(), String::new()));
-                let source = html(&target, shared)?;
-                shared.pages.borrow_mut().get_mut(&target).unwrap().1 = source;
-                name
-            }
-        };
+        let name = self.builder.shared.page(target)?;
         Ok(self.allocator.alloc_str(&format!("apps:///{name}")))
     }
 
@@ -1079,8 +1405,8 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                 && let Some(file) = value.strip_prefix('/')
                 && Path::new(file).extension().is_some_and(is_asset)
                 && !is_remote(self.path)
-                && let Ok(path) = self.builder.shared.root.join(file).canonicalize()
-                && path.starts_with(&self.builder.shared.root)
+                && let Ok(path) = self.builder.shared.app_file(file).canonicalize()
+                && self.builder.shared.in_app(&path)
                 && let Some(url) = self.builder.url_of(&path)?
             {
                 self.cacheable = false;
@@ -1142,7 +1468,7 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                 )
                 && let Some(path) = specifier.value.as_str()
                 && path.starts_with('.')
-                && let Some(asset) = asset(self.folder, path, &self.builder.shared)
+                && let Some(asset) = self.builder.shared.asset(self.folder, path)
             {
                 self.cacheable = false;
                 let value = self.allocator.alloc_str(&asset);
@@ -1171,12 +1497,7 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                 )
             {
                 self.cacheable = false;
-                let main = self
-                    .builder
-                    .shared
-                    .process_entries
-                    .borrow()
-                    .contains(self.path);
+                let main = self.builder.shared.is_process_entry(self.path);
                 *expression = Expression::new_boolean_literal(span, main, &self.ast);
                 return Ok(());
             }
@@ -1206,8 +1527,10 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                     && env.property.name == "env"
                     && matches!(env.object.get_inner_expression(), Expression::ImportMeta(_))
                 {
-                    let code =
-                        self.builder.shared.meta_env[member.property.name.as_str()].to_string();
+                    let code = self
+                        .builder
+                        .shared
+                        .meta_env(Some(member.property.name.as_str()));
                     *expression = self.parse(if code == "null" { "void 0" } else { &code })?;
                     return Ok(());
                 }
@@ -1221,7 +1544,7 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                     let url = if is_remote(self.path) {
                         self.path.to_string_lossy().trim_end_matches('#').to_owned()
                     } else if self.builder.shared.production {
-                        let relative = self.builder.app_name(self.path)?;
+                        let relative = self.builder.shared.app_name(self.path)?;
                         let mut url = String::from("apps:///");
                         for &byte in relative.as_os_str().as_encoded_bytes() {
                             match byte {
@@ -1311,11 +1634,7 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                         .canonicalize()
                         .with_context(|| format!("Cannot resolve {}", target.display()))?;
                     self.cacheable = false;
-                    self.builder
-                        .shared
-                        .process_entries
-                        .borrow_mut()
-                        .insert(target.clone());
+                    self.builder.shared.add_process_entry(target.clone());
                     let index = self.builder.script_chunk(target)?;
                     let value = self
                         .allocator
@@ -1402,7 +1721,7 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                 && (path.ends_with(".html") || path.ends_with(".htm"))
                 && !path.contains(':')
                 && !Path::new(path).is_absolute()
-                && let Ok(target) = self.builder.shared.root.join(path).canonicalize()
+                && let Ok(target) = self.builder.shared.app_file(path).canonicalize()
             {
                 let literal = specifier.span;
                 let value = self.page(target)?;
@@ -1494,7 +1813,7 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                 }
                 Expression::ImportMeta(_) => {
                     *expression =
-                        self.parse(&format!("({{env:{}}})", self.builder.shared.meta_env))?;
+                        self.parse(&format!("({{env:{}}})", self.builder.shared.meta_env(None)))?;
                     return Ok(());
                 }
                 _ => None,
@@ -1564,18 +1883,7 @@ impl Builder {
         } else {
             Realm::Main
         };
-        let key = (path, realm);
-        let shared = self.shared.clone();
-        if let Some(index) = shared.workers.borrow().get(&key).copied() {
-            return Ok(index);
-        }
-        let index = shared.scripts.borrow().len();
-        shared.scripts.borrow_mut().push(String::new());
-        shared.workers.borrow_mut().insert(key.clone(), index);
-        let app = bundle(vec![(key.0, None)], key.1, shared.clone())?;
-        shared.scripts.borrow_mut()[index] =
-            script_source(&BBTreeMap::from([("app.js".into(), app)]), true);
-        Ok(index)
+        self.shared.chunk(path, realm)
     }
 
     fn url_of(&mut self, path: &Path) -> Result<Option<String>> {
@@ -1586,10 +1894,10 @@ impl Builder {
             let index = self.script_chunk(path.to_owned())?;
             return Ok(Some(format!("apps:///script-{index}.js")));
         }
-        let Some(name) = asset_name(&self.shared.root, path) else {
+        let Some(name) = self.shared.asset_name(path) else {
             return Ok(None);
         };
-        self.shared.files.borrow_mut().insert(path.to_owned());
+        self.shared.watch(path.to_owned());
         Ok(Some(format!("apps:///{name}")))
     }
 
@@ -1624,22 +1932,11 @@ impl Builder {
                 .to_string_lossy()
                 .into_owned());
         }
-        Ok(self.app_name(path)?.to_string_lossy().replace('\\', "/"))
-    }
-
-    // File names must be unique: they key `require.cache`, `import.meta.url` and `__filename`.
-    fn app_name(&self, path: &Path) -> Result<PathBuf> {
-        let relative = app_relative(&self.shared.root, path);
-        let name = relative.to_string_lossy().replace('\\', "/");
-        let mut names = self.shared.names.borrow_mut();
-        let previous = names.entry(name.clone()).or_insert_with(|| path.to_owned());
-        ensure!(
-            previous == path,
-            "Output name collision at {name}: {} and {}",
-            previous.display(),
-            path.display()
-        );
-        Ok(relative)
+        Ok(self
+            .shared
+            .app_name(path)?
+            .to_string_lossy()
+            .replace('\\', "/"))
     }
 
     fn locate(
@@ -1723,7 +2020,7 @@ impl Builder {
                         format!("export default {};", json!(url))
                     }
                     "raw" => {
-                        self.shared.files.borrow_mut().insert(path.clone());
+                        self.shared.watch(path.clone());
                         format!("export default {};", json!(fs::read_to_string(&path)?))
                     }
                     _ => format!(
@@ -1744,14 +2041,11 @@ impl Builder {
                 return Ok((PathBuf::from(name), Some(source)));
             }
         }
-        let cache = self.shared.cache.clone();
         let resolution = (self.realm, base.to_owned(), specifier.to_owned(), require);
-        let cached = cache
-            .as_ref()
-            .and_then(|cache| cache.resolutions.borrow().get(&resolution).cloned());
+        let cached = self.shared.resolution(&resolution);
         if let Some((target, root, manifest)) = cached {
             self.package_roots.extend(root);
-            self.shared.files.borrow_mut().extend(manifest);
+            self.shared.watch_all(manifest);
             return Ok((target, None));
         }
         if specifier.starts_with('.') || Path::new(specifier).is_absolute() {
@@ -1760,12 +2054,7 @@ impl Builder {
             let path = resolve_file(&path, fields)?;
             let root = path.parent().filter(|_| package).map(Path::to_owned);
             self.package_roots.extend(root.clone());
-            if let Some(cache) = cache {
-                cache
-                    .resolutions
-                    .borrow_mut()
-                    .insert(resolution, (path.clone(), root, None));
-            }
+            self.shared.remember(resolution, (path.clone(), root, None));
             return Ok((path, None));
         }
         if !specifier.starts_with('#')
@@ -1793,12 +2082,7 @@ impl Builder {
                 resolve_file(&config.base.join(target), fields).ok()
             })
         {
-            if let Some(cache) = cache {
-                cache
-                    .resolutions
-                    .borrow_mut()
-                    .insert(resolution, (path.clone(), None, None));
-            }
+            self.shared.remember(resolution, (path.clone(), None, None));
             return Ok((path, None));
         }
         let alias = self.shared.aliased(specifier);
@@ -1848,27 +2132,7 @@ impl Builder {
             self.package_roots.insert(directory.clone());
         }
         let package_file = directory.join("package.json");
-        let cached = self.shared.manifests.borrow().get(&package_file).cloned();
-        let metadata = match cached {
-            Some(metadata) => metadata,
-            None => {
-                self.shared.files.borrow_mut().insert(package_file.clone());
-                let metadata = Rc::new(
-                    serde_json::from_str::<Value>(
-                        &fs::read_to_string(&package_file)
-                            .with_context(|| format!("Cannot read {}", package_file.display()))?,
-                    )
-                    .with_context(|| {
-                        format!("Invalid package metadata in {}", package_file.display())
-                    })?,
-                );
-                self.shared
-                    .manifests
-                    .borrow_mut()
-                    .insert(package_file.clone(), metadata.clone());
-                metadata
-            }
-        };
+        let metadata = self.shared.manifest(&package_file)?;
         let entry = if let Some(exports) = metadata.get(if imports { "imports" } else { "exports" })
         {
             let conditions: &[&str] = match (self.realm == Realm::Renderer, require) {
@@ -1912,16 +2176,14 @@ impl Builder {
             imports || target.starts_with(&directory),
             "Package export escapes its directory"
         );
-        if let Some(cache) = cache {
-            cache.resolutions.borrow_mut().insert(
-                resolution,
-                (
-                    target.clone(),
-                    (!imports).then_some(directory),
-                    Some(package_file),
-                ),
-            );
-        }
+        self.shared.remember(
+            resolution,
+            (
+                target.clone(),
+                (!imports).then_some(directory),
+                Some(package_file),
+            ),
+        );
         Ok((target, None))
     }
 
@@ -1939,7 +2201,7 @@ impl Builder {
             return Ok(id);
         }
         let id = self.id(key);
-        if self.realm == Realm::Renderer && self.shared.preload.as_ref() == Some(&path) {
+        if self.realm == Realm::Renderer && self.shared.is_preload(&path) {
             self.define(
                 id,
                 Module {
@@ -1961,7 +2223,7 @@ impl Builder {
                 self.realm != Realm::Renderer,
                 "Native addons are unavailable in page scripts. Use a preload script."
             );
-            self.shared.files.borrow_mut().insert(path.clone());
+            self.shared.watch(path.clone());
             let name = native_specifier(&path)?;
             self.define(
                 id,
@@ -1976,7 +2238,7 @@ impl Builder {
             );
             return Ok(id);
         }
-        let stamp = (self.shared.cache.is_some() && inline.is_none())
+        let stamp = (self.shared.watching() && inline.is_none())
             .then(|| fs::metadata(&path).ok())
             .flatten()
             .and_then(|metadata| Some((metadata.modified().ok()?, metadata.len())));
@@ -1987,7 +2249,7 @@ impl Builder {
             .filter(|cached| Some(cached.stamp) == stamp)
             .map(|cached| (cached.line.clone(), cached.requests.clone()));
         if let Some((line, requests)) = cached {
-            self.shared.files.borrow_mut().insert(path.clone());
+            self.shared.watch(path.clone());
             let mut valid = true;
             for (base, specifier, require, dep) in &requests {
                 if self.resolve(base, specifier, *require).ok() != Some(*dep) {
@@ -2020,7 +2282,7 @@ impl Builder {
         let source = if let Some(source) = inline {
             source
         } else if let Some((index, module, loaders)) = loader {
-            self.shared.files.borrow_mut().insert(path.clone());
+            self.shared.watch(path.clone());
             let (code, source_type, map) = (|| -> Result<_> {
                 let content = fs::read_to_string(&path)?;
                 let args = json!({"filename": path.to_string_lossy(), "content": content});
@@ -2072,7 +2334,7 @@ impl Builder {
             loaded = Some((source_type, map));
             code
         } else {
-            self.shared.files.borrow_mut().insert(path.clone());
+            self.shared.watch(path.clone());
             match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
                 "html" => {
                     ensure!(
@@ -2099,11 +2361,11 @@ impl Builder {
                         serde_json::to_string(&value.to_string())?
                     )
                 }
-                _ if asset_name(&self.shared.root, &path).is_some() => format!(
+                _ if self.shared.asset_name(&path).is_some() => format!(
                     "export default {};",
                     json!(format!(
                         "apps:///{}",
-                        asset_name(&self.shared.root, &path).unwrap()
+                        self.shared.asset_name(&path).unwrap()
                     ))
                 ),
                 "cjs" | "cts" if !dependency => bail!(
@@ -2584,12 +2846,11 @@ impl Builder {
         }
         let requests = std::mem::replace(&mut self.requests, outer);
         if self.shared.production {
-            let manifests = self.shared.manifests.borrow();
-            let package = path
-                .ancestors()
-                .skip(1)
-                .find_map(|root| Some((root, manifests.get(&root.join("package.json"))?)));
-            module.pure = match package.map(|(root, manifest)| (root, &manifest["sideEffects"])) {
+            let package = self.shared.package_of(&path);
+            module.pure = match package
+                .as_ref()
+                .map(|(root, manifest)| (*root, &manifest["sideEffects"]))
+            {
                 Some((_, Value::Bool(false))) => true,
                 Some((root, Value::Array(patterns))) => {
                     let relative = path
@@ -2611,7 +2872,6 @@ impl Builder {
                 }
                 _ => false,
             };
-            drop(manifests);
             self.modules[id] = module;
         } else {
             let line: Rc<str> = module.line(id).into();
@@ -2860,7 +3120,7 @@ pub fn compile(
                 shared.clone(),
             )?,
         )]);
-        finish(&mut output, &shared, entry.parent())?;
+        shared.finish(&mut output, entry.parent())?;
         let cached = cache
             .as_ref()
             .and_then(|cache| cache.loaders.borrow().clone())
@@ -2907,16 +3167,15 @@ pub fn compile(
         preload,
         loaders,
         meta_env,
-        root,
+        root: root.clone(),
         files,
         production,
         cache,
         ..Shared::default()
     });
-    shared
-        .process_entries
-        .borrow_mut()
-        .extend(entry.canonicalize());
+    if let Ok(entry) = entry.canonicalize() {
+        shared.add_process_entry(entry);
+    }
     let mut output = BBTreeMap::new();
     let main = if rust {
         let defaults = [json!("index.html")];
@@ -2926,8 +3185,8 @@ pub fn compile(
                 .context("package.json pages must be an array")?
                 .as_slice(),
             None => {
-                let index = shared.root.join("index.html");
-                shared.files.borrow_mut().insert(index.clone());
+                let index = shared.app_file("index.html");
+                shared.watch(index.clone());
                 if index.try_exists()? {
                     defaults.as_slice()
                 } else {
@@ -2950,17 +3209,17 @@ pub fn compile(
                 "Invalid page path {name:?}"
             );
             ensure!(!output.contains_key(name), "Duplicate page {name:?}");
-            let path = shared.root.join(relative);
-            shared.files.borrow_mut().insert(path.clone());
+            let path = shared.app_file(relative);
+            shared.watch(path.clone());
             ensure!(
                 path.canonicalize()
                     .with_context(|| format!("Cannot find page {name:?}"))?
-                    .starts_with(&shared.root),
+                    .starts_with(&root),
                 "Page outside app: {name}"
             );
             output.insert(name.into(), html(&path, &shared)?);
         }
-        Some(shared.root.as_path())
+        Some(root.as_path())
     } else {
         output.insert(
             "app.js".into(),
@@ -2968,7 +3227,7 @@ pub fn compile(
         );
         entry.parent().filter(|_| realm == Realm::Main)
     };
-    finish(&mut output, &shared, main)?;
+    shared.finish(&mut output, main)?;
     Ok(output)
 }
 
@@ -2993,16 +3252,13 @@ fn meta_env(production: bool, values: Option<&Value>) -> Value {
 fn bundle(entries: Vec<Entry>, realm: Realm, shared: Rc<Shared>) -> Result<String> {
     let production = shared.production;
     let key = (realm, entries[0].0.clone());
-    let graph = shared
-        .cache
-        .as_ref()
-        .and_then(|cache| cache.graphs.borrow_mut().remove(&key));
+    let graph = shared.take_graph(&key);
     let mut builder = Builder {
         realm,
         modules: Vec::new(),
         lines: Vec::new(),
         ids: BBTreeMap::new(),
-        graph: graph.unwrap_or_default(),
+        graph,
         requests: Vec::new(),
         inlined: 0,
         package_roots: BTreeSet::new(),
@@ -3035,12 +3291,9 @@ fn bundle(entries: Vec<Entry>, realm: Realm, shared: Rc<Shared>) -> Result<Strin
             Ok(id)
         })
         .collect::<Result<Vec<_>>>();
-    if let Some(cache) = &builder.shared.cache {
-        cache
-            .graphs
-            .borrow_mut()
-            .insert(key.clone(), std::mem::take(&mut builder.graph));
-    }
+    builder
+        .shared
+        .store_graph(key.clone(), std::mem::take(&mut builder.graph));
     let entries = result?;
     let mut chunked = serde_json::Map::new();
     if production {
@@ -3561,8 +3814,7 @@ fn bundle(entries: Vec<Entry>, realm: Realm, shared: Rc<Shared>) -> Result<Strin
                     ascii_json(&json!(imports))
                 );
                 factory = format!("function($scope){{with($scope)return {factory}}}");
-            } else if realm == Realm::Renderer && builder.shared.preload.is_some() && module.linked
-            {
+            } else if realm == Realm::Renderer && builder.shared.has_preload() && module.linked {
                 let imports: Vec<_> = module
                     .imports
                     .iter()
@@ -3620,9 +3872,8 @@ fn bundle(entries: Vec<Entry>, realm: Realm, shared: Rc<Shared>) -> Result<Strin
                 source.push_str(builder.lines[id].as_deref().unwrap_or(""));
             }
             source.push_str("})");
-            let mut scripts = builder.shared.scripts.borrow_mut();
-            scripts.push(source);
-            chunked.insert(format!("script-{}.js", scripts.len() - 1), json!(members));
+            let index = builder.shared.script(source);
+            chunked.insert(format!("script-{index}.js"), json!(members));
         }
         for (id, line) in builder.lines.iter_mut().enumerate() {
             if owner[id] != 0 {
@@ -3676,111 +3927,6 @@ fn factory(program: &Program, result: MinifierReturn, id: usize) -> Result<Strin
         .with_private_member_mappings(result.class_private_mappings);
     codegen.print_expression(&assignment.right);
     Ok(codegen.into_source_text())
-}
-
-fn finish(
-    files: &mut BBTreeMap<String, String>,
-    shared: &Shared,
-    main: Option<&Path>,
-) -> Result<()> {
-    for (_, (name, source)) in shared.pages.take() {
-        files.insert(name, source);
-    }
-    for (index, code) in shared.scripts.take().into_iter().enumerate() {
-        files.insert(format!("script-{index}.js"), code);
-    }
-    let (sources, root) = (&mut *shared.files.borrow_mut(), &shared.root);
-    let mut native = std::collections::BTreeMap::new();
-    for path in sources.iter().filter(|path| {
-        path.extension()
-            .is_some_and(|extension| extension == "node")
-    }) {
-        let name = native_specifier(path)?;
-        if let Some(previous) = native.insert(name.clone(), path.clone()) {
-            ensure!(
-                previous == *path,
-                "Native addon output collision at {name}: {} and {}",
-                previous.display(),
-                path.display()
-            );
-        }
-    }
-    if !native.is_empty() {
-        files.insert("native.json".into(), serde_json::to_string(&native)?);
-    }
-    let mut assets = std::collections::BTreeMap::new();
-    for path in sources.iter() {
-        if let Some(name) = asset_name(root, path)
-            && let Some(previous) = assets.insert(name.clone(), path.clone())
-        {
-            bail!(
-                "Asset output collision at {name}: {} and {}",
-                previous.display(),
-                path.display()
-            );
-        }
-    }
-    if !assets.is_empty() {
-        files.insert("assets.json".into(), serde_json::to_string(&assets)?);
-    }
-    if let Some(root) = main {
-        let mut package = json!({});
-        for directory in root.ancestors() {
-            let path = directory.join("package.json");
-            if !path.try_exists()? {
-                continue;
-            }
-            let source = fs::read_to_string(&path)
-                .with_context(|| format!("Cannot read {}", path.display()))?;
-            package = serde_json::from_str(&source)
-                .with_context(|| format!("Invalid package metadata in {}", path.display()))?;
-            ensure!(
-                package.is_object(),
-                "Expected an object in {}",
-                path.display()
-            );
-            sources.insert(path);
-            break;
-        }
-        if package.get("name").is_none() {
-            let path = root.join("index.html");
-            if path.try_exists()? {
-                let source = fs::read_to_string(&path)
-                    .with_context(|| format!("Cannot read {}", path.display()))?;
-                if let Some(title) = Document::parse(&source)
-                    .title()
-                    .filter(|title| !title.is_empty())
-                {
-                    for key in ["name", "productName"] {
-                        if package.get(key).is_none() {
-                            let mut candidate = package.clone();
-                            candidate[key] = title.as_str().into();
-                            if apps_runtime::bundle::package_metadata(Some(&candidate.to_string()))
-                                .is_ok()
-                            {
-                                package = candidate;
-                                break;
-                            }
-                        }
-                    }
-                }
-                sources.insert(path);
-            }
-        }
-        let source = package.to_string();
-        let (name, product_name, version, identifier) =
-            apps_runtime::bundle::package_metadata(Some(&source))?;
-        apps_runtime::bundle::disabled_features(Some(&source))?;
-        let mut metadata = json!({"name":name,"productName":product_name,"version":version,"identifier":identifier});
-        if package["type"] == "rust" {
-            metadata["type"] = "rust".into();
-        }
-        if let Some(features) = package.get("features") {
-            metadata["features"] = features.clone();
-        }
-        files.insert("package.json".into(), metadata.to_string());
-    }
-    Ok(())
 }
 
 fn native_specifier(path: &Path) -> Result<String> {
@@ -3936,29 +4082,6 @@ pub(crate) fn is_asset(extension: &std::ffi::OsStr) -> bool {
     })
 }
 
-fn asset_name(root: &Path, path: &Path) -> Option<String> {
-    let extension = path
-        .extension()
-        .filter(|e| is_asset(e))?
-        .to_str()?
-        .to_ascii_lowercase();
-    let hash = app_relative(root, path)
-        .as_os_str()
-        .as_encoded_bytes()
-        .iter()
-        .map(|&byte| {
-            if byte == std::path::MAIN_SEPARATOR as u8 {
-                b'/'
-            } else {
-                byte
-            }
-        })
-        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
-        });
-    Some(format!("assets/{hash:016x}.{extension}"))
-}
-
 thread_local! {
     static DOWNLOADS: RefCell<HashMap<String, String>> = RefCell::default();
 }
@@ -4015,32 +4138,6 @@ fn remote(directory: &Path, reference: &str, http: bool) -> Result<Option<(PathB
     Ok(Some((PathBuf::from(path), source)))
 }
 
-fn asset(directory: &Path, reference: &str, shared: &Shared) -> Option<String> {
-    let root = &shared.root;
-    let reference = reference.trim().trim_matches(['"', '\'']);
-    if reference.contains(':') || reference.starts_with('#') {
-        return None;
-    }
-    if let Some(base) = remote_base(directory) {
-        return base.join(reference).ok().map(String::from);
-    }
-    let reference = reference.replace('\\', "/");
-    if reference.starts_with("//") {
-        return None;
-    }
-    let file = reference.split(['?', '#']).next()?;
-    let path = match file.strip_prefix('/') {
-        Some(rest) => root.join(rest),
-        None => directory.join(file),
-    }
-    .canonicalize()
-    .ok()
-    .filter(|path| !reference.starts_with('/') || path.starts_with(root))?;
-    let name = asset_name(root, &path)?;
-    shared.files.borrow_mut().insert(path);
-    Some(format!("apps:///{name}"))
-}
-
 fn urls(source: &str, directory: &Path, shared: &Shared) -> String {
     let bytes = source.as_bytes();
     let string = |start: usize| {
@@ -4070,7 +4167,7 @@ fn urls(source: &str, directory: &Path, shared: &Shared) -> String {
             pos = source[end..]
                 .find(')')
                 .map_or(bytes.len(), |close| end + close);
-            if let Some(url) = asset(directory, &source[start..pos], shared) {
+            if let Some(url) = shared.asset(directory, &source[start..pos]) {
                 result.push_str(&source[copied..start]);
                 result.push('"');
                 result.push_str(&url);
@@ -4107,7 +4204,7 @@ fn html(path: &Path, shared: &Rc<Shared>) -> Result<String> {
         };
         for name in references {
             if let Some(source) = node.attrs.get_mut(name)
-                && let Some(url) = asset(parent, source, shared)
+                && let Some(url) = shared.asset(parent, source)
             {
                 *source = url;
             }
@@ -4124,7 +4221,7 @@ fn html(path: &Path, shared: &Rc<Shared>) -> Result<String> {
                     .unwrap_or(candidate.len());
                 let url = candidate[..end].trim_end_matches(',');
                 result.push_str(&rest[..start]);
-                result.push_str(&asset(parent, url, shared).unwrap_or_else(|| url.into()));
+                result.push_str(&shared.asset(parent, url).unwrap_or_else(|| url.into()));
                 let descriptors = &candidate[url.len()..];
                 let next = if url.len() < end {
                     0
@@ -4154,12 +4251,7 @@ fn html(path: &Path, shared: &Rc<Shared>) -> Result<String> {
             let href = node.attrs.get("href").context("Stylesheet has no href")?;
             let text = match remote(parent, href, http)? {
                 Some((path, text)) => css(&path, Some(text), &mut Vec::new(), shared)?,
-                None => css(
-                    &local(&shared.root, parent, href)?,
-                    None,
-                    &mut Vec::new(),
-                    shared,
-                )?,
+                None => css(&shared.local(parent, href)?, None, &mut Vec::new(), shared)?,
             };
             node.attrs
                 .insert(apps_runtime::bundle::LINK_SHEET.into(), text);
@@ -4189,7 +4281,7 @@ fn html(path: &Path, shared: &Rc<Shared>) -> Result<String> {
             let entry = match src {
                 Some(src) => match remote(parent, &src, http)? {
                     Some((path, source)) => (path, Some(source)),
-                    None => (local(&shared.root, parent, &src)?, None),
+                    None => (shared.local(parent, &src)?, None),
                 },
                 None => (path.to_owned(), Some(text)),
             };
@@ -4202,16 +4294,12 @@ fn html(path: &Path, shared: &Rc<Shared>) -> Result<String> {
                 (file, None) => {
                     let source = fs::read_to_string(&file)
                         .with_context(|| format!("Cannot read {}", file.display()))?;
-                    shared.files.borrow_mut().insert(file);
+                    shared.watch(file);
                     source
                 }
             };
-            let mut list = shared.scripts.borrow_mut();
-            list.push(source);
-            let entry = (
-                PathBuf::from(format!("apps:///script-{}.js", list.len() - 1)),
-                None,
-            );
+            let chunk = shared.script(source);
+            let entry = (PathBuf::from(format!("apps:///script-{chunk}.js")), None);
             if deferred {
                 scripts[0].push((index, entry));
             } else {
@@ -4228,7 +4316,7 @@ fn html(path: &Path, shared: &Rc<Shared>) -> Result<String> {
         }
     }
     scripts[0].splice(0..0, blocking);
-    if let Some(preload) = &shared.preload {
+    if let Some(preload) = shared.preload_import() {
         let parent = doc
             .nodes
             .iter()
@@ -4241,19 +4329,7 @@ fn html(path: &Path, shared: &Rc<Shared>) -> Result<String> {
         node.parent = Some(parent);
         doc.nodes.push(node);
         doc.nodes[parent].children.insert(0, index);
-        scripts[1].insert(
-            0,
-            (
-                index,
-                (
-                    PathBuf::from("apps:preload"),
-                    Some(format!(
-                        "import * as api from {};globalThis.__appsPublishPreload(api);",
-                        json!(preload)
-                    )),
-                ),
-            ),
-        );
+        scripts[1].insert(0, (index, (PathBuf::from("apps:preload"), Some(preload))));
     }
     for (realm, list) in [Realm::Renderer, Realm::Preload].into_iter().zip(scripts) {
         let Some(&(mut first, _)) = list.first() else {
@@ -4295,12 +4371,10 @@ fn html(path: &Path, shared: &Rc<Shared>) -> Result<String> {
             &BBTreeMap::from([("app.js".into(), bundle(entries, realm, shared.clone())?)]),
             true,
         );
-        let mut scripts = shared.scripts.borrow_mut();
-        scripts.push(code);
-        doc.nodes[first].attrs.insert(
-            "src".into(),
-            format!("apps:///script-{}.js", scripts.len() - 1),
-        );
+        let chunk = shared.script(code);
+        doc.nodes[first]
+            .attrs
+            .insert("src".into(), format!("apps:///script-{chunk}.js"));
     }
     // The runtime parses this text again, and the parser drops one newline at the start of these elements.
     let starts: Vec<usize> = (0..doc.nodes.len())
@@ -4312,31 +4386,6 @@ fn html(path: &Path, shared: &Rc<Shared>) -> Result<String> {
         doc.nodes[child].text.insert(0, '\n');
     }
     Ok(doc.serialize(0))
-}
-
-fn local(root: &Path, directory: &Path, reference: &str) -> Result<PathBuf> {
-    // Treat `\` as `/`. Root-relative and absolute paths must stay inside the app folder.
-    let reference = reference.replace('\\', "/");
-    let rooted = !matches!(
-        Path::new(&reference).components().next(),
-        Some(
-            std::path::Component::Normal(_)
-                | std::path::Component::CurDir
-                | std::path::Component::ParentDir
-        )
-    );
-    let path = match reference.strip_prefix('/') {
-        Some(rest) => root.join(rest),
-        None => directory.join(&reference),
-    };
-    let path = path
-        .canonicalize()
-        .with_context(|| format!("Cannot find {reference} from {}", directory.display()))?;
-    ensure!(
-        !rooted || path.starts_with(root),
-        "{reference} is outside the app folder"
-    );
-    Ok(path)
 }
 
 fn exported(exports: &Value, key: &str, conditions: &[&str], imports: bool) -> Result<String> {
@@ -4449,7 +4498,7 @@ fn css(
     let source = match inline {
         Some(source) => source,
         None => {
-            shared.files.borrow_mut().insert(path.to_owned());
+            shared.watch(path.to_owned());
             ensure!(
                 path.extension()
                     .is_some_and(|extension| extension.eq_ignore_ascii_case("css")),
@@ -4558,7 +4607,7 @@ fn css(
             Some((target, text)) => css(&target, Some(text), stack, shared)?,
             None => {
                 let target = if name.starts_with(['.', '/']) || Path::new(name).is_absolute() {
-                    local(&shared.root, directory, name)?
+                    shared.local(directory, name)?
                 } else {
                     css_package(directory, name)?
                         .canonicalize()
