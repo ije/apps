@@ -1,4 +1,4 @@
-use super::document::Attrs;
+use super::document::{Attrs, RAW};
 use super::{Document, Node};
 
 mod entities;
@@ -31,16 +31,6 @@ const SPECIAL: usize = 5;
 const HTML: usize = 6;
 const MARKER: usize = 7;
 
-pub(super) const RAW: [&str; 8] = [
-    "style",
-    "script",
-    "xmp",
-    "iframe",
-    "noembed",
-    "noframes",
-    "noscript",
-    "plaintext",
-];
 const IMPLIED: [&str; 10] = [
     "dd", "dt", "li", "optgroup", "option", "p", "rb", "rp", "rt", "rtc",
 ];

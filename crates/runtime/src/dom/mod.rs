@@ -9,7 +9,6 @@ pub(crate) mod tree;
 mod walk;
 
 pub use document::{Document, Node, escape};
-pub(crate) use geometry::Drawn;
 pub use geometry::Geometry;
 pub use interaction::Interaction;
 pub use mirror::LayoutMirror;

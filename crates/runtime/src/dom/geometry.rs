@@ -231,6 +231,54 @@ pub(crate) fn painted_offset(
 }
 
 impl Geometry {
+    // Where a canvas drew element `id`. A matrix or clip that is `None` stays as it was, and the element takes
+    // the pointer before the others unless it `keeps` its order. True when the matrix changed.
+    pub(crate) fn draw(
+        &mut self,
+        id: usize,
+        matrix: Option<[f32; 16]>,
+        clip: Option<[f32; 4]>,
+        keeps: bool,
+    ) -> bool {
+        let old = self.drawn.remove(&id);
+        if !(keeps && old.is_some()) {
+            self.drawn_order += 1;
+        }
+        let new = Drawn {
+            matrix: matrix
+                .or(old.as_ref().map(|old| old.matrix))
+                .unwrap_or(crate::css::value::transform::IDENTITY),
+            clip: clip.or(old.as_ref().and_then(|old| old.clip)),
+            order: match &old {
+                Some(old) if keeps => old.order,
+                _ => self.drawn_order,
+            },
+        };
+        let moved = old.is_none_or(|old| old.matrix != new.matrix);
+        self.drawn.insert(id, new);
+        moved
+    }
+
+    // Sets the marks of the mirror that come from styles, once for each style pass `epoch`.
+    pub(crate) fn style_flags(
+        &mut self,
+        computed: &crate::style::ComputedStyles,
+        epoch: u64,
+        flags: impl Fn(&crate::css::properties::Style) -> [bool; 3],
+    ) {
+        if self.layout_epoch == epoch {
+            return;
+        }
+        self.layout_epoch = epoch;
+        let mut known = rustc_hash::FxHashMap::default();
+        for (id, style) in computed.values.iter().enumerate() {
+            let bits = *known
+                .entry(Rc::as_ptr(style))
+                .or_insert_with(|| flags(style));
+            self.mirror.style_flags(id, bits);
+        }
+    }
+
     pub(crate) fn forget(&mut self, id: usize) {
         self.mirror.remove(&id);
         self.fragments.remove(&id);

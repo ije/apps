@@ -175,6 +175,12 @@ impl PageState {
         self.styles.place(id, doc.nodes.len());
     }
 
+    // Places a node whose parent is already in the arena.
+    pub(crate) fn place_attached(&mut self, doc: &mut Document, id: usize, node: Node) {
+        self.tree.place_attached(doc, id, node);
+        self.styles.place(id, doc.nodes.len());
+    }
+
     // The styles of the page now: the last pass when it still holds, or a new pass.
     pub(crate) fn restyle(
         &mut self,
@@ -327,7 +333,7 @@ impl PageState {
                                 && tag.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'),
                             "Invalid tag"
                         );
-                        ensure!(self.tree.reserved.remove(&id), "Invalid node");
+                        ensure!(self.tree.claim(id), "Invalid node");
                         self.place(
                             doc,
                             id,
@@ -371,11 +377,7 @@ impl PageState {
                         }
                         doc.nodes[id].text = value.into();
                         doc.nodes[id].stylesheet = None;
-                        for child in std::mem::take(&mut doc.nodes[id].children) {
-                            doc.nodes[child].parent = None;
-                            self.tree.detached.push(child);
-                            self.tree.removed.push(child);
-                        }
+                        self.tree.detach_children(doc, id);
                         true
                     }
                     2 => {
@@ -461,9 +463,7 @@ impl PageState {
                             prune(doc, previous);
                         }
                         self.mutated(doc, parent);
-                        doc.nodes[child].parent = None;
-                        self.tree.detached.push(child);
-                        self.tree.removed.push(child);
+                        self.tree.detach(doc, child);
                         true
                     }
                     4 | 5 => {
@@ -494,24 +494,8 @@ impl PageState {
                     }
                     6 => {
                         let (host, root) = (node(doc, a)?, node(doc, b)?);
-                        ensure!(
-                            !doc.nodes[host].tag.starts_with('#')
-                                && doc.nodes[root].tag == "#fragment"
-                                && doc.nodes[root].parent.is_none(),
-                            "Invalid shadow root"
-                        );
-                        ensure!(
-                            !self.tree.shadows.contains_key(&host)
-                                && !self.tree.hosts.contains_key(&root),
-                            "Shadow root already exists"
-                        );
-                        ensure!(
-                            !self.tree.reaches(doc, host, root),
-                            "Cannot create a DOM cycle"
-                        );
+                        self.tree.attach_shadow(doc, host, root)?;
                         self.mutated(doc, host);
-                        self.tree.shadows.insert(host, root);
-                        self.tree.hosts.insert(root, host);
                         true
                     }
                     7 => {
@@ -600,7 +584,7 @@ impl PageState {
                     10 => {
                         let (id, from) =
                             (usize::try_from(a).context("Invalid node")?, node(doc, b)?);
-                        ensure!(self.tree.reserved.remove(&id), "Invalid node");
+                        ensure!(self.tree.claim(id), "Invalid node");
                         let from = &doc.nodes[from];
                         let text = match &from.stylesheet {
                             Some(sheet) if from.tag == "#text" => sheet.source(),

@@ -1,4 +1,3 @@
-use crate::dom::Drawn;
 use crate::dom::{Document, Node};
 use crate::render::PageState;
 use crate::render::media::Placeholder;
@@ -319,23 +318,8 @@ pub(super) fn node(
                 _ => {
                     let matrix = floats(&args[2]).and_then(|list| <[f32; 16]>::try_from(list).ok());
                     let clip = floats(&args[3]).and_then(|list| <[f32; 4]>::try_from(list).ok());
-                    let old = state.geometry.drawn.remove(&id);
-                    if !(args[4] == true && old.is_some()) {
-                        state.geometry.drawn_order += 1;
-                    }
-                    let new = Drawn {
-                        matrix: matrix
-                            .or(old.as_ref().map(|old| old.matrix))
-                            .unwrap_or(crate::css::value::transform::IDENTITY),
-                        clip: clip.or(old.as_ref().and_then(|old| old.clip)),
-                        order: match &old {
-                            Some(old) if args[4] == true => old.order,
-                            _ => state.geometry.drawn_order,
-                        },
-                    };
                     // The boxes take the pointer at their new place after the next frame.
-                    state.dirty |= old.is_none_or(|old| old.matrix != new.matrix);
-                    state.geometry.drawn.insert(id, new);
+                    state.dirty |= state.geometry.draw(id, matrix, clip, args[4] == true);
                     Ok(Value::Null)
                 }
             }

@@ -5,7 +5,6 @@ use crate::render::PageState;
 use crate::style;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::rc::Rc;
 
 pub(super) fn page(
     op: &str,
@@ -308,13 +307,9 @@ pub(super) fn node(
 
 pub(crate) fn layout_flags(doc: &mut Document, state: &mut PageState, viewport: [f32; 2]) {
     let computed = state.restyle(doc, viewport);
-    if state.geometry.layout_epoch == state.styles.epoch {
-        return;
-    }
-    state.geometry.layout_epoch = state.styles.epoch;
-    let mut known = rustc_hash::FxHashMap::default();
-    for (id, style) in computed.values.iter().enumerate() {
-        let bits = *known.entry(Rc::as_ptr(style)).or_insert_with(|| {
+    state
+        .geometry
+        .style_flags(&computed, state.styles.epoch, |style| {
             let clip = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
                 .into_iter()
                 .any(|prop| {
@@ -326,6 +321,4 @@ pub(crate) fn layout_flags(doc: &mut Document, state: &mut PageState, viewport: 
             let positioned = crate::render::effects::establishes(style).absolute;
             [clip, positioned, position == "fixed"]
         });
-        state.geometry.mirror.style_flags(id, bits);
-    }
 }

@@ -1,7 +1,18 @@
-use super::html::RAW;
 use super::{CHECKED, DIRTY, editable_value};
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
+
+// The elements whose text is raw: the parser reads no tags in it and the serializer escapes nothing.
+pub(super) const RAW: [&str; 8] = [
+    "style",
+    "script",
+    "xmp",
+    "iframe",
+    "noembed",
+    "noframes",
+    "noscript",
+    "plaintext",
+];
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(transparent)]

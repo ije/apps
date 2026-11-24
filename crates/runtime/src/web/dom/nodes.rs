@@ -130,7 +130,7 @@ pub(super) fn page(
         let ids: Vec<_> = (0..args[0].as_u64().context("Expected count")?.min(4096))
             .map(|_| state.allocate(doc, Node::default()))
             .collect();
-        state.tree.reserved.extend(&ids);
+        state.tree.reserve(&ids);
         return Ok(json!(ids));
     }
     anyhow::bail!("Unknown DOM operation: {op}")
@@ -252,11 +252,7 @@ pub(super) fn node(
                 None if tag.starts_with('#') => Document::fragment(source, "template"),
                 None => Document::build(source, Some(tag), form()),
             };
-            for child in std::mem::take(&mut doc.nodes[id].children) {
-                doc.nodes[child].parent = None;
-                state.tree.detached.push(child);
-                state.tree.removed.push(child);
-            }
+            state.tree.detach_children(doc, id);
             doc.nodes[id].text.clear();
             let mut ids = Vec::with_capacity(parsed.nodes.len());
             ids.push(id);
@@ -268,15 +264,13 @@ pub(super) fn node(
                 .iter()
                 .map(|&child| ids[child])
                 .collect();
-            let detached = state.tree.detached.len();
             for (index, mut node) in parsed.nodes.into_iter().enumerate().skip(1) {
                 node.parent = node.parent.map(|parent| ids[parent]);
                 for child in &mut node.children {
                     *child = ids[*child];
                 }
-                state.place(doc, ids[index], node);
+                state.place_attached(doc, ids[index], node);
             }
-            state.tree.detached.truncate(detached);
             state.dirty = true;
             Ok(tree(doc, id, false))
         }

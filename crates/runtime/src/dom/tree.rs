@@ -30,6 +30,55 @@ impl Tree {
         self.detached.push(id);
     }
 
+    // A node whose parent is already set joins the arena without the detached list.
+    pub(crate) fn place_attached(&mut self, doc: &mut Document, id: usize, node: Node) {
+        doc.nodes[id] = node;
+    }
+
+    // Takes `child` out of its parent. The parent keeps it in its list of children until the caller prunes it.
+    pub(crate) fn detach(&mut self, doc: &mut Document, child: usize) {
+        doc.nodes[child].parent = None;
+        self.detached.push(child);
+        self.removed.push(child);
+    }
+
+    pub(crate) fn detach_children(&mut self, doc: &mut Document, id: usize) {
+        for child in std::mem::take(&mut doc.nodes[id].children) {
+            self.detach(doc, child);
+        }
+    }
+
+    // IDs that a page gets for the nodes it creates, until a batch places them.
+    pub(crate) fn reserve(&mut self, ids: &[usize]) {
+        self.reserved.extend(ids);
+    }
+
+    pub(crate) fn claim(&mut self, id: usize) -> bool {
+        self.reserved.remove(&id)
+    }
+
+    pub(crate) fn attach_shadow(
+        &mut self,
+        doc: &Document,
+        host: usize,
+        root: usize,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !doc.nodes[host].tag.starts_with('#')
+                && doc.nodes[root].tag == "#fragment"
+                && doc.nodes[root].parent.is_none(),
+            "Invalid shadow root"
+        );
+        anyhow::ensure!(
+            !self.shadows.contains_key(&host) && !self.hosts.contains_key(&root),
+            "Shadow root already exists"
+        );
+        anyhow::ensure!(!self.reaches(doc, host, root), "Cannot create a DOM cycle");
+        self.shadows.insert(host, root);
+        self.hosts.insert(root, host);
+        Ok(())
+    }
+
     // Whether `to` is above `id`, through tree parents and the hosts of shadow roots.
     pub(crate) fn reaches(&self, doc: &Document, mut id: usize, to: usize) -> bool {
         loop {
