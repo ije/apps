@@ -437,14 +437,34 @@ impl Scene {
         }
         // Entries of a scroll hash their clips before the viewport cut them, so content that moves across the edge of
         // the viewport keeps its hash. They hash the viewports around them instead, each in the content around it.
+        // A side that a viewport cut takes the side of the entry, so it clips nothing: it is outside the viewport, and
+        // the edge of an interest area there moves in steps while the content scrolls.
         self.uncut.clear();
         for raw in &self.raw {
-            let (key, clip) = match *raw {
-                Raw::Instance(layer, at, clip) => ((layer, at, false), clip),
-                Raw::Nested(layer, at, bounds) => ((layer, at, true), bounds.to_array()),
+            let (key, clip, cut, area) = match *raw {
+                Raw::Instance(layer, at, clip) => {
+                    let instance = &self.layers[layer as usize].instances[at as usize];
+                    let [clip, cut] = [clip, instance.clip].map(crate::gpu::rect);
+                    ((layer, at, false), clip, cut, instance.area())
+                }
+                Raw::Nested(layer, at, bounds) => {
+                    let nested = &self.layers[layer as usize].nested[at as usize];
+                    ((layer, at, true), bounds, nested.clip.bounds, nested.bounds)
+                }
                 Raw::Effect(..) => continue,
             };
-            self.uncut.entry(key).or_insert(clip);
+            self.uncut.entry(key).or_insert_with(|| {
+                let side = |clip: f32, cut: f32, area: f32| if cut != clip { area } else { clip };
+                let min = point(
+                    side(clip.left(), cut.left(), area.left()),
+                    side(clip.top(), cut.top(), area.top()),
+                );
+                let max = point(
+                    side(clip.right(), cut.right(), area.right()),
+                    side(clip.bottom(), cut.bottom(), area.bottom()),
+                );
+                Rect::between(min, max).to_array()
+            });
         }
         let mut frames: Vec<u64> = Vec::with_capacity(self.scrolls.len());
         for scroll in &self.scrolls {
