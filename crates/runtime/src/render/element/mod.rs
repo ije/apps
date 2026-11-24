@@ -11,6 +11,7 @@ pub(crate) mod paragraph;
 pub(crate) mod plan;
 pub(crate) mod pseudos;
 pub(crate) mod query;
+pub(crate) mod replaced;
 pub(crate) mod svg;
 
 use self::create::create;
