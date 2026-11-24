@@ -365,15 +365,20 @@ impl Window {
         });
     }
 
-    pub fn take_snapshots(&self) -> Vec<crate::Snapshot> {
-        self.native.take_snapshots()
-    }
-
-    pub fn draw(&self, scene: &Scene, capture: bool) -> Capture {
+    // Draws `scene`, and returns the capture and the snapshot layers that it read. The window keeps its own size.
+    pub fn draw(
+        &self,
+        scene: &Scene,
+        _: Option<(Size<Pixels>, f32)>,
+        capture: bool,
+    ) -> (Capture, Vec<crate::Snapshot>) {
         if self.quiet.replace(Some(true)).is_none() {
             self.wait();
         }
-        self.native.draw(scene, capture)
+        (
+            self.native.draw(scene, capture),
+            self.native.take_snapshots(),
+        )
     }
 
     fn wait(&self) {

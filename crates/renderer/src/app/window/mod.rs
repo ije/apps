@@ -816,10 +816,11 @@ impl Window {
     pub(crate) fn draw_patch(&mut self) {
         if mem::take(&mut self.patch) {
             // The atlas and text caches keep their frame, so the tiles this scene reads stay.
-            #[cfg(target_os = "macos")]
-            let _ = self.platform.draw(&self.scene, None, false);
-            #[cfg(not(target_os = "macos"))]
-            let _ = self.platform.draw(&self.scene, false);
+            let (_, snapshots) = self.platform.draw(&self.scene, None, false);
+            debug_assert!(
+                snapshots.is_empty(),
+                "a patch frame reads no snapshot layers"
+            );
             self.scene.drawn();
         }
     }
@@ -1120,14 +1121,8 @@ impl Window {
         self.scene.read_shots(&mut self.shots);
         let fresh = self.atlas.take_fresh();
         self.scene.diff(fresh.as_deref());
-        #[cfg(target_os = "macos")]
         let (mut frame, snapshots) =
             (self.platform).draw(&self.scene, Some(self.native), !captures.is_empty());
-        #[cfg(not(target_os = "macos"))]
-        let (mut frame, snapshots) = (
-            self.platform.draw(&self.scene, !captures.is_empty()),
-            self.platform.take_snapshots(),
-        );
         self.scene.drawn();
         self.scene.keep_unread(&snapshots, &mut self.shots);
         if let Some(tree) = &mut self.tree {

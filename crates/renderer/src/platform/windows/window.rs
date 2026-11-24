@@ -239,18 +239,24 @@ impl Window {
         });
     }
 
-    pub fn take_snapshots(&self) -> Vec<crate::Snapshot> {
-        match self.shared.drawing.try_borrow_mut() {
-            Ok(mut renderer) => std::mem::take(&mut renderer.snapshots),
-            Err(_) => Vec::new(),
-        }
-    }
-
-    pub fn draw(&self, scene: &Scene, capture: bool) -> Option<Result<([u32; 2], Vec<u8>)>> {
+    // Draws `scene`, and returns the capture and the snapshot layers that it read. The window keeps its own size.
+    #[allow(clippy::type_complexity)]
+    pub fn draw(
+        &self,
+        scene: &Scene,
+        _: Option<(Size<Pixels>, f32)>,
+        capture: bool,
+    ) -> (Option<Result<([u32; 2], Vec<u8>)>>, Vec<crate::Snapshot>) {
         self.shared.quiet.take();
         match self.shared.drawing.try_borrow_mut() {
-            Ok(mut renderer) => renderer.draw(scene, capture),
-            Err(_) => capture.then(|| Err(anyhow::anyhow!("The window is busy"))),
+            Ok(mut renderer) => {
+                let frame = renderer.draw(scene, capture);
+                (frame, std::mem::take(&mut renderer.snapshots))
+            }
+            Err(_) => (
+                capture.then(|| Err(anyhow::anyhow!("The window is busy"))),
+                Vec::new(),
+            ),
         }
     }
 
