@@ -3,7 +3,7 @@ use anyhow::{Context, Result, anyhow};
 use std::{ffi::c_void, mem::MaybeUninit, path::Path, ptr::NonNull, sync::OnceLock};
 
 // The source of the media library, compiled here without FFmpeg: the built-in player of WAV files.
-#[path = "../../../media/src/lib.rs"]
+#[path = "../../../../media/src/lib.rs"]
 mod audio;
 use audio::{ABI, Frame, Host};
 
@@ -98,11 +98,11 @@ fn load() -> Result<Library> {
 }
 
 #[derive(Default)]
-pub struct Media {
+pub struct Player {
     raw: Option<(NonNull<c_void>, &'static Library)>,
 }
 
-impl Media {
+impl Player {
     fn raw(&mut self, ffmpeg: bool) -> Result<(NonNull<c_void>, &'static Library)> {
         if let Some(raw) = self.raw {
             return Ok(raw);
@@ -220,7 +220,7 @@ impl Media {
     }
 }
 
-impl Drop for Media {
+impl Drop for Player {
     fn drop(&mut self) {
         if let Some((raw, library)) = self.raw {
             unsafe { (library.free)(raw.as_ptr()) };

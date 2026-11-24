@@ -41,13 +41,13 @@ pub fn package_app(
         .filter(|_| enabled(apps_runtime::bundle::Feature::WebGpu));
     // FFmpeg is LGPL, so it ships as its own library with its license, which users can replace.
     let media = if enabled(apps_runtime::bundle::Feature::Media) {
-        let ffmpeg = apps_runtime::media::ffmpeg_name(target.platform);
+        let ffmpeg = apps_runtime::player::ffmpeg_name(target.platform);
         ensure!(
             runtime.canonicalize()?.with_file_name(ffmpeg).is_file(),
             "The media feature needs the media library and its FFmpeg next to the runtime. Run bash scripts/build-ffmpeg.sh, then cargo build --workspace --release."
         );
         vec![
-            apps_runtime::media::library_name(target.platform),
+            apps_runtime::player::library_name(target.platform),
             ffmpeg,
             "FFmpeg.LICENSE",
         ]
@@ -624,8 +624,8 @@ mod tests {
         let error = build(r#"["media"]"#).unwrap_err();
         assert!(error.to_string().contains("FFmpeg"), "{error}");
         let names = [
-            apps_runtime::media::library_name(target.platform),
-            apps_runtime::media::ffmpeg_name(target.platform),
+            apps_runtime::player::library_name(target.platform),
+            apps_runtime::player::ffmpeg_name(target.platform),
             "FFmpeg.LICENSE",
         ];
         for name in &names {

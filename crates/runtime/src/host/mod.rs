@@ -118,7 +118,7 @@ impl Host {
     fn forget_page(&mut self, id: u64) {
         let mut store = self.store.borrow_mut();
         store.graphics.remove(&id);
-        store.media.remove(&id);
+        store.players.remove(&id);
         drop(store);
         self.bridge.remove(&id);
         self.dropped.remove(&id);

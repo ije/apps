@@ -3,11 +3,11 @@
 use super::super::ViewState;
 use crate::css;
 use crate::css::properties::Prop;
-use crate::style;
-use crate::web::terminal::{
+use crate::render::media::terminal::{
     BOLD, Cell, FAINT, Frame, INVERSE, INVISIBLE, ITALIC, OVERLINE, Placement, SCROLL_ROW,
     SELECTED, SPACER, STRIKETHROUGH, Terminals, UNDERLINE,
 };
+use crate::style;
 use renderer::{
     Color, DecorationStyle, FontId, GlyphId, Hooks, NodeCx, Rect, TextAlign, TextRun, Timer,
     Window, point, px, size,

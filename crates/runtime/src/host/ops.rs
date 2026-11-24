@@ -507,7 +507,9 @@ pub(super) fn dispatch(
     } else if let (Role::Renderer(id) | Role::Preload(id), Some(op)) =
         (role, op.strip_prefix("terminal."))
     {
-        host.try_borrow_mut().context("Host is busy")?.terminal(
+        let store = host.try_borrow().context("Host is busy")?.store.clone();
+        crate::web::terminal::call(
+            &mut *store.try_borrow_mut().context("Host is busy")?,
             id,
             matches!(role, Role::Preload(_)),
             op,
@@ -733,7 +735,7 @@ impl Host {
         let store = &mut *store;
         let page = store.pages.get_mut(&id).context("Window is closed")?;
         let state = &mut page.state;
-        let media = store.media.entry(id).or_default();
+        let media = store.players.entry(id).or_default();
         if op == "poll" {
             let events: Value = serde_json::from_slice(&media.poll())?;
             for event in events.as_array().into_iter().flatten() {
@@ -1004,7 +1006,7 @@ impl Host {
                     if let Some(gpu) = store.graphics.get_mut(&id) {
                         let _ = gpu.call("resetCanvas", format!("[{node}]").as_bytes());
                     }
-                    if let (Some(media), Some(node)) = (store.media.get_mut(&id), node.as_u64()) {
+                    if let (Some(media), Some(node)) = (store.players.get_mut(&id), node.as_u64()) {
                         media.close(node);
                     }
                     if let (Some(state), Some(node)) = (store.page_state(id), node.as_u64()) {

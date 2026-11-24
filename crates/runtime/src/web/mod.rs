@@ -1,12 +1,10 @@
 pub(crate) mod crypto;
 pub mod dom;
-pub mod gpu;
-pub mod media;
 pub(crate) mod platform;
 pub(crate) mod serve;
 pub(crate) mod storage;
 pub(crate) mod tcp;
-pub mod terminal;
+pub(crate) mod terminal;
 pub(crate) mod websocket;
 pub(crate) mod worker;
 

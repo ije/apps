@@ -18,8 +18,8 @@ pub struct Store {
     pub viewports: HashMap<u64, [f32; 2]>,
     pub resized: Vec<u64>,
     pub backgrounds: HashMap<u64, (u32, u8)>,
-    pub graphics: HashMap<u64, crate::web::gpu::Gpu>,
-    pub media: HashMap<u64, crate::web::media::Media>,
+    pub graphics: HashMap<u64, super::media::gpu::Gpu>,
+    pub players: HashMap<u64, super::media::player::Player>,
     // The same app as the host's.
     pub app: std::rc::Rc<crate::bundle::AppInfo>,
     // The state that views of a closed page still write to until they go. Nothing reads it back.

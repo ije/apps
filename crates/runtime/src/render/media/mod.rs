@@ -1,3 +1,7 @@
+pub mod gpu;
+pub mod player;
+pub mod terminal;
+
 use anyhow::ensure;
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,7 +42,7 @@ pub(crate) type CanvasSource = (
 #[derive(Default)]
 pub struct Media {
     pub canvases: rustc_hash::FxHashMap<usize, crate::render::raster::canvas::Canvas>,
-    pub(crate) terminals: Rc<std::cell::RefCell<crate::web::terminal::Terminals>>,
+    pub(crate) terminals: Rc<std::cell::RefCell<terminal::Terminals>>,
     pub(crate) sources: std::cell::RefCell<rustc_hash::FxHashMap<usize, CanvasSource>>,
     pub images: rustc_hash::FxHashMap<usize, Arc<renderer::RenderImage>>,
     pub retired: Vec<Arc<renderer::RenderImage>>,

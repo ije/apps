@@ -145,9 +145,9 @@ impl ViewState {
         for (node, image) in dom.media.recycled.drain(..) {
             window.release_image(image.clone());
             if let Ok(image) = Arc::try_unwrap(image)
-                && let Some(media) = state.media.get_mut(&self.id)
+                && let Some(player) = state.players.get_mut(&self.id)
             {
-                media.recycle(node as u64, image);
+                player.recycle(node as u64, image);
             }
         }
         dom.media.retired_canvases.clear();

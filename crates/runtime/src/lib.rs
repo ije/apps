@@ -37,8 +37,8 @@ pub mod style;
 mod web;
 pub use web::download;
 // The DOM operations of page scripts, which tests drive directly.
+pub use render::media::{gpu, player, terminal};
 pub use web::dom::call as dom_call;
-pub use web::{gpu, media, terminal};
 
 pub use anyhow::Result;
 pub use desktop::app::{self, App, AppHandle, BrowserWindow, WindowOptions};
