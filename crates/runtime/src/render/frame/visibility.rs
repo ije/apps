@@ -1,6 +1,7 @@
 use super::super::layout::cull;
 use super::super::paint::{background, spacer};
-use super::super::{PageState, ViewState};
+use super::super::{PageState, ViewState, layout};
+use super::Cx;
 use crate::css;
 use crate::css::properties::Prop;
 use crate::dom::Document;
@@ -423,6 +424,119 @@ pub(crate) fn update(
         );
     }
     (visible, previous, flips)
+}
+
+// Clear node-ID caches for hidden or removed nodes here, and freed nodes in dom.release. New nodes
+// can reuse their IDs.
+pub(crate) fn forget(
+    cx: &Cx,
+    dom: &mut PageState,
+    styles: &ComputedStyles,
+    flips: Vec<usize>,
+    flipped: bool,
+    window: &mut renderer::Window,
+) {
+    drop_hidden_images(dom, cx.visible, styles, |image| window.release_image(image));
+    cx.view
+        .mask_sources
+        .borrow_mut()
+        .retain(|key, _| dom.rasters.masks.contains_key(key));
+    for id in flips.into_iter().filter(|&id| !cx.shown(id)) {
+        cx.view.svgs.borrow_mut().remove(&id);
+        cx.view.kept.borrow_mut().remove(&id);
+        cx.view.patches.borrow_mut().remove(&id);
+        cx.view.outs.borrow_mut().remove(&id);
+        cx.view.walked.borrow_mut().remove(&id);
+        cx.view.adjoined.borrow_mut().remove(&id);
+        cx.view.fields.borrow_mut().remove(&id);
+        cx.view
+            .decoding
+            .borrow_mut()
+            .retain(|_, (node, _)| *node != id);
+        dom.layout.containers.remove(&id);
+        dom.layout.flexed_grids.remove(&id);
+        dom.layout.grid_widest.remove(&id);
+        dom.layout.tracks.remove(&id);
+        dom.layout.areas.remove(&id);
+        dom.layout.anchors.remove(&id);
+        dom.layout
+            .anchors
+            .remove(&crate::render::inline::atom_key(id, 2));
+    }
+    if flipped {
+        cx.view.svgs.borrow_mut().retain(|&id, _| cx.shown(id));
+        cx.view.kept.borrow_mut().retain(|&id, _| cx.shown(id));
+        cx.view.patches.borrow_mut().retain(|&id, _| cx.shown(id));
+        cx.view.outs.borrow_mut().retain(|&id, _| cx.shown(id));
+        cx.view.walked.borrow_mut().retain(|&id, _| cx.shown(id));
+        cx.view.adjoined.borrow_mut().retain(|&id, _| cx.shown(id));
+        cx.view.fields.borrow_mut().retain(|&id, _| cx.shown(id));
+        cx.view
+            .decoding
+            .borrow_mut()
+            .retain(|_, (id, _)| cx.shown(*id));
+        dom.layout.containers.retain(|&id, _| cx.shown(id));
+        dom.layout.flexed_grids.retain(|&id, _| cx.shown(id));
+        dom.layout.grid_widest.retain(|&id, _| cx.shown(id));
+        dom.layout.tracks.retain(|&id, _| cx.shown(id));
+        dom.layout.areas.retain(|&id, _| cx.shown(id));
+        // Pseudo-elements keep their anchors by `atom_key`.
+        dom.layout
+            .anchors
+            .retain(|&id, _| cx.shown(id & ((1 << 30) - 1)));
+    }
+    {
+        let mut reach = cx.view.reach.borrow_mut();
+        if reach.len() > cx.doc.nodes.len() {
+            reach.truncate(cx.doc.nodes.len());
+            reach.shrink_to_fit();
+        }
+    }
+    // The boxes around an `<svg>` whose spill changed build again, so spacers follow its flags.
+    for id in std::mem::take(&mut dom.layout.cull.respilled) {
+        let mut kept = cx.view.kept.borrow_mut();
+        let mut node = Some(id).filter(|&id| id < cx.doc.nodes.len());
+        while let Some(id) = node {
+            kept.remove(&id);
+            node = dom.tree.flat_parent(cx.doc, &styles.children, id);
+        }
+    }
+    if cx.view.focused.replace(dom.interaction.focus) != dom.interaction.focus
+        && let Some(focus) = dom.interaction.focus.filter(|&id| id < cx.doc.nodes.len())
+    {
+        let mut kept = cx.view.kept.borrow_mut();
+        let mut node = Some(focus);
+        while let Some(id) = node {
+            kept.remove(&id);
+            node = dom.tree.flat_parent(cx.doc, &styles.children, id);
+        }
+    }
+    if !cx.same {
+        let unscrolled: Vec<usize> = dom
+            .geometry
+            .scroll
+            .keys()
+            .copied()
+            .filter(|&id| {
+                cx.shown(id)
+                    && id != 0
+                    && !matches!(cx.doc.nodes[id].tag.as_str(), "html" | "body")
+                    && !layout::size::text_field(&cx.doc.nodes[id], &styles.values[id])
+                    && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+                        .into_iter()
+                        .all(|prop| {
+                            styles.values[id]
+                                .get(prop)
+                                .is_none_or(|value| matches!(value, "visible" | "clip"))
+                        })
+            })
+            .collect();
+        // Pages read offsets from the layout mirror, which only handles write.
+        for id in unscrolled {
+            dom.geometry.scroll.remove(&id);
+            dom.geometry.mirror.unscroll(id);
+        }
+    }
 }
 
 #[cfg(test)]

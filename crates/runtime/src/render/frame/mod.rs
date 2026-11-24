@@ -6,6 +6,7 @@ pub(crate) mod pointer;
 pub(crate) mod visibility;
 
 use super::ViewState;
+use crate::css::properties::Style;
 use crate::dom::{Document, LayoutMirror};
 use crate::render::inline::InlineText;
 use crate::style::ComputedStyles;
@@ -23,9 +24,23 @@ pub(crate) struct Cx<'a> {
     pub(crate) last: Option<&'a (u64, Option<usize>, Rc<ComputedStyles>)>,
     pub(crate) walked: &'a Rc<Vec<(u32, u32)>>,
     pub(crate) serial: u64,
+    // The tree, the focus and the styles are the ones of the last frame.
+    pub(crate) same: bool,
+    pub(crate) visible: &'a [bool],
+    // Animated boxes that draw in composited layers, and whether they turn.
+    pub(crate) composited: &'a [(usize, bool)],
+    // Pseudo-elements that animate only their opacity.
+    pub(crate) pseudo_layers: &'a [usize],
+    // The cascade values of animated pseudo-elements.
+    pub(crate) restore_pseudos: &'a [(usize, Rc<[Style; 2]>)],
 }
 
 impl Cx<'_> {
+    #[inline]
+    pub(crate) fn shown(&self, id: usize) -> bool {
+        self.visible.get(id) == Some(&true)
+    }
+
     #[inline]
     pub(crate) fn place(
         &self,

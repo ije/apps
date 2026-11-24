@@ -1,4 +1,4 @@
-use super::super::{LAYOUT_REVISION, PageState};
+use super::super::{LAYOUT_REVISION, PageState, effects};
 use super::Cx;
 use super::visibility::walk;
 use crate::css;
@@ -393,4 +393,220 @@ pub(crate) fn detect(
     }
     dom.layout.cull.marked = marked;
     (changed, sources, framed)
+}
+
+// Animated boxes take their flags and build in place where they can, and painted values go into `styles` until
+// the end of the frame. It gives the number of restored values that move boxes.
+pub(crate) fn animate(
+    cx: &Cx,
+    dom: &mut PageState,
+    styles: &mut Rc<ComputedStyles>,
+    info: &mut [cull::Info],
+    fresh: &mut Option<Vec<usize>>,
+    paint: Vec<(usize, Rc<css::properties::Style>)>,
+    restore: &mut Vec<(usize, Rc<css::properties::Style>)>,
+) -> usize {
+    for &(id, turns) in cx.composited {
+        info[id].flags |= cull::COMPOSITED | (u32::from(turns) * cull::TRANSFORMED);
+        fresh.iter_mut().for_each(|fresh| fresh.push(id));
+    }
+    for &id in cx.pseudo_layers {
+        info[id].flags |= cull::COMPOSITED_PSEUDO;
+        fresh.iter_mut().for_each(|fresh| fresh.push(id));
+    }
+    let mut animate = |info: &mut [cull::Info], id: usize| {
+        let mut node = Some(id);
+        while let Some(id) = node.filter(|&id| id < info.len()) {
+            if info[id].flags & cull::ANIMATED != 0 {
+                break;
+            }
+            info[id].flags |= cull::ANIMATED;
+            fresh.iter_mut().for_each(|fresh| fresh.push(id));
+            node = cx.doc.nodes[id].parent;
+        }
+    };
+    for &(id, _) in cx.composited {
+        animate(info, id);
+    }
+    // A box that can't build in place builds again with its ancestors. It then keeps a record, so the
+    // next frames build it in place.
+    let mut unplaced = |info: &mut [cull::Info], node: usize| {
+        cx.view.repaint.borrow_mut().insert(node);
+        if let Some(parent) = cx.doc.nodes[node].parent {
+            animate(info, parent);
+        }
+    };
+    let mut placed = std::mem::take(&mut *cx.view.animated.borrow_mut());
+    placed.retain(|&id| {
+        id < cx.doc.nodes.len()
+            && paint.binary_search_by_key(&id, |(id, _)| *id).is_err()
+            && cx
+                .place(
+                    styles,
+                    &mut dom.layout.measurements.texts,
+                    &dom.geometry.mirror,
+                    id,
+                )
+                .map_err(|node| unplaced(info, node))
+                .is_ok()
+    });
+    for (id, _) in &paint {
+        if let Err(node) = cx.place(
+            styles,
+            &mut dom.layout.measurements.texts,
+            &dom.geometry.mirror,
+            *id,
+        ) {
+            unplaced(info, node);
+        }
+        cx.view.animated.borrow_mut().push(*id);
+    }
+    // Pseudo-elements that only fade build their element in place too. Others can move its boxes.
+    for &(id, _) in cx
+        .restore_pseudos
+        .iter()
+        .filter(|(id, _)| cx.pseudo_layers.contains(id))
+    {
+        if let Err(node) = cx.place(
+            styles,
+            &mut dom.layout.measurements.texts,
+            &dom.geometry.mirror,
+            id,
+        ) {
+            unplaced(info, node);
+        }
+        cx.view.animated.borrow_mut().push(id);
+    }
+    for &(id, _) in cx
+        .restore_pseudos
+        .iter()
+        .filter(|(id, _)| !cx.pseudo_layers.contains(id))
+    {
+        animate(info, id);
+    }
+    placed.extend(cx.view.animated.borrow().iter());
+    let mut recolored = std::mem::take(&mut dom.styles.recolored);
+    // The values that move boxes. `cx.view.animated` builds the boxes of painted values in place next frame.
+    let relayouts = restore.len();
+    if !paint.is_empty() {
+        let values = &mut Rc::make_mut(styles).values;
+        for (id, style) in paint {
+            if style.get(Prop::COLOR) != values[id].get(Prop::COLOR) {
+                dom.styles.recolored.push(id);
+            }
+            restore.push((id, std::mem::replace(&mut values[id], style)));
+        }
+    }
+    let establishes = |id: usize| cx.shown(id) && effects::establishes(&styles.values[id]).absolute;
+    if !cx.same {
+        dom.layout.blocks.retain(|&id, _| establishes(id));
+    } else {
+        // Only animated boxes, now or in the last frame, can stop being containing blocks.
+        let ids = restore
+            .iter()
+            .map(|(id, _)| *id)
+            .chain(dom.styles.animating.keys().copied());
+        for id in ids.collect::<Vec<_>>() {
+            if !establishes(id) {
+                dom.layout.blocks.remove(&id);
+            }
+        }
+    }
+    recolored.extend(&dom.styles.recolored);
+    placed.sort_unstable();
+    recolored.retain(|id| placed.binary_search(id).is_err());
+    for &id in &recolored {
+        animate(info, id);
+    }
+    for id in recolored {
+        let mut node = Some(id).filter(|&id| id < styles.values.len());
+        while let Some(id) = node {
+            dom.layout.measurements.texts.remove(&id);
+            node = cx.doc.nodes[id].parent.filter(|_| {
+                styles.values[id]
+                    .get(Prop::DISPLAY)
+                    .is_none_or(|value| matches!(value, "inline" | "contents"))
+            });
+        }
+    }
+    relayouts
+}
+
+// Measurements of boxes that a new frame size, a container query pass or a new layout changed go.
+pub(crate) fn remeasure(
+    cx: &Cx,
+    dom: &mut PageState,
+    styles: &ComputedStyles,
+    changed: &[usize],
+    info: &mut [cull::Info],
+    fresh: &mut Option<Vec<usize>>,
+) {
+    dom.layout.measurements.noted.clear();
+    if dom.layout.cull.frame != cx.frame {
+        dom.layout.measurements.retain(|_| false);
+        // Text keeps the fonts that it resolved, so a font load must build it again.
+        dom.layout.measurements.texts.clear();
+        dom.layout.grids.clear();
+        cx.view.walked.borrow_mut().clear();
+        cx.view.adjoined.borrow_mut().clear();
+    } else if dom.layout.container_pass && !dom.styles.cache.units.is_empty() {
+        // Container units change the boxes in the resized containers, and the sizes of the boxes around them.
+        let mut nodes = rustc_hash::FxHashSet::default();
+        for &container in &dom.styles.cache.units {
+            let mut node = dom.tree.flat_parent(cx.doc, &styles.children, container);
+            while let Some(id) = node.filter(|&id| nodes.insert(id)) {
+                node = dom.tree.flat_parent(cx.doc, &styles.children, id);
+            }
+            let mut pending = vec![container];
+            while let Some(id) = pending.pop() {
+                if id < cx.doc.nodes.len() && nodes.insert(id) {
+                    pending.extend(&cx.doc.nodes[id].children);
+                    pending.extend(dom.tree.shadows.get(&id));
+                }
+            }
+        }
+        let measured = &mut dom.layout.measurements;
+        measured.retain(|id| !nodes.contains(&id));
+        let (mut walked, mut adjoined) =
+            (cx.view.walked.borrow_mut(), cx.view.adjoined.borrow_mut());
+        for id in &nodes {
+            measured.texts.remove(id);
+            dom.layout.grids.remove(id);
+            walked.remove(id);
+            adjoined.remove(id);
+        }
+    }
+    let mut stale = false;
+    let mut around = rustc_hash::FxHashSet::default();
+    let mut regridded = rustc_hash::FxHashSet::default();
+    for &id in changed {
+        dom.layout.measurements.texts.remove(&id);
+        if dom.layout.layout_nodes[id]
+            .as_ref()
+            .is_some_and(|node| node.geometry == node.revision)
+        {
+            let mut node = Some(id);
+            while let Some(id) = node.filter(|&id| around.insert(id)) {
+                info[id].flags |= cull::GEOMETRY_CHANGED;
+                fresh.iter_mut().for_each(|fresh| fresh.push(id));
+                node = dom.tree.flat_parent(cx.doc, &styles.children, id);
+            }
+            // Grid tracks leave out absolutely positioned items, so the grids above one keep their layout.
+            let mut node = Some(id);
+            while let Some(id) = node.filter(|&id| regridded.insert(id)) {
+                dom.layout.grids.remove(&id);
+                node = (info[id].flags & cull::OUT_OF_FLOW == 0)
+                    .then(|| dom.tree.flat_parent(cx.doc, &styles.children, id))
+                    .flatten();
+            }
+            stale = true;
+        }
+    }
+    if stale {
+        dom.layout.measurements.retain(|id| {
+            info.get(id)
+                .is_none_or(|info| info.flags & cull::GEOMETRY_CHANGED == 0)
+        });
+    }
+    dom.layout.text_layouts.clear();
 }
