@@ -1,7 +1,4 @@
-use crate::{
-    host::Host,
-    jsc::{JavaScriptCore, Ptr},
-};
+use crate::jsc::{JavaScriptCore, Ptr};
 use anyhow::{Context, Result, ensure};
 use calls::{Callback, Info};
 use hooks::Hooks;
@@ -91,7 +88,8 @@ thread_local! { static CONTEXTS: RefCell<HashMap<usize, Weak<Root>>> = RefCell::
 pub(crate) struct Root {
     api: Rc<JavaScriptCore>,
     ctx: Ptr,
-    host: Weak<RefCell<Host>>,
+    // The pages of the host, with its app.
+    store: Weak<RefCell<crate::render::Store>>,
     environments: RefCell<Vec<Rc<State>>>,
     modules: RefCell<HashMap<std::path::PathBuf, Ptr>>,
 }
@@ -574,11 +572,15 @@ impl State {
 }
 
 impl Root {
-    pub(crate) fn new(api: Rc<JavaScriptCore>, ctx: Ptr, host: &Rc<RefCell<Host>>) -> Rc<Self> {
+    pub(crate) fn new(
+        api: Rc<JavaScriptCore>,
+        ctx: Ptr,
+        store: &Rc<RefCell<crate::render::Store>>,
+    ) -> Rc<Self> {
         let root = Rc::new(Self {
             api,
             ctx,
-            host: Rc::downgrade(host),
+            store: Rc::downgrade(store),
             environments: RefCell::default(),
             modules: RefCell::default(),
         });
@@ -624,17 +626,20 @@ impl Root {
     }
 
     pub(crate) fn load(&self, name: &str) -> Result<Ptr> {
-        let host = self.host.upgrade().context("Node-API context is closed")?;
-        let path = host
-            .borrow()
+        let app = self
+            .store
+            .upgrade()
+            .context("Node-API context is closed")?
+            .try_borrow()
+            .context("Host is busy")?
             .app
+            .clone();
+        let path = app
             .native_modules
             .get(name)
             .cloned()
             .with_context(|| format!("Native addon is not in the bundle: {name}"))?;
-        let packed = path
-            .to_str()
-            .and_then(|key| host.borrow().app.scripts.get(key).cloned());
+        let packed = path.to_str().and_then(|key| app.scripts.get(key).cloned());
         // Replace cached addons by rename, never in place. Hash name and content so copies at different paths
         // remain separate modules.
         let path = match packed {
@@ -651,7 +656,7 @@ impl Root {
                     std::env::var_os("XDG_CACHE_HOME")
                         .map_or_else(|| home.join(".cache"), Into::into)
                 }
-                .join(host.borrow().app.name.as_deref().unwrap_or("apps"));
+                .join(app.name.as_deref().unwrap_or("apps"));
                 let hash = name
                     .bytes()
                     .chain([0])
@@ -908,7 +913,7 @@ mod tests {
     #[test]
     fn reused_addresses_and_short_calls_are_rejected() {
         let api = JavaScriptCore::load().unwrap();
-        let host = Rc::new(RefCell::new(Host::default()));
+        let host = Rc::new(RefCell::new(crate::host::Host::default()));
         let _engine =
             crate::host::context::JsContext::new(api.clone(), host.clone(), crate::jsc::Role::Main)
                 .unwrap();

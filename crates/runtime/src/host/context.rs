@@ -296,7 +296,11 @@ impl JsContext {
         let napi = if matches!(role, Role::Renderer(_)) {
             None
         } else {
-            Some(crate::node::napi::Root::new(api.clone(), ctx, &host))
+            Some(crate::node::napi::Root::new(
+                api.clone(),
+                ctx,
+                &host.borrow().store,
+            ))
         };
         let interrupt = match interrupt {
             Some(stop) => {
