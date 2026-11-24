@@ -459,9 +459,9 @@ pub(super) fn dispatch(
                 _ => {}
             }
         }
-        let destination = jsc::contexts::<Binding>()
-            .into_iter()
-            .find(|(_, binding)| Rc::ptr_eq(host, &binding.host) && target == Some(binding.role));
+        let destination = jsc::find::<Binding>(|binding| {
+            Rc::ptr_eq(host, &binding.host) && target == Some(binding.role)
+        });
         if destination.is_none() && matches!(role, Role::Main) && values[1]["kind"] == "event" {
             return Ok(serde_json::Value::Null);
         }

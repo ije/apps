@@ -871,6 +871,16 @@ pub(crate) fn data<T: 'static>(ctx: Ptr) -> Option<Rc<T>> {
     data.downcast().ok()
 }
 
+// The first context of this thread whose data is a `T` that `found` accepts.
+pub(crate) fn find<T: 'static>(found: impl Fn(&T) -> bool) -> Option<(Ptr, Rc<T>)> {
+    CONTEXTS.with_borrow(|contexts| {
+        contexts.iter().find_map(|(&ctx, (_, data))| {
+            data.downcast_ref::<T>().filter(|value| found(value))?;
+            Some((ctx as Ptr, data.clone().downcast().ok()?))
+        })
+    })
+}
+
 // The contexts of this thread whose data is a `T`.
 pub(crate) fn contexts<T: 'static>() -> Vec<(Ptr, Rc<T>)> {
     CONTEXTS.with_borrow(|contexts| {
