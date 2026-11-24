@@ -60,7 +60,7 @@ pub(crate) fn mark_moves(
                     if !walk.walk.contains(id) {
                         out.leave(id, unstyled, empty);
                     } else if Rc::ptr_eq(&out.values[id], unstyled) {
-                        matches.dirty[id] = true;
+                        matches.touch(id);
                     }
                 }
                 #[cfg(debug_assertions)]
@@ -74,7 +74,7 @@ pub(crate) fn mark_moves(
                         assert!(
                             !kept
                                 || *slot == up
-                                || matches.dirty[id as usize]
+                                || matches.is_dirty(id as usize)
                                 || doc.nodes[id as usize].parent != Some(up as usize),
                             "node {id} moved without a dirty mark"
                         );
@@ -88,9 +88,9 @@ pub(crate) fn mark_moves(
                     if placed[id] != up
                         || root(&old.tree, &old.trees, id) != root(&walk.tree, &walk.trees, id)
                     {
-                        matches.dirty[id] = true;
+                        matches.touch(id);
                         if let Some(&host) = shadows.hosts.get(&id) {
-                            matches.dirty[host] = true;
+                            matches.touch(host);
                         }
                     }
                     placed[id] = KEPT;

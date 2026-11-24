@@ -59,7 +59,7 @@ impl StyleScope {
         &mut self,
         rules: Vec<Collected>,
         tailwind: Option<&FxHashMap<usize, u64>>,
-        attributes: &mut crate::dom::Named,
+        matches: &mut crate::dom::SelectorCache,
     ) {
         let mut lists = Vec::new();
         for (selectors, body, layer, container, media) in rules {
@@ -157,7 +157,7 @@ impl StyleScope {
             if seen.insert((Rc::as_ptr(&list), subject)) {
                 for selector in list.iter() {
                     self.states |= selector.states(&mut parents);
-                    selector.attributes(attributes, subject);
+                    matches.note_selector(selector, subject);
                 }
             }
         }
@@ -196,14 +196,19 @@ impl StyleScope {
                 (*selectors, *body, layer, container.clone(), media.clone())
             })
             .collect();
-        self.push(rules, Some(update.keys), &mut matches.attributes);
+        self.push(rules, Some(update.keys), matches);
         self.blocks.extend(blocks.iter().cloned());
-        Some(self.rematch(start, doc, &mut matches.dirty))
+        Some(self.rematch(start, doc, matches))
     }
 
     // Forget the matched rules of the nodes that the rules from `start` can match, and mark them dirty. False
     // means that the rules can also reach other nodes, so only a full pass finds them all.
-    pub(crate) fn rematch(&mut self, start: usize, doc: &Document, dirty: &mut [bool]) -> bool {
+    pub(crate) fn rematch(
+        &mut self,
+        start: usize,
+        doc: &Document,
+        matches: &mut crate::dom::SelectorCache,
+    ) -> bool {
         let added = self.pseudos.iter().filter(|pseudo| pseudo.2 >= start);
         let passed = added
             .clone()
@@ -250,9 +255,7 @@ impl StyleScope {
                 && let Some(matched) = self.nodes.get_mut(id)
             {
                 *matched = None;
-                if let Some(dirty) = dirty.get_mut(id) {
-                    *dirty = true;
-                }
+                matches.touch(id);
             }
         }
         !passed
@@ -835,12 +838,12 @@ impl StyleCache {
                     }
                     if room {
                         let start = cached.rules.len();
-                        cached.push(inserted, None, &mut self.matches.attributes);
+                        cached.push(inserted, None, &mut self.matches);
                         for (order, key) in (start..).zip(keys) {
                             cached.keys[order] = key;
                         }
-                        cached.push(pending, None, &mut self.matches.attributes);
-                        let local = cached.rematch(start, doc, &mut self.matches.dirty);
+                        cached.push(pending, None, &mut self.matches);
+                        let local = cached.rematch(start, doc, &mut self.matches);
                         let Collect {
                             keyframes,
                             properties,
@@ -1022,7 +1025,7 @@ impl StyleCache {
                 scope.push(
                     rules,
                     tailwind.as_ref().map(|update| update.keys),
-                    &mut self.matches.attributes,
+                    &mut self.matches,
                 );
                 self.scopes.push(scope);
                 self.scopes.len() - 1
@@ -1160,13 +1163,13 @@ impl StyleScope {
             self.nodes[id] = Some(MatchedRules {
                 checked: std::cell::Cell::new(matches.epoch),
                 cached: None,
-                dependencies: matches.dependencies.as_slice().into(),
+                dependencies: matches.recorded().into(),
                 rules: share.rules.clone(),
                 pseudos: share.pseudos.clone(),
             });
             (share.rules.clone(), share.pseudos.clone())
         } else {
-            matches.dependencies.clear();
+            matches.begin();
             // Candidates come from the node's classes, so its matches always read them.
             matches.depend(id, 0);
             matches.depend(id, 7);
@@ -1216,9 +1219,9 @@ impl StyleScope {
                 selector.always()
                     || !selector.host_only()
                         && if fresh {
-                            selector.matches_fresh(doc, id, matches)
+                            matches.matches_fresh(selector, doc, id)
                         } else {
-                            selector.matches_cached(doc, id, None, matches)
+                            matches.matches(selector, doc, id, None)
                         }
             };
             let (mut matched, mut matched_pseudos) = (Vec::new(), Vec::new());
@@ -1263,7 +1266,7 @@ impl StyleScope {
                 unique.fill((0, 0));
                 *generation = 1;
             }
-            matches.dependencies.retain(|&(key, revision)| {
+            matches.retain_recorded(|&(key, revision)| {
                 let key = key as usize;
                 if key >= unique.len() {
                     unique.resize(key + 1, (0, 0));
@@ -1271,8 +1274,7 @@ impl StyleScope {
                 let seen = std::mem::replace(&mut unique[key], (*generation, revision));
                 seen != (*generation, revision)
             });
-            matches.dependencies.sort_unstable();
-            matches.register(id);
+            matches.finish(id);
             let shared = intern(&mut self.lists, &matched);
             let matched_pseudos = if matched_pseudos.is_empty() {
                 no_pseudos.clone()
@@ -1288,7 +1290,7 @@ impl StyleScope {
                         from: id,
                         rules: shared.clone(),
                         pseudos: matched_pseudos.clone(),
-                        dependencies: matches.dependencies.as_slice().into(),
+                        dependencies: matches.recorded().into(),
                         style: style.then(|| matches.signature(id)[6]),
                     },
                 );
@@ -1296,7 +1298,7 @@ impl StyleScope {
             self.nodes[id] = Some(MatchedRules {
                 checked: std::cell::Cell::new(matches.epoch),
                 cached: None,
-                dependencies: matches.dependencies.as_slice().into(),
+                dependencies: matches.recorded().into(),
                 rules: shared.clone(),
                 pseudos: matched_pseudos.clone(),
             });

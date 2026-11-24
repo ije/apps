@@ -599,7 +599,7 @@ pub(crate) fn compute_styles(
     let last = context.and_then(|context| context.previous.as_deref());
     if stored {
         if !fast {
-            style_cache.matches.dirty.fill(false);
+            style_cache.matches.clean_all();
         }
         style_cache.full = false;
         style_cache.styled = Some(Styled {

@@ -1,4 +1,3 @@
-use crate::css::selector::Selector;
 mod document;
 mod entities;
 pub(crate) mod geometry;
@@ -14,7 +13,8 @@ pub(crate) use geometry::Drawn;
 pub use geometry::Geometry;
 pub use interaction::Interaction;
 pub use mirror::LayoutMirror;
-pub(crate) use selector::{Dependency, Named, SelectorCache};
+pub use selector::matches;
+pub(crate) use selector::{Dependency, SelectorCache};
 pub use tree::Tree;
 pub(crate) use walk::{ABSENT, Walk};
 

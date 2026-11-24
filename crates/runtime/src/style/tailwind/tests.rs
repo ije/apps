@@ -7,7 +7,7 @@ fn computed(source: &str, hovered: Option<&str>) -> (Document, super::super::Com
     let mut doc = Document::parse(source);
     if let Some(selector) = hovered {
         let id = (0..doc.nodes.len())
-            .find(|&id| doc.matches(id, selector))
+            .find(|&id| crate::dom::matches(&doc, id, selector))
             .unwrap();
         doc.nodes[id].state = crate::css::selector::HOVER;
     }
@@ -25,7 +25,7 @@ fn computed(source: &str, hovered: Option<&str>) -> (Document, super::super::Com
 
 fn id(doc: &Document, selector: &str) -> usize {
     (0..doc.nodes.len())
-        .find(|&id| doc.matches(id, selector))
+        .find(|&id| crate::dom::matches(doc, id, selector))
         .unwrap()
 }
 

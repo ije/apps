@@ -580,7 +580,7 @@ fn select_options_follow_selection_and_keyboard() {
             node.tag == "option" && node.attrs.get("value").map(String::as_str) == Some("d")
         })
         .unwrap();
-    assert!(apps_runtime::dom::Document::matches(
+    assert!(apps_runtime::dom::matches(
         doc,
         option,
         "select option:checked"

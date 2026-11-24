@@ -195,9 +195,11 @@ pub(super) fn node(
                 _ => node.text.clone(),
             }))
         }
-        "dom.matches" => Ok(json!(parsed(state, &args[1])?.iter().any(|s| {
-            s.matches_cached(doc, id, Some(id), &mut SelectorCache::default())
-        }))),
+        "dom.matches" => {
+            Ok(json!(parsed(state, &args[1])?.iter().any(|s| {
+                SelectorCache::default().matches(s, doc, id, Some(id))
+            })))
+        }
         "dom.closest" => {
             let selectors = parsed(state, &args[1])?;
             let mut memo = SelectorCache::default();
@@ -205,7 +207,7 @@ pub(super) fn node(
             while let Some(node) = current.filter(|&node| !doc.nodes[node].tag.starts_with('#')) {
                 if selectors
                     .iter()
-                    .any(|s| s.matches_cached(doc, node, Some(id), &mut memo))
+                    .any(|s| memo.matches(s, doc, node, Some(id)))
                 {
                     return Ok(json!(node));
                 }
@@ -222,7 +224,7 @@ pub(super) fn node(
             while let Some(node) = pending.pop() {
                 if selectors
                     .iter()
-                    .any(|s| s.matches_cached(doc, node, Some(id), &mut memo))
+                    .any(|s| memo.matches(s, doc, node, Some(id)))
                 {
                     if first {
                         return Ok(json!(node));

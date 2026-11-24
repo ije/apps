@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 fn element(doc: &Document, selector: &str) -> usize {
     (0..doc.nodes.len())
-        .find(|&id| doc.matches(id, selector))
+        .find(|&id| crate::dom::matches(doc, id, selector))
         .unwrap()
 }
 

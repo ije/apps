@@ -839,7 +839,9 @@ fn cousins_share_matches_only_with_the_same_ancestors() {
             "<style>{css}</style><div id=list>{}</div>",
             groups.replace('R', rows)
         ));
-        if let Some(hovered) = (0..doc.nodes.len()).find(|&id| doc.matches(id, "#hovered")) {
+        if let Some(hovered) =
+            (0..doc.nodes.len()).find(|&id| crate::dom::matches(&doc, id, "#hovered"))
+        {
             doc.nodes[hovered].state = crate::css::selector::HOVER;
         }
         let pass = |unshared: bool| {

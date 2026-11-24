@@ -77,7 +77,7 @@ fn descendant_selector() {
         .position(|node| node.tag == "span")
         .unwrap();
     let started = Instant::now();
-    assert!(!doc.matches(leaf, &selector));
+    assert!(!apps_runtime::dom::matches(&doc, leaf, &selector));
     println!(
         "descendant_30_parts_1000_nodes_ms={:.3}",
         started.elapsed().as_secs_f64() * 1000.

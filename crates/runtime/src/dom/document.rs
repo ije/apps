@@ -1,4 +1,4 @@
-use super::{CHECKED, DIRTY, Selector, editable_value};
+use super::{CHECKED, DIRTY, editable_value};
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
 
@@ -2374,12 +2374,6 @@ impl Document {
         }
         result
     }
-
-    pub fn matches(&self, id: usize, selector: &str) -> bool {
-        Selector::parse(selector, None)
-            .iter()
-            .any(|selector| selector.matches(self, id))
-    }
 }
 
 pub fn escape(value: &str) -> std::borrow::Cow<'_, str> {
@@ -2605,7 +2599,7 @@ mod tests {
         let h = find(&doc, "h1");
         assert_eq!(doc.text(h), "你好 & A");
         assert_eq!(doc.nodes[h].attrs["data-x"], "a>b");
-        assert!(doc.matches(h, "body #g"));
+        assert!(crate::dom::matches(&doc, h, "body #g"));
         let script = find(&doc, "script");
         assert!(doc.nodes[script].text.is_empty());
         assert_eq!(doc.nodes[script].children.len(), 1);

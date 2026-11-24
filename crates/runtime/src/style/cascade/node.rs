@@ -293,12 +293,7 @@ impl NodePass<'_> {
         // the root elements are in the list because they set the root font size.
         let mut seeds: Vec<u32> = Vec::new();
         if fast {
-            let dirty = matches.dirty.chunks(64).enumerate();
-            let dirty = dirty.filter(|(_, chunk)| chunk.contains(&true));
-            let dirty = dirty.flat_map(|(index, chunk)| {
-                let set = chunk.iter().enumerate().filter(|(_, dirty)| **dirty);
-                set.map(move |(bit, _)| index * 64 + bit)
-            });
+            let dirty = matches.dirty_nodes();
             let animated = context.filter(|_| !stored);
             let animated = animated
                 .into_iter()
@@ -338,7 +333,7 @@ impl NodePass<'_> {
             let id = id as usize;
             if fast {
                 if !all
-                    && !matches.dirty[id]
+                    && !matches.is_dirty(id)
                     && moving.get(id) != Some(&true)
                     && (up == u32::MAX || changed!(up as usize) == 0)
                 {
@@ -353,7 +348,7 @@ impl NodePass<'_> {
                 );
                 visited = Some((at, id));
                 if stored {
-                    matches.dirty[id] = false;
+                    matches.clean(id);
                 }
                 unstyle!(id);
             }
@@ -441,13 +436,13 @@ impl NodePass<'_> {
                 if !inner.nodes[root].as_ref().is_some_and(|matched| {
                     matches.valid_since(&matched.dependencies, &matched.checked)
                 }) {
-                    matches.dependencies.clear();
+                    matches.begin();
                     matches.depend(root, 0);
                     let mut matched: Vec<(usize, [usize; 3])> = Vec::new();
                     for &entry in inner.universal.iter().filter(|&&entry| entry < PSEUDO) {
                         let (order, index) = (entry >> SELECTOR, entry & ((1 << SELECTOR) - 1));
                         let selector = &inner.rules[order].0[index];
-                        if selector.matches_cached(doc, root, None, matches) {
+                        if matches.matches(selector, doc, root, None) {
                             match matched.last_mut() {
                                 Some(last) if last.0 == order => {
                                     last.1 = last.1.max(selector.specificity)
@@ -465,16 +460,14 @@ impl NodePass<'_> {
                             let (kind, selector, _, key) = &inner.pseudos[index];
                             key.is_empty()
                                 && *kind != 12
-                                && selector.matches_cached(doc, root, None, matches)
+                                && matches.matches(selector, doc, root, None)
                         })
                         .collect();
-                    matches.dependencies.sort_unstable();
-                    matches.dependencies.dedup();
-                    matches.register(id);
+                    matches.finish(id);
                     inner.nodes[root] = Some(MatchedRules {
                         checked: std::cell::Cell::new(matches.epoch),
                         cached: None,
-                        dependencies: matches.dependencies.as_slice().into(),
+                        dependencies: matches.recorded().into(),
                         rules: matched.into(),
                         pseudos,
                     });
@@ -538,7 +531,7 @@ impl NodePass<'_> {
             let names = (tree != 0).then(|| node.attrs.get("part")).flatten();
             let named = names.and_then(|_| exported.get(&walk.trees[tree].1));
             if assigned.is_some() || named.is_some() {
-                matches.dependencies.clear();
+                matches.begin();
                 for passed in assigned.into_iter().flat_map(|list| list.iter()).chain(
                     named
                         .into_iter()
@@ -555,7 +548,7 @@ impl NodePass<'_> {
                     if !passed
                         .compound
                         .iter()
-                        .any(|selector| selector.matches_cached(doc, id, None, matches))
+                        .any(|selector| matches.matches(selector, doc, id, None))
                     {
                         continue;
                     }
@@ -567,9 +560,7 @@ impl NodePass<'_> {
                     }
                     shadow.push(rule);
                 }
-                matches.dependencies.sort_unstable();
-                matches.dependencies.dedup();
-                matches.register(id);
+                matches.finish(id);
             }
             let shadow: Option<Rc<[ShadowRule]>> = (!shadow.is_empty()).then(|| shadow.into());
             let animated = context.and_then(|context| context.animated.get(&id));

@@ -169,6 +169,22 @@ pub(crate) fn selector_boundary(source: &str, separator: impl Fn(char) -> bool) 
 }
 
 impl Selector {
+    // A shadow root is featureless, so callers must not skip matching for it with this.
+    pub(crate) fn always(&self) -> bool {
+        self.previous.is_none()
+            && self
+                .simple
+                .iter()
+                .all(|simple| matches!(simple, SimpleSelector::Universal))
+    }
+    pub(crate) fn host_only(&self) -> bool {
+        self.previous.is_none()
+            && self
+                .simple
+                .iter()
+                .any(|simple| matches!(simple, SimpleSelector::Pseudo(name, ..) if name == "host"))
+    }
+
     pub(crate) fn argument(
         name: &str,
         argument: &str,

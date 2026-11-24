@@ -518,7 +518,7 @@ fn selectors_match_through_value_and_alternative_buckets() {
     let computed = styles(&doc, 800., 600.);
     let color = |selector: &str| {
         (0..doc.nodes.len())
-            .filter(|&id| doc.matches(id, selector))
+            .filter(|&id| crate::dom::matches(&doc, id, selector))
             .map(|id| computed[id].get("color").cloned().unwrap_or_default())
             .collect::<Vec<_>>()
     };
@@ -617,7 +617,7 @@ fn leaving_top_layer_boxes_keep_their_place_and_backdrop() {
         ["fixed", "none"]
     );
     assert!(leaving.backdrops.contains_key(&d) && leaving.backdrops.contains_key(&p));
-    assert!(!doc.matches(d, ":modal"));
+    assert!(!crate::dom::matches(&doc, d, ":modal"));
     doc.nodes[d].state = 0;
     let left = styles(&doc);
     assert_eq!(&left.values[d]["position"], "absolute");

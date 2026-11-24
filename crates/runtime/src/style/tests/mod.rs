@@ -23,7 +23,7 @@ mod values;
 
 fn element(doc: &Document, selector: &str) -> usize {
     (0..doc.nodes.len())
-        .find(|&id| doc.matches(id, selector))
+        .find(|&id| crate::dom::matches(doc, id, selector))
         .unwrap()
 }
 
@@ -43,7 +43,7 @@ fn styles_of(doc: &Document, selector: &str, name: &str) -> Option<String> {
 fn attach(doc: &mut Document) -> Rc<Shadows> {
     let mut pairs = Vec::new();
     for (host, root) in [("#host", "#root"), ("#inner", "#root2")] {
-        let Some(root) = (0..doc.nodes.len()).find(|&id| doc.matches(id, root)) else {
+        let Some(root) = (0..doc.nodes.len()).find(|&id| crate::dom::matches(doc, id, root)) else {
             continue;
         };
         if let Some(parent) = doc.nodes[root].parent {
