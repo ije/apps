@@ -209,16 +209,12 @@ fn reflow(id: u64) {
     if view.host.try_borrow_mut().map_or(true, |mut host| {
         let shifted = !host.pages.get(&id).is_some_and(|page| page.dirty)
             && host
-                .pages
-                .get_mut(&id)
-                .map(|page| &mut page.state)
+                .page_state_mut(id)
                 .is_some_and(|dom| dom.shift_scrolls());
         shifted
             || !host.pages.get(&id).is_some_and(|page| page.dirty)
                 && !host
-                    .pages
-                    .get(&id)
-                    .map(|page| &page.state)
+                    .page_state(id)
                     .is_some_and(|dom| dom.geometry.mirror.moved() || dom.layout.cull.reskipped)
     }) {
         return;
@@ -292,9 +288,7 @@ fn animation_frame(view: Rc<ViewState>, window: &mut Window, cx: &mut App) {
         .try_borrow_mut()
         .ok()
         .and_then(|mut host| {
-            host.pages
-                .get_mut(&view.id)
-                .map(|page| &mut page.state)
+            host.page_state_mut(view.id)
                 .map(|dom| std::mem::take(&mut dom.frame_requested))
         })
         .unwrap_or(false)
@@ -524,7 +518,7 @@ impl PageView {
             let size = window.viewport_size();
             if !parked.is_empty()
                 && data.host.try_borrow().is_ok_and(|host| {
-                    host.pages.get(&data.id).map(|page| &page.state).is_some_and(|dom| {
+                    host.page_state(data.id).is_some_and(|dom| {
                         parked.iter().any(|(id, clips)| {
                             in_view(&dom.geometry.mirror, [f32::from(size.width), f32::from(size.height)], *id, clips.iter().copied())
                         })
@@ -617,7 +611,8 @@ impl PageView {
                 let (mut target, mut wheel, mut terminal) = (None, false, None);
                 if let Ok(host) = view.host.try_borrow() {
                     let viewport = *host.viewports.get(&view.id).unwrap_or(&[800., 600.]);
-                    if let (Some(page), Some(state)) = (host.pages.get(&view.id), host.pages.get(&view.id).map(|page| &page.state)) {
+                    if let Some(page) = host.pages.get(&view.id) {
+                        let state = &page.state;
                         let seen = state.layout.cull.seen.as_ref().map(|seen| seen.2.clone()).or_else(|| state.styles.computed.clone());
                         target = seen.as_ref().and_then(|computed| {
                             let at = [position.x, position.y].map(f32::from);
@@ -2309,9 +2304,7 @@ impl PageView {
                             Default::default(),
                             [[0.; 4]; 3],
                             self.0.clone(),
-                            host.pages
-                                .get(&self.id)
-                                .map(|page| &page.state)
+                            host.page_state(self.id)
                                 .and_then(|state| state.base.as_ref()),
                             &host.app.assets,
                             false,
@@ -2700,8 +2693,7 @@ impl PageView {
                 renderer::canvas(
                     move |_, _| {
                         if let Ok(mut host) = data.host.try_borrow_mut()
-                            && let Some(dom) =
-                                host.pages.get_mut(&data.id).map(|page| &mut page.state)
+                            && let Some(dom) = host.page_state_mut(data.id)
                         {
                             dom.geometry.sync_scroll();
                             dom.geometry.prepainted(dom.pixel_ratio);

@@ -968,9 +968,7 @@ pub(super) fn border_image(
         Some(url) => {
             let host = view.host.borrow();
             let base = host
-                .pages
-                .get(&view.id)
-                .map(|page| &page.state)
+                .page_state(view.id)
                 .and_then(|state| state.base.clone());
             let path =
                 super::image::url_file(url, base.as_ref(), &host.app.assets).filter(|path| {

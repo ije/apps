@@ -1032,7 +1032,7 @@ impl renderer::Hooks for InlineText {
                 let host = self.view.host.borrow();
                 let (page, dom) = (
                     host.pages.get(&self.view.id)?,
-                    host.pages.get(&self.view.id).map(|page| &page.state)?,
+                    host.page_state(self.view.id)?,
                 );
                 let &(node, _) = self.data.ranges.first()?;
                 let (up, inner) = std::iter::successors(page.doc.nodes.get(node)?.parent, |&up| {
@@ -1163,9 +1163,7 @@ impl renderer::Hooks for InlineText {
                 .get_or_insert_with(|| {
                     view.host
                         .borrow()
-                        .pages
-                        .get(&view.id)
-                        .map(|page| &page.state)
+                        .page_state(view.id)
                         .and_then(|dom| dom.styles.last().cloned())
                 })
                 .as_ref()

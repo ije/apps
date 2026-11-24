@@ -545,7 +545,7 @@ impl renderer::View for PageView {
     fn window_changed(&mut self, window: &mut Window, cx: &mut App) {
         self.origin.set(None);
         if let Ok(mut host) = self.host.try_borrow_mut() {
-            if let Some(state) = host.pages.get_mut(&self.id).map(|page| &mut page.state) {
+            if let Some(state) = host.page_state_mut(self.id) {
                 state.window = window.window_state();
             }
             if !host.window_changes.contains(&self.id) {
@@ -753,7 +753,7 @@ impl renderer::View for PageView {
         super::scripted(cx, Some(window), || super::reflow(self.id));
         let id = state["id"].as_u64()? as usize;
         let host = self.host.borrow();
-        let dom = host.pages.get(&self.id).map(|page| &page.state)?;
+        let dom = host.page_state(self.id)?;
         let password = password(&host, self.id, id, &state);
         let caret = state["node"]
             .as_u64()
@@ -824,7 +824,7 @@ impl renderer::View for PageView {
         let state = self.editing()?;
         let id = state["id"].as_u64()? as usize;
         let host = self.host.borrow();
-        let dom = host.pages.get(&self.id).map(|page| &page.state)?;
+        let dom = host.page_state(self.id)?;
         if let Some((layout, text, span, rows, _)) = dom.layout.text_layouts.get(&id) {
             let [dx, dy] = dom.geometry.scroll_shift(&dom.styles.walk, id);
             let point = point - renderer::point(px(dx), px(dy));

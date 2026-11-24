@@ -864,10 +864,7 @@ impl Desktop {
                     (
                         host.pages.get(&id).is_some_and(|p| p.dirty)
                             || host.graphics.get(&id).is_some_and(|gpu| gpu.presented()),
-                        host.pages
-                            .get(&id)
-                            .map(|page| &page.state)
-                            .is_some_and(|dom| dom.frame_requested),
+                        host.page_state(id).is_some_and(|dom| dom.frame_requested),
                     )
                 };
                 if frame
@@ -877,12 +874,7 @@ impl Desktop {
                             crate::render::queue_animation_frame(data, window)
                         })
                         .is_some()
-                    && let Some(dom) = app
-                        .host
-                        .borrow_mut()
-                        .pages
-                        .get_mut(&id)
-                        .map(|page| &mut page.state)
+                    && let Some(dom) = app.host.borrow_mut().page_state_mut(id)
                 {
                     dom.frame_requested = false;
                 }

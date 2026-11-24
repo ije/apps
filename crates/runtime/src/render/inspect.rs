@@ -17,12 +17,10 @@ pub(super) fn paint(view: &ViewState, window: &mut Window) {
     let Ok(host) = view.host.try_borrow() else {
         return;
     };
-    let (Some(page), Some(state)) = (
-        host.pages.get(&view.id),
-        host.pages.get(&view.id).map(|page| &page.state),
-    ) else {
+    let Some(page) = host.pages.get(&view.id) else {
         return;
     };
+    let state = &page.state;
     let nodes = [
         (
             inspect.hover.filter(|_| inspect.hover != inspect.selected),

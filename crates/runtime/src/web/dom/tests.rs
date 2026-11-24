@@ -258,9 +258,7 @@ fn invalidation_skips_text_edits_and_unused_states() {
         )
         .unwrap();
     host.borrow_mut()
-        .pages
-        .get_mut(&1)
-        .map(|page| &mut page.state)
+        .page_state_mut(1)
         .unwrap()
         .fonts
         .aliases
@@ -276,13 +274,7 @@ fn invalidation_skips_text_edits_and_unused_states() {
         .unwrap()
         .values[p]
         .clone();
-    host.borrow_mut()
-        .pages
-        .get_mut(&1)
-        .map(|page| &mut page.state)
-        .unwrap()
-        .styles
-        .computed = None;
+    host.borrow_mut().page_state_mut(1).unwrap().styles.computed = None;
     engine.eval("getComputedStyle(p).color", "test").unwrap();
     assert!(Rc::ptr_eq(
         &first,
