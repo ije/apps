@@ -1171,7 +1171,7 @@ pub(super) fn element(
         let held = (record.call == call || inside) && {
             let fresh = record.epoch.get() == build.epoch;
             let host = build.view.host.borrow();
-            let dom = host.pages.get(&build.view.id).map(|page| &page.state);
+            let dom = host.page_state(build.view.id);
             record.reads.iter().all(|read| {
                 fresh && !read.query.host()
                     || match build.replay(id, containing, container, cell, dom, read) {
@@ -1191,7 +1191,7 @@ pub(super) fn element(
             build.doc.nodes[id].tag,
             if record.call == call {
                 let host = build.view.host.borrow();
-                let dom = host.pages.get(&build.view.id).map(|page| &page.state);
+                let dom = host.page_state(build.view.id);
                 format!(
                     "{:?} changed",
                     record
@@ -1657,7 +1657,7 @@ fn create(
                     return Some(zone.clone());
                 }
                 let host = view.host.borrow();
-                let dom = host.pages.get(&view.id).map(|page| &page.state)?;
+                let dom = host.page_state(view.id)?;
                 let rect = *dom.geometry.mirror.get(&id)?;
                 let moved = dom.layout.cull.scrolled.get(&id).copied().unwrap_or(0.);
                 Some(Rc::new(cull::Zone {
@@ -1731,14 +1731,7 @@ fn create(
                 }
                 // Prefer the last layout to the estimate: missed min/max constraints can cause endless
                 // redraws.
-                let size = reader.block_size(
-                    view.host
-                        .borrow()
-                        .pages
-                        .get(&view.id)
-                        .map(|page| &page.state),
-                    block,
-                );
+                let size = reader.block_size(view.host.borrow().page_state(view.id), block);
                 reader.log(
                     Query::Block(block as u32),
                     0,
@@ -1979,9 +1972,7 @@ fn create(
             },
             move |bounds, _, window| {
                 let caret = painter.host.try_borrow().is_ok_and(|host| {
-                    host.pages
-                        .get(&painter.id)
-                        .map(|page| &page.state)
+                    host.page_state(painter.id)
                         .is_some_and(|dom| dom.interaction.selection_caret == Some(id))
                 });
                 if caret {
@@ -2010,9 +2001,7 @@ fn create(
         let last = view
             .host
             .borrow()
-            .pages
-            .get(&view.id)
-            .map(|page| &page.state)
+            .page_state(view.id)
             .and_then(|dom| dom.layout.cull.widths.get(&id).copied());
         let mut measured = measured.borrow_mut();
         let skips = cull::skips(info[id].flags, style, id, &measured, false);
@@ -2338,7 +2327,7 @@ fn create(
     let hit = share.and_then(|key| {
         let shared = view.shared.borrow();
         let host = view.host.borrow();
-        let dom = host.pages.get(&view.id).map(|page| &page.state);
+        let dom = host.page_state(view.id);
         let here = |read: &Read| Read {
             query: read.query.moved(u32::MAX, id as u32).unwrap_or(read.query),
             ..*read
@@ -2536,9 +2525,7 @@ fn create(
             );
         }
         if let Some(state) = host
-            .pages
-            .get(&view.id)
-            .map(|page| &page.state)
+            .page_state(view.id)
             .filter(|_| host.app.features.has(crate::bundle::Feature::Terminal))
         {
             let look = super::terminal::look(style, styles.selections.get(&id), &units);
@@ -2580,9 +2567,7 @@ fn create(
         let (image, vector) = view
             .host
             .borrow()
-            .pages
-            .get(&view.id)
-            .map(|page| &page.state)
+            .page_state(view.id)
             .filter(|_| !broken)
             .map_or((None, None), |state| {
                 (
@@ -2872,9 +2857,7 @@ fn create(
         }) && view
             .host
             .borrow()
-            .pages
-            .get(&view.id)
-            .map(|page| &page.state)
+            .page_state(view.id)
             .is_some_and(|state| state.media.svg_sources.contains_key(&id));
         if !kept {
             let mut header = format!(
@@ -4953,9 +4936,7 @@ fn create(
         let base = view
             .host
             .borrow()
-            .pages
-            .get(&view.id)
-            .map(|page| &page.state)
+            .page_state(view.id)
             .and_then(|state| state.base.clone());
         background.extend(css_background(
             layers,
@@ -6090,14 +6071,7 @@ fn create(
                         false,
                     ),
                     Some(block) => {
-                        let size = reader.block_size(
-                            view.host
-                                .borrow()
-                                .pages
-                                .get(&view.id)
-                                .map(|page| &page.state),
-                            block,
-                        );
+                        let size = reader.block_size(view.host.borrow().page_state(view.id), block);
                         reader.log(
                             Query::Block(block as u32),
                             0,
@@ -6292,9 +6266,7 @@ fn create(
                 let base = view
                     .host
                     .borrow()
-                    .pages
-                    .get(&view.id)
-                    .map(|page| &page.state)
+                    .page_state(view.id)
                     .and_then(|state| state.base.clone());
                 decoration = decoration.children(css_background(
                     pseudo,
@@ -6756,9 +6728,7 @@ fn create(
         let last = view
             .host
             .borrow()
-            .pages
-            .get(&view.id)
-            .map(|page| &page.state)
+            .page_state(view.id)
             .and_then(|dom| dom.layout.atoms.get(&atom.key()).copied());
         reader.log(
             Query::Atom(atom.key() as u32),
@@ -7264,9 +7234,7 @@ fn create(
                 if let Some(last) = view
                     .host
                     .borrow()
-                    .pages
-                    .get(&view.id)
-                    .map(|page| &page.state)
+                    .page_state(view.id)
                     .and_then(|dom| dom.layout.cull.widths.get(&id))
                 {
                     content[0] = last[0].max(0.);
@@ -7331,20 +7299,14 @@ fn create(
                 definite = (containing[1] - insets - margin[0] - margin[2] - vertical).max(0.);
                 Some(definite)
             } else if flexed {
-                let height = view
-                    .host
-                    .borrow()
-                    .pages
-                    .get(&view.id)
-                    .map(|page| &page.state)
-                    .and_then(|state| {
-                        state
-                            .layout
-                            .cull
-                            .widths
-                            .get(&id)
-                            .map(|size| size[1].max(0.))
-                    });
+                let height = view.host.borrow().page_state(view.id).and_then(|state| {
+                    state
+                        .layout
+                        .cull
+                        .widths
+                        .get(&id)
+                        .map(|size| size[1].max(0.))
+                });
                 tracked[1] = Some((height.unwrap_or(f32::NAN), vertical));
                 height
             } else {
@@ -7375,9 +7337,7 @@ fn create(
             let cached = view
                 .host
                 .borrow()
-                .pages
-                .get(&view.id)
-                .map(|page| &page.state)
+                .page_state(view.id)
                 .and_then(|state| state.layout.grids.get(&id))
                 .filter(|(width, cached, inherited, _)| {
                     *width == content[0]
@@ -7395,9 +7355,7 @@ fn create(
                     slot.as_ref().map(|(_, grid)| grid),
                     view.host
                         .borrow()
-                        .pages
-                        .get(&view.id)
-                        .map(|page| &page.state)
+                        .page_state(view.id)
                         .map(|dom| &dom.layout.baselines),
                     text,
                     &mut measured.borrow_mut(),
@@ -7712,7 +7670,7 @@ fn create(
         let mut plan = None;
         if let Some(zone) = stack {
             let host = view.host.borrow();
-            if let Some(dom) = host.pages.get(&view.id).map(|page| &page.state)
+            if let Some(dom) = host.page_state(view.id)
                 && let Some(&[left, ..]) = dom.geometry.mirror.get(&id)
                 && let Some(&[width, _]) = dom.layout.cull.widths.get(&id)
             {
@@ -7828,13 +7786,7 @@ fn create(
         }
         let mut culled = Vec::new();
         if let (Some(grid), Some(zone)) = (&grid, &build.zone) {
-            if let Some(dom) = view
-                .host
-                .borrow()
-                .pages
-                .get(&view.id)
-                .map(|page| &page.state)
-            {
+            if let Some(dom) = view.host.borrow().page_state(view.id) {
                 for &(child, _, [x, y, width, height], _) in &grid.cells {
                     if super::grid::pseudo_item(child).is_some() {
                         continue;
@@ -8897,13 +8849,7 @@ fn create(
                         })
             })
             .collect();
-        if let Some(dom) = view
-            .host
-            .borrow_mut()
-            .pages
-            .get_mut(&view.id)
-            .map(|page| &mut page.state)
-        {
+        if let Some(dom) = view.host.borrow_mut().page_state_mut(view.id) {
             let last = dom
                 .layout
                 .autos
@@ -8964,12 +8910,10 @@ fn create(
                 // Use the nearest drag-region box under the pointer so no-drag children keep their clicks.
                 let dragged = view.host.try_borrow().is_ok_and(|host| {
                     let viewport = *host.viewports.get(&view.id).unwrap_or(&[800., 600.]);
-                    let (Some(page), Some(state)) = (
-                        host.pages.get(&view.id),
-                        host.pages.get(&view.id).map(|page| &page.state),
-                    ) else {
+                    let Some(page) = host.pages.get(&view.id) else {
                         return true;
                     };
+                    let state = &page.state;
                     let Some(computed) = &state.styles.computed else {
                         return true;
                     };
@@ -9052,12 +8996,7 @@ fn create(
     let sticky = (position == "sticky")
         .then(|| {
             let host = view.host.borrow();
-            let scrolls = &host
-                .pages
-                .get(&view.id)
-                .map(|page| &page.state)?
-                .geometry
-                .scroll;
+            let scrolls = &host.page_state(view.id)?.geometry.scroll;
             let parent = scroller(doc, styles, ancestors.iter().rev().copied(), scrolls, 0);
             let border = insets(styles, parent, false, containing[0]);
             reader.log(
@@ -10931,9 +10870,7 @@ fn fieldset_border(
             let gap = view
                 .host
                 .borrow()
-                .pages
-                .get(&view.id)
-                .map(|page| &page.state)
+                .page_state(view.id)
                 .and_then(|dom| dom.geometry.mirror.get(&legend).copied())
                 .map(|[x, _, width, _]| [px(x), px(x + width)]);
             let top = bounds.top() + px(middle - widths[0] / 2.);

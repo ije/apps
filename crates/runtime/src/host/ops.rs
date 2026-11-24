@@ -631,15 +631,11 @@ pub(super) fn dispatch(
 
 // Account for native DOM memory so removed wrappers trigger GC before row churn exhausts memory.
 fn report_nodes(binding: &Binding, ctx: Ptr, id: u64) {
-    let created = binding.host.try_borrow_mut().ok().and_then(|mut host| {
-        Some(
-            host.pages
-                .get_mut(&id)
-                .map(|page| &mut page.state)?
-                .tree
-                .take_created(),
-        )
-    });
+    let created = binding
+        .host
+        .try_borrow_mut()
+        .ok()
+        .and_then(|mut host| Some(host.page_state_mut(id)?.tree.take_created()));
     if let Some(created) = created.filter(|&created| created > 0) {
         // Count only wrapped nodes: JSC resets this cost only after a full GC.
         binding.api.add_memory(ctx, created * 65536);
@@ -986,9 +982,7 @@ impl Host {
                     if let (Some(media), Some(node)) = (self.media.get_mut(&id), node.as_u64()) {
                         media.close(node);
                     }
-                    if let (Some(state), Some(node)) =
-                        (self.pages.get(&id).map(|page| &page.state), node.as_u64())
-                    {
+                    if let (Some(state), Some(node)) = (self.page_state(id), node.as_u64()) {
                         state.media.terminals.borrow_mut().release(node as usize);
                     }
                 }

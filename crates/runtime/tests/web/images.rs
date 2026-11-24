@@ -213,11 +213,8 @@ fn svg_and_bundled_images_load_through_the_host() {
     assert!(load(&mut host, "apps:///assets/missing.png").is_err());
     assert!(load(&mut host, png.to_str().unwrap()).is_err());
     assert!(load(&mut host, url::Url::from_file_path(&png).unwrap().as_str()).is_err());
-    host.pages
-        .get_mut(&1)
-        .map(|page| &mut page.state)
-        .unwrap()
-        .base = Some(url::Url::from_directory_path(directory.path()).unwrap());
+    host.page_state_mut(1).unwrap().base =
+        Some(url::Url::from_directory_path(directory.path()).unwrap());
     load(&mut host, "sample.png").unwrap();
     assert_eq!(decoded(&mut host), json!([4, 3]));
     load(&mut host, "missing.png").unwrap();

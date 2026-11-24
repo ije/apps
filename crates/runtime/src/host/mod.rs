@@ -29,7 +29,7 @@ pub struct Host {
     pub relaunch: Option<Vec<String>>,
     pub argv: Option<Vec<String>>,
     pub commands: Vec<Value>,
-    pub pages: HashMap<u64, Page>,
+    pub pages: rustc_hash::FxHashMap<u64, Page>,
     pub bridge: HashMap<u64, HashMap<String, crate::jsc::payload::Payload>>,
     pub dropped: HashMap<u64, Vec<String>>,
     pub browsers: crate::native::browser::State,
@@ -60,6 +60,14 @@ impl Host {
         }
     }
 
+    pub fn page_state(&self, id: u64) -> Option<&crate::render::PageState> {
+        self.pages.get(&id).map(|page| &page.state)
+    }
+
+    pub fn page_state_mut(&mut self, id: u64) -> Option<&mut crate::render::PageState> {
+        self.pages.get_mut(&id).map(|page| &mut page.state)
+    }
+
     // The state of the page in window `id`.
     pub fn state(&mut self, id: u64) -> &mut crate::render::PageState {
         match self.pages.get_mut(&id) {
@@ -85,7 +93,7 @@ impl Host {
 
     // The URL of the page in window `id`.
     pub(crate) fn page_url(&self, id: u64) -> Option<&url::Url> {
-        self.pages.get(&id).map(|page| &page.state)?.base.as_ref()
+        self.page_state(id)?.base.as_ref()
     }
 
     // The nodes of each page: in its tree, allocated, and free for reuse.
@@ -99,7 +107,7 @@ impl Host {
                         attached += 1;
                         pending.extend(&page.doc.nodes[node].children);
                     }
-                    let free = self.pages.get(id).map(|page| &page.state).map_or(0, |state| state.tree.free_count());
+                    let free = page.state.tree.free_count();
                     (
                         format!("window {id}"),
                         json!({"attached": attached, "allocated": page.doc.nodes.len(), "free": free}),

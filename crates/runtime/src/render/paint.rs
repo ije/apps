@@ -310,7 +310,7 @@ impl Hooks for Picture {
     fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let view = &*self.view;
         let image = view.host.try_borrow().ok().and_then(|host| {
-            let dom = host.pages.get(&view.id).map(|page| &page.state);
+            let dom = host.page_state(view.id);
             match self.source {
                 Source::Element => dom?.media.images.get(&self.id).cloned(),
                 Source::Presented => view
@@ -553,9 +553,7 @@ impl Contained {
     ) -> Point<Pixels> {
         let block = {
             let host = view.host.borrow();
-            host.pages
-                .get(&view.id)
-                .map(|page| &page.state)
+            host.page_state(view.id)
                 .and_then(|dom| match self.container {
                     usize::MAX => Some(Rect::new(
                         Point::default(),
@@ -634,9 +632,7 @@ impl Hooks for PseudoBlock {
             && let Some(anchor) = {
                 let view = &*self.view;
                 let host = view.host.borrow();
-                host.pages
-                    .get(&view.id)
-                    .map(|page| &page.state)
+                host.page_state(view.id)
                     .and_then(|dom| dom.layout.anchors.get(&key).copied())
             }
         {
@@ -1030,9 +1026,7 @@ impl Hooks for DomBox {
             && let Some(anchor) = {
                 let view = &*self.view;
                 let host = view.host.borrow();
-                host.pages
-                    .get(&view.id)
-                    .map(|page| &page.state)
+                host.page_state(view.id)
                     .and_then(|dom| dom.layout.anchors.get(&self.id).copied())
             }
         {
@@ -1078,9 +1072,7 @@ impl Hooks for DomBox {
                     let view = &*self.view;
                     let host = view.host.borrow();
                     let [x, y, width, height] = host
-                        .pages
-                        .get(&view.id)
-                        .map(|page| &page.state)?
+                        .page_state(view.id)?
                         .geometry
                         .mirror
                         .get(&parent)
@@ -1166,13 +1158,8 @@ impl Hooks for DomBox {
             .and_then(|((distance, origin), parent)| {
                 let view = &*self.view;
                 let host = view.host.borrow();
-                let [x, y, width, height] = *host
-                    .pages
-                    .get(&view.id)
-                    .map(|page| &page.state)?
-                    .geometry
-                    .mirror
-                    .get(parent)?;
+                let [x, y, width, height] =
+                    *host.page_state(view.id)?.geometry.mirror.get(parent)?;
                 let [ox, oy, _] =
                     crate::css::value::transform::origin(origin, &self.units, [width, height]);
                 Some((*distance, [x + ox, y + oy]))
@@ -1208,9 +1195,7 @@ impl Hooks for DomBox {
                 && let Some(block) = view
                     .host
                     .borrow_mut()
-                    .pages
-                    .get_mut(&view.id)
-                    .map(|page| &mut page.state)
+                    .page_state_mut(view.id)
                     .and_then(|dom| dom.layout.blocks.get_mut(&self.id))
             {
                 block.origin += translation;
@@ -1321,24 +1306,18 @@ impl Hooks for DomBox {
                 // The box takes the pointer where its canvas drew it.
                 let view = &*self.view;
                 let content = view.drawing.get();
-                let drawn = view
-                    .host
-                    .borrow()
-                    .pages
-                    .get(&view.id)
-                    .map(|page| &page.state)
-                    .and_then(|dom| {
-                        let to_canvas = dom.geometry.drawn.get(&self.id)?.matrix;
-                        let [x, y] = [bounds.origin.x, bounds.origin.y].map(f32::from);
-                        let from_box = crate::css::value::transform::translate(-x, -y, 0.);
-                        let to_window = crate::css::value::transform::translate(
-                            content.x.into(),
-                            content.y.into(),
-                            0.,
-                        );
-                        let placed = crate::css::value::transform::multiply(&to_canvas, &from_box);
-                        Some(crate::css::value::transform::multiply(&to_window, &placed))
-                    });
+                let drawn = view.host.borrow().page_state(view.id).and_then(|dom| {
+                    let to_canvas = dom.geometry.drawn.get(&self.id)?.matrix;
+                    let [x, y] = [bounds.origin.x, bounds.origin.y].map(f32::from);
+                    let from_box = crate::css::value::transform::translate(-x, -y, 0.);
+                    let to_window = crate::css::value::transform::translate(
+                        content.x.into(),
+                        content.y.into(),
+                        0.,
+                    );
+                    let placed = crate::css::value::transform::multiply(&to_canvas, &from_box);
+                    Some(crate::css::value::transform::multiply(&to_window, &placed))
+                });
                 window.with_hits_at(drawn, &mut prepaint)
             }
             Some(matrix) => window.with_keyed_hit_transform(
@@ -1535,7 +1514,7 @@ impl Hooks for DomBox {
         // A new page or a new node with this number has no snapshot of the box yet.
         let view = &*self.view;
         let host = view.host.borrow();
-        let fresh = (host.pages.get(&view.id).map(|page| &page.state))
+        let fresh = (host.page_state(view.id))
             .is_none_or(|dom| !dom.media.snapshots.contains_key(&self.id));
         drop(host);
         let key = Some((self.id as u64, fresh));
@@ -1696,9 +1675,7 @@ impl DomBox {
             .get(Prop::ISOLATION)
             .is_some_and(|value| value == "isolate")
             && host
-                .pages
-                .get(&view.id)
-                .map(|page| &page.state)
+                .page_state(view.id)
                 .and_then(|dom| dom.styles.last())
                 .is_none_or(|styles| styles.blended());
         let needed = outer.transform.is_some()
