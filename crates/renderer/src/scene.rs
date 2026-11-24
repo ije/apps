@@ -1,6 +1,7 @@
 use crate::{
     Clip, Color, Pixels, Point, Radii, Rect, Size,
     atlas::Tile,
+    geometry::transform_bounds,
     gpu::{Instance, SHADOW, bytes, rect},
     point,
 };
@@ -1244,7 +1245,7 @@ impl Scene {
             self.shots.push(Shot {
                 key,
                 layer,
-                region: crate::frame::region(bounds),
+                region: crate::geometry::region(bounds),
                 read: false,
             });
         }
@@ -2168,27 +2169,6 @@ impl Walk<'_> {
     }
 }
 
-pub(crate) fn transform_bounds(matrix: &[f32; 16], bounds: Rect<f32>) -> Rect<f32> {
-    let (mut min, mut max) = ([f32::MAX; 2], [f32::MIN; 2]);
-    for corner in [
-        bounds.origin,
-        bounds.top_right(),
-        bounds.bottom_left(),
-        bounds.bottom_right(),
-    ] {
-        let [x, y] = [corner.x, corner.y];
-        let w = matrix[3] * x + matrix[7] * y + matrix[15];
-        if w <= 1e-4 {
-            return Rect::new(point(-1e6, -1e6), Size::new(2e6, 2e6));
-        }
-        let px = (matrix[0] * x + matrix[4] * y + matrix[12]) / w;
-        let py = (matrix[1] * x + matrix[5] * y + matrix[13]) / w;
-        min = [min[0].min(px), min[1].min(py)];
-        max = [max[0].max(px), max[1].max(py)];
-    }
-    Rect::between(point(min[0], min[1]), point(max[0], max[1]))
-}
-
 // The shader reads these numbers.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum BlendMode {
@@ -2763,7 +2743,7 @@ mod tests {
         let fill = |scene: &mut Scene, opacity: f32, shadow: bool| {
             scene.clear();
             scene.push(Instance::new(BOX, bounds([0., 0., 800., 600.]), mask));
-            let mut matrix = crate::frame::IDENTITY;
+            let mut matrix = crate::geometry::IDENTITY;
             [matrix[12], matrix[13]] = [300., 200.];
             scene.push_effect(
                 EffectState {
@@ -2845,7 +2825,7 @@ mod tests {
             for &(at, red) in boxes {
                 scene.push(quad(at, red));
             }
-            let mut matrix = crate::frame::IDENTITY;
+            let mut matrix = crate::geometry::IDENTITY;
             [matrix[0], matrix[5], matrix[12]] = [turn, turn, 100.];
             scene.push_effect(
                 EffectState {

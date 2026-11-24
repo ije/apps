@@ -172,7 +172,7 @@ pub(crate) struct Pacer {
     pub wants: bool,
     pub visible: bool,
     pub display: Option<u32>,
-    pub closed: bool,
+    closed: bool,
 }
 
 impl Pacer {
@@ -188,6 +188,11 @@ impl Pacer {
             display: None,
             closed: false,
         }))
+    }
+
+    pub fn close(&mut self) {
+        self.closed = true;
+        self.sync();
     }
 
     pub fn sync(&mut self) {

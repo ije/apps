@@ -89,11 +89,7 @@ define_class!(
         #[unsafe(method(close))]
         fn close_now(&self) {
             self.ivars().closed.set(true);
-            {
-                let mut pacer = lock(&self.ivars().pacer);
-                pacer.closed = true;
-                pacer.sync();
-            }
+            lock(&self.ivars().pacer).close();
             // SAFETY: the NSWindow implementation.
             unsafe { msg_send![super(self), close] }
         }

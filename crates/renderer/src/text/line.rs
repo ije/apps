@@ -1,5 +1,5 @@
-use super::{FontId, GlyphId, TextRun};
-use crate::{Color, Decoration, Pixels, Size, px};
+use super::{Decoration, FontId, GlyphId, TextRun};
+use crate::{Color, Pixels, Size, px};
 use std::rc::Rc;
 
 /// `x` and `y` are relative to the start of its line and the baseline.

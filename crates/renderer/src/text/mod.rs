@@ -8,7 +8,7 @@ mod style;
 
 pub use breaks::{Banded, Wrapping};
 pub use cache::Span;
-pub use draw::Decoration;
+
 pub use line::*;
 pub use paragraph::*;
 pub use raster::*;
@@ -139,6 +139,23 @@ pub struct Fonts {
 }
 
 impl Fonts {
+    pub(crate) fn generation(&self) -> usize {
+        self.generation.get()
+    }
+
+    /// Adds a face to `family` and returns the family name that finds it.
+    pub fn add_font(&self, bytes: Vec<u8>, family: &str) -> Result<String> {
+        let name = self.platform.add_font(bytes, family)?;
+        self.resolved.borrow_mut().clear();
+        self.recent.borrow_mut().clear();
+        self.generation.set(self.generation.get() + 1);
+        Ok(name)
+    }
+
+    pub(crate) fn shape(&self, text: &str, font_size: Pixels, spans: &[Span]) -> Line {
+        self.platform.shape(text, font_size, spans)
+    }
+
     pub fn families(&self) -> Vec<String> {
         let mut names = self.platform.families();
         names.sort_unstable();
@@ -349,7 +366,7 @@ impl TextSystem {
 
     pub(crate) fn for_window(&self) -> Self {
         Self {
-            generation: Cell::new(self.fonts.generation.get()),
+            generation: Cell::new(self.fonts.generation()),
             fonts: self.fonts.clone(),
             cache: Cache::default(),
             spans: Cell::default(),
@@ -357,21 +374,8 @@ impl TextSystem {
         }
     }
 
-    pub(crate) fn generation(&self) -> usize {
-        self.fonts.generation.get()
-    }
-
-    /// Adds a face to `family` and returns the family name that finds it.
-    pub fn add_font(&self, bytes: Vec<u8>, family: &str) -> Result<String> {
-        let name = self.platform.add_font(bytes, family)?;
-        self.resolved.borrow_mut().clear();
-        self.recent.borrow_mut().clear();
-        self.fonts.generation.set(self.fonts.generation.get() + 1);
-        Ok(name)
-    }
-
     fn cache(&self) -> &Cache {
-        let now = self.fonts.generation.get();
+        let now = self.fonts.generation();
         if self.generation.replace(now) != now {
             self.cache.clear();
         }

@@ -1,16 +1,5 @@
-use super::{DecorationStyle, FontId, Line, Look, TextAlign, TextLine};
+use super::{Decoration, FontId, Line, Look, TextAlign, TextLine};
 use crate::{Color, Pixels, Point, Rect, Scalar, Size, Window, point, px};
-
-/// Strikethroughs have no offset.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Decoration {
-    pub thickness: Pixels,
-    /// The text color when `None`.
-    pub color: Option<Color>,
-    pub style: DecorationStyle,
-    /// From the baseline, instead of the default place under it.
-    pub offset: Option<Pixels>,
-}
 
 struct Rows<'a> {
     line: &'a Line,

@@ -101,7 +101,7 @@ impl Cache {
                 (text, line, breaks)
             }
             None => {
-                let mut line = fonts.platform.shape(text, font_size, spans);
+                let mut line = fonts.shape(text, font_size, spans);
                 // Text with a font size of 0 takes no room, so its glyphs have no advance and no metrics.
                 if spans.iter().any(|span| span.size == px(0.)) {
                     let (mut end, mut zero) = (0, Vec::new());

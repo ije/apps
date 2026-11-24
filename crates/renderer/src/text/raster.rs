@@ -16,6 +16,9 @@ pub struct GlyphRaster {
     pub stroke: f32,
 }
 
+// The place a glyph raster shows at, its size, and its bytes.
+pub(crate) type GlyphPixels = (Rect<i32>, Size<i32>, Vec<u8>);
+
 impl Eq for GlyphRaster {}
 
 impl Hash for GlyphRaster {
@@ -60,11 +63,7 @@ impl Fonts {
     }
 
     /// A glyph larger than `max` rasters at a smaller scale, and `shown` is the place it stretches back to.
-    pub(crate) fn raster(
-        &self,
-        raster: &GlyphRaster,
-        max: i32,
-    ) -> Result<Option<crate::atlas::Raster<Vec<u8>>>> {
+    pub(crate) fn raster(&self, raster: &GlyphRaster, max: i32) -> Result<Option<GlyphPixels>> {
         let full = self.platform.raster_bounds(raster)?;
         let stretch = full.size.width.max(full.size.height) as f32 / max as f32;
         let (raster, bounds) = if stretch > 1. {
@@ -148,7 +147,7 @@ mod tests {
         };
         let full = text.platform.raster_bounds(&raster).unwrap();
         assert!(full.size.width > 16384);
-        let max = crate::atlas::MAX_GLYPH_SIDE;
+        let max = 2048;
         let (shown, size, bytes) = text.raster(&raster, max).unwrap().unwrap();
         assert!(size.width.max(size.height) <= max + 4);
         assert_eq!(bytes.len(), (size.width * size.height) as usize);

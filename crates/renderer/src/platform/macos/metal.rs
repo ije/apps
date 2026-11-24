@@ -714,7 +714,7 @@ impl Renderer {
     }
 
     pub fn release(&mut self, scene: &crate::Scene) {
-        self.atlas.release_images(scene);
+        self.atlas.release_images(scene.texels());
         self.shot_copies.clear();
         // An empty command buffer waits for earlier frames on the same queue.
         self.atlas.free_retired(|| {
@@ -797,7 +797,7 @@ impl Renderer {
                 {
                     continue;
                 }
-                let region = crate::frame::region(bounds);
+                let region = crate::geometry::region(bounds);
                 if region[2] <= 0 || region[3] <= 0 {
                     continue;
                 }
@@ -2062,7 +2062,7 @@ mod tests {
                 (image.info[2], image.info[3]) = (1., tile.page as f32);
                 scene.push(image);
                 let (sin, cos) = 0.3f32.sin_cos();
-                let mut turn = crate::frame::IDENTITY;
+                let mut turn = crate::geometry::IDENTITY;
                 [turn[0], turn[1], turn[4], turn[5], turn[12], turn[13]] =
                     [cos, sin, -sin, cos, 10., -20.];
                 let state = EffectState {

@@ -230,6 +230,10 @@ impl<T: Send + 'static> Latest<T> {
         self.post(apply);
     }
 
+    fn take(&self) -> Option<T> {
+        lock(&self.value).take()
+    }
+
     fn post(self: &Arc<Self>, apply: impl FnOnce(&Arc<Self>) + Send + 'static) {
         if !self.posted.swap(true, Ordering::AcqRel) {
             let latest = self.clone();
@@ -375,7 +379,7 @@ impl Window {
         self.control.native.wait();
         self.quiet = None;
         let renderer = &mut self.renderer;
-        let stale = lock(&self.presents.value).take();
+        let stale = self.presents.take();
         if let Some(stale) = stale {
             renderer.discard(stale);
         }
@@ -388,7 +392,7 @@ impl Window {
             // Dropping a present on main shows it there.
             // Present outside the lock: the render thread takes it in `draw()`.
             self.presents.send(present, |latest| {
-                let present = lock(&latest.value).take();
+                let present = latest.take();
                 drop(present);
             });
         }
@@ -422,7 +426,7 @@ impl Window {
 fn show_controls(native: Arc<Native>, latest: Arc<Latest<Controls>>) {
     native.with(|window| {
         // Code up the stack can be using the controls: try again in the next pass.
-        if !window.view().update_controls(|| lock(&latest.value).take()) {
+        if !window.view().update_controls(|| latest.take()) {
             let native = native.clone();
             latest.post(move |latest| show_controls(native, latest.clone()));
         }
@@ -431,11 +435,7 @@ fn show_controls(native: Arc<Native>, latest: Arc<Latest<Controls>>) {
 
 impl Drop for Window {
     fn drop(&mut self) {
-        {
-            let mut pacer = lock(&self.pacer);
-            pacer.closed = true;
-            pacer.sync();
-        }
+        lock(&self.pacer).close();
         let native = self.control.native.clone();
         native_post(Box::new(move || {
             if lock(&native.opener).take().is_some() {

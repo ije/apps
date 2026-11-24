@@ -1,5 +1,6 @@
 use crate::{
     BlendMode, Point, Rect, Size,
+    geometry::{IDENTITY, invert, plane_of, region},
     gpu::{
         BOX, Blur, COMPOSITE_BACKDROP, COMPOSITE_BLEND, COMPOSITE_CLIP, COMPOSITE_MASK,
         COMPOSITE_MATRIX, COMPOSITE_SHADOW, Composite, Globals, Instance,
@@ -7,10 +8,6 @@ use crate::{
     scene::{NESTED, Nested, Scene, Under},
 };
 use std::ops::Range;
-
-pub(crate) const IDENTITY: [f32; 16] = [
-    1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
-];
 
 const HALF_RESOLUTION_SIGMA: f32 = 8.;
 // A layer that the target cuts draws its content in cells of this size, so it keeps its pixels while it moves.
@@ -254,15 +251,6 @@ impl<T> Pool<T> {
         frame.cache.clear();
         frame.under = None;
     }
-}
-
-pub fn region(bounds: Rect<f32>) -> [i32; 4] {
-    let [x, y] = [bounds.origin.x.floor(), bounds.origin.y.floor()];
-    let [right, bottom] = [
-        (bounds.origin.x + bounds.size.width).ceil(),
-        (bounds.origin.y + bounds.size.height).ceil(),
-    ];
-    [x as i32, y as i32, (right - x) as i32, (bottom - y) as i32]
 }
 
 // The window regions to draw again, or `None` for the whole window. A layer that reads the pixels
@@ -1309,7 +1297,7 @@ impl RenderFrame {
         let [reach, around] = match &effect.transform {
             Some(transform) => {
                 let [x, y, width, height] = visible;
-                let back = crate::window::invert(&crate::window::plane_of(transform));
+                let back = invert(&plane_of(transform));
                 let seen = back.and_then(|m| {
                     [
                         [x, y],
@@ -1539,7 +1527,7 @@ mod tests {
 
     fn record(window: [u32; 2], quad: [f32; 4], scale: f32) -> RenderFrame {
         let mask = Clip::from(bounds([-1e6, -1e6, 2e6, 2e6]));
-        let mut transform = super::IDENTITY;
+        let mut transform = crate::geometry::IDENTITY;
         transform[0] = scale;
         let mut scene = Scene::default();
         let state = EffectState {
@@ -1749,7 +1737,7 @@ mod tests {
         let mask = Clip::from(bounds([0., 0., 800., 600.]));
         let turn = |degrees: f32| {
             let (sin, cos) = degrees.to_radians().sin_cos();
-            let mut m = super::IDENTITY;
+            let mut m = crate::geometry::IDENTITY;
             [m[0], m[1], m[4], m[5]] = [cos, sin, -sin, cos];
             [m[12], m[13]] = [
                 150. - cos * 150. + sin * 150.,
@@ -1758,7 +1746,7 @@ mod tests {
             m
         };
         let shift = |x: f32, y: f32| {
-            let mut m = super::IDENTITY;
+            let mut m = crate::geometry::IDENTITY;
             [m[12], m[13]] = [x, y];
             m
         };
@@ -1804,7 +1792,7 @@ mod tests {
         let mask = Clip::from(bounds([0., 0., 800., 600.]));
         for shift in [-1700., -5000., 0.] {
             let mut scene = Scene::default();
-            let mut matrix = super::IDENTITY;
+            let mut matrix = crate::geometry::IDENTITY;
             matrix[12] = shift;
             let state = EffectState {
                 transform: Some(matrix),

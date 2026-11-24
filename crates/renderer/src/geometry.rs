@@ -794,3 +794,97 @@ pub(crate) fn snap_width(logical: f32, scale_factor: f32) -> f32 {
     }
     snap(logical.max(0.) * scale_factor).max(1.)
 }
+
+// Column-major 3x3 matrices of the z = 0 plane of a CSS transform.
+pub(crate) type Plane = [f32; 9];
+
+pub(crate) fn plane_of(m: &[f32; 16]) -> Plane {
+    [m[0], m[1], m[3], m[4], m[5], m[7], m[12], m[13], m[15]]
+}
+
+pub(crate) fn compose(outer: &Plane, inner: &Plane) -> Plane {
+    let mut out = [0.; 9];
+    for (index, out) in out.iter_mut().enumerate() {
+        let (v, row) = (&inner[index - index % 3..], index % 3);
+        *out = outer[row] * v[0] + outer[3 + row] * v[1] + outer[6 + row] * v[2];
+    }
+    out
+}
+
+pub(crate) fn invert(m: &Plane) -> Option<Plane> {
+    let cross = |a: &[f32], b: &[f32]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let (c0, c1, c2) = (&m[0..3], &m[3..6], &m[6..9]);
+    let rows = [cross(c1, c2), cross(c2, c0), cross(c0, c1)];
+    let det = c0[0] * rows[0][0] + c0[1] * rows[0][1] + c0[2] * rows[0][2];
+    (det.abs() > 1e-9).then(|| std::array::from_fn(|i| rows[i % 3][i / 3] / det))
+}
+
+pub(crate) fn project(m: &Plane, at: Point<Pixels>) -> Option<Point<Pixels>> {
+    let (x, y) = (at.x.0, at.y.0);
+    let [u, v, w] = [0, 1, 2].map(|row| m[row] * x + m[3 + row] * y + m[6 + row]);
+    (w.abs() > 1e-6).then(|| point(px(u / w), px(v / w)))
+}
+
+pub(crate) fn transform_bounds(matrix: &[f32; 16], bounds: Rect<f32>) -> Rect<f32> {
+    let (mut min, mut max) = ([f32::MAX; 2], [f32::MIN; 2]);
+    for corner in [
+        bounds.origin,
+        bounds.top_right(),
+        bounds.bottom_left(),
+        bounds.bottom_right(),
+    ] {
+        let [x, y] = [corner.x, corner.y];
+        let w = matrix[3] * x + matrix[7] * y + matrix[15];
+        if w <= 1e-4 {
+            return Rect::new(point(-1e6, -1e6), Size::new(2e6, 2e6));
+        }
+        let px = (matrix[0] * x + matrix[4] * y + matrix[12]) / w;
+        let py = (matrix[1] * x + matrix[5] * y + matrix[13]) / w;
+        min = [min[0].min(px), min[1].min(py)];
+        max = [max[0].max(px), max[1].max(py)];
+    }
+    Rect::between(point(min[0], min[1]), point(max[0], max[1]))
+}
+
+pub(crate) const IDENTITY: [f32; 16] = [
+    1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+];
+
+pub(crate) fn region(bounds: Rect<f32>) -> [i32; 4] {
+    let [x, y] = [bounds.origin.x.floor(), bounds.origin.y.floor()];
+    let [right, bottom] = [
+        (bounds.origin.x + bounds.size.width).ceil(),
+        (bounds.origin.y + bounds.size.height).ceil(),
+    ];
+    [x as i32, y as i32, (right - x) as i32, (bottom - y) as i32]
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub enum AvailableSpace {
+    Definite(Pixels),
+    #[default]
+    MinContent,
+    MaxContent,
+}
+
+impl AvailableSpace {
+    pub(crate) fn unscaled(space: taffy::AvailableSpace, factor: f32) -> Self {
+        match space {
+            taffy::AvailableSpace::Definite(value) => Self::Definite(Pixels(value / factor)),
+            taffy::AvailableSpace::MinContent => Self::MinContent,
+            taffy::AvailableSpace::MaxContent => Self::MaxContent,
+        }
+    }
+}
+
+impl From<Pixels> for AvailableSpace {
+    fn from(value: Pixels) -> Self {
+        Self::Definite(value)
+    }
+}

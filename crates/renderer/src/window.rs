@@ -3,7 +3,7 @@ use crate::{
     Modifiers, NodeKey, PaintEffect, Pixels, Point, Radii, Rect, RenderImage, ScrollRef, Size,
     Tree, Utf16Selection, WheelPhase,
     atlas::TileKey,
-    geometry::{snap, snap_width},
+    geometry::{Plane, compose, invert, plane_of, project, snap, snap_width},
     platform, point, px,
     scene::{self, BackdropState, EffectState, Scene},
     size,
@@ -183,42 +183,6 @@ impl Region {
     pub fn under_pointer(&self, window: &Window) -> bool {
         window.under.contains(&self.key)
     }
-}
-
-// Column-major 3x3 matrices of the z = 0 plane of a CSS transform.
-pub(crate) type Plane = [f32; 9];
-
-pub(crate) fn plane_of(m: &[f32; 16]) -> Plane {
-    [m[0], m[1], m[3], m[4], m[5], m[7], m[12], m[13], m[15]]
-}
-
-fn compose(outer: &Plane, inner: &Plane) -> Plane {
-    let mut out = [0.; 9];
-    for (index, out) in out.iter_mut().enumerate() {
-        let (v, row) = (&inner[index - index % 3..], index % 3);
-        *out = outer[row] * v[0] + outer[3 + row] * v[1] + outer[6 + row] * v[2];
-    }
-    out
-}
-
-pub(crate) fn invert(m: &Plane) -> Option<Plane> {
-    let cross = |a: &[f32], b: &[f32]| {
-        [
-            a[1] * b[2] - a[2] * b[1],
-            a[2] * b[0] - a[0] * b[2],
-            a[0] * b[1] - a[1] * b[0],
-        ]
-    };
-    let (c0, c1, c2) = (&m[0..3], &m[3..6], &m[6..9]);
-    let rows = [cross(c1, c2), cross(c2, c0), cross(c0, c1)];
-    let det = c0[0] * rows[0][0] + c0[1] * rows[0][1] + c0[2] * rows[0][2];
-    (det.abs() > 1e-9).then(|| std::array::from_fn(|i| rows[i % 3][i / 3] / det))
-}
-
-fn project(m: &Plane, at: Point<Pixels>) -> Option<Point<Pixels>> {
-    let (x, y) = (at.x.0, at.y.0);
-    let [u, v, w] = [0, 1, 2].map(|row| m[row] * x + m[3 + row] * y + m[6 + row]);
-    (w.abs() > 1e-6).then(|| point(px(u / w), px(v / w)))
 }
 
 // CSS-pixel matrices become device-pixel matrices at this scale.
@@ -848,12 +812,12 @@ impl Window {
             Some(transforms) => transforms
                 .iter()
                 .map(|matrix| {
-                    crate::scene::transform_bounds(&device_matrix(*matrix, scale), content)
+                    crate::geometry::transform_bounds(&device_matrix(*matrix, scale), content)
                 })
                 .reduce(|all, bounds| all.union(bounds)),
             None => Some(content),
         };
-        let region = crate::frame::region(content);
+        let region = crate::geometry::region(content);
         // Promoted layers bypass window clips. Keep them inside the clip with no overlapping content above.
         let window = Rect::new(Point::default(), self.viewport_size.scale(scale));
         let reach = reach.map(|reach| reach.intersect(window));
@@ -1172,7 +1136,7 @@ impl Window {
             tree.bury();
         }
         self.text_system.end_frame();
-        self.platform.atlas().finish_frame(&self.scene);
+        self.platform.atlas().finish_frame(self.scene.texels());
         let last = captures.len().wrapping_sub(1);
         for (index, capture) in captures.into_iter().enumerate() {
             let result = match &mut frame {

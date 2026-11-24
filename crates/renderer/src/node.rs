@@ -1,8 +1,8 @@
 use crate::{
-    AlignContent, AlignItems, App, Baseline, Color, Corners, Cursor, Display, Edges, Event,
-    FlexDirection, FlexWrap, FontWeight, Length, Overflow, Overscroll, Pixels, Point, Position,
-    Rect, Region, Scope, SharedString, Size, Style, TextAlign, TextOverrides, TextRun, TextStyle,
-    WheelPhase, WhiteSpace, Window, point, px, relative,
+    AlignContent, AlignItems, App, AvailableSpace, Baseline, Color, Corners, Cursor, Display,
+    Edges, Event, FlexDirection, FlexWrap, FontWeight, Length, Overflow, Overscroll, Pixels, Point,
+    Position, Rect, Region, Scope, SharedString, Size, Style, TextAlign, TextOverrides, TextRun,
+    TextStyle, WheelPhase, WhiteSpace, Window, point, px, relative,
 };
 use std::{
     any::Any,
@@ -10,30 +10,6 @@ use std::{
     rc::Rc,
     time::{Duration, Instant},
 };
-
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
-pub enum AvailableSpace {
-    Definite(Pixels),
-    #[default]
-    MinContent,
-    MaxContent,
-}
-
-impl AvailableSpace {
-    pub(crate) fn unscaled(space: taffy::AvailableSpace, factor: f32) -> Self {
-        match space {
-            taffy::AvailableSpace::Definite(value) => Self::Definite(Pixels(value / factor)),
-            taffy::AvailableSpace::MinContent => Self::MinContent,
-            taffy::AvailableSpace::MaxContent => Self::MaxContent,
-        }
-    }
-}
-
-impl From<Pixels> for AvailableSpace {
-    fn from(value: Pixels) -> Self {
-        Self::Definite(value)
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeKey(pub u64);
