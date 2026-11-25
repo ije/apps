@@ -463,6 +463,10 @@ impl WindowControl {
         Some(self.native()?.state())
     }
 
+    pub fn scale_factor(&self) -> f32 {
+        self.native().map_or(1., |native| native.scale())
+    }
+
     pub fn raw_window_handle(&self) -> Result<RawWindowHandle> {
         let native = self
             .native()

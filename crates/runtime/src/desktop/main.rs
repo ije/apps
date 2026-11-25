@@ -314,7 +314,13 @@ impl Main {
                     .and_then(|window| window.native.as_ref())
                 {
                     Some((_, control)) => match control.raw_window_handle() {
-                        Ok(window) => Parent::Ready(NativeHandle(window)),
+                        Ok(window) => {
+                            #[cfg(target_os = "linux")]
+                            let scale = control.scale_factor() as f64;
+                            #[cfg(not(target_os = "linux"))]
+                            let scale = 1.;
+                            Parent::Ready(NativeHandle(window), scale)
+                        }
                         Err(_) => Parent::Waiting,
                     },
                     None if windows.contains_key(&parent) || self.link.spawning(parent) => {

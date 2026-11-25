@@ -2,8 +2,8 @@ use crate::css::value::grammar::grammar;
 use crate::css::value::specified::math_sum;
 use crate::css::{
     properties::BORDERS, properties::PADDING, properties::Prop, properties::Registry,
-    properties::Style, value::area_cells, value::corner_shape, value::grammar::INITIAL,
-    value::grammar::SHORTHANDS, value::shorthand::BORDER_IMAGE, value::shorthand::expand,
+    properties::Style, value::area_cells, value::corner_shape, value::grammar::SHORTHANDS,
+    value::grammar::initial, value::shorthand::BORDER_IMAGE, value::shorthand::expand,
     value::specified::specified, value::tokens::components, value::tokens::number,
     value::tokens::write_printed, value::units::Kind, value::units::Lengths,
 };
@@ -375,10 +375,7 @@ pub(crate) fn resolved(
     let Some(prop) = Prop::find(name) else {
         return String::new();
     };
-    let initial = INITIAL
-        .binary_search_by(|(property, _)| (*property).cmp(name))
-        .ok()
-        .map(|index| INITIAL[index].1);
+    let initial = initial(name);
     let shorthand = |shorthand: Prop, key: &str| {
         let list = components(style.get(shorthand)?, ',');
         let parts: Vec<_> = list

@@ -10,6 +10,8 @@ use webkit2gtk::{
 pub(crate) struct Window {
     window: gtk::Window,
     attached: Cell<bool>,
+    // Device pixels per CSS pixel of the parent window.
+    scale: Cell<f64>,
     visible: bool,
     shown: Cell<bool>,
     bounds: Cell<Option<[f64; 4]>>,
@@ -19,6 +21,7 @@ pub(crate) struct Window {
 impl Window {
     pub fn new(
         parent: Option<RawWindowHandle>,
+        scale: f64,
         options: &Value,
         events: Arc<Events>,
     ) -> Result<Self> {
@@ -51,13 +54,14 @@ impl Window {
         let result = Self {
             window,
             attached: Cell::new(false),
+            scale: Cell::new(1.),
             visible: options["show"] != false,
             shown: Cell::new(true),
             bounds: Cell::new(None),
             closed,
         };
         if let Some(parent) = parent {
-            result.attach(parent)?;
+            result.attach(parent, scale)?;
         } else if options["show"] != false {
             result.window.show();
         }
@@ -99,7 +103,7 @@ impl Window {
         Ok(view)
     }
 
-    pub fn attach(&self, parent: RawWindowHandle) -> Result<()> {
+    pub fn attach(&self, parent: RawWindowHandle, scale: f64) -> Result<()> {
         let xid = match parent {
             RawWindowHandle::Xlib(parent) => parent.window,
             RawWindowHandle::Xcb(parent) => parent.window.get() as _,
@@ -123,6 +127,7 @@ impl Window {
         native.reparent(parent.upcast_ref(), 0, 0);
         native.raise();
         self.attached.set(true);
+        self.scale.set(scale);
         let bounds = self.bounds.take().unwrap_or([0., 0., 800., 600.]);
         self.set_bounds(bounds)
     }
@@ -163,14 +168,16 @@ impl Window {
                 && width > 0.
                 && height > 0.,
         );
-        let width = (width as i32).max(1);
-        let height = (height as i32).max(1);
+        // Bounds are CSS pixels. GDK places windows in its own units, device pixels over its scale.
+        let unit = self.scale.get() / f64::from(self.window.scale_factor().max(1));
+        let [x, y] = [x, y].map(|value| (value * unit).round() as i32);
+        let [width, height] = [width, height].map(|value| ((value * unit).round() as i32).max(1));
         self.window.resize(width, height);
         if self.attached.get() {
             self.window
                 .window()
                 .context("Browser window is unavailable")?
-                .move_resize(x as i32, y as i32, width, height);
+                .move_resize(x, y, width, height);
         }
         self.bounds.set(Some(bounds));
         Ok(())

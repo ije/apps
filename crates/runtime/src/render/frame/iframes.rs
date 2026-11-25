@@ -24,6 +24,7 @@ pub(super) fn sync(
             std::collections::hash_map::Entry::Vacant(entry) => {
                 match apps_webview::Browser::new(
                     window,
+                    window.scale_factor() as f64,
                     &serde_json::json!({"javascript":attrs.get("sandbox").is_none_or(|s|s.split_whitespace().any(|s|s=="allow-scripts")),"inspectable":inspectable}),
                 ) {
                     Ok(browser) => entry.insert(Frame {

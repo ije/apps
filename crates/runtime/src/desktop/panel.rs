@@ -54,7 +54,11 @@ impl DevTools {
     pub(crate) fn new(title: &str, role: Role, window: Option<&renderer::Window>) -> Result<Self> {
         let page = page()?;
         let docked = window.filter(|_| cfg!(target_os = "macos")).map(|window| {
-            let browser = Browser::new(window, &json!({"inspectable":true}))?;
+            let browser = Browser::new(
+                window,
+                window.scale_factor() as f64,
+                &json!({"inspectable":true}),
+            )?;
             let titlebar = browser.dock(300.)?;
             anyhow::Ok((browser, titlebar))
         });

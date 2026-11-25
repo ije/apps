@@ -86,6 +86,7 @@ impl HasWindowHandle for Window {
 impl Window {
     pub fn new(
         parent: Option<RawWindowHandle>,
+        _scale: f64,
         options: &Value,
         events: Arc<Events>,
     ) -> anyhow::Result<Self> {
@@ -222,7 +223,7 @@ impl Window {
         Ok(view)
     }
 
-    pub fn attach(&self, parent: RawWindowHandle) -> anyhow::Result<()> {
+    pub fn attach(&self, parent: RawWindowHandle, _scale: f64) -> anyhow::Result<()> {
         let RawWindowHandle::Win32(parent) = parent else {
             bail!("WebView2 requires a Win32 window");
         };

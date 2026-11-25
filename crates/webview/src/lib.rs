@@ -112,10 +112,13 @@ pub struct Browser {
 }
 
 impl Browser {
-    pub fn new(window: &impl HasWindowHandle, options: &Value) -> Result<Self> {
+    /// `scale` is device pixels per CSS pixel of the window. Only Linux uses it: the other platforms get it
+    /// from the window.
+    pub fn new(window: &impl HasWindowHandle, scale: f64, options: &Value) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
             use raw_window_handle::RawWindowHandle;
+            let _ = scale;
             let RawWindowHandle::AppKit(handle) = window.window_handle()?.as_raw() else {
                 bail!("Expected an AppKit window");
             };
@@ -124,7 +127,7 @@ impl Browser {
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             Ok(Self {
-                backend: wry::Browser::new(Some(window.window_handle()?.as_raw()), options)?,
+                backend: wry::Browser::new(Some(window.window_handle()?.as_raw()), scale, options)?,
             })
         }
     }
@@ -137,7 +140,7 @@ impl Browser {
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             Ok(Self {
-                backend: wry::Browser::new(None, options)?,
+                backend: wry::Browser::new(None, 1., options)?,
             })
         }
     }
@@ -174,10 +177,12 @@ impl Browser {
         })
     }
 
-    pub fn attach(&self, window: &impl HasWindowHandle) -> Result<()> {
+    /// `scale` is as in `new()`.
+    pub fn attach(&self, window: &impl HasWindowHandle, scale: f64) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
             use raw_window_handle::RawWindowHandle;
+            let _ = scale;
             let RawWindowHandle::AppKit(handle) = window.window_handle()?.as_raw() else {
                 bail!("Expected an AppKit window");
             };
@@ -190,7 +195,9 @@ impl Browser {
         }
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
-            self.backend.window.attach(window.window_handle()?.as_raw())
+            self.backend
+                .window
+                .attach(window.window_handle()?.as_raw(), scale)
         }
     }
 

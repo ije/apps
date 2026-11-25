@@ -104,9 +104,9 @@ pub(super) struct Browser {
 }
 
 impl Browser {
-    pub fn new(parent: Option<RawWindowHandle>, options: &Value) -> Result<Self> {
+    pub fn new(parent: Option<RawWindowHandle>, scale: f64, options: &Value) -> Result<Self> {
         let events = Arc::new(Events::default());
-        let window = Window::new(parent, options, events.clone())?;
+        let window = Window::new(parent, scale, options, events.clone())?;
         let partition = options["partition"].as_str().unwrap_or("");
         let application = options["application"]
             .as_str()
@@ -388,13 +388,13 @@ mod tests {
     #[test]
     #[ignore = "requires a desktop display and the installed WebKitGTK or WebView2 runtime"]
     fn system_webview() {
-        let parent = Window::new(None, &json!({"show":true}), Arc::default()).unwrap();
+        let parent = Window::new(None, 1., &json!({"show":true}), Arc::default()).unwrap();
         let browser =
-            Browser::new(None, &json!({"show":false,"partition":"browser-smoke"})).unwrap();
+            Browser::new(None, 1., &json!({"show":false,"partition":"browser-smoke"})).unwrap();
         browser.window.set_bounds([10., 20., 320., 240.]).unwrap();
         browser
             .window
-            .attach(parent.window_handle().unwrap().as_raw())
+            .attach(parent.window_handle().unwrap().as_raw(), 1.)
             .unwrap();
         browser.command("loadHTML", &json!({"html":"<!doctype html><title>System browser</title><h1 id='value'>你好</h1>","baseURL":"https://example.test/base/"})).unwrap();
         let loaded = wait(&browser, |event| event["type"] == "did-finish-load");
@@ -438,7 +438,7 @@ mod tests {
         browser.command("cookies.set", &json!({"id":5,"details":{"url":"https://example.test/","name":"test","value":"shared","httpOnly":true,"secure":true}})).unwrap();
         assert!(wait(&browser, |event| event["id"] == 5)["error"].is_null());
         let shared =
-            Browser::new(None, &json!({"show":false,"partition":"browser-smoke"})).unwrap();
+            Browser::new(None, 1., &json!({"show":false,"partition":"browser-smoke"})).unwrap();
         shared
             .command(
                 "cookies.get",
@@ -448,7 +448,7 @@ mod tests {
         let cookies = wait(&shared, |event| event["id"] == 6);
         assert_eq!(cookies["value"][0]["value"], "shared");
         assert_eq!(cookies["value"][0]["httpOnly"], true);
-        let separate = Browser::new(None, &json!({"show":false})).unwrap();
+        let separate = Browser::new(None, 1., &json!({"show":false})).unwrap();
         separate
             .command("cookies.get", &json!({"id":7,"filter":{}}))
             .unwrap();
@@ -489,7 +489,7 @@ mod tests {
         browser.window.set_bounds([10., 20., 320., 240.]).unwrap();
         browser
             .window
-            .attach(parent.window_handle().unwrap().as_raw())
+            .attach(parent.window_handle().unwrap().as_raw(), 1.)
             .unwrap();
         browser
             .command(
