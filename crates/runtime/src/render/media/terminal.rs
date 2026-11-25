@@ -5,7 +5,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use serde_json::{Value, json};
 use std::{ffi::c_void, ptr::NonNull, sync::OnceLock};
 
-const ABI: u32 = 3;
+const ABI: u32 = 4;
 
 pub const LICENSE: &str = "Ghostty.LICENSE";
 
@@ -163,6 +163,7 @@ struct Library {
         Raw,
         *const u8,
         usize,
+        bool,
         *const u8,
         usize,
         *const u8,
@@ -178,7 +179,7 @@ struct Library {
     resize: unsafe extern "C" fn(Raw, u16, u16, u32, u32),
     theme: unsafe extern "C" fn(Raw, *const u32, bool),
     poll: unsafe extern "C" fn(Raw, *mut c_void, Alloc) -> bool,
-    info: unsafe extern "C" fn(Raw, *mut c_void, Alloc),
+    info: unsafe extern "C" fn(Raw, bool, *mut c_void, Alloc),
     text: unsafe extern "C" fn(Raw, bool, *mut c_void, Alloc) -> bool,
     frame: unsafe extern "C" fn(Raw, *mut Frame) -> bool,
     image: unsafe extern "C" fn(Raw, u32, u64, *mut u32, *mut c_void, Alloc) -> bool,
@@ -283,9 +284,15 @@ impl Terminal {
         })
     }
 
-    /// Starts a program in a PTY. An empty `argv` is the login shell of the user, and an empty `env` is the
-    /// environment of the app.
-    pub fn spawn(&mut self, argv: &[String], env: &[String], cwd: &str) -> Result<u32> {
+    /// Starts a program in a PTY. An empty `argv` is the login shell of the user, and with `shell` the first string
+    /// of `argv` is a command line for that shell. An empty `env` is the environment of the app.
+    pub fn spawn(
+        &mut self,
+        argv: &[String],
+        shell: bool,
+        env: &[String],
+        cwd: &str,
+    ) -> Result<u32> {
         let list = |items: &[String]| {
             let mut bytes = Vec::new();
             for item in items {
@@ -301,6 +308,7 @@ impl Terminal {
                 self.raw.as_ptr(),
                 argv.as_ptr(),
                 argv.len(),
+                shell,
                 env.as_ptr(),
                 env.len(),
                 cwd.as_ptr(),
@@ -396,9 +404,9 @@ impl Terminal {
     }
 
     /// The state for `info`: the library's fields, with the size, title and status.
-    pub(crate) fn info(&mut self) -> Result<Value> {
+    pub(crate) fn info(&mut self, process: bool) -> Result<Value> {
         let (_, json) = self.json(|library, raw, output| unsafe {
-            (library.info)(raw, output, alloc);
+            (library.info)(raw, process, output, alloc);
             true
         });
         let mut info: Value = serde_json::from_slice(&json)?;

@@ -87,23 +87,22 @@ runs:
         path: target/ffmpeg/*-*
         key: ${{ steps.ffmpeg.outputs.cache-primary-key }}
 
-    # libghostty-vt builds with Zig. Windows has no terminal library yet.
-    - if: runner.os != 'Windows'
-      uses: actions/cache/restore@v4
+    # libghostty-vt builds with Zig.
+    - uses: actions/cache/restore@v4
       id: ghostty
       with:
         path: target/ghostty/*-*
         key: ghostty-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-ghostty.sh') }}
-    - if: runner.os != 'Windows' && steps.ghostty.outputs.cache-hit != 'true'
+    - if: steps.ghostty.outputs.cache-hit != 'true'
       uses: mlugg/setup-zig@v2
       with:
         version: 0.17.0
         # build-ghostty.sh uses a new Zig cache for each build.
         use-cache: false
-    - if: runner.os != 'Windows' && steps.ghostty.outputs.cache-hit != 'true'
+    - if: steps.ghostty.outputs.cache-hit != 'true'
       shell: bash
       run: bash scripts/build-ghostty.sh
-    - if: runner.os != 'Windows' && steps.ghostty.outputs.cache-hit != 'true'
+    - if: steps.ghostty.outputs.cache-hit != 'true'
       uses: actions/cache/save@v4
       with:
         path: target/ghostty/*-*

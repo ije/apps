@@ -53,7 +53,6 @@ impl Contexts {
         self.page.tick().unwrap();
     }
 
-    #[cfg(unix)]
     fn wait(&self, ready: &str) {
         for _ in 0..5000 {
             self.tick();
@@ -66,13 +65,10 @@ impl Contexts {
     }
 }
 
-#[cfg(unix)]
 const SETUP: &str = "globalThis.el = document.getElementById('parsed'); globalThis.events = [];
     globalThis.listen = session => { for (const type of ['data', 'titlechange', 'cwdchange', 'bell', 'exit', 'statuschange', 'resize', 'close'])
         session.addEventListener(type, event => events.push([type, event.data ?? event.exitCode ?? null])); return session; };";
 
-// Windows has no terminal library yet.
-#[cfg(unix)]
 #[test]
 fn pages_show_the_sessions_of_their_preload_script() {
     let contexts = contexts(r#"["terminal"]"#);
@@ -243,7 +239,6 @@ fn pages_show_the_sessions_of_their_preload_script() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn sessions_run_programs() {
     let contexts = contexts(r#"["terminal"]"#);
@@ -251,13 +246,15 @@ fn sessions_run_programs() {
     let preload = |code: &str| contexts.preload.eval(code, "terminal-test").unwrap();
     value(SETUP);
     // The program starts with the session.
-    let pid = value(
-        "globalThis.term = listen(create({ command: ['/bin/sh', '-c', 'printf \"in %s\" \"$PWD\"; read line; echo \"got $line $NAME\"; exit 3'], cwd: '/', env: { NAME: 'env', PATH: '/usr/bin:/bin' } })); term.pid",
-    );
+    let pid = value(if cfg!(windows) {
+        "globalThis.root = 'C:\\\\'; globalThis.term = listen(create({ command: ['cmd.exe', '/d', '/v:on', '/c', 'echo in !CD!& set /p line=& echo got !line! !NAME!& exit 3'], cwd: root, env: { NAME: 'env' } })); term.pid"
+    } else {
+        "globalThis.root = '/'; globalThis.term = listen(create({ command: ['/bin/sh', '-c', 'printf \"in %s\" \"$PWD\"; read line; echo \"got $line $NAME\"; exit 3'], cwd: root, env: { NAME: 'env', PATH: '/usr/bin:/bin' } })); term.pid"
+    });
     assert!(pid.parse::<u32>().unwrap() > 0, "{pid}");
-    contexts.wait("term.text.includes('in /')");
+    contexts.wait("term.text.includes('in ' + root)");
     assert_eq!(value("term.process.pid"), pid);
-    assert_eq!(value("term.cwd"), "/");
+    assert_eq!(value("term.cwd === root"), "true");
     value("term.input('hi\\r')");
     contexts.wait("events.some(event => event[0] === 'exit') && term.text.includes('got hi env')");
     assert_eq!(
@@ -266,13 +263,19 @@ fn sessions_run_programs() {
         ),
         r#"[[["exit",3]],null,null]"#
     );
+    // The preload script can get its events one task after the page.
+    contexts.tick();
     assert_eq!(
         preload("JSON.stringify(seen.filter(event => event[0] === 'exit'))"),
         r#"[["exit",3]]"#
     );
     // A command line runs in the shell of the user, and a signal ends it.
     value("events.length = 0; term.reset()");
-    preload("made[0].spawn('printf started; sleep 30')");
+    preload(if cfg!(windows) {
+        r#"made[0].spawn('echo "started" & pause')"#
+    } else {
+        "made[0].spawn('printf started; sleep 30')"
+    });
     contexts.wait("term.text.includes('started')");
     value("term.kill('SIGTERM')");
     contexts.wait("events.some(event => event[0] === 'exit')");

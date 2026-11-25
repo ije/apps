@@ -407,6 +407,10 @@ size_t vt_key(Vt *vt, uint32_t action, const char *name, size_t name_len, uint32
   }
   // Control characters come from the key, not from the text.
   if (text_len && (text[0] < 0x20 || text[0] == 0x7f)) text_len = 0;
+#ifdef _WIN32
+  // Windows reports AltGr, which types a character, as Ctrl and Alt.
+  if (text_len && (mods & 6) == 6) mods &= ~6u;
+#endif
   GhosttyMods held = mods_of(mods), consumed = 0;
   if (text_len) {
     consumed = held & GHOSTTY_MODS_SHIFT;

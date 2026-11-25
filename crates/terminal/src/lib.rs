@@ -4,15 +4,14 @@
 // The crate has the name of its file, libGhostty.
 #![allow(non_snake_case)]
 
-// The PTY code is for Unix.
-#[cfg(all(ghostty, unix))]
+#[cfg(ghostty)]
 mod terminal;
 
-#[cfg(all(ghostty, unix))]
+#[cfg(ghostty)]
 pub use terminal::*;
 
 /// Zero means that the library was built without libghostty-vt.
-#[cfg(not(all(ghostty, unix)))]
+#[cfg(not(ghostty))]
 #[unsafe(no_mangle)]
 pub extern "C" fn apps_terminal_abi() -> u32 {
     0

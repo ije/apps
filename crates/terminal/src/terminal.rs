@@ -1,13 +1,7 @@
 use std::{
-    ffi::{CStr, c_void},
+    ffi::c_void,
     fmt::Write as _,
-    fs::File,
-    io::{Read, Write},
-    os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::process::{CommandExt, ExitStatusExt},
-    },
-    process::Command,
+    io::Write,
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -16,7 +10,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const ABI: u32 = 3;
+#[cfg_attr(windows, path = "windows.rs")]
+#[cfg_attr(unix, path = "unix.rs")]
+mod pty;
+
+pub const ABI: u32 = 4;
 
 pub type Alloc = extern "C" fn(output: *mut c_void, length: usize) -> *mut u8;
 
@@ -273,10 +271,7 @@ struct State {
     // Boxed, because the C side keeps its address.
     effects: Box<Effects>,
     input: Option<mpsc::Sender<Vec<u8>>>,
-    // The side of the PTY that the terminal reads and writes.
-    master: Option<File>,
-    // The write end of a pipe. Closing it stops the read thread, because another process can keep the PTY open.
-    stop: Option<OwnedFd>,
+    pty: Option<pty::Pty>,
     // Of the program, until it is reaped.
     pid: Option<u32>,
     // Counts the programs, so the threads of an old program stop.
@@ -336,7 +331,12 @@ fn path_of(pwd: &str) -> String {
             index += 1;
         }
     }
-    String::from_utf8_lossy(&bytes).into_owned()
+    let path = String::from_utf8_lossy(&bytes).into_owned();
+    match path.as_bytes() {
+        // A path with a drive, like `/C:/folder`.
+        [b'/', _, b':', ..] if cfg!(windows) => path[1..].replace('/', "\\"),
+        _ => path,
+    }
 }
 
 impl State {
@@ -479,15 +479,14 @@ impl State {
         json
     }
 
-    // Sends the hangup signal to the process group of a program that still runs.
+    // Ends a program that still runs.
     fn hang_up(&mut self) {
         self.program += 1;
         self.held = None;
         self.input = None;
-        self.master = None;
-        self.stop = None;
-        if let Some(pid) = self.pid.take() {
-            unsafe { libc::kill(-(pid as i32), libc::SIGHUP) };
+        let pid = self.pid.take();
+        if let Some(pty) = self.pty.take() {
+            pty.hang_up(pid);
         }
     }
 }
@@ -544,47 +543,6 @@ impl Drop for Terminal {
     }
 }
 
-// The name and the working directory of a process.
-#[cfg(target_os = "macos")]
-fn process(pid: i32) -> (String, String) {
-    let text = |bytes: &[libc::c_char]| {
-        let bytes: Vec<u8> = bytes
-            .iter()
-            .take_while(|byte| **byte != 0)
-            .map(|byte| *byte as u8)
-            .collect();
-        String::from_utf8_lossy(&bytes).into_owned()
-    };
-    let mut name = [0 as libc::c_char; 64];
-    unsafe { libc::proc_name(pid, name.as_mut_ptr().cast(), name.len() as u32) };
-    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
-    let size = size_of::<libc::proc_vnodepathinfo>() as i32;
-    let read = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDVNODEPATHINFO,
-            0,
-            (&raw mut info).cast(),
-            size,
-        )
-    };
-    let cwd = if read == size {
-        text(info.pvi_cdir.vip_path.as_flattened())
-    } else {
-        String::new()
-    };
-    (text(&name), cwd)
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn process(pid: i32) -> (String, String) {
-    let name = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
-    let cwd = std::fs::read_link(format!("/proc/{pid}/cwd"))
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    (name.trim_end().to_owned(), cwd)
-}
-
 impl Terminal {
     fn new(host: Host, cols: u16, rows: u16) -> Option<Self> {
         let mut effects = Box::<Effects>::default();
@@ -606,8 +564,7 @@ impl Terminal {
                     vt,
                     effects,
                     input: None,
-                    master: None,
-                    stop: None,
+                    pty: None,
                     pid: None,
                     program: 0,
                     records: Vec::new(),
@@ -626,114 +583,23 @@ impl Terminal {
         })
     }
 
-    // Starts a program in a new PTY. Without arguments it is the login shell of the user.
-    fn spawn(&self, argv: &[&str], env: &[&str], cwd: &str) -> Result<u32, String> {
-        let error = |error: &dyn std::fmt::Display| error.to_string();
+    fn spawn(&self, argv: &[&str], shell: bool, env: &[&str], cwd: &str) -> std::io::Result<u32> {
         let mut state = self.shared.state();
         state.hang_up();
-        let (mut master, mut slave) = (0, 0);
-        let size = window_size(state.size);
-        if unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &size as *const _ as *mut _,
-            )
-        } != 0
-        {
-            return Err(error(&std::io::Error::last_os_error()));
-        }
-        let (master, slave) = unsafe { (File::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-        let mut pipe = [0; 2];
-        if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
-            return Err(error(&std::io::Error::last_os_error()));
-        }
-        let (stopped, stop) =
-            unsafe { (OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])) };
-        // Other programs of the app must not get the PTY or the pipe.
-        for fd in [master.as_raw_fd(), slave.as_raw_fd(), pipe[0], pipe[1]] {
-            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-        }
-        let home = std::env::var("HOME").unwrap_or_default();
-        let mut command = match argv {
-            // The login shell of the user. A shell is a login shell when its name starts with `-`.
-            [] => {
-                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
-                let mut command = Command::new(&shell);
-                command.arg0(format!("-{}", shell.rsplit('/').next().unwrap_or("sh")));
-                command
-            }
-            [program, args @ ..] => {
-                let mut command = Command::new(program);
-                command.args(args);
-                command
-            }
-        };
-        if !cwd.is_empty() {
-            command.current_dir(cwd);
-        } else if std::path::Path::new(&home).is_dir() {
-            command.current_dir(&home);
-        }
-        if !env.is_empty() {
-            command.env_clear();
-        }
-        for pair in env {
-            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            command.env(key, value);
-        }
-        if !env.iter().any(|pair| pair.starts_with("TERM=")) {
-            command.env("TERM", "xterm-256color");
-            command.env("COLORTERM", "truecolor");
-        }
-        let files = unsafe { libc::getdtablesize() }.min(65536);
-        let stdio = || slave.try_clone().map_err(|e| error(&e));
-        command.stdin(stdio()?).stdout(stdio()?).stderr(slave);
-        // this runs in the new process before the program, where only system calls are safe.
-        unsafe {
-            command.pre_exec(move || {
-                // The program gets the default signals, its own session with the PTY as its terminal, and
-                // no other file of the app.
-                for signal in [
-                    libc::SIGCHLD,
-                    libc::SIGHUP,
-                    libc::SIGINT,
-                    libc::SIGQUIT,
-                    libc::SIGTERM,
-                    libc::SIGALRM,
-                ] {
-                    libc::signal(signal, libc::SIG_DFL);
-                }
-                let mut none: libc::sigset_t = std::mem::zeroed();
-                libc::sigemptyset(&mut none);
-                libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
-                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                for fd in 3..files {
-                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-                }
-                Ok(())
-            })
-        };
-        let mut child = command.spawn().map_err(|e| error(&e))?;
-        // The program has the other side of the PTY now.
-        drop(command);
-        let pid = child.id();
-        let mut reader = master.try_clone().map_err(|e| error(&e))?;
-        let mut writer = master.try_clone().map_err(|e| error(&e))?;
+        let pty::Program {
+            pty,
+            mut reader,
+            mut writer,
+            child,
+            pid,
+        } = pty::spawn(argv, shell, env, cwd, state.size)?;
         let (input, bytes) = mpsc::channel::<Vec<u8>>();
-        state.master = Some(master);
-        state.stop = Some(stop);
+        state.pty = Some(pty);
         state.input = Some(input);
         state.pid = Some(pid);
         let program = state.program;
         let thread = |name: &str, run: Box<dyn FnOnce() + Send>| {
-            std::thread::Builder::new()
-                .name(name.into())
-                .spawn(run)
-                .map_err(|e| error(&e))
+            std::thread::Builder::new().name(name.into()).spawn(run)
         };
         let shared = self.shared.clone();
         // Dropped when the reader ends, so `exit` can come after the last output.
@@ -743,28 +609,15 @@ impl Terminal {
             Box::new(move || {
                 let _read = read;
                 let mut bytes = vec![0; 65536];
-                let mut fds = [reader.as_raw_fd(), stopped.as_raw_fd()].map(|fd| libc::pollfd {
-                    fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                });
                 loop {
-                    if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 {
-                        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-                        {
-                            continue;
-                        }
+                    let count = reader.read(&mut bytes);
+                    if count == 0 {
                         return;
                     }
-                    if fds[1].revents != 0 {
-                        return;
-                    }
-                    let Ok(count @ 1..) = reader.read(&mut bytes) else {
-                        return;
-                    };
                     let mut state = shared.reading();
+                    // A console of Windows ends only when its output is read.
                     if state.program != program {
-                        return;
+                        continue;
                     }
                     state.write(&bytes[..count]);
                     drop(state);
@@ -786,23 +639,12 @@ impl Terminal {
         thread(
             "apps-terminal-wait",
             Box::new(move || {
-                // Wait without reaping: the PID stays ours until `state.pid` is cleared.
-                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-                while unsafe {
-                    libc::waitid(
-                        libc::P_PID,
-                        pid as _,
-                        &mut info,
-                        libc::WEXITED | libc::WNOWAIT,
-                    )
-                } != 0
-                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-                {
+                child.wait();
+                if drained.recv_timeout(pty::DRAIN) == Err(mpsc::RecvTimeoutError::Timeout) {
+                    child.end_rest();
                 }
-                // Another process can keep the PTY open, so the wait has a limit.
-                let _ = drained.recv_timeout(Duration::from_millis(100));
                 let Some(shared) = shared.upgrade() else {
-                    let _ = child.wait();
+                    child.reap();
                     return;
                 };
                 let mut state = shared.state();
@@ -811,7 +653,7 @@ impl Terminal {
                 if current {
                     state.pid = None;
                 }
-                let status = child.wait();
+                let exit = child.reap();
                 if !current {
                     return;
                 }
@@ -819,25 +661,16 @@ impl Terminal {
                 if state.held.take().is_some() {
                     state.changed = true;
                 }
-                let _ = match status
-                    .as_ref()
-                    .map(|status| (status.signal(), status.code()))
-                {
-                    Ok((Some(signal), _)) => {
-                        // The name of the signal, like `Terminated: 15`.
-                        let name = unsafe { libc::strsignal(signal) };
-                        let name = if name.is_null() {
-                            format!("Signal {signal}")
-                        } else {
-                            unsafe { CStr::from_ptr(name) }
-                                .to_string_lossy()
-                                .into_owned()
-                        };
-                        write!(state.events, "[\"exit\",null,\"{name}\"],")
-                    }
-                    Ok((_, code)) => write!(state.events, "[\"exit\",{},null],", code.unwrap_or(1)),
-                    Err(_) => write!(state.events, "[\"exit\",null,null],"),
+                state.events.push_str("[\"exit\",");
+                let _ = match exit.0 {
+                    Some(code) => write!(state.events, "{code},"),
+                    None => write!(state.events, "null,"),
                 };
+                match exit.1 {
+                    Some(signal) => quote(&mut state.events, &signal),
+                    None => state.events.push_str("null"),
+                }
+                state.events.push_str("],");
                 drop(state);
                 shared.wake();
             }),
@@ -845,7 +678,7 @@ impl Terminal {
         Ok(pid)
     }
 
-    fn info(&self) -> String {
+    fn info(&self, process: bool) -> String {
         let state = self.shared.state();
         let mut info: Info = unsafe { std::mem::zeroed() };
         unsafe { vt_info(state.vt, &mut info) };
@@ -863,15 +696,13 @@ impl Terminal {
         quote(&mut json, &info.title.text());
         let mut cwd = path_of(&info.pwd.text());
         json.push_str(",\"process\":");
-        let foreground = state
-            .master
-            .as_ref()
-            .filter(|_| state.pid.is_some())
-            .map(|master| unsafe { libc::tcgetpgrp(master.as_raw_fd()) })
-            .filter(|pid| *pid > 0);
+        let foreground = match (&state.pty, state.pid) {
+            (Some(pty), Some(pid)) if process => pty.foreground(pid),
+            _ => None,
+        };
         match foreground {
             Some(pid) => {
-                let (name, directory) = process(pid);
+                let (name, directory) = pty::process(pid);
                 let _ = write!(json, "{{\"pid\":{pid},\"name\":");
                 quote(&mut json, &name);
                 json.push('}');
@@ -889,16 +720,6 @@ impl Terminal {
             None => write!(json, ",\"pid\":null}}"),
         };
         json
-    }
-}
-
-// The size of the PTY, from columns, rows and the pixels of a cell.
-fn window_size([cols, rows, cell_w, cell_h]: [u32; 4]) -> libc::winsize {
-    libc::winsize {
-        ws_row: rows as u16,
-        ws_col: cols as u16,
-        ws_xpixel: (cols * cell_w).min(65535) as u16,
-        ws_ypixel: (rows * cell_h).min(65535) as u16,
     }
 }
 
@@ -952,8 +773,8 @@ pub unsafe extern "C" fn apps_terminal_free(terminal: *mut Terminal) {
 }
 
 /// Starts a program in a PTY, and ends the program before it. `argv` and `env` are lists of strings that
-/// each end with a NUL byte. An empty `argv` is the login shell, an empty `env` is the environment of the
-/// app. Returns the process ID, or -1 with the error text in `out`.
+/// each end with a NUL byte. An empty `argv` is the login shell, and with `shell` the first string of `argv` is
+/// a command line for that shell. An empty `env` is the environment of the app. Returns the process ID, or -1 with the error text in `out`.
 ///
 /// # Safety
 /// `terminal` comes from `apps_terminal_new`, and the pointers hold their lengths.
@@ -962,6 +783,7 @@ pub unsafe extern "C" fn apps_terminal_spawn(
     terminal: *mut Terminal,
     argv: *const u8,
     argv_len: usize,
+    shell: bool,
     env: *const u8,
     env_len: usize,
     cwd: *const u8,
@@ -973,12 +795,13 @@ pub unsafe extern "C" fn apps_terminal_spawn(
     let cwd = std::str::from_utf8(unsafe { bytes(cwd, cwd_len) }).unwrap_or("");
     match terminal.spawn(
         &unsafe { list(argv, argv_len) },
+        shell,
         &unsafe { list(env, env_len) },
         cwd,
     ) {
         Ok(pid) => pid as i64,
         Err(error) => {
-            output(out, alloc, error.as_bytes());
+            output(out, alloc, error.to_string().as_bytes());
             -1
         }
     }
@@ -1132,9 +955,11 @@ pub unsafe extern "C" fn apps_terminal_control(terminal: *mut Terminal, op: u32,
             SELECT_NONE => vt_select(vt, false),
             RESET => vt_reset(vt),
             KILL => {
-                if let Some(pid) = state.pid.filter(|pid| *pid > 0) {
-                    // The program leads its process group.
-                    libc::kill(-(pid as i32), value as i32);
+                // Windows has no signals. The console turns this key into an interrupt.
+                if cfg!(windows) && value == 2. && state.pid.is_some() {
+                    state.send(vec![3]);
+                } else if let (Some(pty), Some(pid)) = (&state.pty, state.pid) {
+                    pty.signal(pid, value as i32);
                 }
             }
             _ => {}
@@ -1160,9 +985,8 @@ pub unsafe extern "C" fn apps_terminal_resize(
     state.size = [cols as u32, rows as u32, cell_w.max(1), cell_h.max(1)];
     unsafe { vt_resize(state.vt, cols, rows, cell_w.max(1), cell_h.max(1)) };
     state.settle();
-    if let Some(master) = &state.master {
-        let size = window_size(state.size);
-        unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ as _, &size) };
+    if let Some(pty) = &state.pty {
+        pty.resize(state.size);
     }
 }
 
@@ -1202,17 +1026,19 @@ pub unsafe extern "C" fn apps_terminal_poll(
     std::mem::take(&mut state.changed)
 }
 
-/// Writes the state of the terminal and of its foreground process as a JSON object.
+/// Writes the state of the terminal as a JSON object. With `process` it has the foreground process and its
+/// directory, which take longer to find.
 ///
 /// # Safety
 /// `terminal` comes from `apps_terminal_new`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn apps_terminal_info(
     terminal: *mut Terminal,
+    process: bool,
     out: *mut c_void,
     alloc: Alloc,
 ) {
-    output(out, alloc, unsafe { &*terminal }.info().as_bytes());
+    output(out, alloc, unsafe { &*terminal }.info(process).as_bytes());
 }
 
 /// Writes the selected text, or all text with the scrollback. Returns false when there is none.

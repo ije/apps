@@ -49,10 +49,8 @@ pub(crate) fn call(
     let number = |index: usize| args[index].as_f64().unwrap_or(0.);
     // A string is a command line for the login shell of the user.
     let program = || -> Result<_> {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
         let argv = match &args[1] {
-            Value::String(command) if cfg!(windows) => vec!["cmd.exe", "/C", command],
-            Value::String(command) => vec![&shell, "-l", "-c", command],
+            Value::String(command) => vec![command.as_str()],
             list => list
                 .as_array()
                 .into_iter()
@@ -70,14 +68,19 @@ pub(crate) fn call(
                 Ok(format!("{key}={value}"))
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok((argv, env, args[2]["cwd"].as_str().unwrap_or("")))
+        Ok((
+            argv,
+            args[1].is_string(),
+            env,
+            args[2]["cwd"].as_str().unwrap_or(""),
+        ))
     };
     match op {
         "create" => {
             let mut terminal = Terminal::new()?;
             if args[0] != true {
-                let (argv, env, cwd) = program()?;
-                terminal.spawn(&argv, &env, cwd)?;
+                let (argv, shell, env, cwd) = program()?;
+                terminal.spawn(&argv, shell, &env, cwd)?;
             }
             return Ok(json!(terminals.create(terminal)));
         }
@@ -114,8 +117,8 @@ pub(crate) fn call(
         !matches!(op, "info" | "text") && !(op == "mouse" && args[1] == 2 && args[6] != true);
     match op {
         "spawn" => {
-            let (argv, env, cwd) = program()?;
-            return Ok(json!(terminal.spawn(&argv, &env, cwd)?));
+            let (argv, shell, env, cwd) = program()?;
+            return Ok(json!(terminal.spawn(&argv, shell, &env, cwd)?));
         }
         "write" => terminal.write(number(1) as u32, crate::node::bytes(&args[2])?),
         "key" => {
@@ -152,7 +155,7 @@ pub(crate) fn call(
             };
             terminal.control(op, value);
         }
-        "info" => return terminal.info(),
+        "info" => return terminal.info(args[1] == true),
         "text" => return Ok(json!(terminal.text(args[1].as_bool().unwrap_or(false)))),
         "preedit" => terminal.set_preedit(args[1].as_str().unwrap_or("")),
         _ => bail!("Unknown terminal operation: {op}"),

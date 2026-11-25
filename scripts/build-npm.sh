@@ -46,13 +46,11 @@ fs.writeFileSync("Cargo.toml", cargo)' "$version"
 cargo build --release --workspace
 
 bin=packages/apps-$os-$cpu/bin
-files=("apps$exe" "apps-runtime$exe" "${lib}apps_media$ext" "${lib}ffmpeg$ext" FFmpeg.LICENSE "${lib}apps_devtools$ext")
+files=("apps$exe" "apps-runtime$exe" "${lib}apps_media$ext" "${lib}ffmpeg$ext" FFmpeg.LICENSE "${lib}apps_devtools$ext" "${lib}Ghostty$ext" Ghostty.LICENSE)
 jsc=target/bun-jsc/$system-$arch
 jscs=("${lib}JavaScriptCore$ext" JavaScriptCore.LICENSE)
 # Linux links WebGPU into the runtime.
 [[ $os != linux ]] && files+=("${lib}apps_webgpu$ext")
-# The terminal library has no Windows build yet.
-[[ $os != win32 ]] && files+=("${lib}Ghostty$ext" Ghostty.LICENSE)
 # build-jsc.sh --aot writes these. Linux packages include them when that build has been run.
 [[ $os-$cpu == darwin-arm64 ]] && jscs+=(libJavaScriptCoreAOT.dylib libJavaScriptCoreCompiler.dylib libapps_aot.dylib)
 [[ $os == linux && -f $jsc/libJavaScriptCoreAOT.so ]] && jscs+=(libJavaScriptCoreAOT.so libJavaScriptCoreCompiler.so libapps_aot.so)

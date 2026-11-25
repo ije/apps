@@ -62,7 +62,7 @@ impl Test {
 
     fn info(&self) -> String {
         let mut out = Vec::new();
-        unsafe { apps_terminal_info(self.0, (&raw mut out).cast(), alloc) };
+        unsafe { apps_terminal_info(self.0, true, (&raw mut out).cast(), alloc) };
         String::from_utf8(out).unwrap()
     }
 
@@ -99,6 +99,35 @@ impl Test {
                 text.as_ptr(),
                 text.len(),
             )
+        }
+    }
+
+    fn spawn(&self, argv: &[&str], cwd: &str) -> u32 {
+        let argv: String = argv.iter().map(|arg| format!("{arg}\0")).collect();
+        let mut error = Vec::new();
+        let pid = unsafe {
+            apps_terminal_spawn(
+                self.0,
+                argv.as_ptr(),
+                argv.len(),
+                false,
+                std::ptr::null(),
+                0,
+                cwd.as_ptr(),
+                cwd.len(),
+                (&raw mut error).cast(),
+                alloc,
+            )
+        };
+        assert!(pid > 0, "{}", String::from_utf8_lossy(&error));
+        pid as u32
+    }
+
+    fn wait(&self, what: &mut dyn FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !what() {
+            assert!(Instant::now() < deadline, "{:?}", self.text(false));
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 }
@@ -405,49 +434,36 @@ fn frames_have_the_images_of_the_screen() {
     assert_eq!(frame.placed, 1);
 }
 
-#[cfg(unix)]
 #[test]
 fn a_program_runs_in_a_pty() {
     let test = Test::new(40, 4);
-    let mut error = Vec::new();
-    let argv = "/bin/sh\0-c\0printf 'in %s' \"$PWD\"; read line; echo \"got $line\"; exit 7\0";
-    let pid = unsafe {
-        apps_terminal_spawn(
-            test.0,
-            argv.as_ptr(),
-            argv.len(),
-            std::ptr::null(),
-            0,
-            "/".as_ptr(),
-            1,
-            (&raw mut error).cast(),
-            alloc,
-        )
+    let (argv, cwd): (&[&str], _) = if cfg!(windows) {
+        let line = "echo in !CD!& set /p line=& echo got !line!& exit 7";
+        (&["cmd.exe", "/d", "/v:on", "/c", line], "C:\\")
+    } else {
+        let line = "printf 'in %s' \"$PWD\"; read line; echo \"got $line\"; exit 7";
+        (&["/bin/sh", "-c", line], "/")
     };
-    assert!(pid > 0, "{}", String::from_utf8_lossy(&error));
-    let wait = |what: &mut dyn FnMut() -> bool| {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while !what() {
-            assert!(Instant::now() < deadline, "{:?}", test.text(false));
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    };
-    wait(&mut || test.text(false).is_some_and(|text| text.contains("in /")));
+    let pid = test.spawn(argv, cwd);
+    let shown = |what: &str| test.text(false).is_some_and(|text| text.contains(what));
+    test.wait(&mut || shown(&format!("in {cwd}")));
     let info = test.info();
+    let name = if cfg!(windows) { "cmd" } else { "" };
     assert!(
-        info.contains(&format!(r#""process":{{"pid":{pid},"name":""#)),
+        info.contains(&format!(r#""process":{{"pid":{pid},"name":"{name}"#)),
         "{info}"
     );
     assert!(!info.contains(r#""name":"""#), "{info}");
-    assert!(info.contains(r#""cwd":"/""#), "{info}");
+    let cwd = cwd.replace('\\', "\\\\");
+    assert!(info.contains(&format!(r#""cwd":"{cwd}""#)), "{info}");
     unsafe { apps_terminal_write(test.0, INPUT, "hi\r".as_ptr(), 3) };
     let mut events = String::new();
-    wait(&mut || {
+    test.wait(&mut || {
         events.push_str(&test.poll());
         events.contains("exit")
     });
     assert!(events.contains(r#"["exit",7,null]"#), "{events}");
-    wait(&mut || test.text(false).is_some_and(|text| text.contains("got hi")));
+    test.wait(&mut || shown("got hi"));
     assert!(test.info().contains(r#""pid":null"#));
 }
 
@@ -455,34 +471,12 @@ fn a_program_runs_in_a_pty() {
 #[test]
 fn closing_hangs_up_the_group_and_frees_the_state() {
     let test = Test::new(40, 4);
-    let mut error = Vec::new();
     // The leader ignores the hangup and keeps the PTY open. The other sleep is an orphan, so it is reaped
     // when it ends.
-    let argv =
-        "/bin/sh\0-c\0trap '' HUP; ((trap - HUP; exec sleep 30) & echo \"bg $!\"); exec sleep 30\0";
-    let pid = unsafe {
-        apps_terminal_spawn(
-            test.0,
-            argv.as_ptr(),
-            argv.len(),
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            0,
-            (&raw mut error).cast(),
-            alloc,
-        )
-    };
-    assert!(pid > 0, "{}", String::from_utf8_lossy(&error));
-    let wait = |what: &mut dyn FnMut() -> bool| {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while !what() {
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    };
+    let line = "trap '' HUP; ((trap - HUP; exec sleep 30) & echo \"bg $!\"); exec sleep 30";
+    let pid = test.spawn(&["/bin/sh", "-c", line], "");
     let mut sleep = 0;
-    wait(&mut || {
+    test.wait(&mut || {
         sleep = test
             .text(false)
             .and_then(|text| {
@@ -498,8 +492,92 @@ fn closing_hangs_up_the_group_and_frees_the_state() {
     });
     let shared = Arc::downgrade(&unsafe { &*test.0 }.shared);
     drop(test);
-    wait(&mut || shared.strong_count() == 0 && unsafe { libc::kill(sleep, 0) } != 0);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while shared.strong_count() > 0 || unsafe { libc::kill(sleep, 0) } == 0 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
     unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+}
+
+#[cfg(windows)]
+#[test]
+fn closing_ends_the_programs_and_frees_the_state() {
+    let test = Test::new(80, 24);
+    test.spawn(&["cmd.exe", "/d", "/c", "ping -n 120 127.0.0.1"], "");
+    // The newest process of the shell is in the foreground.
+    let mut info = String::new();
+    test.wait(&mut || {
+        info = test.info();
+        info.to_lowercase().contains(r#""name":"ping""#)
+    });
+    let pid = info.split("\"process\":{\"pid\":").nth(1).unwrap();
+    let pid: u32 = pid.split(',').next().unwrap().parse().unwrap();
+    let shared = Arc::downgrade(&unsafe { &*test.0 }.shared);
+    drop(test);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while shared.strong_count() > 0 || !pty::process(pid).0.is_empty() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // A program that just starts ends too.
+    let test = Test::new(80, 24);
+    test.spawn(&["cmd.exe", "/d", "/k"], "");
+    let shared = Arc::downgrade(&unsafe { &*test.0 }.shared);
+    drop(test);
+    while shared.strong_count() > 0 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn signals_end_a_program() {
+    let argv: &[&str] = if cfg!(windows) {
+        &["cmd.exe", "/d", "/k", "echo started"]
+    } else {
+        &["/bin/sh", "-c", "echo started; sleep 30"]
+    };
+    let test = Test::new(80, 24);
+    // Hangup, kill and terminate.
+    for signal in [1., 9., 15.] {
+        test.spawn(argv, "");
+        test.wait(&mut || {
+            test.text(false)
+                .is_some_and(|text| text.contains("started"))
+        });
+        unsafe { apps_terminal_control(test.0, KILL, signal) };
+        test.wait(&mut || test.poll().contains("exit"));
+        unsafe { apps_terminal_control(test.0, RESET, 0.) };
+    }
+    // An interrupt goes to the process in the foreground.
+    let argv: &[&str] = if cfg!(windows) {
+        &["cmd.exe", "/d", "/c", "ping -n 120 127.0.0.1"]
+    } else {
+        &["/bin/sh", "-c", "echo 127.0.0.1; sleep 120"]
+    };
+    test.spawn(argv, "");
+    test.wait(&mut || {
+        test.text(false)
+            .is_some_and(|text| text.contains("127.0.0.1"))
+    });
+    unsafe { apps_terminal_control(test.0, KILL, 2.) };
+    test.wait(&mut || test.poll().contains("exit"));
+}
+
+#[test]
+fn a_program_sees_a_resize() {
+    let test = Test::new(80, 24);
+    let argv: &[&str] = if cfg!(windows) {
+        &["cmd.exe", "/d", "/v:on", "/c", "set /p a=go & mode con"]
+    } else {
+        &["/bin/sh", "-c", "echo go; read a; stty size"]
+    };
+    test.spawn(argv, "");
+    test.wait(&mut || test.text(false).is_some_and(|text| text.contains("go")));
+    unsafe { apps_terminal_resize(test.0, 101, 33, 8, 16) };
+    unsafe { apps_terminal_write(test.0, INPUT, "\r".as_ptr(), 1) };
+    test.wait(&mut || test.text(false).is_some_and(|text| text.contains("101")));
 }
 
 #[test]
@@ -532,22 +610,13 @@ fn a_held_screen_gives_the_time_until_the_hold_ends() {
 #[test]
 fn exit_comes_after_the_last_output_and_ends_the_hold() {
     let test = Test::new(40, 4);
-    let mut error = Vec::new();
-    let argv = "/bin/sh\0-c\0printf '\\033[?2026hlast'\0";
-    let pid = unsafe {
-        apps_terminal_spawn(
-            test.0,
-            argv.as_ptr(),
-            argv.len(),
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            0,
-            (&raw mut error).cast(),
-            alloc,
-        )
+    let argv: &[&str] = if cfg!(windows) {
+        let line = "$e = [char]27; [Console]::Write(\"$e[?2026hlast\")";
+        &["powershell.exe", "-NoProfile", "-Command", line]
+    } else {
+        &["/bin/sh", "-c", "printf '\\033[?2026hlast'"]
     };
-    assert!(pid > 0, "{}", String::from_utf8_lossy(&error));
+    test.spawn(argv, "");
     let deadline = Instant::now() + Duration::from_secs(60);
     while !test.poll().contains("exit") {
         assert!(Instant::now() < deadline);

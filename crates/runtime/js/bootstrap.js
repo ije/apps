@@ -202,15 +202,15 @@
     static { sessionId = value => typeof value === 'object' && value !== null && #id in value ? sessions.get(value.#id) === value ? value.#id : 0 : undefined; }
     // The native side rejects a new session in a page. Only `adopt` makes the object of a session that exists.
     constructor(options = {}) { super(); this.#id = adopted || call('terminal.create', !!options?.manual, ...terminalProgram(options?.command, options)); adopted = 0; sessions.set(this.#id, this); }
-    #info() { return call('terminal.info', this.#id); }
+    #info(process = false) { return call('terminal.info', this.#id, process); }
     #control(op, value = 0) { call('terminal.control', this.#id, op, value); }
     get closed() { return !sessionId(this); }
     get cols() { return this.#info().cols; }
     get rows() { return this.#info().rows; }
     get cursor() { const [x, y, visible] = this.#info().cursor; return { x, y, visible }; }
     get pid() { return this.#info().pid; }
-    get process() { return this.#info().process; }
-    get cwd() { return this.#info().cwd; }
+    get process() { return this.#info(true).process; }
+    get cwd() { return this.#info(true).cwd; }
     get title() { return this.#info().title; }
     get programStatus() { return this.#info().status; }
     get alternateScreen() { return this.#info().alternate; }

@@ -101,7 +101,7 @@ interface TerminalSession extends EventTarget {
    * the process ID.
    */
   spawn(command?: string | string[] | null, options?: { cwd?: string; env?: Record<string, string> }): number
-  /** Sends a signal to the program. The default is `SIGHUP`. */
+  /** Sends a signal to the program. The default is `SIGHUP`. On Windows `SIGINT` is Ctrl+C, `SIGHUP` closes the console, and the others end the program. */
   kill(signal?: 'SIGHUP' | 'SIGINT' | 'SIGQUIT' | 'SIGKILL' | 'SIGTERM'): void
   /** Sends input to the program, as if the user typed it. */
   input(data: string | ArrayBuffer | ArrayBufferView): void

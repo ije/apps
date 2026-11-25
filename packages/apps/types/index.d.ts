@@ -768,7 +768,7 @@ export declare const webUtils: {
 }
 
 export interface TerminalSessionOptions {
-  /** A string is a command line for the login shell, an array is the program and its arguments. The default is the login shell. */
+  /** A string is a command line for the login shell, an array is the program and its arguments. The default is the login shell. On Windows the shell is `cmd.exe`. */
   command?: string | string[] | null
   cwd?: string
   /** The environment of the program. The default is the environment of the app. */
