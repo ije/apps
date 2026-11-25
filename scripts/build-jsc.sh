@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-revision=a8d825d8a049a7957b8aac6dab1716a18c05ec3f
-bun_revision=4ce14ba8b150c3c7315284f3df8480eb4158b38a
+revision=32300d4d274b67f5cd3b3f109da0f0589aff742f
+bun_revision=2e321d89067f623e648fb933daed375dc9e68bca
 
 aot=0
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
@@ -342,15 +342,14 @@ if ((aot)); then
       "$bun_source/target/release/libapps_aot.a" -liconv -lc -lm
   else
     name=libapps_aot.so
-    # -u pulls the archive members that define the exports. --gc-sections then drops the rest.
-    cc -c -fPIC -fvisibility=hidden -o "$output/apps-aot-stubs.o" "$root/scripts/apps-aot-stubs.c"
+    # -u pulls the archive members that define the exports. --gc-sections then drops the rest, with their references
+    # to Bun's C++ code: the version script hides their exports.
+    version_script=$output/build-aot/apps-aot.version
+    printf '%s\n' '{ global: apps_aot_front_end; apps_aot_free; apps_aot_revision; local: *; };' > "$version_script"
     c++ -shared -fPIC -o "$output/.$name" -Wl,--gc-sections -Wl,-z,defs \
       -Wl,-u,apps_aot_front_end -Wl,-u,apps_aot_free -Wl,-u,apps_aot_revision \
-      -Wl,--export-dynamic-symbol,apps_aot_front_end -Wl,--export-dynamic-symbol,apps_aot_free \
-      -Wl,--export-dynamic-symbol,apps_aot_revision \
-      "$bun_source/target/release/libapps_aot.a" "$output/apps-aot-stubs.o" -pthread -ldl -lm
+      -Wl,--version-script,"$version_script" "$bun_source/target/release/libapps_aot.a" -pthread -ldl -lm
     strip --strip-unneeded "$output/.$name"
-    rm -f "$output/apps-aot-stubs.o"
   fi
   mv -f "$output/.$name" "$output/$name"
 fi

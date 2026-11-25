@@ -29,7 +29,7 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
     );
     let compiler_name = apps_runtime::jsc::aot::compiler_library(platform);
     let compiler = library.with_file_name(compiler_name);
-    let compiler = unsafe { libloading::Library::new(&compiler) }.with_context(|| {
+    let compiler = unsafe { apps_runtime::jsc::open_library(&compiler) }.with_context(|| {
         format!(
             "Cannot load {}; run bash scripts/build-jsc.sh --aot",
             compiler.display()
@@ -549,6 +549,8 @@ INSERT AFTER .text;
         format!("-Wl,-z,max-page-size={align}"),
         format!("-Wl,-z,common-page-size={align}"),
         "-Wl,-z,noexecstack".to_string(),
+        // GNU ld separates code by default on x86 only.
+        "-Wl,-z,separate-code".to_string(),
         "-Wl,-T,aot.lds".to_string(),
         "image.s".to_string(),
         "-o".to_string(),

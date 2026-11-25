@@ -43,7 +43,7 @@ run(
 );
 
 const { allDeps } = await import(join(root, "scripts/build/deps/index.ts"));
-for (const name of ["lolhtml", "rust-argon2", "zstd", "boringssl"]) {
+for (const name of ["lolhtml", "rust-argon2", "boringssl"]) {
   const dep = allDeps.find((dep: { name: string }) => dep.name === name);
   const { repo, commit } = dep.source({});
   const patches = (dep.patches ?? []).map((patch: string) => join(root, patch));
