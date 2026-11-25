@@ -76,7 +76,6 @@ pub struct Layout {
     // box from the border box of the element in layout, its size, then the padding plus border of each side.
     pub pseudo_boxes: rustc_hash::FxHashMap<usize, [f32; 8]>,
     pub(in crate::render) container_pass: bool,
-    pub(in crate::render) anchors: rustc_hash::FxHashMap<usize, renderer::Rect<renderer::Pixels>>,
     pub(in crate::render) blocks: rustc_hash::FxHashMap<usize, renderer::Rect<renderer::Pixels>>,
     pub(crate) cull: cull::Cull,
     // The `content-visibility: auto` boxes, each with the boxes on its path, the boxes that clip it, and the view
@@ -202,8 +201,6 @@ impl Layout {
         self.measurements.texts.remove(&id);
         self.cull.spills.remove(&id);
         self.measurements.naturals.remove(&id);
-        self.anchors.remove(&id);
-        self.anchors.remove(&crate::render::inline::atom_key(id, 2));
         self.blocks.remove(&id);
         self.containers.remove(&id);
         self.flexed_grids.remove(&id);

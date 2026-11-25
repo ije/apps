@@ -701,7 +701,7 @@ pub(super) fn pseudo_elements(
             decoration
         };
         let mut contained = None;
-        let decoration = match escaped {
+        let mut decoration = match escaped {
             Some((container, size, sized)) => {
                 let inset = [Prop::TOP, Prop::RIGHT, Prop::BOTTOM, Prop::LEFT].map(|prop| {
                     let axis = usize::from(matches!(prop, Prop::TOP | Prop::BOTTOM));
@@ -737,7 +737,7 @@ pub(super) fn pseudo_elements(
                 decoration.style().placed = inset_axes(pseudo);
                 contained = Some(crate::render::paint::PseudoBlock {
                     view: view.clone(),
-                    anchor: None,
+                    unplaced: [1, 2].map(|axis| inset_axes(pseudo) & axis == 0),
                     place: Some(crate::render::paint::Contained {
                         key: crate::render::effects::pseudo_key(id, index as u8 + 1) as usize,
                         container,
@@ -770,40 +770,16 @@ pub(super) fn pseudo_elements(
                 && !node.children.is_empty()
                 && cx.inline_text().is_none()
             {
-                let mut placeholder = static_mark(view, key).flex_shrink_0();
+                let mut placeholder = static_mark(key, 0., false).flex_shrink_0();
                 placeholder.style().align_self = Some(renderer::AlignItems::FlexStart);
                 *static_anchor = Some(placeholder);
             }
-            let axes = [[Prop::LEFT, Prop::RIGHT], [Prop::TOP, Prop::BOTTOM]].map(|axis| {
-                axis.iter()
-                    .all(|&prop| pseudo.get(prop).is_none_or(|value| value == "auto"))
-            });
-            // The direction of the containing block: the element's, or the one of the block it escapes to.
-            let rtl = match escaped {
-                Some((block, ..)) => super::super::query::rtl(
-                    doc,
-                    styles,
-                    if block == usize::MAX { 0 } else { block },
-                ),
-                None => rtl,
-            };
-            let anchor = Some((
-                axes,
-                key,
-                [pseudo_margin[3], pseudo_margin[0], pseudo_margin[1]],
+            decoration.style().follow = Some(renderer::Follow {
+                mark: key as u64,
+                axes: 3 & !inset_axes(pseudo),
+                below: false,
                 rtl,
-            ));
-            match &mut contained {
-                Some(contained) => contained.anchor = anchor,
-                None => {
-                    contained = Some(crate::render::paint::PseudoBlock {
-                        view: view.clone(),
-                        place: None,
-                        anchor,
-                        offset: Default::default(),
-                    })
-                }
-            }
+            });
         }
         let order = pseudo
             .get(Prop::Z_INDEX)

@@ -123,13 +123,65 @@ impl Tree {
         // A new page can have fewer slots.
         self.escaping.retain(|&index| {
             slots.get(index as usize).is_some_and(|slot| {
-                slot.live && slot.style.escape & Escape::ABSOLUTE != 0 && slot.style.placed != 0
+                slot.live
+                    && (slot.style.escape & Escape::ABSOLUTE != 0 && slot.style.placed != 0
+                        || slot.style.follow.is_some())
             })
+        });
+        self.marks.retain(|&mark, &mut index| {
+            slots
+                .get(index as usize)
+                .is_some_and(|slot| slot.live && slot.style.mark.is_some_and(|it| it.key == mark))
         });
         for &index in &self.escaping {
             let slot = &slots[index as usize];
             let parent = slot.parent;
-            if parent == NONE || slots[parent as usize].style.contains & Escape::ABSOLUTE != 0 {
+            if parent == NONE {
+                continue;
+            }
+            if let Some(follow) = slot.style.follow
+                && let Some(&mark) = self.marks.get(&follow.mark)
+            {
+                let layout = slot.layout;
+                let marked = &slots[mark as usize];
+                let drop = marked.style.mark.map_or(0., |mark| mark.drop.0 * scale)
+                    + if follow.below {
+                        marked.layout.size.height
+                    } else {
+                        0.
+                    };
+                let mut place = point(marked.shift.x, marked.shift.y + drop);
+                let mut at = mark;
+                while at != parent && at != NONE {
+                    let inner = &slots[at as usize];
+                    place.x += inner.layout.location.x;
+                    place.y += inner.layout.location.y;
+                    if let Some(split) = &inner.split {
+                        place += split.shift;
+                    }
+                    at = inner.parent;
+                }
+                let mut location = layout.location;
+                if at == parent && follow.axes & 1 != 0 {
+                    location.x = match follow.rtl {
+                        true => place.x - layout.margin.right - layout.size.width,
+                        false => place.x + layout.margin.left,
+                    };
+                }
+                if at == parent && follow.axes & 2 != 0 {
+                    location.y = place.y + layout.margin.top;
+                }
+                if location != layout.location {
+                    slots[index as usize].layout.location = location;
+                    changed(slots, index as usize);
+                    unfar(slots, parent as usize);
+                }
+            }
+            let slot = &slots[index as usize];
+            if slot.style.escape & Escape::ABSOLUTE == 0
+                || slot.style.placed == 0
+                || slots[parent as usize].style.contains & Escape::ABSOLUTE != 0
+            {
                 continue;
             }
             // The parent's place in the containing block, which is the outermost box when no box contains it.

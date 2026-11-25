@@ -517,6 +517,8 @@ pub struct Window {
     // `rebar`: the bars of this pass are not the ones it was built with. `rebars`: the extra passes for bars.
     rebar: bool,
     rebars: u8,
+    // The marks that texts placed in this prepaint.
+    marks: Vec<(u64, Point<Pixels>)>,
     restart: bool,
     restarts: u8,
     rebuild: bool,
@@ -599,6 +601,7 @@ impl Window {
             settling: false,
             rebar: false,
             rebars: 0,
+            marks: Vec::new(),
             restart: false,
             restarts: 0,
             rebuild: false,
@@ -669,6 +672,15 @@ impl Window {
     pub fn rebar(&mut self) {
         self.redraw();
         self.rebar = self.drawing;
+    }
+
+    /// A text put the mark `key` in a line, `by` from where layout placed it.
+    pub fn place_mark(&mut self, key: u64, by: Point<Pixels>) {
+        self.marks.push((key, by));
+    }
+
+    pub(crate) fn take_marks(&mut self) -> Vec<(u64, Point<Pixels>)> {
+        mem::take(&mut self.marks)
     }
 
     // The page changed while this pass was built. The pass is built again, a few times per frame at most, and this doesn't use up the extra pass that sizes settle in.

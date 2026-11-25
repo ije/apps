@@ -71,7 +71,7 @@ pub(super) fn paragraph(
         .atoms
         .iter()
         .map(|atom| match atom.pseudo {
-            _ if marker(atom) => static_mark(view, atom.key()).into(),
+            _ if marker(atom) => static_mark(atom.key(), 0., true).into(),
             0 => element(build, atom.node, atom_containing, container, None),
             pseudo => pseudo_atoms[usize::from(pseudo - 1)]
                 .take()
@@ -90,6 +90,7 @@ pub(super) fn paragraph(
                     size: [0.; 3],
                     align: Some(renderer::AlignItems::FlexStart),
                     at: Default::default(),
+                    mark: true,
                 };
             }
             cx.atom_slot(atom, child, containing[0], &|| {

@@ -621,6 +621,7 @@ impl Cx<'_> {
             size,
             align: self.align_of(child),
             at: std::cell::Cell::new(point(px(0.), px(0.))),
+            mark: false,
         }
     }
 

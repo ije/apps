@@ -674,6 +674,8 @@ pub(crate) struct AtomSlot {
     pub(crate) size: [f32; 3],
     pub(crate) align: Option<AlignItems>,
     pub(crate) at: std::cell::Cell<Point<Pixels>>,
+    // The static place of an out-of-flow box.
+    pub(crate) mark: bool,
 }
 
 pub(crate) struct AtomBox {
@@ -708,6 +710,10 @@ impl renderer::Hooks for AtomBox {
     fn prepaint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let slot = &self.slots[self.index];
         let offset = slot.at.get() - cx.bounds.origin;
+        if slot.mark {
+            let by = slot.at.get() - cx.exact.origin;
+            cx.window.place_mark(self.node as u64, by);
+        }
         // The filler reports its width in its own prepaint, so the children go first.
         cx.window
             .scope(renderer::Scope::Offset(offset), |window| inner(window));

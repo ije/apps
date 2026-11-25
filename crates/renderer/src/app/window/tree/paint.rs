@@ -340,6 +340,7 @@ impl Tree {
                             window,
                             bounds: slot.bounds,
                             exact: slot.exact,
+                            unscroll: slot.unscroll,
                             inset: inset(&slot.layout, scale),
                             baselines: self.baselines(index, scale),
                             text: &slot.text,

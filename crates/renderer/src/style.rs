@@ -284,6 +284,8 @@ style! {
     escape: u8 = 0,
     /// The axes, 1 for x and 2 for y, whose insets place an absolute box in a containing block outside its parent.
     placed: u8 = 0,
+    mark: Option<Mark> = None,
+    follow: Option<Follow> = None,
     /// A column set: its first child is the flow of content, as wide as one column.
     columns: Option<Box<Columns>> = None,
     /// [`Break`] bits of a box in a column flow.
@@ -294,6 +296,27 @@ style! {
     scroll_anchor: u8 = 0,
     /// The bounds that [`Length::Bound`] lengths of this style index.
     bounds: Vec<Bound> = Vec::new(),
+}
+
+/// The static place of the out-of-flow box that follows `key`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mark {
+    pub key: u64,
+    /// How far below the mark the place is.
+    pub drop: Pixels,
+    /// A text places the mark in a line, see `Window::place_mark`.
+    pub inline: bool,
+}
+
+/// An out-of-flow box without insets on `axes`, 1 for x and 2 for y, which layout places at its mark.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Follow {
+    pub mark: u64,
+    pub axes: u8,
+    /// Below the mark, not at its top.
+    pub below: bool,
+    /// The right margin edge is at the mark.
+    pub rtl: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

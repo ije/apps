@@ -22,13 +22,27 @@ impl Tree {
         self.stacks.clear();
         self.depths.clear();
         self.blocks.clear();
+        self.scrolled.clear();
         self.hidden.clear();
         self.anchoring.clear();
         #[cfg(debug_assertions)]
         let start = window.region_places().len();
         self.copies = window.copies();
+        window.take_marks();
         self.prepaint_node(index_of(root), Point::default(), false, window);
         self.unshift = false;
+        for (mark, at) in window.take_marks() {
+            if let Some(&index) = self.marks.get(&mark)
+                && (self.slots[index as usize].style.mark).is_some_and(|mark| mark.inline)
+            {
+                let shift = &mut self.slots[index as usize].shift;
+                let at = point(at.x.0, at.y.0) * window.scale_factor();
+                if (shift.x - at.x).abs() > 0.05 || (shift.y - at.y).abs() > 0.05 {
+                    *shift = at;
+                    window.redraw();
+                }
+            }
+        }
         // The check lays out all boxes again, so it checks every third pass, and state that a skip keeps reaches it.
         // Hooks then hold the state of the full pass, which copies don't show, so the next paint draws all boxes.
         #[cfg(debug_assertions)]
@@ -78,6 +92,7 @@ impl Tree {
             window.truncate_regions(start);
             self.stacks.clear();
             self.blocks.clear();
+            self.scrolled.clear();
             self.full = true;
             self.prepaint_node(index_of(root), Point::default(), false, window);
             self.full = false;
@@ -214,6 +229,7 @@ impl Tree {
     fn escape(&mut self, index: u32, window: &mut Window) -> Option<usize> {
         let slot = &self.slots[index as usize];
         let escape = slot.style.escape;
+        let mut unscroll = Point::default();
         // An outline takes the clip of its box, not the overflow clip inside it.
         let (escaped, depth, cut) = if escape == Escape::OUTLINE {
             let placed = self.slots[slot.parent as usize].placed;
@@ -233,6 +249,14 @@ impl Tree {
                 },
                 |at| (self.blocks[at].1, self.blocks[at].2),
             );
+            let around = self.scrolled.last().copied().unwrap_or_default();
+            unscroll = around
+                - match at {
+                    Some(at) => self.blocks[at].3,
+                    None if escape & Escape::FIXED != 0 => Point::default(),
+                    // The initial containing block scrolls with the page.
+                    None => self.scrolled.first().copied().unwrap_or_default(),
+                };
             (Some(mask), Some(at.map_or(0, |at| at + 1)), cut)
         } else {
             (None, None, 0)
@@ -249,8 +273,12 @@ impl Tree {
             self.hidden.push(window.hide_viewports(cut as usize));
         }
         let slot = &mut self.slots[index as usize];
-        (slot.escaped, slot.cut) = (escaped, cut);
+        (slot.escaped, slot.cut, slot.unscroll) = (escaped, cut, unscroll);
         depth
+    }
+
+    fn scrolled(&self, offset: Point<Pixels>) -> Point<Pixels> {
+        self.scrolled.last().copied().unwrap_or_default() + offset
     }
 
     // Ends `escape`.
@@ -378,7 +406,12 @@ impl Tree {
                         style.contains,
                         window.content_mask(),
                         window.depth() as u32,
+                        self.scrolled(offset),
                     ));
+                }
+                let scrolls = scroll.is_some();
+                if scrolls {
+                    self.scrolled.push(self.scrolled(offset));
                 }
                 let interest = scroll.map(|_| (bounds.origin, offset));
                 window.scope(Scope::Offset(offset), |window| {
@@ -391,6 +424,9 @@ impl Tree {
                         }
                     })
                 });
+                if scrolls {
+                    self.scrolled.pop();
+                }
                 // Outlines don't scroll with the content.
                 for child in 0..self.slots[index as usize].children.len() {
                     let child = index_of(self.slots[index as usize].children[child]);
@@ -491,6 +527,7 @@ impl Tree {
             for child in 0..self.slots[index as usize].children.len() {
                 let child = index_of(self.slots[index as usize].children[child]);
                 if self.slots[child as usize].style.escape & (Escape::FIXED | Escape::OUTLINE) == 0
+                    && !self.unscrolled(child)
                 {
                     let [child_near, child_far] = self.far(child, scale, nested);
                     (near, far) = (near.min(child_near), far.max(child_far));
@@ -508,6 +545,25 @@ impl Tree {
         let corners = self.painted(index, nested, scale, [near, far]);
         self.slots[index as usize].far[nested as usize] = Some(corners);
         placed(corners)
+    }
+
+    // Whether a scroll container around an absolute box is inside its containing block, so it doesn't scroll the box.
+    // The page scrolls the boxes without another containing block.
+    fn unscrolled(&self, index: u32) -> bool {
+        let slot = &self.slots[index as usize];
+        let clips = |style: &Style| {
+            style.overflow.x != Overflow::Visible || style.overflow.y != Overflow::Visible
+        };
+        if slot.style.escape & Escape::ABSOLUTE == 0 {
+            return false;
+        }
+        let up = |at: u32| Some(self.slots[at as usize].parent).filter(|&at| at != NONE);
+        let mut outer = std::iter::successors(up(index), |&at| up(at))
+            .map(|at| &*self.slots[at as usize].style);
+        outer
+            .find(|style| style.contains & Escape::ABSOLUTE != 0 || clips(style))
+            .is_some_and(|style| style.contains & Escape::ABSOLUTE == 0)
+            && outer.any(|style| clips(style))
     }
 
     // Like Chrome, lines take the boxes where layout placed them, and the overflow takes them where they paint.
@@ -577,10 +633,15 @@ impl Tree {
             let (layout, absolute) = (child.layout, child.style.position == Position::Absolute);
             if child.style.escape & (Escape::FIXED | Escape::OUTLINE) != 0
                 || layout.size.width == 0. && layout.size.height == 0. && child.children.is_empty()
+                || self.unscrolled(id)
             {
                 continue;
             }
-            let [mut near, mut far] = self.far(id, scale, false);
+            // The end padding doesn't follow out-of-flow boxes.
+            let [mut near, mut far] = match child.style.escape {
+                0 => self.far(id, scale, false),
+                _ => [end - origin, start - origin],
+            };
             if !absolute {
                 far.x += layout.margin.right.max(0.);
                 far.y += layout.margin.bottom.max(0.);
@@ -1042,13 +1103,6 @@ impl Tree {
                     let depth = window.depth() + usize::from(scrolls && window.opens_interest());
                     self.depths.push((depth, false));
                 }
-                if style.contains != 0 {
-                    (self.blocks).push((
-                        style.contains,
-                        window.content_mask(),
-                        window.depth() as u32,
-                    ));
-                }
                 // A scroll container drives its offset as in `prepaint_box`.
                 let scroll = (self.slots[index as usize].events.as_ref())
                     .and_then(|events| events.scroll.clone());
@@ -1062,12 +1116,26 @@ impl Tree {
                     };
                     handle.clamp(style, bounds, client, content, scale)
                 });
+                if style.contains != 0 {
+                    (self.blocks).push((
+                        style.contains,
+                        window.content_mask(),
+                        window.depth() as u32,
+                        self.scrolled(offset.unwrap_or_default()),
+                    ));
+                }
+                if let Some(offset) = offset {
+                    self.scrolled.push(self.scrolled(offset));
+                }
                 let interest = offset.map(|offset| (bounds.origin, offset));
                 window.scope(Scope::Offset(offset.unwrap_or_default()), |window| {
                     window.with_interest(interest, |window| {
                         self.keep_children(index, origin, false, window)
                     })
                 });
+                if offset.is_some() {
+                    self.scrolled.pop();
+                }
                 self.keep_children(index, origin, true, window);
                 if style.contains != 0 {
                     self.blocks.pop();
@@ -1171,6 +1239,7 @@ impl Tree {
             window,
             bounds: slot.bounds,
             exact: slot.exact,
+            unscroll: slot.unscroll,
             inset: inset(&slot.layout, scale),
             baselines: self.baselines(index, scale),
             text: &text,

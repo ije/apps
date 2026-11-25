@@ -351,18 +351,15 @@ pub(super) fn inset_axes(style: &css::properties::Style) -> u8 {
         .fold(0, |axes, (axis, _)| axes | 1 << axis)
 }
 
-// An empty box at the static place of an absolute box, which puts its place in `anchors` for the box to follow.
-pub(super) fn static_mark(view: &Rc<super::super::ViewState>, key: usize) -> renderer::Node {
-    let view = view.clone();
-    renderer::canvas_watching(
-        move |bounds, _| {
-            let mut store = view.store.borrow_mut();
-            store.state(view.id).layout.anchors.insert(key, bounds);
-        },
-        |_, _, _| {},
-    )
-    .w(px(0.))
-    .h(px(0.))
+// An empty box at the static place of an out-of-flow box, which layout moves there.
+pub(super) fn static_mark(key: usize, drop: f32, inline: bool) -> renderer::Node {
+    let mut mark = renderer::node().w(px(0.)).h(px(0.));
+    mark.style().mark = Some(renderer::Mark {
+        key: key as u64,
+        drop: px(drop),
+        inline,
+    });
+    mark
 }
 
 pub(super) fn positioner(

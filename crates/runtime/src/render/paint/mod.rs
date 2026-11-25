@@ -629,14 +629,22 @@ impl Contained {
     }
 }
 
-// Moves an absolute or fixed `::before` or `::after` into its containing block, when that is not its element, and
-// to its static place in the last line on the axes without insets.
+// A box at its static place moves only with the scrolls of its containing block and outside it.
+fn unscroll(offset: &mut Point<Pixels>, unplaced: [bool; 2], by: Point<Pixels>) {
+    if unplaced[0] {
+        offset.x -= by.x;
+    }
+    if unplaced[1] {
+        offset.y -= by.y;
+    }
+}
+
+// Moves an absolute or fixed `::before` or `::after` into its containing block, when that is not its element.
 pub(crate) struct PseudoBlock {
     pub(crate) view: Rc<super::ViewState>,
     pub(crate) place: Option<Contained>,
-    // The axes without insets, the key of the placeholder in `anchors`, the left, top and right margins, and
-    // whether the containing block is right-to-left.
-    pub(crate) anchor: Option<([bool; 2], usize, [f32; 3], bool)>,
+    // The axes without insets.
+    pub(crate) unplaced: [bool; 2],
     pub(crate) offset: Rc<Cell<Point<Pixels>>>,
 }
 
@@ -644,26 +652,8 @@ impl Hooks for PseudoBlock {
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let mut bounds = cx.exact;
         let mut offset = Point::default();
-        if let Some((axes, key, margin, rtl)) = self.anchor
-            && let Some(anchor) = {
-                let view = &*self.view;
-                let store = view.store.borrow();
-                store
-                    .page_state(view.id)
-                    .and_then(|dom| dom.layout.anchors.get(&key).copied())
-            }
-        {
-            if axes[0] {
-                offset.x = match rtl {
-                    true => anchor.left() - px(margin[2]) - bounds.right(),
-                    false => anchor.left() + px(margin[0]) - bounds.left(),
-                };
-            }
-            if axes[1] {
-                offset.y = anchor.top() + px(margin[1]) - bounds.top();
-            }
-            bounds.origin += offset;
-        }
+        unscroll(&mut offset, self.unplaced, cx.unscroll);
+        bounds.origin += offset;
         if let Some(place) = &self.place {
             offset += place.shift(&self.view, bounds, cx.window);
         }
@@ -688,7 +678,8 @@ impl Hooks for PseudoBlock {
 }
 
 pub(crate) struct DomBox {
-    pub(crate) anchor: Option<([bool; 2], bool, [f32; 2])>,
+    // The axes without insets of an out-of-flow box.
+    pub(crate) unplaced: [bool; 2],
     pub(crate) id: usize,
     pub(crate) plans: u8,
     pub(crate) ids: Rc<super::effects::Ids>,
@@ -1035,32 +1026,12 @@ impl Hooks for DomBox {
 
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let parts: Vec<_> = cx.fragments().collect();
-        let (exact, baselines) = (cx.exact, cx.baselines);
+        let (exact, baselines, unscrolled) = (cx.exact, cx.baselines, cx.unscroll);
         let window = &mut *cx.window;
         let mut bounds = exact;
         let mut offset = point(px(0.), px(0.));
-        if let Some((axes, block, margin)) = self.anchor
-            && let Some(anchor) = {
-                let view = &*self.view;
-                let store = view.store.borrow();
-                store
-                    .page_state(view.id)
-                    .and_then(|dom| dom.layout.anchors.get(&self.id).copied())
-            }
-        {
-            // In a right-to-left containing block, the right margin edge is at the static place.
-            if axes[0] && !block {
-                offset.x = match self.rtl {
-                    true => anchor.left() - px(self.margin[1]) - bounds.right(),
-                    false => anchor.left() + px(margin[0]) - bounds.left(),
-                };
-            }
-            if axes[1] {
-                offset.y = if block { anchor.bottom() } else { anchor.top() } + px(margin[1])
-                    - bounds.top();
-            }
-            bounds.origin += offset;
-        }
+        unscroll(&mut offset, self.unplaced, unscrolled);
+        bounds.origin += offset;
         if let Some(sticky) = &self.sticky {
             let Sticky {
                 scroll,
@@ -1176,7 +1147,7 @@ impl Hooks for DomBox {
                     offset.y = at - origin;
                 }
             }
-            bounds.origin += offset;
+            bounds.origin = exact.origin + offset;
         }
         self.block(bounds, point(px(0.), px(0.)));
         let perspective = self
@@ -1386,7 +1357,6 @@ impl Hooks for DomBox {
 
     fn volatile(&self) -> bool {
         self.drawn
-            || self.anchor.is_some()
             || self.sticky.is_some()
             || self.fixed
             || self.container.is_some()

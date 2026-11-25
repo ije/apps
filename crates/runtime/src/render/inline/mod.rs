@@ -116,10 +116,10 @@ pub(crate) fn placed_out_of_flow(style: &Style) -> bool {
             })
 }
 
-/// Whether an absolute box keeps its static place in a line, as a box that was inline. The text holds an empty
+/// Whether an out-of-flow box keeps its static place in a line, as a box that was inline. The text holds an empty
 /// atom there, which the box follows.
 pub(crate) fn static_inline(style: &Style) -> bool {
-    style.get(Prop::POSITION) == Some("absolute")
+    matches!(style.get(Prop::POSITION), Some("absolute" | "fixed"))
         && style.contains(Prop::INTERNAL_STATIC_INLINE)
         && !placed_out_of_flow(style)
 }
@@ -154,7 +154,7 @@ pub(crate) fn lifts_pseudos(
     true
 }
 
-/// Whether the `::after` of `id` is absolute at its static place in the last line.
+/// Whether the `::after` of `id` is out of flow at its static place in the last line.
 pub(crate) fn static_after(styles: &ComputedStyles, id: usize) -> bool {
     styles.generated(id).is_some_and(|pseudos| {
         let after = &pseudos[1];

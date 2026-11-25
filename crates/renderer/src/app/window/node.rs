@@ -237,6 +237,7 @@ impl Chain {
         let NodeCx {
             bounds,
             exact,
+            unscroll,
             inset,
             baselines,
             text,
@@ -250,6 +251,7 @@ impl Chain {
                 window,
                 bounds,
                 exact,
+                unscroll,
                 inset,
                 baselines,
                 text,
@@ -351,6 +353,8 @@ pub struct NodeCx<'a> {
     pub window: &'a mut Window,
     pub bounds: Rect,
     pub exact: Rect,
+    /// How far the scrolls between an out-of-flow box and its containing block moved it.
+    pub unscroll: Point<Pixels>,
     pub inset: [Pixels; 4],
     pub baselines: [Option<Pixels>; 2],
     pub text: &'a TextStyle,

@@ -141,40 +141,39 @@ pub(super) fn finish(
         axis.iter()
             .all(|prop| style.get(*prop).is_none_or(|v| v == "auto"))
     });
-    let mut anchor = None;
-    if position == "absolute" && slot.is_none() && axes.contains(&true) {
-        // A grid places a box that it contains by its alignment.
-        if matches!(parent_display, "grid" | "inline-grid") {
-            if positioner != parent {
-                if axes[0] {
-                    el = el.left(px(0.));
-                }
-                if axes[1] {
-                    el = el.top(px(0.));
-                }
-            }
-        } else if !matches!(parent_display, "flex" | "inline-flex") {
-            let block =
-                !display.starts_with("inline") && !style.contains(Prop::INTERNAL_STATIC_INLINE);
-            if block
-                && axes[0]
-                && let Some(parent) = parent
-            {
-                // The static position is at the start of the parent's content box.
-                let (start, rtl) = padding_start(styles, parent, containing[0]);
-                reader.log(
-                    Query::FlatParentPadding,
-                    depth,
-                    hashed(Some((start.to_bits(), rtl))),
-                );
-                el = if rtl {
-                    el.right(px(start))
-                } else {
-                    el.left(px(start))
-                };
-            }
-            anchor = Some((axes, block, [margin[3], margin[0]]));
+    let mut follow = None;
+    let unplaced = axes.map(|auto| auto && matches!(position, "absolute" | "fixed"));
+    if slot.is_none()
+        && unplaced.contains(&true)
+        && !matches!(
+            parent_display,
+            "flex" | "inline-flex" | "grid" | "inline-grid"
+        )
+    {
+        let block = !display.starts_with("inline") && !style.contains(Prop::INTERNAL_STATIC_INLINE);
+        if block
+            && axes[0]
+            && let Some(parent) = parent
+        {
+            // The static position is at the start of the parent's content box.
+            let (start, rtl) = padding_start(styles, parent, containing[0]);
+            reader.log(
+                Query::FlatParentPadding,
+                depth,
+                hashed(Some((start.to_bits(), rtl))),
+            );
+            el = if rtl {
+                el.right(px(start))
+            } else {
+                el.left(px(start))
+            };
         }
+        follow = Some(renderer::Follow {
+            mark: id as u64,
+            axes: u8::from(axes[0] && !block) | u8::from(axes[1]) << 1,
+            below: block,
+            rtl: reader.parent(id, Prop::DIRECTION) == Some("rtl"),
+        });
     }
     if stacking {
         el = el.child(renderer::layers(false));
@@ -319,6 +318,9 @@ pub(super) fn finish(
         }
         None => el,
     };
+    if follow.is_some() {
+        el.style().follow = follow;
+    }
     let hooks = DomBox {
         text_clip,
         drawn: node.attrs.contains_key("drawable")
@@ -329,7 +331,7 @@ pub(super) fn finish(
         local: Default::default(),
         offset: Default::default(),
         frame: node.tag == "iframe",
-        anchor,
+        unplaced,
         block: made.absolute.then_some(borders),
         container: positioner.filter(|&block| position == "fixed" || Some(block) != parent_box),
         rtl: rtl_block,
@@ -464,7 +466,7 @@ pub(super) fn finish(
         reader.extra.get(),
         (
             (
-                hooks.anchor,
+                hooks.unplaced,
                 hooks.block,
                 hooks.container,
                 hooks.sized,

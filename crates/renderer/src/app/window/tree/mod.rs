@@ -126,6 +126,10 @@ struct Slot {
     contained: bool,
     // The count of scroll viewports around the containing block of an out-of-flow box, whose clips it escapes.
     cut: u32,
+    // How far the scrolls between an out-of-flow box and its containing block moved it.
+    unscroll: Point<Pixels>,
+    // Where the text of a mark in a line puts it, from its layout.
+    shift: Point<f32>,
     // No hit transform is in it, so its regions move with a scroll as they are.
     flat: bool,
     // How far scrolls moved the box without a prepaint of the boxes in it, since one last went through them.
@@ -238,6 +242,8 @@ impl Slot {
             skipped: 0,
             contained: false,
             cut: 0,
+            unscroll: Point::default(),
+            shift: Point::default(),
             flat: false,
             lag: Point::default(),
             ahead: Point::default(),
@@ -275,6 +281,7 @@ impl Slot {
         self.layout = Layout::new();
         self.baselines = Baselines::NONE;
         self.room = None;
+        (self.unscroll, self.shift) = Default::default();
         self.origin = Point::default();
         (self.bounds, self.painted, self.exact) = Default::default();
         self.far = [None; 2];
@@ -361,6 +368,8 @@ pub struct Tree {
     bounded: Vec<u32>,
     // Absolute boxes that escape their parent, which layout places again in their containing blocks.
     escaping: FxHashSet<u32>,
+    // The boxes at the static places that out-of-flow boxes follow.
+    marks: FxHashMap<u64, u32>,
     // Out-of-flow boxes that escape their parent, which took the room of their containing block.
     roomed: FxHashSet<u32>,
     root: Option<u32>,
@@ -382,7 +391,9 @@ pub struct Tree {
     // parents, like `escapes`.
     foreign: Option<usize>,
     // Containing blocks: what they contain, their mask, and the count of scroll viewports around them.
-    blocks: Vec<(u8, Clip<Pixels>, u32)>,
+    blocks: Vec<(u8, Clip<Pixels>, u32, Point<Pixels>)>,
+    // The scroll offsets around the current box, each with the ones outside it.
+    scrolled: Vec<Point<Pixels>>,
     painting: Vec<u32>,
     unbounded: u32,
     prepaints: u32,
@@ -441,6 +452,7 @@ impl Tree {
             self.free.clear();
             self.keys.clear();
             self.escaping.clear();
+            self.marks.clear();
             self.roomed.clear();
             self.orphans.clear();
             self.root = None;
@@ -730,7 +742,8 @@ impl Tree {
                     || slot.style.baseline_source != styled.baseline_source
                     || slot.style.inline != styled.inline
                     || slot.style.block != styled.block
-                    || slot.style.flow != styled.flow);
+                    || slot.style.flow != styled.flow
+                    || slot.style.follow != styled.follow);
         let relaid = outer || !same_measure || relisted;
         if !same_measure {
             match measurement {
@@ -746,14 +759,27 @@ impl Tree {
             }
         }
         slot.kind = kind;
-        if styled.escape & Escape::ABSOLUTE != 0 && styled.placed != 0 {
+        if styled.escape & Escape::ABSOLUTE != 0 && styled.placed != 0 || styled.follow.is_some() {
             self.escaping.insert(index);
         }
+        if let Some(mark) = styled.mark {
+            self.marks.insert(mark.key, index);
+        }
+        // A slot can become a mark outside a line, or the mark of another box.
+        if slot.style.mark != styled.mark {
+            slot.shift = Point::default();
+        }
+        // Whether scroll containers take the absolute boxes in this box reads these styles.
+        let scoped = kept.is_some()
+            && (slot.style.contains != styled.contains || slot.style.overflow != styled.overflow);
         slot.style = styled;
         slot.stretched = stretched;
         slot.volatile = hooks.as_ref().is_some_and(|hooks| hooks.volatile());
         slot.placed = None;
         unfar(&mut self.slots, index as usize);
+        if scoped {
+            self.slots.iter_mut().for_each(|slot| slot.far = [None; 2]);
+        }
         let slot = &mut self.slots[index as usize];
         slot.events = events;
         slot.hooks = hooks;
@@ -923,6 +949,10 @@ impl Tree {
                 .filter(|&index| index != NONE)
                 .collect();
         }
+        self.marks.retain(|_, index| {
+            *index = moved[*index as usize];
+            *index != NONE
+        });
         self.slots = slots;
         self.free.clear();
         self.layers.clear();

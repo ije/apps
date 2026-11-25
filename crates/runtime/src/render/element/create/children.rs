@@ -926,7 +926,7 @@ pub(super) fn children(
                 && grid.is_none()
                 && child_style
                     .get(Prop::POSITION)
-                    .is_some_and(|value| value == "absolute")
+                    .is_some_and(|value| matches!(value, "absolute" | "fixed"))
                 && child_style
                     .get(Prop::DISPLAY)
                     .is_none_or(|value| value != "none")
@@ -937,7 +937,6 @@ pub(super) fn children(
                             .all(|prop| child_style.get(*prop).is_none_or(|value| value == "auto"))
                     })
             {
-                // The placeholder must come before the box, which reads its bounds in prepaint.
                 let block = child_style
                     .get(Prop::DISPLAY)
                     .is_some_and(|value| !value.starts_with("inline"))
@@ -967,39 +966,24 @@ pub(super) fn children(
                             let used = used[2] + if empty { used[0] } else { 0. };
                             (positive + negative - used).max(0.)
                         });
-                let entity = view.clone();
-                // Its place in the window goes to `anchors`, so each move prepares it again.
-                let mut placeholder = renderer::canvas_watching(
-                    move |mut bounds, _| {
-                        bounds.origin.y += px(pending);
-                        let view = &*entity;
-                        view.store
-                            .borrow_mut()
-                            .state(view.id)
-                            .layout
-                            .anchors
-                            .insert(child, bounds);
-                    },
-                    |_, _, _| {},
-                )
-                .w(px(0.))
-                .flex_shrink_0()
-                .h(px(
-                    if block
-                        && (line.is_some()
-                            || all_inline && {
-                                for &other in &children[seen..index] {
-                                    flowed |= in_flow(doc, info, other);
-                                }
-                                seen = index;
-                                flowed
-                            })
-                    {
-                        units.font.lh
-                    } else {
-                        0.
-                    },
-                ));
+                let mut placeholder = super::super::query::static_mark(child, pending, false)
+                    .flex_shrink_0()
+                    .h(px(
+                        if block
+                            && (line.is_some()
+                                || all_inline && {
+                                    for &other in &children[seen..index] {
+                                        flowed |= in_flow(doc, info, other);
+                                    }
+                                    seen = index;
+                                    flowed
+                                })
+                        {
+                            units.font.lh
+                        } else {
+                            0.
+                        },
+                    ));
                 placeholder.style().align_self = Some(renderer::AlignItems::FlexStart);
                 match line.take() {
                     Some(open) => line = Some(open.child(placeholder)),

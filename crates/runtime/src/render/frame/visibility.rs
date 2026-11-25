@@ -441,10 +441,6 @@ pub(super) fn forget(
         dom.layout.grid_widest.remove(&id);
         dom.layout.tracks.remove(&id);
         dom.layout.areas.remove(&id);
-        dom.layout.anchors.remove(&id);
-        dom.layout
-            .anchors
-            .remove(&crate::render::inline::atom_key(id, 2));
     }
     if flipped {
         cx.view.svgs.borrow_mut().retain(|&id, _| cx.shown(id));
@@ -463,10 +459,6 @@ pub(super) fn forget(
         dom.layout.grid_widest.retain(|&id, _| cx.shown(id));
         dom.layout.tracks.retain(|&id, _| cx.shown(id));
         dom.layout.areas.retain(|&id, _| cx.shown(id));
-        // Pseudo-elements keep their anchors by `atom_key`.
-        dom.layout
-            .anchors
-            .retain(|&id, _| cx.shown(id & ((1 << 30) - 1)));
     }
     {
         let mut reach = cx.view.reach.borrow_mut();

@@ -1736,3 +1736,52 @@ fn rtl_pseudo_elements_keep_their_right_edge_when_wider_than_the_box() {
         )],
     );
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn static_places_of_out_of_flow_boxes_follow_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('static.html');
+        const step = async (name, code) => console.log('STATIC ' + name + ' ' + await run(code));
+        await step('end', "const d = document.documentElement; [d.scrollHeight, at(line), at(end)].join()");
+        await step('scrolled', "scrollTo(0, 100); list.scrollTop = 30; [at(fixed), at(inline), at(menu), at(after), list.scrollHeight].join()");
+        await win.webContents.capturePage();
+        await step('frame', "[at(fixed), at(inline), at(menu)].join()");
+        await step('moved', "first.style.height = '70px'; [at(fixed), at(inline), at(menu), d.scrollHeight].join()");
+        await step('placed', "fixed.style.top = '5px'; const top = at(fixed); fixed.style.top = ''; [top, at(fixed)].join()");
+        await load('lines.html');
+        await step('line', "x() >= 0 && x() < 10");
+        await win.webContents.capturePage();
+        await step('row', "document.body.append(document.createElement('pre')); x() >= 0 && x() < 10");
+        "#,
+        &[
+            (
+                "static.html",
+                "<body style='margin:0'><style>body{line-height:20px}.f{position:fixed}.a{position:absolute}.f,.a{width:10px;height:50px}</style>\
+             <div id=first style='height:50px'></div><div class=f id=fixed></div><div>text <span class=f id=inline></span></div>\
+             <div id=list style='overflow:auto;height:60px'><div style='height:40px'></div><div class=a id=menu></div><div style='height:80px'></div></div>\
+             <div id=after style='height:800px'></div><div>a <span class=a id=line></span></div><div class=a id=end style='margin-top:30px'></div><script>\
+             for (const id of ['first', 'fixed', 'inline', 'list', 'menu', 'after', 'line', 'end']) globalThis[id] = document.getElementById(id);\
+             globalThis.at = box => Math.round(box.getBoundingClientRect().top);</script></body>",
+            ),
+            (
+                "lines.html",
+                "<body style='margin:0'><a id=a>text</a> <span id=box style='position:absolute;top:50px'>box</span><script>\
+             globalThis.box = document.getElementById('box');\
+             globalThis.x = () => box.getBoundingClientRect().left - document.getElementById('a').getBoundingClientRect().right;</script></body>",
+            ),
+        ],
+    );
+    for line in [
+        "end 1030,930,980",
+        "scrolled 50,50,10,30,120",
+        "frame 50,50,10",
+        "moved 70,70,10,1050",
+        "placed 5,70",
+        "line true",
+        "row true",
+    ] {
+        assert!(text.contains(&format!("STATIC {line}\n")), "{line}: {text}");
+    }
+}
