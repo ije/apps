@@ -267,6 +267,11 @@ impl Browser {
                         matches.push(json!({"name":cookie.name(),"value":cookie.value(),"domain":cookie.domain(),"path":cookie.path(),"secure":cookie.secure().unwrap_or(false),"httpOnly":cookie.http_only().unwrap_or(false),"session":cookie.expires_datetime().is_none(),"expirationDate":cookie.expires_datetime().map(|date|date.unix_timestamp())}));
                     }
                 }
+                // WebView2 changes cookies later. A read waits for the change.
+                #[cfg(target_os = "windows")]
+                if operation == "cookies.remove" {
+                    self.view.cookies()?;
+                }
                 self.events.complete(
                     &arguments["id"],
                     Ok(if operation == "cookies.get" {
@@ -298,6 +303,8 @@ impl Browser {
                     )?);
                 }
                 self.view.set_cookie(&cookie)?;
+                #[cfg(target_os = "windows")]
+                self.view.cookies()?;
                 self.events.complete(&arguments["id"], Ok(Value::Null));
             }
             "focus" => self.view.focus()?,
