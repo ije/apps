@@ -75,9 +75,7 @@ pub(super) fn scroll(
     state: &mut PageState,
     viewport: [f32; 2],
 ) -> Result<Value> {
-    let page = doc.nodes[id].parent == Some(0)
-        && doc.nodes[id].tag == "html"
-        && !state.geometry.scroll.contains_key(&id);
+    let page = doc.nodes[id].parent == Some(0) && doc.nodes[id].tag == "html";
     if args[1].is_null() && args[2].is_null() {
         let handle = state.geometry.scroll.get(&if page { 0 } else { id });
         if !handle.is_some_and(renderer::ScrollRef::snaps) {
@@ -98,7 +96,11 @@ pub(super) fn scroll(
         let boxed = style
             .and_then(|style| style.get(Prop::DISPLAY))
             .is_some_and(|value| !matches!(value, "inline" | "contents" | "none"));
-        if doc.nodes[id].tag.starts_with('#') || !scrolls || !boxed {
+        if doc.nodes[id].tag.starts_with('#')
+            || !scrolls
+            || !boxed
+            || crate::render::viewport_overflow(doc, &computed, id)
+        {
             return Ok(json!([0., 0.]));
         }
     }
@@ -224,13 +226,7 @@ pub(super) fn client(
         .edges(now, css::properties::PADDING, base)
         .map(|value| value.max(0.));
     let bars = (state.geometry.scroll.get(&id)).map_or([0.; 4], |handle| {
-        crate::render::paint::scrollbar::room(
-            style,
-            computed.extras(id),
-            units,
-            handle.extent(),
-            true,
-        )
+        crate::render::paint::scrollbar::room(style, computed.extras(id), units, handle, true)
     });
     // Like offsetWidth, client sizes ignore transforms, so a transformed box takes its layout size,
     // and the shift from its bounds to its own untransformed corner.

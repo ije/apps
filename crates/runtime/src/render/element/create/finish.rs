@@ -184,7 +184,7 @@ pub(super) fn finish(
         .then(|| {
             let store = view.store.borrow();
             let scrolls = &store.page_state(view.id)?.geometry.scroll;
-            let parent = scroller(doc, styles, ancestors.iter().rev().copied(), scrolls, 0);
+            let parent = scroller(doc, styles, ancestors.iter().rev().copied(), 0);
             let border = insets(styles, parent, false, containing[0]);
             reader.log(
                 Query::Scroller(0),
@@ -233,7 +233,7 @@ pub(super) fn finish(
     // An absolute box with both insets of an axis aligns in its inset-modified containing block. Start and end
     // follow the direction of the containing block, and `auto` is `normal`.
     let rtl_block = matches!(position, "absolute" | "fixed")
-        && styles.values[positioner.unwrap_or(0)].get(Prop::DIRECTION) == Some("rtl");
+        && super::super::query::rtl(doc, styles, positioner.unwrap_or(0));
     if hit.is_none() && matches!(position, "absolute" | "fixed") {
         let own = style.get(Prop::DIRECTION) == Some("rtl");
         for (prop, insets, inline) in [

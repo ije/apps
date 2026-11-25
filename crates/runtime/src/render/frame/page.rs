@@ -3,6 +3,7 @@ use super::Cx;
 use super::snap;
 use crate::css;
 use crate::css::properties::{Prop, Style};
+use crate::dom::Document;
 use crate::render::paint::{background, scrollbar, spacer};
 use crate::render::{PageState, ViewState, inspect};
 use crate::render::{effects, paint};
@@ -93,6 +94,7 @@ pub(super) struct Viewport {
 }
 
 pub(super) fn viewport(
+    doc: &Document,
     dom: &mut PageState,
     styles: &ComputedStyles,
     html: Option<usize>,
@@ -118,8 +120,8 @@ pub(super) fn viewport(
     });
     let [page_scrolls_x, page_scrolls] =
         [overflow_x, overflow].map(|value| !matches!(value, "hidden" | "clip"));
-    // Like Chrome, the viewport takes the direction of the root element, so an RTL page scrolls from its right.
-    let page_rtl = html.is_some_and(|html| styles.values[html].get(Prop::DIRECTION) == Some("rtl"));
+    // An RTL page scrolls from its right.
+    let page_rtl = element::query::page_direction(doc, styles) == Some("rtl");
     let page_overscroll = html.map_or_else(Default::default, |html| {
         element::margin::overscroll(&styles.values[html])
     });
@@ -144,7 +146,7 @@ pub(super) fn viewport(
             Some(look)
         });
     let page_space = page_bar.as_ref().map_or([0.; 2], |look| {
-        look.space(look.shown([page_scrolls_x, page_scrolls], page_scroll.extent()))
+        look.space(look.shown([page_scrolls_x, page_scrolls], &page_scroll))
     });
     Viewport {
         scroll: page_scroll,
@@ -182,11 +184,12 @@ pub(super) fn node(
         page.style().flow |= renderer::Flow::RTL_BLOCK;
     }
     page.style().overscroll = viewport.overscroll;
-    page.style().bars = renderer::Edges {
+    let bars = renderer::Edges {
         right: renderer::px(viewport.space[1]),
         bottom: renderer::px(viewport.space[0]),
         ..Default::default()
     };
+    page.style().bars = bars;
     // The box would scroll the page by the room of the bars.
     pointer_events.style().size = renderer::size(
         renderer::Length::Calc(1., renderer::px(-viewport.space[1])),
@@ -286,21 +289,19 @@ pub(super) fn node(
     if overlay.is_empty() {
         page.into()
     } else {
-        renderer::node()
-            .size_full()
-            .child(page)
-            .children(overlay)
-            .into()
+        let mut window = renderer::node().size_full();
+        window.style().bars = bars;
+        window.child(page).children(overlay).into()
     }
 }
 
 // The boxes of the top layer, each above its backdrop.
-pub(super) fn overlay(
-    build: &Build,
-    backdrops: &[(usize, Rc<Style>)],
-    size: [f32; 2],
-) -> Vec<renderer::Child> {
+pub(super) fn overlay(build: &Build, backdrops: &[(usize, Rc<Style>)]) -> Vec<renderer::Child> {
     let mut overlay: Vec<renderer::Child> = Vec::new();
+    let layer = || {
+        let [width, height] = build.port.map(renderer::px);
+        renderer::node().absolute().w(width).h(height)
+    };
     for &id in build.top_layer {
         if let Some(backdrop) = backdrops
             .iter()
@@ -309,7 +310,7 @@ pub(super) fn overlay(
             .filter(|style| style.get(Prop::DISPLAY) != Some("none"))
         {
             let units = build.styles.lengths[id];
-            let mut el = renderer::node().absolute().top_0().left_0().size_full();
+            let mut el = layer().top_0().left_0();
             if backdrop
                 .get(Prop::VISIBILITY)
                 .is_none_or(|value| value == "visible")
@@ -368,12 +369,10 @@ pub(super) fn overlay(
             );
         }
         overlay.push(
-            renderer::node()
-                .absolute()
-                .size_full()
+            layer()
                 .stacking()
                 .child(renderer::layers(true))
-                .child(element(build, id, size, size, None))
+                .child(element(build, id, build.port, build.port, None))
                 .child(renderer::layers(false))
                 .into(),
         );

@@ -1,3 +1,4 @@
+use super::super::element::margin::viewport_overflow;
 use super::super::layout::cull;
 use super::super::paint::{background, spacer};
 use super::super::{PageState, ViewState, layout};
@@ -48,7 +49,7 @@ pub(super) fn clips<'a>(
             let axes = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
                 .map(|prop| style.get(prop).is_some_and(|value| value != "visible"));
             if axes != [false; 2]
-                && !matches!(doc.nodes[parent].tag.as_str(), "html" | "body")
+                && !viewport_overflow(doc, styles, parent)
                 && style
                     .get(Prop::DISPLAY)
                     .is_some_and(|value| !matches!(value, "inline" | "contents"))
@@ -502,15 +503,15 @@ pub(super) fn forget(
             .filter(|&id| {
                 cx.shown(id)
                     && id != 0
-                    && !matches!(cx.doc.nodes[id].tag.as_str(), "html" | "body")
                     && !layout::size::text_field(&cx.doc.nodes[id], &styles.values[id])
-                    && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
-                        .into_iter()
-                        .all(|prop| {
-                            styles.values[id]
-                                .get(prop)
-                                .is_none_or(|value| matches!(value, "visible" | "clip"))
-                        })
+                    && (viewport_overflow(cx.doc, styles, id)
+                        || [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+                            .into_iter()
+                            .all(|prop| {
+                                styles.values[id]
+                                    .get(prop)
+                                    .is_none_or(|value| matches!(value, "visible" | "clip"))
+                            }))
             })
             .collect();
         // Pages read offsets from the layout mirror, which only handles write.

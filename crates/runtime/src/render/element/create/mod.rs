@@ -30,7 +30,7 @@ use self::svg::svg_box;
 use super::border::{border_canvas, fieldset_border, inset_shadows, shade_border};
 use super::columns::columns;
 use super::kept::{Query, Read, Replay, hashed};
-use super::margin::{body_overflow_moves, definite_line, in_flow, margins, overscroll};
+use super::margin::{definite_line, in_flow, margins, overscroll, viewport_overflow};
 use super::query::{
     backdrop, box_parent, content_editable, positioner, row_fill, scrolled, starts_line,
 };
@@ -215,15 +215,15 @@ pub(super) fn create(
             || doc.nodes[parent].tag.starts_with('#')
             || styles.values[parent].get(Prop::DISPLAY).unwrap_or("inline") != "inline"
     });
-    let viewport = || viewport(reader, &units);
+    let viewport = || viewport(reader);
     let block_size = if position == "fixed" && positioner.is_none() {
-        viewport()
+        Some(viewport())
     } else {
         positioner
             .filter(|&block| Some(block) != parent_box)
             .and_then(|block| {
                 if block == 0 {
-                    return viewport();
+                    return Some(viewport());
                 }
                 // Prefer the last layout to the estimate: missed min/max constraints can cause endless
                 // redraws.
@@ -473,7 +473,7 @@ pub(super) fn create(
             .note_runs(doc, styles, id, &flat, true);
     }
     let cut_ids: rustc_hash::FxHashSet<usize> = cuts.iter().map(|&(cut, ..)| cut).collect();
-    let rtl = style.get(Prop::DIRECTION) == Some("rtl");
+    let rtl = super::query::rtl(doc, styles, id);
     let line_justify = match (style.get(Prop::TEXT_ALIGN), rtl) {
         (Some("right" | "-webkit-right"), _)
         | (Some("end"), false)
@@ -802,24 +802,18 @@ pub(super) fn create(
             "visible"
         })
     });
-    let overflow = if node.tag == "body"
-        && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
-            .into_iter()
-            .all(|prop| {
-                reader
-                    .parent(id, prop)
-                    .is_none_or(|value| value == "visible")
-            })
-        && body_overflow_moves(doc, styles, id)
-    {
-        ["visible"; 2]
-    } else {
-        overflow
+    if node.tag == "body" {
+        for prop in [Prop::OVERFLOW_X, Prop::OVERFLOW_Y] {
+            reader.parent(id, prop);
+        }
+    }
+    let overflow = match viewport_overflow(doc, styles, id) {
+        true => ["visible"; 2],
+        false => overflow,
     };
-    let page = matches!(node.tag.as_str(), "html" | "body");
     // `content-visibility` contains the paint of the contents, like `overflow: clip`.
     let overflow = if info[id].flags & cull::SKIPS != 0
-        && !page
+        && !matches!(node.tag.as_str(), "html" | "body")
         && style
             .get(Prop::CONTENT_VISIBILITY)
             .is_some_and(|v| v != "visible")
@@ -828,10 +822,9 @@ pub(super) fn create(
     } else {
         overflow
     };
-    let boxed = !page
-        && overflow
-            .iter()
-            .any(|value| !matches!(*value, "visible" | "clip"));
+    let boxed = overflow
+        .iter()
+        .any(|value| !matches!(*value, "visible" | "clip"));
     let overflow = overflow.map(|value| match value {
         "auto" | "scroll" => renderer::Overflow::Scroll,
         "hidden" => renderer::Overflow::Hidden,
@@ -861,13 +854,6 @@ pub(super) fn create(
             &units,
             backdrop.map(|(_, ink)| ink),
         )
-        .map(|mut look| {
-            if page {
-                look.forced = [false; 2];
-                look.gutter = false;
-            }
-            look
-        })
     } else {
         None
     };
@@ -877,7 +863,7 @@ pub(super) fn create(
         let dom = store.state(view.id);
         let handle = dom.geometry.scroll.entry(id).or_default();
         reader.log(Query::Scroll(id as u32), 0, hashed(scrolled(Some(handle))));
-        look.space(look.shown(scrolls, handle.extent()))
+        look.space(look.shown(scrolls, handle))
     });
     let mut padding = parsed.padding.unwrap_or_else(|| {
         units
@@ -953,7 +939,7 @@ pub(super) fn create(
     if rtl_parent && hit.is_none() {
         el.style().flow |= renderer::Flow::RTL;
     }
-    if hit.is_none() && style.get(Prop::DIRECTION) == Some("rtl") {
+    if hit.is_none() && rtl {
         el.style().flow |= renderer::Flow::RTL_BLOCK;
     }
     if hit.is_none()
@@ -1529,7 +1515,7 @@ pub(super) fn create(
         el.text_style().set_text_overflow(Some("…".into()));
     }
     if position == "fixed" {
-        let viewport = units.viewport;
+        let viewport = viewport();
         let inset = [Prop::LEFT, Prop::RIGHT, Prop::TOP, Prop::BOTTOM].map(|prop| {
             style.get(prop).and_then(|v| {
                 units.resolve(
@@ -1614,8 +1600,7 @@ pub(super) fn create(
         let mut store = view.store.borrow_mut();
         let scroll = &mut store.state(view.id).geometry.scroll;
         if scrolls.contains(&true)
-            || !page
-                && overflow.contains(&renderer::Overflow::Hidden)
+            || overflow.contains(&renderer::Overflow::Hidden)
                 && (overscroll != renderer::Point::default()
                     || (style.get(Prop::SCROLL_SNAP_TYPE)).is_some_and(|kind| kind != "none"))
         {
@@ -1842,7 +1827,7 @@ pub(super) fn create(
             .iter()
             .copied()
             .filter(|&ancestor| {
-                !matches!(doc.nodes[ancestor].tag.as_str(), "html" | "body")
+                !viewport_overflow(doc, styles, ancestor)
                     && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
                         .into_iter()
                         .any(|prop| {

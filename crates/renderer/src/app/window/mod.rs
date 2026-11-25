@@ -514,6 +514,9 @@ pub struct Window {
     // `again`: the page asked for another pass while one was built. `settling`: this is that extra pass.
     again: bool,
     settling: bool,
+    // `rebar`: the bars of this pass are not the ones it was built with. `rebars`: the extra passes for bars.
+    rebar: bool,
+    rebars: u8,
     restart: bool,
     restarts: u8,
     rebuild: bool,
@@ -594,6 +597,8 @@ impl Window {
             drawing: false,
             again: false,
             settling: false,
+            rebar: false,
+            rebars: 0,
             restart: false,
             restarts: 0,
             rebuild: false,
@@ -657,6 +662,13 @@ impl Window {
             true => self.again = true,
             false => self.refresh(),
         }
+    }
+
+    /// Scroll bars came or went, which can make other bars come or go, so this pass is followed by another one, up to
+    /// a few in a frame.
+    pub fn rebar(&mut self) {
+        self.redraw();
+        self.rebar = self.drawing;
     }
 
     // The page changed while this pass was built. The pass is built again, a few times per frame at most, and this doesn't use up the extra pass that sizes settle in.
@@ -1096,7 +1108,8 @@ impl Window {
                     self.hovered = self.pending.probe(self.pointer, &mut self.under);
                     let restarting = self.restart && self.restarts < 4;
                     let again = self.again || self.restart;
-                    if !restarting && (!again || self.settling) {
+                    let rebar = self.rebar && self.rebars < 4;
+                    if !restarting && (!again || self.settling && !rebar) {
                         tree.paint(root, self);
                     }
                 }
@@ -1106,15 +1119,18 @@ impl Window {
             let restart = mem::take(&mut self.restart);
             if restart && self.restarts < 4 {
                 self.restarts += 1;
-                self.again = false;
+                (self.again, self.rebar) = (false, false);
                 continue;
             }
             let again = mem::take(&mut self.again) || restart;
-            if again && !self.settling {
+            let rebar = mem::take(&mut self.rebar) && self.rebars < 4;
+            if again && (rebar || !self.settling) {
+                self.rebars += u8::from(rebar);
                 self.settling = true;
                 continue;
             }
             self.settling = false;
+            self.rebars = 0;
             self.restarts = 0;
             if again {
                 self.refresh();
@@ -1204,8 +1220,8 @@ impl Window {
             return false;
         }
         self.drawing = true;
-        let mut again = false;
-        for _ in 0..2 {
+        let mut again;
+        loop {
             self.clear_pending();
             let mut tree = self.tree.take().unwrap_or_default();
             if let Some(root) = self.build(&mut tree, app, &mut render) {
@@ -1221,11 +1237,16 @@ impl Window {
             let states = mem::take(&mut self.next_states);
             self.states.extend(states);
             again = mem::take(&mut self.again);
-            if !again {
+            let rebar = mem::take(&mut self.rebar) && self.rebars < 4;
+            if !again || self.settling && !rebar {
                 break;
             }
+            self.rebars += u8::from(rebar);
+            self.settling = true;
         }
         self.drawing = false;
+        self.settling = false;
+        self.rebars = 0;
         if again {
             self.refresh();
         }

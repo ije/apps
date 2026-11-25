@@ -88,10 +88,10 @@
   const scrollOf = (node, k) => {
     if (!observing && !geometry[0] && !changes()) {
       host('dom.layout', false);
-      const id = rootElement(node) && !(marks[node._id] & 2) ? 0 : node._id, i = 4 + id * 8;
+      const id = rootElement(node) ? 0 : node._id, i = 4 + id * 8;
       if (i < limit && !(marks[id] & 16)) return marks[id] & 2 ? geometry[i + k] : 0;
     }
-    if (rootElement(node)) { if (pageScroller(node)) node = document; } else if ((pending() || geometry[3]) && !observing && !call('dom.scrolled', node._id)) return 0;
+    if (rootElement(node)) node = document; else if ((pending() || geometry[3]) && !observing && !call('dom.scrolled', node._id)) return 0;
     return metric(node, k);
   };
   // As in Chrome, a scroll lays out a box that was no scroll box in the last layout, so it scrolls only if it can,
@@ -139,7 +139,6 @@
   const rootElement = node => node._m.tag === 'html' && node._m.up === records[0];
   // The viewport without the scroll bars of the page.
   const viewSize = () => { layout(); const [width, height, , , bars] = host('dom.viewport'); return [width - bars[1], height - bars[0]]; };
-  const pageScroller = node => { layout(); return rootElement(node) && !(marks[node._id] & 2); };
   const create = (tag, text = '', from = -1) => {
     if (!names.has(tag)) { if (!/^[a-z][a-z0-9-]*$/i.test(tag) && !types[tag]) throw new DOMException('Invalid tag', 'InvalidCharacterError'); names.set(tag, tag[0] === '#' ? tag === '#fragment' ? '#document-fragment' : tag : tag.toUpperCase()); }
     if (!pool.length) pool = host('dom.reserve', reserve = Math.min(reserve * 2, 1024)).reverse();
@@ -1067,7 +1066,7 @@
     get clientLeft() { return Math.round(client(this)[0]); } get clientTop() { return Math.round(client(this)[1]); }
     get scrollTop() { return scrollOf(this, 5); } set scrollTop(value) { scrollTo(this, null, Number(value)); }
     get scrollLeft() { return scrollOf(this, 4); } set scrollLeft(value) { scrollTo(this, Number(value), null); }
-    get scrollWidth() { return pageScroller(this) ? Math.round(viewSize()[0] + metric(document, 6)) : extent(this, 0); } get scrollHeight() { return pageScroller(this) ? Math.round(viewSize()[1] + metric(document, 7)) : extent(this, 1); }
+    get scrollWidth() { return rootElement(this) ? Math.round(viewSize()[0] + metric(document, 6)) : extent(this, 0); } get scrollHeight() { return rootElement(this) ? Math.round(viewSize()[1] + metric(document, 7)) : extent(this, 1); }
     scrollTo(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); scrollTo(this, left ?? null, top ?? null, behavior); }
     scroll(left, top) { this.scrollTo(left, top); }
     scrollBy(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); scrollTo(this, this.scrollLeft + (Number(left) || 0), this.scrollTop + (Number(top) || 0), behavior, 'by'); }

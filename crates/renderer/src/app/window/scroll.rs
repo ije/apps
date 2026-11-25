@@ -1,6 +1,6 @@
 use super::snap::{ScrollSnaps, Snap};
 use crate::{
-    App, Length, Overflow, Overscroll, Pixels, Point, Rect, Region, Size, Style, WheelPhase,
+    App, Edges, Length, Overflow, Overscroll, Pixels, Point, Rect, Region, Size, Style, WheelPhase,
     Window, point, px,
 };
 use std::{
@@ -158,6 +158,11 @@ struct ScrollState {
     // The scroll size less the client size before they round to device pixels, which `scrollWidth` rounds.
     overflow: Point<Pixels>,
     bounds: Rect,
+    // The room of the scroll bars in the last layout.
+    room: Edges<Pixels>,
+    // The axes whose content needs a bar, and the ones that got theirs in this frame.
+    bars: [bool; 2],
+    grown: [bool; 2],
     animation: Option<Animation>,
     driven: bool,
     stretch: Point<Pixels>,
@@ -568,6 +573,26 @@ impl ScrollRef {
         self.0.borrow().bounds
     }
 
+    pub fn room(&self) -> Edges<Pixels> {
+        self.0.borrow().room
+    }
+
+    /// The axes whose content needs a bar.
+    pub fn bars(&self) -> [bool; 2] {
+        self.0.borrow().bars
+    }
+
+    /// A layout found the axes that need a bar. Like in Chrome, a bar that a layout of a frame adds stays for the
+    /// other layouts of that frame, so layouts come to an end.
+    pub fn set_bars(&self, needed: [bool; 2], first: bool) {
+        let scroll = &mut *self.0.borrow_mut();
+        for axis in 0..2 {
+            let grown = scroll.grown[axis] && !first;
+            scroll.grown[axis] = grown || needed[axis] && !scroll.bars[axis];
+            scroll.bars[axis] = needed[axis] || grown;
+        }
+    }
+
     pub fn target(&self) -> Point<Pixels> {
         let scroll = self.0.borrow();
         scroll
@@ -910,6 +935,7 @@ impl ScrollRef {
         }
         (scroll.range, scroll.overflow) = (range, overflow);
         scroll.bounds = bounds;
+        scroll.room = style.bars;
         scroll.painted = snap_offset(scroll.offset + scroll.stretch, scale);
         scroll.painted
     }

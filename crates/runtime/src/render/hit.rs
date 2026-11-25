@@ -217,6 +217,7 @@ pub(crate) fn hit_test(
                         && style.get(prop).is_some_and(|value| {
                             matches!(value, "hidden" | "clip" | "auto" | "scroll")
                         })
+                        && !super::viewport_overflow(doc, computed, id)
                 {
                     clip[axis] = clip[axis].max([left, top][axis]);
                     clip[axis + 2] = clip[axis + 2].min([left + width, top + height][axis]);

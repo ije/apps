@@ -54,7 +54,7 @@ pub(super) fn props(
         natural_ratio,
         ..
     } = *fr;
-    let viewport = || viewport(reader, &units);
+    let viewport = || viewport(reader);
     let column_stretched = || {
         slot.is_some()
             && style
@@ -94,7 +94,7 @@ pub(super) fn props(
         // Chrome, an inline-level box takes them from the fixed height of its block, which its line doesn't have.
         // A grid item takes them from its grid area.
         let page_size = || match vertical && parent == Some(0) {
-            true => viewport(),
+            true => Some(viewport()),
             false => (vertical && line_base == Some(true)
                 || slot.is_some() && !style::table_part(doc, styles, id))
             .then_some(containing),

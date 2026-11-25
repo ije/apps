@@ -548,6 +548,7 @@ pub(crate) struct Contained {
     // Tells mismatches of this box from those of others.
     pub(crate) key: usize,
     pub(crate) container: usize,
+    // The window, with the scroll bars of the page.
     pub(crate) viewport: [f32; 2],
     // The containing block size that the build used, when it came from another box.
     pub(crate) sized: Option<[f32; 2]>,
@@ -570,17 +571,17 @@ impl Contained {
             store
                 .page_state(view.id)
                 .and_then(|dom| match self.container {
-                    usize::MAX => Some(Rect::new(
-                        Point::default(),
-                        renderer::size(px(self.viewport[0]), px(self.viewport[1])),
-                    )),
-                    0 => dom.geometry.scroll.get(&0).map(|scroll| {
-                        let [width, height] = self.viewport;
-                        Rect::new(
-                            scroll.bounds().origin + scroll.painted(),
-                            renderer::size(px(width), px(height)),
-                        )
-                    }),
+                    container @ (0 | usize::MAX) => {
+                        let scroll = dom.geometry.scroll.get(&0);
+                        let room = scroll.map_or_else(Default::default, |scroll| scroll.room());
+                        let [width, height] = self.viewport.map(px);
+                        let size = renderer::size(width - room.right, height - room.bottom);
+                        let origin = match container {
+                            0 => scroll.map(|scroll| scroll.bounds().origin + scroll.painted())?,
+                            _ => Point::default(),
+                        };
+                        Some(Rect::new(origin, size))
+                    }
                     // The boxes that a scroll container contains move with its scroll.
                     container => dom.layout.blocks.get(&container).map(|block| {
                         let scroll = dom.geometry.scroll.get(&container);
@@ -1066,10 +1067,10 @@ impl Hooks for DomBox {
                 border,
                 block,
             } = &**sticky;
-            let mut viewport = scroll.bounds();
-            viewport.origin += point(px(border[3]), px(border[0]));
-            viewport.size.width -= px(border[1] + border[3]);
-            viewport.size.height -= px(border[0] + border[2]);
+            let (mut viewport, room) = (scroll.bounds(), scroll.room());
+            viewport.origin += point(px(border[3]) + room.left, px(border[0]) + room.top);
+            viewport.size.width -= px(border[1] + border[3]) + room.left + room.right;
+            viewport.size.height -= px(border[0] + border[2]) + room.top + room.bottom;
             if let Some(left) = self.inset[3] {
                 offset.x = (viewport.left() + px(left) - bounds.left()).max(px(0.));
             }
@@ -1128,7 +1129,14 @@ impl Hooks for DomBox {
             bounds.origin += shift;
         }
         if self.fixed {
-            let viewport = window.viewport_size();
+            let mut viewport = window.viewport_size();
+            if let Some(scroll) = (self.view.store.borrow().page_state(self.view.id))
+                .and_then(|dom| dom.geometry.scroll.get(&0))
+            {
+                let room = scroll.room();
+                viewport.width -= room.left + room.right;
+                viewport.height -= room.top + room.bottom;
+            }
             for axis in 0..2 {
                 let [start, end] = if axis == 0 { [3, 1] } else { [0, 2] };
                 let auto =
@@ -1156,9 +1164,11 @@ impl Hooks for DomBox {
                                 _ => margin(start),
                             }
                     }
-                    (Some(first), _) => px(first) + margin(start),
-                    (None, Some(last)) => extent - px(last) - margin(end) - size,
-                    (None, None) => continue,
+                    (Some(first), last) if axis == 1 || !self.rtl || last.is_none() => {
+                        px(first) + margin(start)
+                    }
+                    (_, Some(last)) => extent - px(last) - margin(end) - size,
+                    (_, None) => continue,
                 };
                 if axis == 0 {
                     offset.x = at - origin;

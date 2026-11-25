@@ -14,6 +14,12 @@ impl Tree {
             width: taffy::AvailableSpace::Definite(viewport.width.0 * scale),
             height: taffy::AvailableSpace::Definite(viewport.height.0 * scale),
         };
+        // The initial containing block leaves out the scroll bars of the page.
+        let bars = self.slots[index_of(root) as usize].style.bars;
+        let viewport = Size::new(
+            viewport.width - bars.left - bars.right,
+            viewport.height - bars.top - bars.bottom,
+        );
         self.choose_anchors(&unanchored, window);
         let mut tree = LayoutTree {
             slots: &mut self.slots,

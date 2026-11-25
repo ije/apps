@@ -62,7 +62,7 @@ pub(super) fn pseudo_elements(
     } = carry;
     let padding = fr.padding;
     let content_box = || fr.content_box(cx);
-    let viewport = || viewport(reader, &units);
+    let viewport = || viewport(reader);
     let made = parsed.made;
     let ink = parsed.ink.unwrap_or(Color::BLACK);
     let sides = css::properties::BORDERS.map(|[width, kind, color]| (width, kind, color));
@@ -309,11 +309,7 @@ pub(super) fn pseudo_elements(
                 reader.log(Query::Positioner(fixed), scope, hashed(block));
             }
             match block {
-                None | Some(0) => (
-                    block.unwrap_or(usize::MAX),
-                    viewport().unwrap_or(units.viewport),
-                    false,
-                ),
+                None | Some(0) => (block.unwrap_or(usize::MAX), viewport(), false),
                 Some(block) => {
                     let size = reader.block_size(view.store.borrow().page_state(view.id), block);
                     reader.log(
@@ -749,13 +745,15 @@ pub(super) fn pseudo_elements(
                         sized: sized.then_some(size),
                         inset,
                         margin: pseudo_margin,
-                        rtl: styles.values[if container == usize::MAX {
-                            0
-                        } else {
-                            container
-                        }]
-                        .get(Prop::DIRECTION)
-                            == Some("rtl"),
+                        rtl: super::super::query::rtl(
+                            doc,
+                            styles,
+                            if container == usize::MAX {
+                                0
+                            } else {
+                                container
+                            },
+                        ),
                     }),
                     offset: Default::default(),
                 });
@@ -782,8 +780,11 @@ pub(super) fn pseudo_elements(
             });
             // The direction of the containing block: the element's, or the one of the block it escapes to.
             let rtl = match escaped {
-                Some((usize::MAX, ..)) => styles.values[0].get(Prop::DIRECTION) == Some("rtl"),
-                Some((block, ..)) => styles.values[block].get(Prop::DIRECTION) == Some("rtl"),
+                Some((block, ..)) => super::super::query::rtl(
+                    doc,
+                    styles,
+                    if block == usize::MAX { 0 } else { block },
+                ),
                 None => rtl,
             };
             let anchor = Some((

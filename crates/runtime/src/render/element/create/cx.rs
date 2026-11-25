@@ -246,9 +246,10 @@ pub(super) fn above(build: &Build<'_>, units: &Lengths, parsed: &Plan) -> f32 {
     ))
 }
 
-pub(super) fn viewport(reader: &Build<'_>, units: &Lengths) -> Option<[f32; 2]> {
-    reader.log(Query::Viewport, 0, hashed(units.viewport.map(f32::to_bits)));
-    Some(units.viewport)
+// The initial containing block: the viewport without the scroll bars of the page.
+pub(super) fn viewport(reader: &Build<'_>) -> [f32; 2] {
+    reader.log(Query::Viewport, 0, hashed(reader.port.map(f32::to_bits)));
+    reader.port
 }
 
 // Makes a wrapper as wide as its line, so the percent width of the box in it takes the line. Negative

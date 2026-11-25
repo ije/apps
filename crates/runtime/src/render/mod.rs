@@ -1,5 +1,6 @@
 pub(crate) mod effects;
 mod element;
+pub(crate) use element::margin::viewport_overflow;
 pub mod fonts;
 pub(crate) mod frame;
 pub(crate) mod hit;
@@ -90,6 +91,7 @@ pub(crate) struct ViewState {
     #[cfg(target_os = "macos")]
     canvas: Cell<(u32, u8)>,
     canvas_layers: Cell<Option<u64>>,
+    rtl: Cell<bool>,
     // The content box of the canvas whose drawable content prepaints.
     drawing: Cell<renderer::Point<renderer::Pixels>>,
     // The page asked for a `paint` event after the frame.
@@ -289,6 +291,7 @@ impl ViewState {
             #[cfg(target_os = "macos")]
             canvas: Cell::default(),
             canvas_layers: Cell::default(),
+            rtl: Cell::default(),
             drawing: Cell::default(),
             paint: Cell::default(),
             kept_frame: RefCell::default(),

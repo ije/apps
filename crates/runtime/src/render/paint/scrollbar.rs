@@ -173,17 +173,38 @@ impl Look {
         Some(look)
     }
 
-    pub(crate) fn shown(&self, axes: [bool; 2], max: Point<Pixels>) -> [bool; 2] {
+    pub(crate) fn shown(&self, axes: [bool; 2], handle: &ScrollRef) -> [bool; 2] {
+        let (max, needed) = (handle.extent(), handle.bars());
         let max = [max.x, max.y];
         [0, 1].map(|axis| {
             axes[axis]
                 && match &self.custom {
-                    Some((size, _)) => {
-                        size[axis] > 0. && (self.forced[axis] || max[axis] > px(0.5))
-                    }
+                    Some((size, _)) => size[axis] > 0. && (self.forced[axis] || needed[axis]),
                     None => max[axis] > px(0.5),
                 }
         })
+    }
+
+    // Finds the bars that the content needs after a layout with bars of this room.
+    fn need(&self, axes: [bool; 2], handle: &ScrollRef, room: [f32; 2], first: bool) {
+        if self.custom.is_none() {
+            return;
+        }
+        let max = handle.extent();
+        let max = [max.x, max.y].map(f32::from);
+        let mut needed = max.map(|max| max > 0.5);
+        // Like in Chrome, two bars that are there only because of each other go.
+        let [bottom, right] = room;
+        if needed == [true; 2]
+            && axes == [true; 2]
+            && self.forced == [false; 2]
+            && !self.gutter
+            && max[0] <= right + 0.5
+            && max[1] <= bottom + 0.5
+        {
+            needed = [false; 2];
+        }
+        handle.set_bars(needed, first);
     }
 
     pub(crate) fn space(&self, shown: [bool; 2]) -> [f32; 2] {
@@ -199,7 +220,7 @@ pub(crate) fn room(
     style: &Style,
     extras: &crate::style::Extras,
     units: &css::value::units::Lengths,
-    extent: Point<Pixels>,
+    handle: &ScrollRef,
     gutters: bool,
 ) -> [f32; 4] {
     let Some(mut look) = Look::new(style, extras.scrollbars.as_deref(), units, None) else {
@@ -208,7 +229,7 @@ pub(crate) fn room(
     let scrolls = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
         .map(|prop| (style.get(prop)).is_some_and(|value| matches!(value, "auto" | "scroll")));
     look.gutter &= gutters;
-    let [bottom, right] = look.space(look.shown(scrolls, extent));
+    let [bottom, right] = look.space(look.shown(scrolls, handle));
     let both = gutters
         && style
             .get(Prop::SCROLLBAR_GUTTER)
@@ -364,10 +385,11 @@ impl Scrollbar {
             state.offset = Some(drawn);
         }
         let max = high - low;
-        let shown = look.shown(self.axes, max);
+        look.need(self.axes, &self.handle, self.reserved, !window.redrawing());
+        let shown = look.shown(self.axes, &self.handle);
         let space = look.space(shown);
         if space != self.reserved {
-            window.redraw();
+            window.rebar();
         }
         if !shown.contains(&true) {
             return None;

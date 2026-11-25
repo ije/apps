@@ -404,7 +404,7 @@ impl ViewState {
         } else {
             Vec::new()
         };
-        let viewport = page::viewport(dom, &styles, html, body, background);
+        let viewport = page::viewport(&doc, dom, &styles, html, body, background);
         if !dom.layout.container_pass {
             let mut moved = 0.;
             dom.layout.cull.scrolled.clear();
@@ -508,6 +508,7 @@ impl ViewState {
             top_layer: &top_layer,
             tree,
             culls: &Cell::new(0),
+            port: [width - viewport.space[1], height - viewport.space[0]],
             resized: false,
             settled: false,
             reads: &reads,
@@ -522,8 +523,10 @@ impl ViewState {
             plan: Default::default(),
         };
         {
+            let frame = [build.port[0], build.port[1], frame[2], frame[3]];
             let mut kept = self.kept_frame.borrow_mut();
-            if kept.0[2..] != frame[2..] || kept.1 != top_layer {
+            let turned = self.rtl.replace(viewport.rtl) != viewport.rtl;
+            if kept.0[2..] != frame[2..] || kept.1 != top_layer || turned {
                 kept.1 = top_layer.clone();
                 self.kept.borrow_mut().clear();
                 self.plans.borrow_mut().clear();
@@ -547,15 +550,10 @@ impl ViewState {
         }
         #[cfg(debug_assertions)]
         let zone = build.zone.clone();
-        let root = element(
-            &build,
-            0,
-            [width - viewport.space[1], height - viewport.space[0]],
-            [width - viewport.space[1], height - viewport.space[0]],
-            None,
-        );
+        let port = build.port;
+        let root = element(&build, 0, port, port, None);
         build.zone = None;
-        let overlay = page::overlay(&build, &backdrops, [width, height]);
+        let overlay = page::overlay(&build, &backdrops);
         if !same {
             patch::patch(&build, window);
         }
@@ -565,7 +563,7 @@ impl ViewState {
             #[cfg(debug_assertions)]
             zone,
             #[cfg(debug_assertions)]
-            [width - viewport.space[1], height - viewport.space[0]],
+            port,
         );
         drop(build);
         let mut reads = reads.into_inner();

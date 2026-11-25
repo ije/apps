@@ -1,6 +1,6 @@
 use super::Build;
 use super::kept::{Query, hashed};
-use super::margin::float_side;
+use super::margin::{float_side, viewport_overflow};
 use crate::css;
 use crate::css::properties::Prop;
 use crate::{
@@ -16,7 +16,27 @@ pub(super) fn parent_style<'b>(
     id: usize,
     prop: Prop,
 ) -> Option<&'b str> {
-    box_parent(doc, styles, id).and_then(|parent| styles.values[parent].get(prop))
+    box_parent(doc, styles, id).and_then(|parent| match (parent, prop) {
+        (0, Prop::DIRECTION) => page_direction(doc, styles),
+        _ => styles.values[parent].get(prop),
+    })
+}
+
+// Like in Chrome, the viewport takes the direction of the body, or of the root when there is no body.
+pub(crate) fn page_direction<'b>(doc: &Document, styles: &'b ComputedStyles) -> Option<&'b str> {
+    let child = |parent: usize, tag: &str| {
+        (doc.nodes[parent].children.iter().copied()).find(|&id| doc.nodes[id].tag == tag)
+    };
+    let html = child(0, "html")?;
+    styles.values[child(html, "body").unwrap_or(html)].get(Prop::DIRECTION)
+}
+
+pub(super) fn rtl(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
+    let direction = match id {
+        0 => page_direction(doc, styles),
+        _ => styles.values[id].get(Prop::DIRECTION),
+    };
+    direction == Some("rtl")
 }
 
 pub(super) fn row_fill(doc: &Document, styles: &ComputedStyles, id: usize) -> Option<Color> {
@@ -288,10 +308,7 @@ pub(super) fn href(node: &crate::dom::Node) -> Option<&str> {
 }
 
 pub(super) fn scrolled(handle: Option<&renderer::ScrollRef>) -> Option<[bool; 2]> {
-    handle.map(|handle| {
-        let max = handle.extent();
-        [max.x > px(0.5), max.y > px(0.5)]
-    })
+    handle.map(renderer::ScrollRef::bars)
 }
 
 pub(super) fn pictured(
@@ -372,7 +389,6 @@ pub(super) fn scroller(
     doc: &Document,
     styles: &ComputedStyles,
     mut ancestors: impl Iterator<Item = usize>,
-    handles: &rustc_hash::FxHashMap<usize, renderer::ScrollRef>,
     mut escape: u8,
 ) -> usize {
     ancestors
@@ -389,8 +405,7 @@ pub(super) fn scroller(
                             .get(prop)
                             .is_some_and(|value| matches!(value, "auto" | "scroll" | "hidden"))
                     })
-                && (!matches!(doc.nodes[ancestor].tag.as_str(), "html" | "body")
-                    || handles.contains_key(&ancestor))
+                && !viewport_overflow(doc, styles, ancestor)
         })
         .unwrap_or(0)
 }

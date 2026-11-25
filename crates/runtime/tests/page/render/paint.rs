@@ -1582,3 +1582,64 @@ fn scroll_snaps_follow_chrome_in_events_focus_and_bars() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn page_bars_follow_chrome() {
+    let text = run_hidden(
+        r#"
+        const step = async (page, name, code) => {
+            await load(page);
+            for (let i = 0; i < 2; i++) await win.webContents.capturePage();
+            console.log('BARS ' + name + ' ' + await run(`(() => { const d = document.documentElement, at = id => { const r = document.getElementById(id).getBoundingClientRect(); return [r.x, r.y, r.right, r.bottom].map(Math.round); }; const size = () => [d.clientWidth - innerWidth, d.clientHeight - innerHeight, d.scrollWidth - innerWidth, d.scrollHeight - innerHeight]; return [${code}].flat().join(); })()`));
+        };
+        // The fixed box stops at the bars, also one that its right and bottom insets place.
+        await step('auto.html', 'fixed', "at('all').map((v, i) => i < 2 ? v : v - [innerWidth, innerHeight][i - 2]), at('end')[2] - innerWidth, at('end')[3] - innerHeight");
+        await step('scroll.html', 'scroll', "(scrollTo(0, 70), scrollY), (scrollTo(9999, 9999), [scrollX, scrollY].map((v, i) => v - (d[['scrollWidth', 'scrollHeight'][i]] - d[['clientWidth', 'clientHeight'][i]])))");
+        await step('hidden.html', 'hidden', "size(), (scrollTo(50, 60), [scrollX, scrollY])");
+        await step('both.html', 'both', "size().slice(0, 2), (m.style.height = '10px', d.scrollHeight, size()), (m.style.height = '3000px', d.scrollHeight, size().slice(0, 2))");
+        await step('rtl.html', 'rtl', "(scrollTo(-9999, 0), [scrollX + d.scrollWidth - d.clientWidth]), (scrollTo(9999, 0), scrollX)");
+        await step('ltr.html', 'ltr', "(scrollTo(50, 0), scrollX), (scrollTo(-50, 0), scrollX)");
+        "#,
+        &[
+            (
+                "auto.html",
+                "<style>body{margin:0}::-webkit-scrollbar{width:20px;height:14px}</style><body><div id=all style='position:fixed;inset:0'></div><div id=end style='position:fixed;right:0;bottom:0;width:10px;height:10px'></div><div style='width:3000px;height:3000px'></div></body>",
+            ),
+            (
+                "scroll.html",
+                "<style>html{overflow-y:scroll}body{margin:0}::-webkit-scrollbar{width:20px;height:14px}</style><body><div style='width:3000px;height:3000px'></div></body>",
+            ),
+            (
+                "hidden.html",
+                "<style>html{overflow:hidden}body{margin:0}</style><body><div style='width:3000px;height:3000px'></div><script>document.querySelector('div').style.cssText = `width:${innerWidth + 100}px;height:${innerHeight + 200}px`</script></body>",
+            ),
+            (
+                "both.html",
+                "<style>body{margin:0}::-webkit-scrollbar{width:20px;height:14px}</style><body><div id=m></div><script>globalThis.m = document.getElementById('m'); m.style.cssText = `width:${innerWidth - 10}px;height:3000px`</script></body>",
+            ),
+            (
+                "rtl.html",
+                "<style>body{margin:0;direction:rtl}::-webkit-scrollbar{width:20px;height:14px}</style><body><div style='width:3000px;height:3000px'></div></body>",
+            ),
+            (
+                "ltr.html",
+                "<style>html{direction:rtl}body{margin:0;direction:ltr}</style><body><div style='width:3000px;height:3000px'></div></body>",
+            ),
+        ],
+    );
+    for line in [
+        "fixed 0,0,-20,-14,-20,-14",
+        "scroll 70,0,0",
+        "hidden 0,0,100,200,50,60",
+        "both -20,-14,0,0,0,0,-20,-14",
+        "rtl 0,0",
+        "ltr 50,0",
+    ] {
+        assert!(
+            text.lines()
+                .any(|out| out.trim_end() == format!("BARS {line}")),
+            "{line}: {text}"
+        );
+    }
+}

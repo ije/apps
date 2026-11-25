@@ -267,6 +267,12 @@ pub(super) fn container(build: &Build<'_>, id: usize) -> bool {
 }
 
 // The overflow of the body goes to the viewport when the html box has none, so the body itself doesn't clip.
+// The viewport takes the overflow of the root, or of the body when the root has none.
+pub(crate) fn viewport_overflow(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
+    doc.nodes[id].tag == "html" && doc.nodes[id].parent == Some(0)
+        || body_overflow_moves(doc, styles, id)
+}
+
 pub(super) fn body_overflow_moves(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
     doc.nodes[id].tag == "body"
         && doc.nodes[id].parent.is_some_and(|parent| {

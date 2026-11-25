@@ -51,6 +51,8 @@ pub(crate) struct Build<'a> {
     pub(super) top_layer: &'a [usize],
     pub(super) tree: &'a renderer::Tree,
     pub(super) culls: &'a std::cell::Cell<usize>,
+    // The viewport without the scroll bars of the page.
+    pub(super) port: [f32; 2],
     pub(super) resized: bool,
     pub(super) settled: bool,
     pub(super) reads: &'a RefCell<Vec<Read>>,
@@ -156,15 +158,9 @@ impl<'a> Build<'a> {
                 };
                 let ancestors = self.ancestors.iter().rev().copied();
                 let scroller = if below {
-                    scroller(
-                        doc,
-                        styles,
-                        std::iter::once(id).chain(ancestors),
-                        handles,
-                        escape,
-                    )
+                    scroller(doc, styles, std::iter::once(id).chain(ancestors), escape)
                 } else {
-                    scroller(doc, styles, ancestors, handles, escape)
+                    scroller(doc, styles, ancestors, escape)
                 };
                 hashed((
                     scroller,
@@ -225,7 +221,7 @@ impl<'a> Build<'a> {
             }
             Query::Collapse => hashed(collapses(doc, styles, id)),
             Query::Value(node) => hashed(&doc.nodes[node as usize].value),
-            Query::Viewport => hashed(styles.lengths[id].viewport.map(f32::to_bits)),
+            Query::Viewport => hashed(self.port.map(f32::to_bits)),
             Query::Theme => hashed(crate::native::theme_state() & 1),
             Query::LineBase(node) => hashed(definite_line(doc, styles, node as usize)),
             Query::Shrinks(node) => hashed(shrinks_around(doc, styles, node as usize)),

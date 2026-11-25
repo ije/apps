@@ -1,3 +1,4 @@
+use crate::render::viewport_overflow;
 use crate::{
     css::properties::{Prop, Style},
     dom::Document,
@@ -54,7 +55,7 @@ pub(super) fn update(doc: &Document, dom: &mut PageState) -> bool {
         let units = &styles.lengths[node];
         let bars = match id {
             0 => [0., geometry.page_bars[1], geometry.page_bars[0], 0.],
-            _ => scrollbar::room(style, styles.extras(node), units, handle.extent(), false),
+            _ => scrollbar::room(style, styles.extras(node), units, handle, false),
         };
         let range = handle.range();
         let key: Key = (
@@ -170,7 +171,7 @@ pub(super) fn update(doc: &Document, dom: &mut PageState) -> bool {
                 });
             }
             // The areas in an inner scroll container belong to it.
-            if !scrolls(style) {
+            if !scrolls(style) || viewport_overflow(doc, &styles, child) {
                 stack.extend(styles.flat_children(doc, child).iter().rev());
             }
         }
