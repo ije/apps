@@ -315,6 +315,15 @@ fn the_wheel_scrolls_the_scrollback() {
 }
 
 #[test]
+fn the_scrollback_keeps_thousands_of_rows() {
+    let test = Test::new(113, 32);
+    for row in 1..=5000 {
+        test.feed(&format!("{row}\r\n"));
+    }
+    assert!(test.info().contains(r#""total":5001"#), "{}", test.info());
+}
+
+#[test]
 fn frames_have_the_images_of_the_screen() {
     let test = Test::new(10, 4);
     unsafe { apps_terminal_resize(test.0, 10, 4, 10, 20) };
