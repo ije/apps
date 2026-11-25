@@ -18,6 +18,7 @@
 #include "JSNativeStdFunction.h"
 #include "APIUtils.h"
 #include "InitializeThreading.h"
+#include "JSBasePrivate.h"
 #include "JSContextRef.h"
 #include "JSGlobalObject.h"
 #include "JSLock.h"
@@ -25,6 +26,7 @@
 #include "JSObjectInlines.h"
 #include "Options.h"
 #include "ObjectConstructor.h"
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -34,6 +36,10 @@ using namespace JSC;
 
 static void initializeAOT()
 {
+#if OS(LINUX) && !APPS_JSC_AOT_RUNTIME
+    // The CLI also runs libJavaScriptCore. Engines that share the default signal deadlock when they suspend threads.
+    JSConfigureSignalForGC(SIGUSR2);
+#endif
     initialize();
     static std::once_flag helpers;
     std::call_once(helpers, [] { AOT::BuiltinBindings::bindNativeHelpersOfEngine(); });
@@ -142,7 +148,7 @@ extern constinit const AOT::ModuleHost appsAOTModuleHost {
 // Match build-jsc.sh's bun_revision: Bun's IR and built-in table must match this compiler.
 extern "C" JS_EXPORT const char* JSGetAOTCompilerRevision()
 {
-    return "4ce14ba8b150c3c7315284f3df8480eb4158b38a";
+    return "2e321d89067f623e648fb933daed375dc9e68bca";
 }
 
 extern "C" JS_EXPORT bool JSCompileAOT(const uint8_t* bytes, size_t size, const char* path, uint32_t* entries, size_t count, size_t* layout, char* error, size_t capacity)

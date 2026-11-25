@@ -347,7 +347,9 @@ pub fn library_path(executable: &Path, platform: &str) -> Result<PathBuf> {
 // WebKitGTK, which loads the system JavaScriptCore with the same C++ symbols. Deep binding makes Bun's
 // library resolve its own symbols first, not the system copy's.
 #[cfg(unix)]
-unsafe fn open_library(path: &Path) -> std::result::Result<Library, libloading::Error> {
+/// # Safety
+/// The initializers of the library run.
+pub unsafe fn open_library(path: &Path) -> std::result::Result<Library, libloading::Error> {
     use libloading::os::unix::{Library, RTLD_LOCAL, RTLD_NOW};
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     let flags = RTLD_NOW | RTLD_LOCAL | libc::RTLD_NODELETE | libc::RTLD_DEEPBIND;
@@ -357,7 +359,9 @@ unsafe fn open_library(path: &Path) -> std::result::Result<Library, libloading::
 }
 
 #[cfg(not(unix))]
-unsafe fn open_library(path: &Path) -> std::result::Result<Library, libloading::Error> {
+/// # Safety
+/// The initializers of the library run.
+pub unsafe fn open_library(path: &Path) -> std::result::Result<Library, libloading::Error> {
     unsafe { Library::new(path) }
 }
 

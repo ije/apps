@@ -38,7 +38,18 @@ runs:
             rm -f /usr/bin/link.exe
             triplet=${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}-windows-static-md
             vcpkg install icu:$triplet
-            options="-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DICU_ROOT=$VCPKG_INSTALLATION_ROOT/installed/$triplet"
+            # The C++ library of MSVC 14.52 needs Clang 22. The image has Clang 20.
+            case $RUNNER_ARCH in
+              ARM64) llvm=woa64 sha256=76f44ef1ba6eeb5a65904e9500f042f588fade49952778ce48f0374daa934396 ;;
+              *) llvm=win64 sha256=16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c ;;
+            esac
+            temp=$(cygpath -m "$RUNNER_TEMP")
+            curl -fsSL --retry 5 -o "$temp/llvm.exe" "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-$llvm.exe"
+            echo "$sha256 *$temp/llvm.exe" | sha256sum -c
+            7z x -y -bso0 -bsp0 "-o$temp/llvm" "$temp/llvm.exe"
+            clang=$temp/llvm/bin/clang-cl.exe
+            "$clang" --version
+            options="-DCMAKE_C_COMPILER=$clang -DCMAKE_CXX_COMPILER=$clang -DICU_ROOT=$VCPKG_INSTALLATION_ROOT/installed/$triplet"
             ;;
         esac
         if [[ '${{ inputs.aot }}' == true ]]; then
