@@ -10,7 +10,7 @@ use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::{
     cell::{OnceCell, RefCell},
-    mem::size_of,
+    mem::{ManuallyDrop, size_of},
     num::NonZeroU64,
     rc::Rc,
     sync::Arc,
@@ -76,7 +76,9 @@ pub(super) struct Gpu {
 }
 
 thread_local! {
-    static GPU: RefCell<Option<Rc<Gpu>>> = const { RefCell::new(None) };
+    // Not dropped at exit: thread locals drop after the display connection closes, and EGL would use it.
+    static GPU: ManuallyDrop<RefCell<Option<Rc<Gpu>>>> =
+        const { ManuallyDrop::new(RefCell::new(None)) };
 }
 
 fn texture(
@@ -139,7 +141,7 @@ impl Gpu {
         window: RawWindowHandle,
     ) -> Result<(Rc<Self>, Surface<'static>)> {
         let kept = GPU
-            .with_borrow(Clone::clone)
+            .with(|slot| slot.borrow().clone())
             .filter(|gpu| !gpu.lost.load(Relaxed));
         let api = match &kept {
             Some(gpu) => gpu.api.clone(),
@@ -207,7 +209,7 @@ impl Gpu {
                 continue;
             }
             let gpu = Rc::new(Self::build(api, adapter, device, queue));
-            GPU.with_borrow_mut(|slot| *slot = Some(gpu.clone()));
+            GPU.with(|slot| *slot.borrow_mut() = Some(gpu.clone()));
             return Ok((gpu, surface));
         }
         bail!("no GPU can draw to the window: {}", refusals.join("; "))
