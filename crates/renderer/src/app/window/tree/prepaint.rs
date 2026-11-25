@@ -553,6 +553,14 @@ impl Tree {
         let slot = &self.slots[index as usize];
         let (layout, reverse) = (slot.layout, slot.style.scrolls_from_end());
         let (padding, border) = (layout.padding, layout.border);
+        // The padding without the room of scroll bars, which is no part of the scrolled area.
+        let bars = slot.style.bars;
+        let own = [
+            padding.top - crate::geometry::to_layout_unit(bars.top.0, scale),
+            padding.right - crate::geometry::to_layout_unit(bars.right.0, scale),
+            padding.bottom - crate::geometry::to_layout_unit(bars.bottom.0, scale),
+            padding.left - crate::geometry::to_layout_unit(bars.left.0, scale),
+        ];
         // The extent before it snaps to device pixels, which `clamp` rounds like Chrome.
         let start = point(
             origin.x + border.left + padding.left,
@@ -580,14 +588,8 @@ impl Tree {
                 near.y -= layout.margin.top.max(0.);
             }
             let [inner_near, inner_far] = self.far(id, scale, true);
-            far = far.max(point(
-                inner_far.x - padding.right,
-                inner_far.y - padding.bottom,
-            ));
-            near = near.min(point(
-                inner_near.x + padding.left,
-                inner_near.y + padding.top,
-            ));
+            far = far.max(point(inner_far.x - own[1], inner_far.y - own[2]));
+            near = near.min(point(inner_near.x + own[3], inner_near.y + own[0]));
             min = min.min(point(origin.x + near.x, origin.y + near.y));
             max = max.max(point(origin.x + far.x, origin.y + far.y));
         }

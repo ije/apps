@@ -845,7 +845,9 @@ pub(super) fn create(
         el.style().overflow.y = overflow[1];
     }
     let scrolls = overflow.map(|axis| axis == renderer::Overflow::Scroll);
-    let look = if scrolls.contains(&true) {
+    let gutter = overflow[1] == renderer::Overflow::Hidden
+        && (style.get(Prop::SCROLLBAR_GUTTER)).is_some_and(|value| value.starts_with("stable"));
+    let look = if scrolls.contains(&true) || gutter {
         let backdrop = backdrop(doc, styles, id);
         reader.log(
             Query::Backdrop(id as u32),
@@ -862,6 +864,7 @@ pub(super) fn create(
         .map(|mut look| {
             if page {
                 look.forced = [false; 2];
+                look.gutter = false;
             }
             look
         })
@@ -898,6 +901,12 @@ pub(super) fn create(
             .pr(px(padding[1]))
             .pb(px(padding[2]))
             .pl(px(padding[3]));
+        el.style().bars = renderer::Edges {
+            top: px(0.),
+            right: px(reserved[1]),
+            bottom: px(reserved[0]),
+            left: px(opposite),
+        };
     }
     let mut margin = margins(
         build,
@@ -1607,7 +1616,8 @@ pub(super) fn create(
         if scrolls.contains(&true)
             || !page
                 && overflow.contains(&renderer::Overflow::Hidden)
-                && overscroll != renderer::Point::default()
+                && (overscroll != renderer::Point::default()
+                    || (style.get(Prop::SCROLL_SNAP_TYPE)).is_some_and(|kind| kind != "none"))
         {
             Some(scroll.entry(id).or_default().clone())
         } else if overflow.contains(&renderer::Overflow::Hidden) {

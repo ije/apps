@@ -96,7 +96,7 @@
   };
   // As in Chrome, a scroll lays out a box that was no scroll box in the last layout, so it scrolls only if it can,
   // and its offset stays in its range.
-  const scrollTo = (node, left, top, behavior = null, by = false) => {
+  const scrollTo = (node, left, top, behavior = null, by = null) => {
     const fresh = !rootElement(node) && !(marks?.[node._id] & 2);
     if (fresh) layout();
     const offset = call('dom.scroll', node._id, left, top, behavior, by);
@@ -137,6 +137,8 @@
   };
   const owned = (doc, node) => { if (doc !== document) node._owner = doc; return node; };
   const rootElement = node => node._m.tag === 'html' && node._m.up === records[0];
+  // The viewport without the scroll bars of the page.
+  const viewSize = () => { layout(); const [width, height, , , bars] = host('dom.viewport'); return [width - bars[1], height - bars[0]]; };
   const pageScroller = node => { layout(); return rootElement(node) && !(marks[node._id] & 2); };
   const create = (tag, text = '', from = -1) => {
     if (!names.has(tag)) { if (!/^[a-z][a-z0-9-]*$/i.test(tag) && !types[tag]) throw new DOMException('Invalid tag', 'InvalidCharacterError'); names.set(tag, tag[0] === '#' ? tag === '#fragment' ? '#document-fragment' : tag : tag.toUpperCase()); }
@@ -1061,26 +1063,26 @@
     }
     getBoundingClientRect() { const i = slot(this), m = geometry; return i < 0 ? new DOMRect() : new DOMRect(m[i], m[i + 1], m[i + 2], m[i + 3]); }
     getClientRects() { if (slot(this) < 0) return listOf(DOMRectList, []); const parts = call('dom.fragments', this._id); return listOf(DOMRectList, parts ? parts.map(part => new DOMRect(...part)) : [this.getBoundingClientRect()]); }
-    get clientWidth() { return rootElement(this) ? innerWidth : Math.round(client(this)[2]); } get clientHeight() { return rootElement(this) ? innerHeight : Math.round(client(this)[3]); }
+    get clientWidth() { return rootElement(this) ? Math.round(viewSize()[0]) : Math.round(client(this)[2]); } get clientHeight() { return rootElement(this) ? Math.round(viewSize()[1]) : Math.round(client(this)[3]); }
     get clientLeft() { return Math.round(client(this)[0]); } get clientTop() { return Math.round(client(this)[1]); }
     get scrollTop() { return scrollOf(this, 5); } set scrollTop(value) { scrollTo(this, null, Number(value)); }
     get scrollLeft() { return scrollOf(this, 4); } set scrollLeft(value) { scrollTo(this, Number(value), null); }
-    get scrollWidth() { return pageScroller(this) ? Math.round(innerWidth + metric(document, 6)) : extent(this, 0); } get scrollHeight() { return pageScroller(this) ? Math.round(innerHeight + metric(document, 7)) : extent(this, 1); }
+    get scrollWidth() { return pageScroller(this) ? Math.round(viewSize()[0] + metric(document, 6)) : extent(this, 0); } get scrollHeight() { return pageScroller(this) ? Math.round(viewSize()[1] + metric(document, 7)) : extent(this, 1); }
     scrollTo(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); scrollTo(this, left ?? null, top ?? null, behavior); }
     scroll(left, top) { this.scrollTo(left, top); }
-    scrollBy(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); scrollTo(this, this.scrollLeft + (Number(left) || 0), this.scrollTop + (Number(top) || 0), behavior, true); }
+    scrollBy(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); scrollTo(this, this.scrollLeft + (Number(left) || 0), this.scrollTop + (Number(top) || 0), behavior, 'by'); }
     scrollIntoView(options = {}) {
       if (typeof options === 'boolean') options = { block: options ? 'start' : 'end' };
       const target = this.getBoundingClientRect(), own = getComputedStyle(this), margin = side => parseFloat(own['scrollMargin' + side]) || 0;
       let left = target.left - margin('Left'), top = target.top - margin('Top');
       const width = target.width + margin('Left') + margin('Right'), height = target.height + margin('Top') + margin('Bottom');
       for (let p = this.assignedSlot ?? this.parentElement ?? this.getRootNode().host; p; p = p.assignedSlot ?? p.parentElement ?? p.getRootNode().host) {
-        const style = getComputedStyle(p), root = p === document.documentElement, bounds = root ? new DOMRect(0, 0, innerWidth, innerHeight) : p.getBoundingClientRect(), to = [null, null]; let scrollable = false;
+        const style = getComputedStyle(p), root = p === document.documentElement, bounds = root ? new DOMRect() : p.getBoundingClientRect(), [viewWidth, viewHeight] = root ? viewSize() : [], to = [null, null]; let scrollable = false;
         const padding = (side, extent) => { const value = style['scrollPadding' + side]; return value.endsWith('%') ? parseFloat(value) / 100 * extent : parseFloat(value) || 0; };
         for (const [axis, align, start, size, edge, client, near, far] of [
-          ['Y', options.block ?? 'start', top, height, root ? 0 : bounds.top + p.clientTop, root ? innerHeight : p.clientHeight, 'Top', 'Bottom'],
+          ['Y', options.block ?? 'start', top, height, root ? 0 : bounds.top + p.clientTop, root ? viewHeight : p.clientHeight, 'Top', 'Bottom'],
           // `start` and `end` are logical, so in a right-to-left box `end` is its left side.
-          ['X', style.direction === 'rtl' ? { start: 'end', end: 'start' }[options.inline] ?? options.inline ?? 'nearest' : options.inline ?? 'nearest', left, width, root ? 0 : bounds.left + p.clientLeft, root ? innerWidth : p.clientWidth, 'Left', 'Right'],
+          ['X', style.direction === 'rtl' ? { start: 'end', end: 'start' }[options.inline] ?? options.inline ?? 'nearest' : options.inline ?? 'nearest', left, width, root ? 0 : bounds.left + p.clientLeft, root ? viewWidth : p.clientWidth, 'Left', 'Right'],
         ]) {
           // The root always scrolls the page, as the viewport.
           if (!root && !['auto','scroll','hidden'].includes(style['overflow' + axis] || style.overflow)) continue;
@@ -1093,9 +1095,10 @@
           else if (align === 'nearest' || align === 'if-needed') delta = before < 0 && after > 0 ? 0 : before < 0 ? (size <= extent ? before : after) : after > 0 ? (size <= extent ? after : before) : 0;
           if (delta) to[axis === 'Y' ? 1 : 0] = (axis === 'Y' ? p.scrollTop : p.scrollLeft) + delta;
         }
-        if (to[0] !== null || to[1] !== null) {
-          const previous = [p.scrollLeft, p.scrollTop], next = call('dom.scroll', p._id, to[0], to[1], options.behavior ?? null);
-          left -= next[0] - previous[0]; top -= next[1] - previous[1];
+        // Like Chrome, a box that does not move can still snap to another area, like one with the focus.
+        if (scrollable) {
+          const previous = [p.scrollLeft, p.scrollTop], next = call('dom.scroll', p._id, to[0], to[1], options.behavior ?? null, 'into');
+          if (next) { left -= next[0] - previous[0]; top -= next[1] - previous[1]; }
         }
         if (scrollable && options.container === 'nearest') break;
       }
@@ -3526,7 +3529,7 @@
   Object.assign(globalThis,{FontFace,FontFaceSet});document.fonts=new FontFaceSet();
   globalThis.NodeFilter = { SHOW_ALL: 0xffffffff, SHOW_ELEMENT: 1, SHOW_ATTRIBUTE: 2, SHOW_TEXT: 4, SHOW_CDATA_SECTION: 8, SHOW_PROCESSING_INSTRUCTION: 64, SHOW_COMMENT: 128, SHOW_DOCUMENT: 256, SHOW_DOCUMENT_TYPE: 512, SHOW_DOCUMENT_FRAGMENT: 1024, FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3 };
   Object.defineProperties(globalThis, { innerWidth: { get: () => host('dom.viewport')[0] }, innerHeight: { get: () => host('dom.viewport')[1] }, devicePixelRatio: { get: () => host('dom.viewport')[2] } });
-  class VisualViewport extends EventTarget { get width() { return innerWidth; } get height() { return innerHeight; } get scale() { return 1; } get offsetLeft() { return 0; } get offsetTop() { return 0; } get pageLeft() { return scrollX; } get pageTop() { return scrollY; } }
+  class VisualViewport extends EventTarget { get width() { return viewSize()[0]; } get height() { return viewSize()[1]; } get scale() { return 1; } get offsetLeft() { return 0; } get offsetTop() { return 0; } get pageLeft() { return scrollX; } get pageTop() { return scrollY; } }
   globalThis.VisualViewport = VisualViewport; globalThis.visualViewport = new VisualViewport();
   const page = axis => ({ get: () => document.documentElement?.[axis] ?? 0, configurable: true });
   Object.defineProperties(globalThis, { scrollX: page('scrollLeft'), scrollY: page('scrollTop'), pageXOffset: page('scrollLeft'), pageYOffset: page('scrollTop') });
@@ -4097,7 +4100,7 @@
   globalThis.__appsWebviewReply = (id, value, error) => { const reply = webviewReplies.get(id); webviewReplies.delete(id); if (error === null) reply?.[0](value); else reply?.[1](new Error(error)); };
   globalThis.__appsMediaChanged=()=>{
     if (!mediaQueries.size) return;
-    const viewport = host('dom.viewport').join(':');
+    const viewport = host('dom.viewport').slice(0, 4).join(':');
     if (viewport === mediaViewport) return;
     mediaViewport = viewport;
     for (const reference of mediaQueries) {
@@ -4151,11 +4154,14 @@
       const value = observer._boxes?.get(target) === 'border-box' ? borderWidth + ':' + borderHeight : width + ':' + height; observer.targets.set(key, [rect.width, rect.height, at, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: borderWidth, blockSize: borderHeight }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) try { observer.callback(entries, observer); } catch (error) { report(error); } }
     // Resize observers measure the last frame before scroll listeners change the page, so its styles are still computed.
     // `scrollend` fires when a box has not scrolled for 100 ms and is not on the way to a snap area, and only pages that listen for it pay for the timers.
-    for (const id of call('dom.scrollEvents')) {
-      if (id.snaps) { for (const [box, done, block, inline] of id.snaps) { const event = new SnapEvent(snapTargets, done ? 'scrollsnapchange' : 'scrollsnapchanging', { bubbles: !box }); snapTargets.set(event, [block, inline].map(area => area === null ? null : wrap(area))); wrap(box)?.dispatchEvent(event); } continue; }
+    for (const event of call('dom.scrollEvents')) {
       // The last item can list `content-visibility: auto` boxes, each with whether it skips its contents now.
-      if (typeof id !== 'number') { for (let i = 0; i < id.length; i += 2) wrap(id[i])?.dispatchEvent(new ContentVisibilityAutoStateChangeEvent('contentvisibilityautostatechange', { bubbles: true, skipped: !!id[i + 1] })); continue; }
-      const node = wrap(id); if (!node) continue; hoverVersion = -1; node.dispatchEvent(new Event('scroll', { bubbles: !id })); if (ending) { clearTimeout(scrollEnds.get(node)); const end = () => { if (call('dom.snapping', id)) { scrollEnds.set(node, setTimeout(end, 100)); return; } scrollEnds.delete(node); node.dispatchEvent(new Event('scrollend', { bubbles: !id })); }; scrollEnds.set(node, setTimeout(end, 100)); } }
+      if (event.skips) { for (const [id, skipped] of event.skips) wrap(id)?.dispatchEvent(new ContentVisibilityAutoStateChangeEvent('contentvisibilityautostatechange', { bubbles: true, skipped })); continue; }
+      const [id, kind, block, inline] = event, node = wrap(id); if (!node) continue;
+      if (kind === 2 || kind === 3) { const event = new SnapEvent(snapTargets, kind === 3 ? 'scrollsnapchange' : 'scrollsnapchanging', { bubbles: !id }); snapTargets.set(event, [block, inline].map(area => area === null ? null : wrap(area))); node.dispatchEvent(event); continue; }
+      if (kind === 4) { clearTimeout(scrollEnds.get(node)); scrollEnds.delete(node); node.dispatchEvent(new Event('scrollend', { bubbles: !id })); continue; }
+      hoverVersion = -1; node.dispatchEvent(new Event('scroll', { bubbles: !id })); if (!kind && ending) { clearTimeout(scrollEnds.get(node)); const end = () => { if (call('dom.snapping', id)) { scrollEnds.set(node, setTimeout(end, 100)); return; } scrollEnds.delete(node); node.dispatchEvent(new Event('scrollend', { bubbles: !id })); }; scrollEnds.set(node, setTimeout(end, 100)); }
+    }
     __appsMediaChanged();
     if(!intersectionObservers.size)return;
     call('dom.layout',false,true);

@@ -247,6 +247,8 @@ style! {
     aspect_ratio: Option<f32> = None,
     margin: Edges<Length> = Edges::all(ZERO),
     padding: Edges<Length> = Edges::all(ZERO),
+    /// The part of the padding that scroll bars take. All scrolled content stays clear of it.
+    bars: Edges<Pixels> = Edges::default(),
     border_widths: Edges<Pixels> = Edges::default(),
     align_items: Option<AlignItems> = None,
     align_self: Option<AlignItems> = None,

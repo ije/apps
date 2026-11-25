@@ -1508,7 +1508,10 @@ impl NodePass<'_> {
                             style
                                 .get(prop)
                                 .is_some_and(|value| matches!(value, "auto" | "scroll"))
-                        }))
+                        })
+                    || style.get(Prop::OVERFLOW_Y) == Some("hidden")
+                        && (style.get(Prop::SCROLLBAR_GUTTER))
+                            .is_some_and(|value| value.starts_with("stable")))
             {
                 if !hovered.is_empty() {
                     for (prop, value) in &thumb {

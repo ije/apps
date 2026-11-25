@@ -1,4 +1,4 @@
-use super::snap::ScrollSnaps;
+use super::snap::{ScrollSnaps, Snap};
 use crate::{
     App, Length, Overflow, Overscroll, Pixels, Point, Rect, Region, Size, Style, WheelPhase,
     Window, point, px,
@@ -85,6 +85,10 @@ impl Wheel {
             if to != from {
                 app.stop_event();
                 handle.animate_to(to, true);
+                handle
+                    .0
+                    .borrow_mut()
+                    .sweep([to.x != from.x, to.y != from.y]);
                 handle.settle(window);
                 handle.drive(window);
             } else if stops {
@@ -168,11 +172,30 @@ struct ScrollState {
     grabbed: bool,
     // The box snaps when it comes to rest.
     settling: bool,
-    // The areas of the last `scrollsnapchange` and `scrollsnapchanging`.
-    reported: [Option<u64>; 2],
-    aimed: [Option<u64>; 2],
-    // A scroll, and not only layouts, moved the box since it was at rest.
+    // The areas of the last `scrollsnapchange` and `scrollsnapchanging`. A new box has none.
+    reported: Option<[Option<u64>; 2]>,
+    aimed: Option<[Option<u64>; 2]>,
+    // The user or a smooth scroll moved the box since it was at rest.
     scrolled: bool,
+    // A scroll, and not only layouts, moved the box since the last events.
+    moved: bool,
+    // The axes that the user moved since the box last snapped. The other ones keep their areas.
+    swept: [bool; 2],
+    // The events to fire, in order over all boxes.
+    events: Vec<(u64, ScrollEvent)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ScrollEvent {
+    Scroll,
+    /// `scrollsnapchanging` and `scrollsnapchange` with the areas on the x and y axes.
+    Changing([Option<u64>; 2]),
+    Change([Option<u64>; 2]),
+    End,
+}
+
+thread_local! {
+    static ORDER: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
 }
 
 // The scroll anchor: a box that keeps its place in the scroll viewport when the content above it changes size.
@@ -281,6 +304,8 @@ impl ScrollState {
         if moved {
             self.animation = None;
             self.spring = None;
+            self.moved = true;
+            self.sweep([moved_x, moved_y]);
         }
         match sent {
             _ if !moved => {}
@@ -345,6 +370,7 @@ impl ScrollState {
         });
         self.offset = from;
         self.glide = None;
+        self.moved = true;
     }
 
     // Where the box is when the running scroll ends.
@@ -364,10 +390,57 @@ impl ScrollState {
             || (self.glide.as_ref()).is_some_and(|glide| glide.to != self.offset)
     }
 
+    // Like Chrome, a box fires each event one time per frame: the first one.
+    fn fire(&mut self, event: ScrollEvent) {
+        let kind = std::mem::discriminant(&event);
+        if !(self.events.iter()).any(|(_, old)| std::mem::discriminant(old) == kind) {
+            self.events.push((ORDER.replace(ORDER.get() + 1), event));
+        }
+    }
+
+    fn changing(&mut self, ids: [Option<u64>; 2]) {
+        if self.snaps.is_some() && self.aimed.replace(ids) != Some(ids) {
+            self.fire(ScrollEvent::Changing(ids));
+        }
+    }
+
+    fn change(&mut self) {
+        if self.snaps.is_some() && self.reported.replace(self.snapped) != Some(self.snapped) {
+            self.fire(ScrollEvent::Change(self.snapped));
+        }
+    }
+
+    fn sweep(&mut self, axes: [bool; 2]) {
+        self.swept = [0, 1].map(|axis| self.swept[axis] || axes[axis]);
+    }
+
+    // Without a move of the user, like after a layout, both axes snap.
+    fn settled(&self) -> Snap {
+        Snap::To(match self.swept {
+            [false, false] => [true; 2],
+            axes => axes,
+        })
+    }
+
+    fn place(&mut self, offset: Point<Pixels>) {
+        (self.offset, self.stretch) = (offset, Point::default());
+        (self.animation, self.spring, self.loose) = (None, None, false);
+        self.glide = None;
+    }
+
+    // A scroll that ends at once.
+    fn jump(&mut self, to: Point<Pixels>) {
+        self.changing(self.snapped);
+        self.place(to);
+        self.fire(ScrollEvent::Scroll);
+        self.change();
+        self.fire(ScrollEvent::End);
+    }
+
     fn snap(&mut self) {
         if let Some(snaps) = &self.snaps {
-            let (to, ids) = snaps.find(self.offset, None, self.range);
-            self.snapped = ids;
+            let (to, ids) = snaps.find(self.offset, self.settled(), self.snapped, self.range);
+            (self.snapped, self.swept) = (ids, [false; 2]);
             if to != self.offset {
                 self.animate_to(to, false);
             }
@@ -431,6 +504,7 @@ impl ScrollState {
             self.stretch = stretch.unwrap_or_default();
             moved = true;
         }
+        self.moved |= moved;
         moved
     }
 }
@@ -504,32 +578,41 @@ impl ScrollRef {
 
     pub fn set_offset(&self, offset: Point<Pixels>) {
         let scroll = &mut *self.0.borrow_mut();
-        (scroll.offset, scroll.stretch) = (offset, Point::default());
-        (scroll.animation, scroll.spring, scroll.loose) = (None, None, false);
-        scroll.glide = None;
+        scroll.place(offset);
+        scroll.moved = true;
+    }
+
+    /// The range of a new layout moves the offset.
+    pub fn limit(&self, offset: Point<Pixels>) {
+        self.0.borrow_mut().place(offset);
+    }
+
+    /// A scroll of a script, which fires its events with the next frame.
+    pub fn jump(&self, to: Point<Pixels>) {
+        self.0.borrow_mut().jump(to);
+    }
+
+    /// A smooth scroll of a script.
+    pub fn glide_to(&self, to: Point<Pixels>) {
+        let scroll = &mut *self.0.borrow_mut();
+        scroll.changing(scroll.snapped);
+        scroll.animate_to(to, false);
+        scroll.scrolled = true;
     }
 
     pub fn animate_to(&self, offset: Point<Pixels>, wheel: bool) {
         self.0.borrow_mut().animate_to(offset, wheel);
     }
 
-    /// Where a scroll to `to` ends. A scroll from `from` snaps in its direction.
-    pub fn snap(&self, to: Point<Pixels>, from: Option<Point<Pixels>>) -> Point<Pixels> {
+    /// Where a scroll to `to` ends, with its snap areas.
+    pub fn snap(&self, to: Point<Pixels>, snap: Snap) -> Point<Pixels> {
         let scroll = &mut *self.0.borrow_mut();
         let Some(snaps) = &scroll.snaps else {
             return to;
         };
-        let (mut found, mut ids) = snaps.find(to, from, scroll.range);
-        // Like Chrome, an axis that the scroll doesn't move keeps its area.
-        let now = scroll.end();
-        if to.x == now.x && scroll.snapped[0].is_some() {
-            (found.x, ids[0]) = (to.x, scroll.snapped[0]);
-        }
-        if to.y == now.y && scroll.snapped[1].is_some() {
-            (found.y, ids[1]) = (to.y, scroll.snapped[1]);
-        }
+        let (found, ids) = snaps.find(to, snap, scroll.snapped, scroll.range);
         (scroll.snapped, scroll.grabbed, scroll.settling) = (ids, false, false);
-        scroll.scrolled = true;
+        scroll.swept = [false; 2];
         found
     }
 
@@ -543,21 +626,42 @@ impl ScrollRef {
         if scroll.snaps.as_deref() == snaps.as_ref() {
             return false;
         }
-        scroll.snaps = snaps.map(Rc::new);
-        let Some(snaps) = &scroll.snaps else {
-            (scroll.snapped, scroll.settling) = ([None; 2], false);
+        // Like Chrome, a box that never had areas is no snap container.
+        if scroll.snaps.is_none() && snaps.as_ref().is_some_and(|snaps| snaps.areas.is_empty()) {
+            return false;
+        }
+        let Some(snaps) = snaps.map(Rc::new) else {
+            scroll.fire(ScrollEvent::Change([None; 2]));
+            (scroll.snaps, scroll.snapped, scroll.settling) = (None, [None; 2], false);
+            (scroll.reported, scroll.aimed) = (None, None);
             return false;
         };
+        scroll.snaps = Some(snaps.clone());
+        for id in &mut scroll.snapped {
+            *id = id.filter(|&id| snaps.areas.iter().any(|area| area.id == id));
+        }
         if scroll.busy() {
             scroll.settling |= !scroll.grabbed;
             return false;
         }
-        let (to, ids) = snaps.follow(scroll.offset, scroll.snapped, scroll.range);
+        let (to, ids) = snaps.find(scroll.offset, Snap::Keep, scroll.snapped, scroll.range);
         scroll.snapped = ids;
+        scroll.aimed.get_or_insert(ids);
         let moved = to != scroll.offset;
-        scroll.offset = to;
-        scroll.glide = None;
+        match moved {
+            true => scroll.jump(to),
+            false => scroll.change(),
+        }
         moved
+    }
+
+    /// The areas with the focus in them, which the next search prefers.
+    pub fn focus_snaps(&self, ids: &[usize]) {
+        if let Some(snaps) = &mut self.0.borrow_mut().snaps {
+            for area in &mut Rc::make_mut(snaps).areas {
+                area.focus = ids.contains(&(area.id as usize));
+            }
+        }
     }
 
     /// A box without a layout snaps to nothing, which is no event.
@@ -570,39 +674,36 @@ impl ScrollRef {
     /// Whether the box still scrolls to a snap area, or has the event for it to fire.
     pub fn snapping(&self) -> bool {
         let scroll = self.0.borrow();
-        scroll.snaps.is_some() && (scroll.busy() || scroll.snapped != scroll.reported)
+        scroll.snaps.is_some() && (scroll.busy() || scroll.scrolled)
     }
 
-    /// The areas, on the x and y axes, of the `scrollsnapchanging` and the `scrollsnapchange` event to fire.
-    pub fn snap_events(&self) -> [Option<[Option<u64>; 2]>; 2] {
+    /// The events to fire with their order, and whether a scroll moved the box since the last call.
+    pub fn take_events(&self) -> (Vec<(u64, ScrollEvent)>, bool) {
         let scroll = &mut *self.0.borrow_mut();
-        if scroll.snaps.is_none() && scroll.reported == [None; 2] {
-            return [None; 2];
-        }
-        let aim = match &scroll.snaps {
-            Some(snaps) if scroll.grabbed || scroll.settling => {
-                snaps.find(scroll.end(), None, scroll.range).1
+        if let Some(snaps) = &scroll.snaps {
+            if scroll.grabbed || scroll.settling {
+                let snap = scroll.settled();
+                let ids = snaps
+                    .find(scroll.end(), snap, scroll.snapped, scroll.range)
+                    .1;
+                scroll.changing(ids);
             }
-            _ => scroll.snapped,
-        };
-        let changing = scroll.scrolled && aim != scroll.aimed;
-        if changing {
-            scroll.aimed = aim;
+            if scroll.scrolled && !scroll.busy() {
+                scroll.changing(scroll.snapped);
+                scroll.change();
+                scroll.scrolled = false;
+            }
         }
-        let rests = !scroll.busy();
-        let change = rests && scroll.snapped != scroll.reported;
-        if rests {
-            (scroll.reported, scroll.aimed) = (scroll.snapped, scroll.snapped);
-            scroll.scrolled = false;
-        }
-        [changing.then_some(aim), change.then_some(scroll.snapped)]
+        (
+            std::mem::take(&mut scroll.events),
+            std::mem::take(&mut scroll.moved),
+        )
     }
 
     pub fn grab(&self) {
         let scroll = &mut *self.0.borrow_mut();
         scroll.scrolled = true;
         (scroll.grabbed, scroll.settling) = (true, false);
-        scroll.snapped = [None; 2];
     }
 
     /// The user let the box go, so it snaps when it comes to rest.
@@ -633,7 +734,7 @@ impl ScrollRef {
         );
         let from = scroll.offset;
         let end = from + speed.map(|value| px(value * DECAY));
-        let (to, ids) = snaps.find(end, Some(from), scroll.range);
+        let (to, ids) = snaps.find(end, Snap::From(from), scroll.snapped, scroll.range);
         let axis = usize::from(moved.x.is_zero());
         if ids[axis].is_none() || to == from {
             return false;
@@ -650,6 +751,7 @@ impl ScrollRef {
             animation.slope = point(slope(to.x - from.x, speed.x), slope(to.y - from.y, speed.y));
         }
         (scroll.snapped, scroll.grabbed, scroll.settling) = (ids, false, false);
+        scroll.swept = [false; 2];
         true
     }
 

@@ -101,6 +101,8 @@ pub(crate) struct Look {
     colors: Option<[Color; 2]>,
     custom: Option<([f32; 2], [Option<Part>; 5])>,
     pub(crate) forced: [bool; 2],
+    // The box keeps room for a bar at its right, also without one.
+    pub(crate) gutter: bool,
 }
 
 impl Look {
@@ -140,11 +142,12 @@ impl Look {
                     .is_some_and(|value| value == "scroll"),
                 style
                     .get(Prop::OVERFLOW_Y)
-                    .is_some_and(|value| value == "scroll")
-                    || style
-                        .get(Prop::SCROLLBAR_GUTTER)
-                        .is_some_and(|value| value.starts_with("stable")),
+                    .is_some_and(|value| value == "scroll"),
             ],
+            gutter: (style.get(Prop::SCROLLBAR_GUTTER))
+                .is_some_and(|value| value.starts_with("stable"))
+                && (style.get(Prop::OVERFLOW_Y))
+                    .is_some_and(|value| matches!(value, "auto" | "scroll" | "hidden")),
         };
         if let Some(parts) = parts
             && let Some(bar) = &parts[0]
@@ -185,27 +188,31 @@ impl Look {
 
     pub(crate) fn space(&self, shown: [bool; 2]) -> [f32; 2] {
         self.custom.as_ref().map_or([0.; 2], |(size, _)| {
-            [0, 1].map(|axis| if shown[axis] { size[axis] } else { 0. })
+            let room = [shown[0], shown[1] || self.gutter];
+            [0, 1].map(|axis| if room[axis] { size[axis] } else { 0. })
         })
     }
 }
 
-// The room that the bars of a box take at its top, right, bottom and left sides.
+// The room that the bars of a box, and its gutters, take at its top, right, bottom and left sides.
 pub(crate) fn room(
     style: &Style,
     extras: &crate::style::Extras,
     units: &css::value::units::Lengths,
     extent: Point<Pixels>,
+    gutters: bool,
 ) -> [f32; 4] {
-    let Some(look) = Look::new(style, extras.scrollbars.as_deref(), units, None) else {
+    let Some(mut look) = Look::new(style, extras.scrollbars.as_deref(), units, None) else {
         return [0.; 4];
     };
     let scrolls = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
         .map(|prop| (style.get(prop)).is_some_and(|value| matches!(value, "auto" | "scroll")));
+    look.gutter &= gutters;
     let [bottom, right] = look.space(look.shown(scrolls, extent));
-    let both = style
-        .get(Prop::SCROLLBAR_GUTTER)
-        .is_some_and(|value| value.contains("both-edges"));
+    let both = gutters
+        && style
+            .get(Prop::SCROLLBAR_GUTTER)
+            .is_some_and(|value| value.contains("both-edges"));
     [0., right, bottom, if both { right } else { 0. }]
 }
 

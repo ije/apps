@@ -140,6 +140,7 @@ pub(super) fn viewport(
                 overflow_x == "scroll" || look.forced[0],
                 overflow == "scroll" || look.forced[1],
             ];
+            look.gutter = false;
             Some(look)
         });
     let page_space = page_bar.as_ref().map_or([0.; 2], |look| {
@@ -160,7 +161,7 @@ pub(super) fn viewport(
 pub(super) fn node(
     view: &Rc<ViewState>,
     viewport: Viewport,
-    pointer_events: renderer::Node,
+    mut pointer_events: renderer::Node,
     root: renderer::Child,
     overlay: Vec<renderer::Child>,
     autos: bool,
@@ -181,6 +182,16 @@ pub(super) fn node(
         page.style().flow |= renderer::Flow::RTL_BLOCK;
     }
     page.style().overscroll = viewport.overscroll;
+    page.style().bars = renderer::Edges {
+        right: renderer::px(viewport.space[1]),
+        bottom: renderer::px(viewport.space[0]),
+        ..Default::default()
+    };
+    // The box would scroll the page by the room of the bars.
+    pointer_events.style().size = renderer::size(
+        renderer::Length::Calc(1., renderer::px(-viewport.space[1])),
+        renderer::Length::Calc(1., renderer::px(-viewport.space[0])),
+    );
     let page = page
         .pr(renderer::px(viewport.space[1]))
         .pb(renderer::px(viewport.space[0]))
@@ -213,7 +224,8 @@ pub(super) fn node(
                     {
                         let dom = &mut page.state;
                         dom.geometry.prepainted(dom.pixel_ratio);
-                        if snap::update(&page.doc, dom, space) {
+                        dom.geometry.page_bars = space;
+                        if snap::update(&page.doc, dom) {
                             window.redraw();
                         }
                         dom.geometry.sync_scroll();

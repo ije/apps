@@ -1,4 +1,5 @@
 use super::{LayoutMirror, Walk};
+use renderer::ScrollEvent;
 use std::rc::Rc;
 
 // A move of the mirror for a scroll: by how much, and the nodes of the walk it moved.
@@ -34,6 +35,8 @@ pub struct Geometry {
     pub(crate) layout_epoch: u64,
     pub(crate) drawn: rustc_hash::FxHashMap<usize, Drawn>,
     pub(crate) drawn_order: u32,
+    // The room of the scroll bars of the page at the bottom and at the right.
+    pub(crate) page_bars: [f32; 2],
     pub(crate) snaps: rustc_hash::FxHashMap<usize, crate::render::frame::snap::Key>,
 }
 
@@ -100,22 +103,38 @@ impl Geometry {
             .fold([0.; 2], |[x, y], (by, ..)| [x + by[0], y + by[1]])
     }
 
-    // The scrolls that moved since the last call. It clamps offsets to their range and marks the mirror as moved.
-    pub(crate) fn scroll_events(&mut self) -> Vec<usize> {
+    // The scroll events since the last call in their order: the box, the event (0 `scroll` of a scroll that can still
+    // go on, 1 `scroll`, 2 `scrollsnapchanging`, 3 `scrollsnapchange`, 4 `scrollend`), and the block and the inline
+    // area. It clamps offsets to their range and marks the mirror as moved.
+    pub(crate) fn scroll_events(&mut self) -> Vec<(usize, u8, Option<u64>, Option<u64>)> {
+        let mut events = Vec::new();
         let mut changed = Vec::new();
         for (&id, handle) in &self.scroll {
+            let (fired, moved) = handle.take_events();
             let offset = scroll_offset(handle, handle.offset());
-            // `set_offset` stops a smooth scroll, so it only runs when the range clamps the offset.
+            // A new place stops a smooth scroll, so this only runs when the range clamps the offset.
             if offset != handle.offset() {
-                handle.set_offset(offset);
+                handle.limit(offset);
             }
             let previous = self.scroll_offsets.entry(id).or_default();
             if *previous != offset {
                 *previous = offset;
                 changed.push(id);
+                if !fired.iter().any(|(_, event)| *event == ScrollEvent::Scroll) {
+                    events.push((0, (id, u8::from(!moved), None, None)));
+                }
             }
+            events.extend(fired.into_iter().map(|(order, event)| {
+                let event = match event {
+                    ScrollEvent::Scroll => (id, 1, None, None),
+                    ScrollEvent::Changing([x, y]) => (id, 2, y, x),
+                    ScrollEvent::Change([x, y]) => (id, 3, y, x),
+                    ScrollEvent::End => (id, 4, None, None),
+                };
+                (order, event)
+            }));
         }
-        changed.sort_unstable();
+        events.sort_unstable();
         // Prepaint moves the mirror for a scroll, so a geometry read before it moves the mirror, or lays out again.
         if !changed.is_empty() {
             self.only_scrolled = (self.only_scrolled || !self.mirror.moved())
@@ -130,21 +149,7 @@ impl Geometry {
             self.mirror.set_moved();
         }
         self.sync_scroll();
-        changed
-    }
-
-    // The snap events to fire, by scroll container: whether it is `scrollsnapchange`, and the block and the inline area.
-    pub(crate) fn snap_events(&self) -> Vec<(usize, bool, Option<u64>, Option<u64>)> {
-        let mut events: Vec<_> = (self.scroll.iter())
-            .flat_map(|(&id, handle)| {
-                let [changing, change] = handle.snap_events();
-                [(false, changing), (true, change)]
-                    .into_iter()
-                    .filter_map(move |(done, areas)| areas.map(|[x, y]| (id, done, y, x)))
-            })
-            .collect();
-        events.sort_unstable_by_key(|&(id, done, ..)| (done, id));
-        events
+        events.into_iter().map(|(_, event)| event).collect()
     }
 
     // Moves the mirror for the user scrolls since the last prepaint, when a script reads geometry. True when the

@@ -1538,3 +1538,47 @@ fn scroll_snaps_fire_events_and_reach_into_shadow_trees() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn scroll_snaps_follow_chrome_in_events_focus_and_bars() {
+    let text = run_hidden(
+        r#"
+        await load('snap.html');
+        const step = async (name, code) => {
+            await run(code + ';0');
+            for (let i = 0; i < 4; i++) { await win.webContents.capturePage(); await run('new Promise(done => setTimeout(done, 20))'); }
+            console.log('SNAP ' + name + ' ' + await run("log.splice(0).join(' ')"));
+        };
+        await step('load', 'log.length = 0; log.push(gap.scrollLeft, gutter.scrollLeft, gutter.clientWidth)');
+        await step('order', 'b.scrollTop = 85; a.scrollTop = 85; b.scrollTop = 170');
+        await step('anchor', "a.children[0].style.height = '120px'");
+        await step('focus', "b.children[1].firstChild.focus({ preventScroll: true }); b.scrollTop = 0; b.scrollTop = 85; log.push(b.scrollTop)");
+        await step('page', 'const d = document.documentElement; scrollTo(9999, 0); log.push(d.clientWidth - innerWidth, d.clientHeight - innerHeight, d.scrollWidth, scrollX + d.clientWidth)');
+        "#,
+        &[(
+            "snap.html",
+            "<body style='margin:0'><style>.s{width:200px;height:100px;overflow:auto;scroll-snap-type:y mandatory}.s::-webkit-scrollbar{display:none}.s>div{height:80px;scroll-snap-align:start}.s p{margin:0;height:80px;scroll-snap-align:start}\
+             .x{width:120px;height:40px;overflow:hidden;scroll-snap-type:x mandatory}.x>div{width:500px;height:40px;padding-left:40px;box-sizing:border-box}.x p{margin:0;width:90px;height:40px;scroll-snap-align:start}\
+             #gutter{overflow:auto;scrollbar-gutter:stable both-edges}#gutter>div{padding-left:20px}::-webkit-scrollbar{width:20px;height:14px}</style>\
+             <div class=s id=a><div></div><div></div><div></div><div></div></div><div class=s id=b><div><p tabindex=0></p></div><div><p tabindex=0></p></div><div></div><div></div></div>\
+             <div class=x id=gap><div><p></p></div></div><div class=x id=gutter><div><p></p></div></div><div style='width:1500px;height:10px'></div><script>\
+             globalThis.log = [];for (const id of ['a', 'b', 'gap', 'gutter']) globalThis[id] = document.getElementById(id);\
+             for (const box of [a, b]) for (const type of ['scrollsnapchanging', 'scrollsnapchange', 'scrollend']) box.addEventListener(type, event => log.push(box.id + ':' + type.replace('scrollsnap', '') + (event.snapTargetBlock ? [...box.children].indexOf(event.snapTargetBlock) : '')));\
+             </script></body>",
+        )],
+    );
+    for line in [
+        "load 40 40 80",
+        "order b:changing1 b:change1 b:scrollend a:changing1 a:change1 a:scrollend",
+        "anchor ",
+        "focus 80 b:changing0 b:change0 b:scrollend",
+        "page -20 -14 1500 1500",
+    ] {
+        assert!(
+            text.lines()
+                .any(|out| out.trim_end() == format!("SNAP {line}").trim_end()),
+            "{line}: {text}"
+        );
+    }
+}

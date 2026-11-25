@@ -3,15 +3,14 @@ use crate::{
     dom::Document,
     render::{PageState, paint::scrollbar},
 };
-use renderer::{ScrollSnaps, SnapArea, px};
+use renderer::{ScrollSnaps, SnapAlign, SnapArea};
 
 // What the snap areas of a scroll container come from: document, styles, its box, its scroll range, and the room of
 // its scroll bars.
 pub(crate) type Key = (u64, u64, [u32; 4], [u32; 4], [u32; 4]);
 
-// Gives the scroll containers the snap areas of this layout. `space` is the room of the scroll bars of the page at the
-// bottom and at the right. True when a box moved to an area.
-pub(super) fn update(doc: &Document, dom: &mut PageState, space: [f32; 2]) -> bool {
+// Gives the scroll containers the snap areas of this layout. True when a box moved to an area.
+pub(super) fn update(doc: &Document, dom: &mut PageState) -> bool {
     let Some(styles) = dom.styles.computed.clone() else {
         return false;
     };
@@ -19,7 +18,7 @@ pub(super) fn update(doc: &Document, dom: &mut PageState, space: [f32; 2]) -> bo
         .nodes
         .first()
         .and_then(|root| (root.children.iter().copied()).find(|&id| doc.nodes[id].tag == "html"));
-    let geometry = &mut dom.geometry;
+    let (focus, geometry) = (&dom.interaction.states[0], &mut dom.geometry);
     let mut moved = Vec::new();
     for (&id, handle) in &geometry.scroll {
         let Some(node) = (if id == 0 { html } else { Some(id) }) else {
@@ -54,8 +53,8 @@ pub(super) fn update(doc: &Document, dom: &mut PageState, space: [f32; 2]) -> bo
         }
         let units = &styles.lengths[node];
         let bars = match id {
-            0 => [0., space[1], space[0], 0.],
-            _ => scrollbar::room(style, styles.extras(node), units, handle.extent()),
+            0 => [0., geometry.page_bars[1], geometry.page_bars[0], 0.],
+            _ => scrollbar::room(style, styles.extras(node), units, handle.extent(), false),
         };
         let range = handle.range();
         let key: Key = (
@@ -80,21 +79,23 @@ pub(super) fn update(doc: &Document, dom: &mut PageState, space: [f32; 2]) -> bo
                 .and_then(|value| units.resolve(value, base))
                 .unwrap_or(0.)
         };
-        let start = [
-            rect[0] + left + padding(Prop::SCROLL_PADDING_LEFT, client[0]),
-            rect[1] + top + padding(Prop::SCROLL_PADDING_TOP, client[1]),
+        let port = [
+            [
+                left + padding(Prop::SCROLL_PADDING_LEFT, client[0]),
+                left + client[0] - padding(Prop::SCROLL_PADDING_RIGHT, client[0]),
+            ],
+            [
+                top + padding(Prop::SCROLL_PADDING_TOP, client[1]),
+                top + client[1] - padding(Prop::SCROLL_PADDING_BOTTOM, client[1]),
+            ],
         ];
-        let end = [
-            rect[0] + left + client[0] - padding(Prop::SCROLL_PADDING_RIGHT, client[0]),
-            rect[1] + top + client[1] - padding(Prop::SCROLL_PADDING_BOTTOM, client[1]),
-        ];
-        let must = kind.contains("mandatory");
         let axis = kind.split_ascii_whitespace().next().unwrap_or_default();
-        let strict = [
-            matches!(axis, "x" | "inline" | "both").then_some(must),
-            matches!(axis, "y" | "block" | "both").then_some(must),
+        let axes = [
+            matches!(axis, "x" | "inline" | "both"),
+            matches!(axis, "y" | "block" | "both"),
         ];
-        let rtl = style.get(Prop::DIRECTION) == Some("rtl");
+        let rtl = |style: &Style| style.get(Prop::DIRECTION) == Some("rtl");
+        let own_rtl = rtl(style);
         let shown = geometry.mirror_offset(id);
         let at = [-shown.x.0, -shown.y.0];
         let scrolls = |style: &Style| {
@@ -129,44 +130,43 @@ pub(super) fn update(doc: &Document, dom: &mut PageState, space: [f32; 2]) -> bo
                         .and_then(|value| units.resolve(value, 0.))
                         .unwrap_or(0.)
                 };
-                let low = [
-                    area[0] - margin(Prop::SCROLL_MARGIN_LEFT),
-                    area[1] - margin(Prop::SCROLL_MARGIN_TOP),
+                // Chrome measures in 1/64 pixels.
+                let place = |axis: usize, sides: [Prop; 2]| {
+                    let first = area[axis] - rect[axis] + at[axis];
+                    [
+                        first - margin(sides[0]),
+                        first + area[axis + 2] + margin(sides[1]),
+                    ]
+                    .map(|value| (value * 64.).round() / 64.)
+                };
+                let spot = [
+                    place(0, [Prop::SCROLL_MARGIN_LEFT, Prop::SCROLL_MARGIN_RIGHT]),
+                    place(1, [Prop::SCROLL_MARGIN_TOP, Prop::SCROLL_MARGIN_BOTTOM]),
                 ];
-                let high = [
-                    area[0] + area[2] + margin(Prop::SCROLL_MARGIN_RIGHT),
-                    area[1] + area[3] + margin(Prop::SCROLL_MARGIN_BOTTOM),
-                ];
+                // A wider area has its own direction.
+                let flipped = match spot[0][1] - spot[0][0] > rect[2] {
+                    true => rtl(style),
+                    false => own_rtl,
+                };
+                let aligned = |align: &str, flipped: bool| match align {
+                    "start" if flipped => Some(SnapAlign::End),
+                    "end" if flipped => Some(SnapAlign::Start),
+                    "start" => Some(SnapAlign::Start),
+                    "end" => Some(SnapAlign::End),
+                    "center" => Some(SnapAlign::Center),
+                    _ => None,
+                };
                 let mut aligns = align.split_ascii_whitespace();
                 let block = aligns.next().unwrap_or("none");
-                let inline = match aligns.next().unwrap_or(block) {
-                    "start" if rtl => "end",
-                    "end" if rtl => "start",
-                    inline => inline,
-                };
-                let place = |axis: usize, align: &str| {
-                    strict[axis]?;
-                    let first = at[axis] + low[axis] - start[axis];
-                    let last = at[axis] + high[axis] - end[axis];
-                    // The snapport can be anywhere in an area that is larger.
-                    Some(match align {
-                        "none" => return None,
-                        _ if last > first => [first, last],
-                        "start" => [first; 2],
-                        "end" => [last; 2],
-                        _ => [(first + last) / 2.; 2],
-                    })
-                };
                 areas.push(SnapArea {
                     id: child as u64,
-                    at: [place(0, inline), place(1, block)],
-                    seen: [0, 1].map(|axis| {
-                        [
-                            at[axis] + low[axis] - end[axis],
-                            at[axis] + high[axis] - start[axis],
-                        ]
-                    }),
+                    rect: spot,
+                    align: [
+                        aligned(aligns.next().unwrap_or(block), flipped),
+                        aligned(block, false),
+                    ],
                     stop: style.get(Prop::SCROLL_SNAP_STOP) == Some("always"),
+                    focus: focus.contains(&child),
                 });
             }
             // The areas in an inner scroll container belong to it.
@@ -174,20 +174,14 @@ pub(super) fn update(doc: &Document, dom: &mut PageState, space: [f32; 2]) -> bo
                 stack.extend(styles.flat_children(doc, child).iter().rev());
             }
         }
-        let ratio = dom.pixel_ratio.max(1.);
-        // Offsets are whole device pixels.
-        for area in &mut areas {
-            for value in area.at.iter_mut().flatten().flatten() {
-                *value = (*value * ratio).round() / ratio;
-            }
-        }
-        let before = handle.offset();
         if handle.set_snaps(Some(ScrollSnaps {
-            strict,
-            port: [end[0] - start[0], end[1] - start[1]],
+            axes,
+            must: kind.contains("mandatory"),
+            port,
             areas,
-        })) && (handle.offset() - before) != renderer::point(px(0.), px(0.))
-        {
+            target: doc.target.map(|id| id as u64),
+            ratio: dom.pixel_ratio.max(1.),
+        })) {
             moved.push(id);
         }
     }

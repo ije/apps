@@ -861,7 +861,8 @@ impl Host {
                     } else {
                         1.
                     },
-                    crate::native::theme_state()
+                    crate::native::theme_state(),
+                    page.state.geometry.page_bars
                 ]));
             }
             let state = &mut page.state;

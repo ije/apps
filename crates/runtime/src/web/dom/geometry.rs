@@ -25,26 +25,14 @@ pub(crate) fn layout_flags(doc: &mut Document, state: &mut PageState, viewport: 
 }
 
 pub(super) fn scroll_events(state: &mut PageState) -> Result<Value> {
-    let changed = state.geometry.scroll_events();
-    let mut changed = json!(changed);
-    let snaps = state.geometry.snap_events();
-    if !snaps.is_empty()
-        && let Some(list) = changed.as_array_mut()
-    {
-        list.push(json!({ "snaps": snaps }));
-    }
+    let mut events = json!(state.geometry.scroll_events());
     let skips = state.layout.take_skip_events();
     if !skips.is_empty()
-        && let Some(list) = changed.as_array_mut()
+        && let Some(list) = events.as_array_mut()
     {
-        list.push(json!(
-            skips
-                .into_iter()
-                .flat_map(|(id, skipped)| [id, usize::from(skipped)])
-                .collect::<Vec<_>>()
-        ));
+        list.push(json!({ "skips": skips }));
     }
-    Ok(changed)
+    Ok(events)
 }
 
 pub(super) fn hit_test(
@@ -90,6 +78,12 @@ pub(super) fn scroll(
     let page = doc.nodes[id].parent == Some(0)
         && doc.nodes[id].tag == "html"
         && !state.geometry.scroll.contains_key(&id);
+    if args[1].is_null() && args[2].is_null() {
+        let handle = state.geometry.scroll.get(&if page { 0 } else { id });
+        if !handle.is_some_and(renderer::ScrollRef::snaps) {
+            return Ok(Value::Null);
+        }
+    }
     // As in Chrome, a box that can't scroll keeps its offset at 0.
     if !page && !state.geometry.scroll.contains_key(&id) {
         let computed = state.restyle(doc, viewport);
@@ -123,19 +117,21 @@ pub(super) fn scroll(
                 .map_or(f32::from(current), |v| -(v as f32 * ratio).round() / ratio),
         )
     };
-    let target = crate::dom::geometry::scroll_offset(
-        &handle,
-        renderer::point(axis(&args[1], previous.x), axis(&args[2], previous.y)),
-    );
-    let from = (args[4].as_bool() == Some(true)).then(|| handle.target());
+    let target = renderer::point(axis(&args[1], previous.x), axis(&args[2], previous.y));
+    let snap = match args[4].as_str() {
+        Some("by") => renderer::Snap::From(previous),
+        Some(_) => renderer::Snap::To([true; 2]),
+        None => renderer::Snap::To([1, 2].map(|axis| !args[axis].is_null())),
+    };
     // A script can turn snapping off and scroll before the next layout.
     let snaps = handle.snaps()
         && (state.restyle(doc, viewport).values[id].get(Prop::SCROLL_SNAP_TYPE))
             .is_some_and(|kind| kind != "none");
     let target = match snaps {
-        true => handle.snap(target, from),
+        true => handle.snap(target, snap),
         false => target,
     };
+    let target = crate::dom::geometry::scroll_offset(&handle, target);
     if target != handle.target() {
         let smooth = handle.extent() != renderer::Point::default()
             && match args[3].as_str() {
@@ -147,9 +143,9 @@ pub(super) fn scroll(
                 }
             };
         if smooth {
-            handle.animate_to(target, false);
+            handle.glide_to(target);
         } else {
-            handle.set_offset(target);
+            handle.jump(target);
         }
     }
     state.dirty |= target != previous;
@@ -228,7 +224,13 @@ pub(super) fn client(
         .edges(now, css::properties::PADDING, base)
         .map(|value| value.max(0.));
     let bars = (state.geometry.scroll.get(&id)).map_or([0.; 4], |handle| {
-        crate::render::paint::scrollbar::room(style, computed.extras(id), units, handle.extent())
+        crate::render::paint::scrollbar::room(
+            style,
+            computed.extras(id),
+            units,
+            handle.extent(),
+            true,
+        )
     });
     // Like offsetWidth, client sizes ignore transforms, so a transformed box takes its layout size,
     // and the shift from its bounds to its own untransformed corner.

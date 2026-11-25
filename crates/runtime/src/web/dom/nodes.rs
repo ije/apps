@@ -157,6 +157,11 @@ pub(super) fn focus(
             node.state |= flag;
         }
     }
+    if index == 0 {
+        for handle in state.geometry.scroll.values() {
+            handle.focus_snaps(&ids);
+        }
+    }
     state.interaction.states[index] = ids;
     if used {
         state.styles.invalidate();
