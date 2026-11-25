@@ -242,7 +242,9 @@ pub(crate) fn cosmetic(old: &css::properties::Style, new: &css::properties::Styl
                     | Prop::CURSOR
                     | Prop::BOX_SHADOW
                     | Prop::TEXT_SHADOW
+                    | Prop::CARET_ANIMATION
                     | Prop::CARET_COLOR
+                    | Prop::CARET_SHAPE
                     | Prop::ACCENT_COLOR
                     | Prop::FILTER
                     | Prop::BACKDROP_FILTER

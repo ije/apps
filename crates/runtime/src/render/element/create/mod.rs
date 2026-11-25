@@ -43,7 +43,7 @@ use crate::render::{
     paint::{background::css_background, scrollbar},
 };
 use crate::style::{self};
-use renderer::{Child, Color, Rect, point, px, relative, size};
+use renderer::{Child, Rect, point, px, relative, size};
 use std::{cell::RefCell, ops::ControlFlow, rc::Rc};
 
 /// Builds the box of `id`, or with `pseudo` only that block pseudo-element of a spliced inline box.
@@ -313,10 +313,13 @@ pub(super) fn create(
         let empty = starts_line(build, id);
         reader.log(Query::Break, depth, hashed(empty));
         let painter = view.clone();
-        let ink = [Prop::CARET_COLOR, Prop::COLOR]
-            .into_iter()
-            .find_map(|prop| css::value::color::color(style.get(prop)?))
-            .map_or(Color::hex(0x000000ff), css::value::color::rgba);
+        let look = crate::render::paint::text::CaretLook::new(style);
+        let (font, em) = (text.face(face), px(units.font.em));
+        let font = (
+            font,
+            em,
+            text.baseline(font, em, px(line_height), pixel_ratio),
+        );
         let view = view.clone();
         let above = above(reader, &units, &parsed);
         // Like Chromium, the box of a `<br>` is the content area of its font, not the line.
@@ -352,8 +355,11 @@ pub(super) fn create(
                     crate::render::paint::text::paint_caret(
                         &painter,
                         [id, 0, 0],
-                        Rect::new(bounds.origin, size(px(1.), px(line_height))),
-                        ink,
+                        bounds.origin,
+                        px(line_height),
+                        None,
+                        font,
+                        look,
                         window,
                     );
                 }

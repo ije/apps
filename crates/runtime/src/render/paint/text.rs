@@ -12,15 +12,114 @@ use std::{
 
 pub(crate) type Blink = ([usize; 3], Instant, Option<(u32, renderer::Timer)>);
 
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum CaretShape {
+    Bar,
+    Block,
+    Underscore,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CaretLook {
+    color: Color,
+    pub(crate) shape: CaretShape,
+    blinks: bool,
+    rtl: bool,
+}
+
+impl CaretLook {
+    pub(crate) fn new(style: &css::properties::Style) -> Self {
+        let own = style
+            .get(Prop::CARET_COLOR)
+            .and_then(css::value::color::paint);
+        let shape = match style.get(Prop::CARET_SHAPE) {
+            Some("block") => CaretShape::Block,
+            Some("underscore") => CaretShape::Underscore,
+            _ => CaretShape::Bar,
+        };
+        let mut color = own
+            .or_else(|| css::value::color::paint(style.get(Prop::COLOR)?))
+            .unwrap_or(Color::BLACK);
+        // Like Chrome, the text stays readable on a block in its own color.
+        if own.is_none() && shape == CaretShape::Block {
+            color.a *= 0.5;
+        }
+        Self {
+            color,
+            shape,
+            blinks: style.get(Prop::CARET_ANIMATION) != Some("manual"),
+            rtl: style.get(Prop::DIRECTION) == Some("rtl"),
+        }
+    }
+
+    // From the caret to the next character that the row draws.
+    pub(crate) fn advance(
+        &self,
+        layout: &renderer::Paragraph,
+        text: &str,
+        rows: &[crate::render::layout::Row],
+        index: usize,
+        at: Point<Pixels>,
+    ) -> Option<Pixels> {
+        if self.shape == CaretShape::Bar {
+            return None;
+        }
+        text.get(index..)?
+            .char_indices()
+            .take_while(|&(_, ch)| ch != '\n')
+            .map_while(|(offset, ch)| {
+                text_position(layout, text, rows, index + offset + ch.len_utf8())
+            })
+            .find(|next| *next != at)
+            .filter(|next| next.y == at.y)
+            .map(|next| next.x - at.x)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_caret(
     view: &ViewState,
     key: [usize; 3],
-    bounds: Rect<Pixels>,
-    color: renderer::Color,
+    at: Point<Pixels>,
+    line_height: Pixels,
+    advance: Option<Pixels>,
+    (face, font_size, baseline): (renderer::FontId, Pixels, Pixels),
+    look: CaretLook,
     window: &mut Window,
 ) {
     const BLINK: Duration = renderer::CARET_BLINK;
+    let color = look.color;
     if color.a == 0. || !window.is_active() {
+        return;
+    }
+    let bounds = if look.shape == CaretShape::Bar {
+        Rect::new(at, size(px(1.), line_height))
+    } else {
+        // The content area of the font, as in Chrome.
+        let (system, scale) = (window.text_system(), window.scale_factor());
+        let [ascent, descent, _] = system
+            .line_metrics(face, font_size * scale)
+            .map(|value| value / scale);
+        let top = at.y + baseline - ascent;
+        let width = advance.unwrap_or_else(|| {
+            let zero = system
+                .advance(face, font_size, '0')
+                .unwrap_or(font_size / 2.);
+            if look.rtl { -zero } else { zero }
+        });
+        let height = if look.shape == CaretShape::Block {
+            ascent + descent
+        } else {
+            px(1.)
+        };
+        Rect::new(
+            point(at.x + width.min(px(0.)), top + ascent + descent - height),
+            size(width.abs(), height),
+        )
+    };
+    if !look.blinks {
+        *view.caret.borrow_mut() = None;
+        window.draw_rect(bounds, color);
         return;
     }
     let now = Instant::now();
@@ -32,7 +131,11 @@ pub(crate) fn paint_caret(
     // A timer can fire just before its time, so the phase rounds up within 8 ms.
     let phase = ((now - *since + Duration::from_millis(8)).as_millis() / BLINK.as_millis()) as u32;
     // The first phase draws, so typing and scrolling move the caret in the same frame as the text.
-    if phase > 0 && window.overlay_caret(bounds, color, *since, phase.is_multiple_of(2)) {
+    // The overlay is above the text, and a block is behind it.
+    if phase > 0
+        && look.shape != CaretShape::Block
+        && window.overlay_caret(bounds, color, *since, phase.is_multiple_of(2))
+    {
         *wake = None;
         return;
     }
@@ -1778,19 +1881,21 @@ impl renderer::Hooks for InlineText {
                     let start = range.start + crate::dom::text::shown_index(source, text, *start);
                     let end = range.start + crate::dom::text::shown_index(source, text, *end);
                     if caret {
-                        let ink = [Prop::CARET_COLOR, Prop::COLOR]
-                            .into_iter()
-                            .find_map(|prop| {
-                                css::value::color::color(styles.values[*id].get(prop)?)
-                            })
-                            .map_or(0x000000ff, |(color, alpha)| color << 8 | alpha as u32);
+                        let look = CaretLook::new(&styles.values[*id]);
                         if let Some(position) = text_position(layout, &self.data.text, rows, start)
                         {
                             paint_caret(
                                 view,
                                 [*id, start, range.len()],
-                                Rect::new(position, size(px(1.), layout.line_height())),
-                                Color::hex(ink),
+                                position,
+                                layout.line_height(),
+                                look.advance(layout, &self.data.text, rows, start, position),
+                                (
+                                    window.text_system().face(&style::font(&styles.values[*id])),
+                                    px(styles.lengths[*id].font.em),
+                                    base,
+                                ),
+                                look,
                                 window,
                             );
                         }

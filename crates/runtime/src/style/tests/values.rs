@@ -434,7 +434,7 @@ fn registered_properties_follow_syntax_inheritance_and_initial_values() {
 }
 
 #[test]
-fn scroll_spacing_parses_like_chrome() {
+fn scroll_spacing_and_carets_parse_like_chrome() {
     for (name, value, valid) in [
         ("scroll-margin-top", "-5px", true),
         ("scroll-margin-top", "5%", false),
@@ -443,11 +443,15 @@ fn scroll_spacing_parses_like_chrome() {
         ("scroll-padding-top", "10%", true),
         ("scroll-padding-top", "-2px", false),
         ("scroll-padding-inline", "auto 5px", true),
+        ("caret-shape", "underscore", true),
+        ("caret-shape", "box", false),
+        ("caret-animation", "manual", true),
+        ("caret-animation", "none", false),
     ] {
         assert_eq!(supports(name, value), Some(valid), "{name}: {value}");
     }
     let doc = Document::parse(
-        "<style>div{scroll-margin-inline-start:5px;scroll-margin-block:3px 4px;scroll-padding-inline:1px 2px}</style><div id=l></div><div id=r dir=rtl><p id=p></p></div>",
+        "<style>div{scroll-margin-inline-start:5px;scroll-margin-block:3px 4px;scroll-padding-inline:1px 2px;caret-shape:block}</style><div id=l></div><div id=r dir=rtl><p id=p></p></div>",
     );
     let styles = styles(&doc, 800., 600.);
     let get = |selector, name| styles[element(&doc, selector)].get(name).cloned();
@@ -459,6 +463,7 @@ fn scroll_spacing_parses_like_chrome() {
         ("#r", "scroll-margin-right", "5px"),
         ("#r", "scroll-padding-right", "1px"),
         ("#r", "scroll-padding-left", "2px"),
+        ("#p", "caret-shape", "block"),
     ] {
         assert_eq!(get(id, name).as_deref(), Some(value), "{id} {name}");
     }

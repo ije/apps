@@ -175,10 +175,6 @@ pub(super) fn controls(
             .get(Prop::COLOR)
             .and_then(css::value::color::paint)
             .unwrap_or(renderer::Color::BLACK);
-        let caret_color = style
-            .get(Prop::CARET_COLOR)
-            .and_then(css::value::color::paint)
-            .unwrap_or(text_color);
         let pseudo = styles
             .extras(id)
             .text
@@ -254,7 +250,7 @@ pub(super) fn controls(
             single_line,
             rtl: rtl && line_justify == Some(renderer::AlignContent::End),
             rows: Default::default(),
-            caret: caret_color,
+            caret: crate::render::paint::text::CaretLook::new(style),
             selection: selection_colors,
             handle: handle.clone(),
         };

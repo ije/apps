@@ -179,7 +179,9 @@ props! {
     BREAK_BEFORE "break-before",
     BREAK_INSIDE "break-inside",
     CAPTION_SIDE "caption-side" inherited "top|bottom",
+    CARET_ANIMATION "caret-animation" inherited "auto|manual",
     CARET_COLOR "caret-color" inherited "auto|<color>",
+    CARET_SHAPE "caret-shape" inherited "auto|bar|block|underscore",
     CLEAR "clear" "none|left|right|both|inline-start|inline-end",
     CLIP "clip",
     CLIP_PATH "clip-path" "none|[inset(|circle(|ellipse(|polygon(|path(|url(|border-box|padding-box|content-box|margin-box|fill-box|stroke-box|view-box]+",
@@ -968,8 +970,6 @@ pub(crate) const LOGICAL: [(Prop, Prop, Prop); 24] = [
         Prop::PADDING_RIGHT,
         Prop::PADDING_LEFT,
     ),
-    (Prop::INSET_INLINE_START, Prop::LEFT, Prop::RIGHT),
-    (Prop::INSET_INLINE_END, Prop::RIGHT, Prop::LEFT),
     (
         Prop::SCROLL_MARGIN_INLINE_START,
         Prop::SCROLL_MARGIN_LEFT,
@@ -990,6 +990,8 @@ pub(crate) const LOGICAL: [(Prop, Prop, Prop); 24] = [
         Prop::SCROLL_PADDING_RIGHT,
         Prop::SCROLL_PADDING_LEFT,
     ),
+    (Prop::INSET_INLINE_START, Prop::LEFT, Prop::RIGHT),
+    (Prop::INSET_INLINE_END, Prop::RIGHT, Prop::LEFT),
     (
         Prop::BORDER_INLINE_START_WIDTH,
         Prop::BORDER_LEFT_WIDTH,

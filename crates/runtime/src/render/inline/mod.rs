@@ -583,7 +583,9 @@ pub(crate) fn splits(style: &Rc<Style>, parent: &Rc<Style>) -> bool {
                         | Prop::TEXT_UNDERLINE_OFFSET
                         | Prop::TEXT_TRANSFORM
                         | Prop::COLOR_SCHEME
+                        | Prop::CARET_ANIMATION
                         | Prop::CARET_COLOR
+                        | Prop::CARET_SHAPE
                         | Prop::CURSOR
                         | Prop::FILL
                         | Prop::TEXT_ALIGN

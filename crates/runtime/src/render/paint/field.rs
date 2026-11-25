@@ -1,5 +1,5 @@
 use super::super::ViewState;
-use renderer::{Pixels, Point, Rect, Window, px, size};
+use renderer::{Pixels, Point, Window, px, size};
 use std::rc::Rc;
 
 pub(crate) type Caret = (Option<[usize; 2]>, usize);
@@ -24,7 +24,7 @@ pub(crate) struct FieldText {
     pub(crate) rtl: bool,
     /// The place of each row for `text-align`, for the lines, width and alignment of the last prepaint.
     pub(crate) rows: std::cell::RefCell<Option<KeptRows>>,
-    pub(crate) caret: renderer::Color,
+    pub(crate) caret: super::text::CaretLook,
     pub(crate) selection: (Option<u32>, u32),
     pub(crate) handle: renderer::ScrollRef,
     pub(crate) selected: std::cell::Cell<Option<[usize; 2]>>,
@@ -222,6 +222,7 @@ impl renderer::Hooks for FieldText {
         let Some(layout) = cx.text_layout().cloned() else {
             return;
         };
+        let font_size = cx.text.font_size;
         let window = &mut *cx.window;
         let selected = self.selected.get();
         if selected.is_some() {
@@ -245,6 +246,44 @@ impl renderer::Hooks for FieldText {
         let strut = window.text_system().face(&self.run.font);
         let mask = window.content_mask().bounds;
         let rows = (self.rows.borrow().as_ref()).map_or_else(Rc::default, |kept| kept.3.clone());
+        let caret = |window: &mut Window| {
+            if let Some([start, end, caret]) = selected
+                && start == end
+                && let Some(mut at) = super::text::text_position(&layout, text, &rows, caret)
+            {
+                let advance = (!self.placeholder)
+                    .then(|| self.caret.advance(&layout, text, &rows, caret, at))
+                    .flatten();
+                // As in Chrome, a caret past the edge of the field shows on the last pixel inside.
+                let shown = self.handle.bounds();
+                if at.x <= shown.right() + px(1.) {
+                    at.x = at.x.min(shown.right() - px(1.));
+                }
+                super::text::paint_caret(
+                    &self.view,
+                    [self.id, caret, text.len()],
+                    at,
+                    line_height,
+                    advance,
+                    (
+                        strut,
+                        font_size,
+                        window.text_system().baseline(
+                            strut,
+                            font_size,
+                            line_height,
+                            window.scale_factor(),
+                        ),
+                    ),
+                    self.caret,
+                    window,
+                );
+            }
+        };
+        let behind = self.caret.shape == super::text::CaretShape::Block;
+        if behind {
+            caret(window);
+        }
         let mut origin = layout.bounds().origin;
         let (mut offset, mut row) = (0, 0);
         for line in layout.lines().iter() {
@@ -275,17 +314,8 @@ impl renderer::Hooks for FieldText {
             origin.y += height;
             offset += line.len() + 1;
         }
-        if let Some([start, end, caret]) = selected
-            && start == end
-            && let Some(at) = super::text::text_position(&layout, text, &rows, caret)
-        {
-            super::text::paint_caret(
-                &self.view,
-                [self.id, caret, text.len()],
-                Rect::new(at, size(px(1.), line_height)),
-                self.caret,
-                window,
-            );
+        if !behind {
+            caret(window);
         }
     }
 }
