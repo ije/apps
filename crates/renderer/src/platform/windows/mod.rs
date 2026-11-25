@@ -12,13 +12,13 @@ use super::single::Task;
 use crate::text::windows::{extent, setting};
 use crate::{Cursor, Rect, WindowOptions, platform::Callbacks, point, px, size};
 use anyhow::Result;
-use rustc_hash::FxHashMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering::*};
-use std::sync::{Condvar, LockResult, Mutex, Once, PoisonError};
-use std::{cell::RefCell, collections::VecDeque, thread, time::Duration, time::Instant};
+use std::sync::{Condvar, LockResult, Mutex, Once, OnceLock, PoisonError};
+use std::{cell::RefCell, ffi::c_void, thread, time::Duration, time::Instant};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::{Dwm::*, Gdi::*};
-use windows::Win32::System::{DataExchange::*, Memory::*, Ole::*, Threading::GetCurrentThreadId};
+use windows::Win32::System::{DataExchange::*, Memory::*, Ole::*, Threading::*};
 use windows::Win32::UI::{HiDpi::*, WindowsAndMessaging::*};
 use windows::{Win32::System::LibraryLoader::GetModuleHandleW, core::w};
 
@@ -32,12 +32,13 @@ static HOST: AtomicIsize = AtomicIsize::new(0);
 static MAIN: AtomicU32 = AtomicU32::new(0);
 static INBOX: Mutex<VecDeque<Task>> = Mutex::new(VecDeque::new());
 static WOKEN: AtomicBool = AtomicBool::new(false);
+static ALARM: OnceLock<PTP_TIMER> = OnceLock::new();
 static POINTER_SHAPE: AtomicIsize = AtomicIsize::new(0);
 
 #[derive(Default)]
 struct Timers {
-    last: usize,
-    waiting: FxHashMap<usize, Box<dyn FnOnce()>>,
+    count: u64,
+    due: BTreeMap<(Instant, u64), Box<dyn FnOnce()>>,
 }
 
 thread_local! {
@@ -63,11 +64,6 @@ fn current_cursor() -> Option<HCURSOR> {
     (handle != 0).then_some(HCURSOR(handle as _))
 }
 
-// Holds a task that may not leave its thread.
-struct Pinned(Box<dyn FnOnce()>);
-// SAFETY: pinned tasks are queued and run on the main thread only, and the inbox is never dropped.
-unsafe impl Send for Pinned {}
-
 pub(crate) fn native_post(task: Task) {
     held(INBOX.lock()).push_back(task);
     wake();
@@ -84,52 +80,78 @@ fn wake() {
     }
 }
 
+// Runs the work that is due now. Work that it adds waits for the next wake, so input and frames get a turn.
 fn drain() {
     WOKEN.store(false, Release);
-    loop {
-        let Some(task) = held(INBOX.lock()).pop_front() else {
+    let count = held(INBOX.lock()).len();
+    for _ in 0..count {
+        let mut inbox = held(INBOX.lock());
+        let Some(task) = inbox.pop_front() else {
             break;
         };
+        let more = !inbox.is_empty();
+        drop(inbox);
+        // A task can run a message loop of its own, which takes the rest.
+        if more {
+            wake();
+        }
         task();
     }
+    let (now, end) = (Instant::now(), TIMERS.with_borrow(|timers| timers.count));
+    while let Some(f) = TIMERS.with_borrow_mut(|timers| {
+        let timer = timers.due.first_entry()?;
+        let (at, number) = *timer.key();
+        (at <= now && number < end).then(|| timer.remove())
+    }) {
+        set_alarm();
+        f();
+    }
+    set_alarm();
+}
+
+// `WM_TIMER` comes only when no other message waits, not even a paint, so busy windows would hold it back.
+fn set_alarm() {
+    let next = TIMERS.with_borrow(|timers| timers.due.first_key_value().map(|(key, _)| key.0));
+    let Some(next) = next else {
+        return;
+    };
+    let wait = next.saturating_duration_since(Instant::now());
+    if wait.is_zero() {
+        return wake();
+    }
+    // SAFETY: the timer is never closed, and its callback only posts a message.
+    let alarm = ALARM.get_or_init(|| unsafe {
+        CreateThreadpoolTimer(Some(alarm), None, None).expect("the timer must open")
+    });
+    // A negative time counts from now, in units of 100 ns.
+    let time = -i64::try_from(wait.as_nanos().div_ceil(100)).unwrap_or(i64::MAX);
+    let time = FILETIME {
+        dwLowDateTime: time as u32,
+        dwHighDateTime: (time >> 32) as u32,
+    };
+    // SAFETY: the timer is live, and the time is a local.
+    unsafe { SetThreadpoolTimer(*alarm, Some(&time), 0, None) };
+}
+
+unsafe extern "system" fn alarm(_: PTP_CALLBACK_INSTANCE, _: *mut c_void, _: PTP_TIMER) {
+    wake();
 }
 
 pub(crate) use native_after as run_after;
 
-// Timers run on the thread that set them, which is the main thread. A zero delay queues the task instead,
-// since timers wait at least 10 ms.
+// Timers run on the thread that set them, which is the main thread.
 pub(crate) fn native_after(delay: Duration, f: impl FnOnce() + 'static) {
-    let f: Box<dyn FnOnce()> = Box::new(f);
-    let millis = delay.as_millis().min(u128::from(USER_TIMER_MAXIMUM)) as u32;
-    let f = match millis {
-        0 => Some(f),
-        _ => TIMERS.with_borrow_mut(|timers| {
-            let id = timers.last.wrapping_add(1).max(1);
-            timers.last = id;
-            // SAFETY: a timer of the hidden window, which fires on this thread.
-            match unsafe { SetTimer(Some(host()), id, millis, None) } {
-                0 => Some(f),
-                _ => {
-                    timers.waiting.insert(id, f);
-                    None
-                }
-            }
-        }),
-    };
-    if let Some(f) = f {
-        let pinned = Pinned(f);
-        native_post(Box::new(move || {
-            let pinned = pinned;
-            (pinned.0)()
-        }));
-    }
-}
-
-fn fire(id: usize) {
-    // SAFETY: ends the timer of the hidden window that just fired.
-    let _ = unsafe { KillTimer(Some(host()), id) };
-    if let Some(f) = TIMERS.with_borrow_mut(|timers| timers.waiting.remove(&id)) {
-        f();
+    let first = TIMERS.with_borrow_mut(|timers| {
+        timers.count += 1;
+        let key = (Instant::now() + delay, timers.count - 1);
+        timers.due.insert(key, Box::new(f));
+        timers
+            .due
+            .first_key_value()
+            .is_some_and(|(first, _)| *first == key)
+    });
+    if first {
+        set_alarm();
     }
 }
 
@@ -186,14 +208,18 @@ impl Platform {
         // SAFETY: the message loop of this thread.
         unsafe {
             // A negative result is an error, which also ends the loop.
-            while GetMessageW(&mut next, None, 0, 0).0 > 0 {
-                // Keys go to the key filter and the page before they turn into characters.
-                let key = matches!(next.message, WM_KEYDOWN | WM_SYSKEYDOWN);
-                if key && window::key_down(&next) {
-                    continue;
+            'run: while GetMessageW(&mut next, None, 0, 0).0 > 0 {
+                let woken = next.message == WM_WAKE;
+                dispatch(&next);
+                // Posted messages come before input and paints, so each wake lets one of both through.
+                for kind in [PM_QS_INPUT, PM_QS_PAINT] {
+                    if woken && PeekMessageW(&mut next, None, 0, 0, PM_REMOVE | kind).as_bool() {
+                        if next.message == WM_QUIT {
+                            break 'run;
+                        }
+                        dispatch(&next);
+                    }
                 }
-                let _ = TranslateMessage(&next);
-                DispatchMessageW(&next);
             }
         }
         crate::native::quit_handler();
@@ -285,6 +311,18 @@ impl Platform {
     }
 }
 
+fn dispatch(message: &MSG) {
+    // Keys go to the key filter and the page before they turn into characters.
+    if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) && window::key_down(message) {
+        return;
+    }
+    // SAFETY: a message of this thread.
+    unsafe {
+        let _ = TranslateMessage(message);
+        DispatchMessageW(message);
+    }
+}
+
 fn set_cursor(cursor: Cursor) -> Option<HCURSOR> {
     let handle = window::cursor(cursor);
     let raw = handle.map_or(0, |handle| handle.0 as isize);
@@ -300,7 +338,6 @@ unsafe extern "system" fn host_proc(
 ) -> LRESULT {
     match msg {
         WM_WAKE => drain(),
-        WM_TIMER => fire(wparam.0),
         // Agrees to end the session, then quits when it ends.
         WM_QUERYENDSESSION => return LRESULT(1),
         WM_ENDSESSION if wparam.0 != 0 => {

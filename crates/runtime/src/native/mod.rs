@@ -364,7 +364,86 @@ pub(crate) fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (operation, arguments);
+        if operation == "image" {
+            return image(arguments);
+        }
         bail!("This native desktop operation is currently available on macOS");
     }
+}
+
+// The image operations of desktop.m. `fileIcon` needs the system.
+#[cfg(not(target_os = "macos"))]
+fn image(arguments: &Value) -> Result<Value> {
+    use crate::render::raster::image::{encode_png, pixels};
+    use base64::{Engine as _, engine::general_purpose::STANDARD as base64};
+    use image::{RgbImage, RgbaImage, codecs::jpeg::JpegEncoder, imageops};
+    let data = base64.decode(arguments["data"].as_str().unwrap_or_default())?;
+    let number = |name: &str| arguments[name].as_f64().unwrap_or(0.) as u32;
+    let (width, height) = (number("width"), number("height"));
+    let operation = arguments["op"].as_str().unwrap_or_default();
+    ensure!(width <= 16384 && height <= 16384, "Image is too large");
+    // The bitmaps of `fromBitmap` and `bitmap` are premultiplied BGRA.
+    let (mut bytes, width_in, height_in) = match operation {
+        "fromBitmap" => (data, width as usize, height as usize),
+        _ => pixels(&data)?,
+    };
+    ensure!(
+        width_in > 0 && height_in > 0 && bytes.len() >= width_in * height_in * 4,
+        "Cannot read the image"
+    );
+    bytes.truncate(width_in * height_in * 4);
+    for pixel in bytes.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+        let alpha = u32::from(pixel[3]);
+        if alpha != 255 && operation != "jpeg" {
+            for value in &mut pixel[..3] {
+                *value = match operation {
+                    "fromBitmap" => (*value).min(alpha as u8),
+                    _ => ((u32::from(*value) * alpha + 127) / 255) as u8,
+                };
+            }
+        }
+    }
+    let mut image = RgbaImage::from_raw(width_in as u32, height_in as u32, bytes)
+        .context("Cannot read the image")?;
+    match operation {
+        "decode" | "fromBitmap" => {}
+        "bitmap" => {
+            let mut bytes = image.into_raw();
+            for pixel in bytes.as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
+            return Ok(serde_json::json!({ "bytes": base64.encode(bytes) }));
+        }
+        "jpeg" => {
+            let (width, height) = image.dimensions();
+            let rgb = image
+                .pixels()
+                .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]);
+            let rgb = RgbImage::from_raw(width, height, rgb.collect()).context("Invalid image")?;
+            let mut bytes = Vec::new();
+            let quality = arguments["quality"].as_f64().unwrap_or(90.).clamp(1., 100.) as u8;
+            rgb.write_with_encoder(JpegEncoder::new_with_quality(&mut bytes, quality))?;
+            return Ok(serde_json::json!({
+                "png": base64.encode(bytes), "width": width, "height": height
+            }));
+        }
+        "resize" => {
+            ensure!(width > 0 && height > 0, "Invalid image size");
+            image = imageops::resize(&image, width, height, imageops::FilterType::Triangle);
+        }
+        "crop" => {
+            let (x, y) = (number("x"), number("y"));
+            image = imageops::crop_imm(&image, x, y, width, height).to_image();
+            ensure!(image.width() > 0 && image.height() > 0, "Empty crop area");
+        }
+        _ => bail!("This native desktop operation is currently available on macOS"),
+    }
+    let (width, height) = image.dimensions();
+    let image = tiny_skia::IntSize::from_wh(width, height)
+        .and_then(|size| tiny_skia::Pixmap::from_vec(image.into_raw(), size))
+        .context("Cannot read the image")?;
+    Ok(serde_json::json!({
+        "png": base64.encode(encode_png(&image)?), "width": width, "height": height
+    }))
 }

@@ -213,3 +213,59 @@ fn process_exit_argv_and_non_utf8_environment() {
         "42,undefined,true\nexit 3 [\"/app/main.js\",\"a\",\"--b\"] \u{fffd}\n"
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn a_busy_window_keeps_timers_captures_and_the_exit_code() {
+    let code = r#"
+        const {app, BrowserWindow} = globalThis.__apps;
+        app.whenReady().then(async () => {
+            const win = new BrowserWindow({width: 900, height: 640});
+            await win.loadFile('apps:///page.html');
+            const start = performance.now();
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            console.log('TIMER ' + (performance.now() - start < 3000));
+            const frames = await win.webContents.executeJavaScript('frames');
+            console.log('FRAMES ' + (frames > 1));
+            const image = await win.webContents.capturePage();
+            console.log('PNG ' + (image.toPNG().length > 0 && image.toBitmap().length > 0));
+            app.quit();
+        });
+    "#;
+    let definition = serde_json::json!({
+        "id":0,"code":code,"imports":[],"exports":[],"stars":[],"commonjs":false
+    });
+    let boxes = "<div></div>".repeat(24);
+    let page = format!(
+        "<style>div{{width:300px;height:300px;position:absolute;filter:blur(12px);background:red}}</style>{boxes}\
+        <script>globalThis.frames=0;(function frame(){{frames++;document.querySelectorAll('div').forEach((div,i)=>div.style.left=i*25+frames%50+'px');requestAnimationFrame(frame)}})();\
+        const channel=new MessageChannel();channel.port1.onmessage=()=>channel.port2.postMessage(0);channel.port2.postMessage(0)</script>"
+    );
+    let bundle = apps_runtime::bundle::Bundle {
+        files: bbtree::unsync::BBTreeMap::from([
+            ("app.js".into(), format!("$appsDefine({definition});")),
+            ("package.json".into(), "{}".into()),
+            ("page.html".into(), page),
+        ]),
+        ..Default::default()
+    };
+    let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
+        .arg("--bundle-stdin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serde_json::to_writer(child.stdin.take().unwrap(), &bundle).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{}: {text}", output.status);
+    for step in ["TIMER true", "FRAMES true", "PNG true"] {
+        assert!(text.contains(step), "{step}: {text}");
+    }
+}

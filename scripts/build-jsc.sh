@@ -71,11 +71,12 @@ case "$(uname -s)" in
     ;;
 esac
 
-case "$(uname -m)" in
-  arm64 | aarch64)
+# Git Bash runs emulated on Windows arm64: uname -m reports x86_64 there, and uname -s ends with -ARM64.
+case "$(uname -s)-$(uname -m)" in
+  *-arm64 | *-aarch64 | *-ARM64-*)
     arch=aarch64
     ;;
-  x86_64 | amd64 | AMD64)
+  *-x86_64 | *-amd64 | *-AMD64)
     arch=x86_64
     ;;
   *)

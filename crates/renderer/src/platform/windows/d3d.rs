@@ -6,7 +6,7 @@ use crate::{
     gpu::{ATTRIBUTES, Blur, Composite, Globals, Instance, Plain, bytes},
 };
 use anyhow::{Context as _, Result, bail, ensure};
-use std::{borrow::Cow, cell::RefCell, mem, rc::Rc, slice, time::Duration};
+use std::{borrow::Cow, cell::RefCell, mem, mem::ManuallyDrop, rc::Rc, slice, time::Duration};
 use windows::{
     Win32::{
         Foundation::{HMODULE, HWND},
@@ -52,12 +52,15 @@ struct Gpu {
 }
 
 thread_local! {
-    static GPU: RefCell<Option<Rc<Gpu>>> = const { RefCell::new(None) };
+    // Not dropped at exit: thread locals drop after the threads of the device end, and its release fails then.
+    static GPU: ManuallyDrop<RefCell<Option<Rc<Gpu>>>> =
+        const { ManuallyDrop::new(RefCell::new(None)) };
 }
 
 // Made again after the device was lost. The atlas stays the same object, emptied.
 fn gpu() -> Result<Rc<Gpu>> {
-    GPU.with_borrow_mut(|slot| {
+    GPU.with(|slot| {
+        let mut slot = slot.borrow_mut();
         if let Some(gpu) = slot.as_ref()
             // SAFETY: a plain device query.
             && unsafe { gpu.device.GetDeviceRemovedReason() }.is_ok()
@@ -87,7 +90,7 @@ fn bytecode(entry: &str) -> Result<Cow<'static, [u8]>> {
     )))
 }
 
-// Debug builds compile the shaders when they start. build.rs compiles them ahead for release builds.
+// build.rs compiles the shaders ahead when the Windows SDK has fxc.
 #[cfg(not(renderer_shaders))]
 fn bytecode(entry: &str) -> Result<Cow<'static, [u8]>> {
     use windows::Win32::Graphics::Direct3D::Fxc::{D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile};

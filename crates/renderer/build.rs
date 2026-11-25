@@ -5,7 +5,7 @@ fn main() {
     match env::var("CARGO_CFG_TARGET_OS").as_deref() {
         #[cfg(target_os = "macos")]
         Ok("macos") => metal(),
-        Ok("windows") if env::var("PROFILE").as_deref() == Ok("release") => hlsl(),
+        Ok("windows") => hlsl(),
         _ => {}
     }
 }

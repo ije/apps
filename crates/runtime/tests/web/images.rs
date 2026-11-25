@@ -232,3 +232,37 @@ fn svg_and_bundled_images_load_through_the_host() {
     load(&mut host, "missing.png").unwrap();
     assert!(decoded(&mut host).is_string());
 }
+
+#[test]
+fn native_images_decode_and_encode() {
+    let engine = apps_runtime::host::context::JsContext::new(
+        apps_runtime::jsc::JavaScriptCore::load().unwrap(),
+        std::rc::Rc::default(),
+        apps_runtime::jsc::Role::Main,
+    )
+    .unwrap();
+    let result = engine.eval(
+        r#"(() => {
+            const { nativeImage } = __apps;
+            const pixels = Buffer.from([0, 0, 255, 255, 0, 64, 0, 128, 255, 0, 0, 255, 0, 0, 0, 0]);
+            const image = nativeImage.createFromBitmap(pixels, { width: 2, height: 2 });
+            const copy = nativeImage.createFromBuffer(image.toPNG());
+            const part = copy.crop({ x: 0, y: 1, width: 1, height: 1 });
+            return JSON.stringify([
+                image.toPNG().length > 0, copy.getSize(), [...copy.toBitmap()], [...part.toBitmap()],
+                copy.resize({ width: 4 }).getSize(), [...copy.toJPEG(80).subarray(0, 2)],
+                nativeImage.createFromBuffer(Buffer.from('no image')).isEmpty(),
+            ]);
+        })()"#,
+        "images",
+    );
+    assert_eq!(
+        result.unwrap(),
+        json!([
+            true, {"width": 2, "height": 2},
+            [0, 0, 255, 255, 0, 64, 0, 128, 255, 0, 0, 255, 0, 0, 0, 0], [255, 0, 0, 255],
+            {"width": 4, "height": 4}, [255, 216], true,
+        ])
+        .to_string()
+    );
+}
