@@ -432,8 +432,8 @@ float4 box_color(float2 p, float4 rect, float4 rx, float4 ry, float2 shape, floa
     if (style == DOUBLE) {
         // Both lines take a whole number of pixels, like in Chromium.
         float width = inner - outer;
-        float line = max(round(width / 3.0), 1.0);
-        alpha *= saturate(0.5 - min(-outer - line, width - line + outer));
+        float stroke = max(round(width / 3.0), 1.0);
+        alpha *= saturate(0.5 - min(-outer - stroke, width - stroke + outer));
     } else if (style == DASHED || style == DOTTED) {
         alpha *= dash_coverage(p, rect, rx, ry, widths, style == DOTTED, (flags & THIN) != 0u, -outer, inner);
     }
