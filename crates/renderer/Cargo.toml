@@ -113,6 +113,8 @@ windows = { workspace = true, features = [
 windows-core.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# The version that wgpu-hal uses.
+ash = { version = "0.38.0", default-features = false }
 cosmic-text = "0.19.0"
 libc.workspace = true
 pollster.workspace = true

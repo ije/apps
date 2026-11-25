@@ -53,6 +53,12 @@ pub(crate) trait PageStore {
         size: Size<i32>,
         bytes: &[u8],
     ) -> Result<(usize, Rect<i32>, u32)>;
+    #[cfg(target_os = "linux")]
+    fn insert_surface(
+        &mut self,
+        size: Size<i32>,
+        surface: &std::sync::Arc<dyn crate::Surface>,
+    ) -> Result<(usize, Rect<i32>, u32)>;
     fn remove(&mut self, tile: Tile);
     fn max_side(&self) -> i32;
 }
@@ -138,6 +144,48 @@ impl<B: PageStore> Atlas<B> {
         pages.remove(tile);
     }
 
+    // Notes a new tile at the place of a freed one.
+    fn refresh(&self, tile: Tile) {
+        let key = (matches!(tile.kind, PageKind::Color), tile.page);
+        if (self.freed.borrow().get(&key)).is_some_and(|(area, _)| area.intersects(tile.rect))
+            && let Some(fresh) = self.fresh.borrow_mut().as_mut()
+        {
+            fresh.push((key.0, key.1, tile.rect));
+        }
+    }
+
+    // Does nothing when the image has a tile or the GPU can't read the surface.
+    #[cfg(target_os = "linux")]
+    pub fn insert_surface(&self, image: &crate::RenderImage) {
+        let (key, size) = (TileKey::Image(image.id), image.size());
+        let Some(surface) = image.surface() else {
+            return;
+        };
+        if !crate::supports_surfaces() || self.tiles.borrow().contains_key(&key) {
+            return;
+        }
+        let max = self.pages.borrow().max_side();
+        if size.width <= 0 || size.height <= 0 || size.width > max || size.height > max {
+            return;
+        }
+        let Ok((page, rect, id)) = self.pages.borrow_mut().insert_surface(size, surface) else {
+            return;
+        };
+        let tile = Tile {
+            page: page as u32,
+            kind: PageKind::Color,
+            id,
+            rect,
+        };
+        self.refresh(tile);
+        let entry = Entry {
+            tile: Some(tile),
+            bounds: Rect::new(Default::default(), size),
+            used: Cell::new(self.frame.get()),
+        };
+        self.tiles.borrow_mut().insert(key, entry);
+    }
+
     pub fn get_or_insert_with(
         &self,
         key: &TileKey,
@@ -167,13 +215,7 @@ impl<B: PageStore> Atlas<B> {
                             rect,
                         });
                 if let Some(tile) = tile {
-                    let key = (matches!(kind, PageKind::Color), tile.page);
-                    if (self.freed.borrow().get(&key))
-                        .is_some_and(|(area, _)| area.intersects(tile.rect))
-                        && let Some(fresh) = self.fresh.borrow_mut().as_mut()
-                    {
-                        fresh.push((key.0, key.1, tile.rect));
-                    }
+                    self.refresh(tile);
                 }
                 if let (Some(tile), TileKey::Glyph(_)) = (tile, key) {
                     self.glyph_pixels
@@ -512,6 +554,15 @@ mod tests {
 
         fn max_side(&self) -> i32 {
             16384
+        }
+
+        #[cfg(target_os = "linux")]
+        fn insert_surface(
+            &mut self,
+            _: Size<i32>,
+            _: &std::sync::Arc<dyn crate::Surface>,
+        ) -> Result<(usize, Rect<i32>, u32)> {
+            anyhow::bail!("no surfaces")
         }
 
         fn remove(&mut self, tile: Tile) {

@@ -16,6 +16,7 @@ use std::{
     hash::{Hash, Hasher},
     mem, slice,
     sync::atomic::{AtomicU64, Ordering::Relaxed},
+    sync::{Arc, OnceLock},
 };
 
 pub struct Scene {
@@ -956,11 +957,39 @@ pub(crate) struct EffectState {
 
 static IMAGES: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum ColorMatrix {
+    Bt601,
+    Bt709,
+    Bt2020,
+}
+
+/// The Y and UV planes of an NV12 frame, as dma-bufs that the surface owns.
+#[derive(Clone, Copy)]
+pub struct Planes {
+    pub size: [u32; 2],
+    pub matrix: ColorMatrix,
+    pub full_range: bool,
+    pub fds: [i32; 2],
+    pub offsets: [u32; 2],
+    pub pitches: [u32; 2],
+    pub modifiers: [u64; 2],
+}
+
+/// A frame in GPU memory, which must not change while this exists.
+pub trait Surface: Send + Sync {
+    fn planes(&self) -> Planes;
+    /// Copies the frame to BGRA pixels.
+    fn read(&self, width: u32, height: u32) -> Vec<u8>;
+}
+
 pub struct RenderImage {
     pub id: u64,
     width: u32,
     height: u32,
-    bytes: Vec<u8>,
+    // The pixels of a surface are read when they are first needed.
+    bytes: OnceLock<Vec<u8>>,
+    surface: Option<Arc<dyn Surface>>,
     premultiplied: bool,
     display_p3: bool,
 }
@@ -972,10 +1001,24 @@ impl RenderImage {
             id: IMAGES.fetch_add(1, Relaxed),
             width,
             height,
-            bytes,
+            bytes: bytes.into(),
+            surface: None,
             premultiplied: false,
             display_p3: false,
         }
+    }
+    pub fn from_surface(width: u32, height: u32, surface: Arc<dyn Surface>) -> Self {
+        Self {
+            width,
+            height,
+            bytes: OnceLock::new(),
+            surface: Some(surface),
+            ..Self::new(0, 0, Vec::new())
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn surface(&self) -> Option<&Arc<dyn Surface>> {
+        self.surface.as_ref()
     }
     pub fn new_premultiplied(width: u32, height: u32, bytes: Vec<u8>) -> Self {
         Self {
@@ -1000,15 +1043,19 @@ impl RenderImage {
         Size::new(self.width as i32, self.height as i32)
     }
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+        self.bytes.get_or_init(|| match &self.surface {
+            Some(surface) => surface.read(self.width, self.height),
+            None => Vec::new(),
+        })
     }
     pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
+        self.bytes.into_inner().unwrap_or_default()
     }
     /// Takes the pixels for the next image. The empty image keeps its id, so its tile can still be released.
     pub fn take_bytes(&mut self) -> Vec<u8> {
         (self.width, self.height) = (0, 0);
-        std::mem::take(&mut self.bytes)
+        self.surface = None;
+        self.bytes.take().unwrap_or_default()
     }
 }
 

@@ -5,7 +5,7 @@ use std::{ffi::c_void, mem::MaybeUninit, path::Path, ptr::NonNull, sync::OnceLoc
 // The source of the media library, compiled here without FFmpeg: the built-in player of WAV files.
 #[path = "../../../../media/src/lib.rs"]
 mod audio;
-use audio::{ABI, Frame, Host};
+use audio::{ABI, Frame, Host, Surface};
 
 static HOST: Host = Host {
     waker,
@@ -13,7 +13,49 @@ static HOST: Host = Host {
     drop_waker,
     alloc: alloc_pixels,
     free: free_pixels,
+    surfaces: renderer::supports_surfaces,
 };
+
+struct Held {
+    surface: Surface,
+    library: &'static Library,
+}
+
+// SAFETY: the media library permits reads and the release of a surface on any thread.
+unsafe impl Send for Held {}
+unsafe impl Sync for Held {}
+
+impl renderer::Surface for Held {
+    fn planes(&self) -> renderer::Planes {
+        let surface = &self.surface;
+        renderer::Planes {
+            size: [surface.width, surface.height],
+            // FFmpeg numbers: 1 is BT.709 and 9 is BT.2020.
+            matrix: match surface.matrix {
+                1 => renderer::ColorMatrix::Bt709,
+                9 => renderer::ColorMatrix::Bt2020,
+                _ => renderer::ColorMatrix::Bt601,
+            },
+            full_range: surface.full_range != 0,
+            fds: surface.fds,
+            offsets: surface.offsets,
+            pitches: surface.pitches,
+            modifiers: surface.modifiers,
+        }
+    }
+
+    fn read(&self, width: u32, height: u32) -> Vec<u8> {
+        let mut pixels = vec![0; width as usize * height as usize * 4];
+        unsafe { (self.library.read)(self.surface.handle, width, height, pixels.as_mut_ptr()) };
+        pixels
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        unsafe { (self.library.release)(self.surface.handle) }
+    }
+}
 
 extern "C" fn alloc_pixels(length: usize) -> *mut u8 {
     // Media files pick the frame size, so a failed allocation returns null instead of aborting.
@@ -44,6 +86,8 @@ struct Library {
     poll: unsafe extern "C" fn(*mut c_void, *mut c_void, Alloc),
     frame: unsafe extern "C" fn(*mut c_void, u64, *mut Frame) -> bool,
     recycle: unsafe extern "C" fn(*mut c_void, u64, *mut u8, u32, u32),
+    read: unsafe extern "C" fn(*mut c_void, u32, u32, *mut u8) -> bool,
+    release: unsafe extern "C" fn(*mut c_void),
 }
 
 static BUILTIN: Library = Library {
@@ -56,6 +100,8 @@ static BUILTIN: Library = Library {
     poll: audio::apps_media_poll,
     frame: audio::apps_media_frame,
     recycle: audio::apps_media_recycle,
+    read: audio::apps_media_read,
+    release: audio::apps_media_release,
 };
 
 pub fn library_name(platform: &str) -> &'static str {
@@ -93,6 +139,8 @@ fn load() -> Result<Library> {
             poll: *library.get(b"apps_media_poll\0")?,
             frame: *library.get(b"apps_media_frame\0")?,
             recycle: *library.get(b"apps_media_recycle\0")?,
+            read: *library.get(b"apps_media_read\0")?,
+            release: *library.get(b"apps_media_release\0")?,
         })
     }
 }
@@ -184,13 +232,18 @@ impl Player {
 
     pub fn frame(&mut self, id: u64) -> Option<renderer::RenderImage> {
         let (raw, library) = self.raw?;
-        let mut frame = Frame {
-            pixels: std::ptr::null_mut(),
-            width: 0,
-            height: 0,
-        };
-        if !unsafe { (library.frame)(raw.as_ptr(), id, &mut frame) } {
+        let mut frame = MaybeUninit::<Frame>::uninit();
+        if !unsafe { (library.frame)(raw.as_ptr(), id, frame.as_mut_ptr()) } {
             return None;
+        }
+        let frame = unsafe { frame.assume_init() };
+        if frame.pixels.is_null() {
+            let surface = frame.surface;
+            return Some(renderer::RenderImage::from_surface(
+                frame.width,
+                frame.height,
+                std::sync::Arc::new(Held { surface, library }),
+            ));
         }
         let length = frame.width as usize * frame.height as usize * 4;
         let pixels =
@@ -207,7 +260,12 @@ impl Player {
             return;
         };
         let size = image.size();
-        let pixels = Box::into_raw(image.into_bytes().into_boxed_slice());
+        let pixels = image.into_bytes();
+        // A surface has no pixels.
+        if pixels.is_empty() {
+            return;
+        }
+        let pixels = Box::into_raw(pixels.into_boxed_slice());
         unsafe {
             (library.recycle)(
                 raw.as_ptr(),

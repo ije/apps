@@ -8,7 +8,13 @@ use raw_window_handle::{DisplayHandle, HandleError, HasDisplayHandle};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::{cell::RefCell, mem::size_of, num::NonZeroU64, rc::Rc, sync::Arc};
+use std::{
+    cell::{OnceCell, RefCell},
+    mem::size_of,
+    num::NonZeroU64,
+    rc::Rc,
+    sync::Arc,
+};
 use wgpu::{BindGroup, BindGroupLayout, BindGroupLayoutEntry, BindingResource, BindingType};
 use wgpu::{Buffer, BufferUsages, Color, CurrentSurfaceTexture as Next, Device, Queue};
 use wgpu::{Extent3d, Origin3d, RenderPipeline, ShaderStages, Surface, SurfaceConfiguration};
@@ -53,16 +59,17 @@ struct Pipelines {
 }
 
 // Made again after the device is lost.
-struct Gpu {
+pub(super) struct Gpu {
     api: wgpu::Instance,
     adapter: wgpu::Adapter,
-    device: Device,
-    queue: Queue,
+    pub(super) device: Device,
+    pub(super) queue: Queue,
     lost: Arc<AtomicBool>,
     // Color atlas pages hold BGRA, swizzled to RGBA where the adapter can't sample BGRA.
-    color: TextureFormat,
+    pub(super) color: TextureFormat,
     module: wgpu::ShaderModule,
-    sampler: wgpu::Sampler,
+    pub(super) sampler: wgpu::Sampler,
+    pub(super) video: OnceCell<RenderPipeline>,
     groups: [BindGroupLayout; 3],
     blank: TextureView,
     pipelines: RefCell<Vec<(TextureFormat, Rc<Pipelines>)>>,
@@ -95,7 +102,7 @@ fn texture(
     })
 }
 
-fn extent(width: i32, height: i32) -> Extent3d {
+pub(super) fn extent(width: i32, height: i32) -> Extent3d {
     Extent3d {
         width: width as u32,
         height: height as u32,
@@ -180,6 +187,8 @@ impl Gpu {
                 required_limits: wgpu::Limits::downlevel_webgl2_defaults()
                     .using_resolution(limits.clone())
                     .using_alignment(limits),
+                required_features: adapter.features()
+                    & wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF,
                 memory_hints: wgpu::MemoryHints::MemoryUsage,
                 ..Default::default()
             };
@@ -214,6 +223,8 @@ impl Gpu {
             }
         });
         device.on_uncaptured_error(Arc::new(|error| eprintln!("apps: GPU error: {error}")));
+        let surfaces = (device.features()).contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF);
+        super::SURFACES.store(surfaces, Relaxed);
         let sampled = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
         let bgra = adapter.get_texture_format_features(TextureFormat::Bgra8Unorm);
         let layout = |entries: &[BindGroupLayoutEntry]| {
@@ -267,6 +278,7 @@ impl Gpu {
             device,
             queue,
             lost,
+            video: OnceCell::new(),
             groups,
             pipelines: RefCell::default(),
         }
@@ -355,7 +367,7 @@ impl Gpu {
         made
     }
 
-    fn buffer(&self, size: u64, usage: BufferUsages) -> Buffer {
+    pub(super) fn buffer(&self, size: u64, usage: BufferUsages) -> Buffer {
         let usage = usage | BufferUsages::COPY_DST;
         let described = wgpu::BufferDescriptor {
             label: None,
@@ -1068,6 +1080,29 @@ impl Pages {
         }
     }
 
+    fn allocate(
+        &mut self,
+        kind: PageKind,
+        size: Size<i32>,
+        format: TextureFormat,
+    ) -> Result<(usize, Rect<i32>, u32)> {
+        let device = &self.gpu.device;
+        let mut grew = false;
+        let (index, _, rect, id) = self.pages[kind as usize].allocate(size, |size| {
+            grew = true;
+            let side = [size.width as u32, size.height as u32];
+            let mut usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
+            if matches!(kind, PageKind::Color) && crate::supports_surfaces() {
+                usage |= TextureUsages::RENDER_ATTACHMENT;
+            }
+            let made = texture(device, side, format, usage);
+            let view = made.create_view(&Default::default());
+            Ok((made, view))
+        })?;
+        self.generation += u64::from(grew);
+        Ok((index, rect, id))
+    }
+
     fn view(&self, color: bool, index: u32) -> Option<&TextureView> {
         Some(&self.pages[usize::from(color)].get(index as usize)?.1)
     }
@@ -1088,15 +1123,10 @@ impl PageStore for Pages {
         } else {
             TextureFormat::R8Unorm
         };
-        let mut grew = false;
-        let (index, (page, _), rect, id) = self.pages[kind as usize].allocate(size, |size| {
-            grew = true;
-            let side = [size.width as u32, size.height as u32];
-            let usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
-            let made = texture(&gpu.device, side, format, usage);
-            let view = made.create_view(&Default::default());
-            Ok((made, view))
-        })?;
+        let (index, rect, id) = self.allocate(kind, size, format)?;
+        let Some((page, _)) = self.pages[kind as usize].get(index) else {
+            bail!("the page is missing");
+        };
         let swizzled: Vec<u8>;
         let data = match color && format == TextureFormat::Rgba8Unorm {
             true => {
@@ -1125,8 +1155,28 @@ impl PageStore for Pages {
         };
         gpu.queue
             .write_texture(target, data, layout, extent(size.width, size.height));
-        self.generation += u64::from(grew);
         Ok((index, rect, id))
+    }
+
+    fn insert_surface(
+        &mut self,
+        size: Size<i32>,
+        surface: &Arc<dyn crate::Surface>,
+    ) -> Result<(usize, Rect<i32>, u32)> {
+        let gpu = self.gpu.clone();
+        let (index, rect, id) = self.allocate(PageKind::Color, size, gpu.color)?;
+        let drawn = match self.view(true, index as u32) {
+            Some(view) => super::video::draw(&gpu, surface, view, rect),
+            None => Err(anyhow!("the page is missing")),
+        };
+        if drawn.is_err() {
+            // Later frames come as pixels.
+            super::SURFACES.store(false, Relaxed);
+            if self.pages[PageKind::Color as usize].free(index, id) {
+                self.generation += 1;
+            }
+        }
+        drawn.map(|()| (index, rect, id))
     }
 
     fn max_side(&self) -> i32 {

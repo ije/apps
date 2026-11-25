@@ -3,6 +3,7 @@
 
 mod gpu;
 mod input;
+mod video;
 mod wayland;
 mod x11;
 
@@ -22,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::{cell::Cell, cell::RefCell, collections::BTreeMap, collections::VecDeque};
 use std::{rc::Rc, rc::Weak, time::Duration, time::Instant};
+pub(crate) use video::SURFACES;
 
 // A window that stops drawing releases its spare GPU resources after this.
 const QUIET: Duration = Duration::from_secs(1);

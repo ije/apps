@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const ABI: u32 = 2;
+pub const ABI: u32 = 3;
 
 pub type Alloc = extern "C" fn(output: *mut c_void, length: usize) -> *mut u8;
 
@@ -22,13 +22,33 @@ pub struct Host {
     pub drop_waker: extern "C" fn(waker: *mut c_void),
     pub alloc: extern "C" fn(length: usize) -> *mut u8,
     pub free: extern "C" fn(bytes: *mut u8, length: usize),
+    /// True when the renderer can read surfaces.
+    pub surfaces: extern "C" fn() -> bool,
 }
 
+/// A decoded NV12 frame in GPU memory.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Surface {
+    pub handle: *mut c_void,
+    pub width: u32,
+    pub height: u32,
+    /// `SWS_CS_*` of FFmpeg.
+    pub matrix: u32,
+    pub full_range: u32,
+    pub fds: [c_int; 2],
+    pub offsets: [u32; 2],
+    pub pitches: [u32; 2],
+    pub modifiers: [u64; 2],
+}
+
+/// Without `pixels`, the frame is a `surface`.
 #[repr(C)]
 pub struct Frame {
     pub pixels: *mut u8,
     pub width: u32,
     pub height: u32,
+    pub surface: Surface,
 }
 
 const PLAY: u32 = 0;
@@ -73,13 +93,17 @@ struct Pixels {
     width: u32,
     height: u32,
     time: f64,
+    surface: Option<Surface>,
 }
 
 unsafe impl Send for Pixels {}
 
 impl Drop for Pixels {
     fn drop(&mut self) {
-        (host().free)(self.bytes, self.width as usize * self.height as usize * 4)
+        match self.surface {
+            Some(surface) => unsafe { apps_ffmpeg_release(surface.handle) },
+            None => (host().free)(self.bytes, self.width as usize * self.height as usize * 4),
+        }
     }
 }
 
@@ -115,6 +139,10 @@ unsafe extern "C" {
         count: *mut c_int,
     ) -> c_int;
     fn apps_ffmpeg_pixels(media: *mut c_void, pixels: *mut u8) -> c_int;
+    fn apps_ffmpeg_surface(media: *mut c_void, surface: *mut Surface) -> c_int;
+    fn apps_ffmpeg_read(handle: *mut c_void, width: c_int, height: c_int, pixels: *mut u8)
+    -> c_int;
+    fn apps_ffmpeg_release(handle: *mut c_void);
     fn apps_ffmpeg_seek(media: *mut c_void, time: f64) -> c_int;
     fn apps_ffmpeg_speed(media: *mut c_void, speed: f64);
     fn apps_ffmpeg_close(media: *mut c_void);
@@ -355,6 +383,16 @@ mod wave {
     pub unsafe fn apps_ffmpeg_pixels(_: *mut c_void, _: *mut u8) -> c_int {
         -1
     }
+
+    pub unsafe fn apps_ffmpeg_surface(_: *mut c_void, _: *mut super::Surface) -> c_int {
+        0
+    }
+
+    pub unsafe fn apps_ffmpeg_read(_: *mut c_void, _: c_int, _: c_int, _: *mut u8) -> c_int {
+        -1
+    }
+
+    pub unsafe fn apps_ffmpeg_release(_: *mut c_void) {}
 
     pub unsafe fn apps_ffmpeg_seek(media: *mut c_void, time: f64) -> c_int {
         unsafe { &mut *media.cast::<Wave>() }.seek(time);
@@ -1021,10 +1059,27 @@ fn run(shared: Arc<Shared>, decoder: Decoder) {
                         continue;
                     }
                     let (width, height) = (width as u32, height as u32);
-                    let spare = lock(&shared.state)
-                        .spare
-                        .pop()
-                        .filter(|pixels| pixels.width == width && pixels.height == height);
+                    let mut surface = std::mem::MaybeUninit::uninit();
+                    if (host().surfaces)()
+                        && unsafe { apps_ffmpeg_surface(media, surface.as_mut_ptr()) } != 0
+                    {
+                        let frame = Pixels {
+                            bytes: std::ptr::null_mut(),
+                            width,
+                            height,
+                            time,
+                            surface: Some(unsafe { surface.assume_init() }),
+                        };
+                        (failures, converted) = (0, time);
+                        let mut state = lock(&shared.state);
+                        if state.generation == generation {
+                            state.frames.push_back(frame);
+                        }
+                        continue;
+                    }
+                    let spare = lock(&shared.state).spare.pop().filter(|pixels| {
+                        pixels.surface.is_none() && pixels.width == width && pixels.height == height
+                    });
                     let pixels = spare.or_else(|| {
                         let bytes = (host().alloc)(width as usize * height as usize * 4);
                         (!bytes.is_null()).then_some(Pixels {
@@ -1032,6 +1087,7 @@ fn run(shared: Arc<Shared>, decoder: Decoder) {
                             width,
                             height,
                             time,
+                            surface: None,
                         })
                     });
                     let Some(mut pixels) = pixels
@@ -1279,7 +1335,7 @@ pub unsafe extern "C" fn apps_media_control(media: *mut c_void, id: u64, op: u32
             state.seek = Some(time);
             state.ready = false;
             let State { frames, spare, .. } = &mut *state;
-            spare.extend(frames.drain(..));
+            spare.extend(frames.drain(..).filter(|frame| frame.surface.is_none()));
             state.woken = false;
             shared.sound.flush();
             shared.sound.set(Some(time), None, None);
@@ -1376,7 +1432,9 @@ pub unsafe extern "C" fn apps_media_frame(media: *mut c_void, id: u64, frame: *m
     {
         state.show = false;
         let next = state.frames.pop_front();
-        if let Some(late) = std::mem::replace(&mut shown, next) {
+        if let Some(late) = std::mem::replace(&mut shown, next)
+            && late.surface.is_none()
+        {
             state.spare.push(late);
         }
     }
@@ -1390,10 +1448,32 @@ pub unsafe extern "C" fn apps_media_frame(media: *mut c_void, id: u64, frame: *m
             pixels: pixels.bytes,
             width: pixels.width,
             height: pixels.height,
+            surface: pixels.surface.unwrap_or(std::mem::zeroed()),
         }
     };
     std::mem::forget(pixels);
     true
+}
+
+/// Copies a surface to BGRA pixels. Returns false when this fails.
+///
+/// # Safety
+/// `handle` comes from a frame and is not released, and `pixels` has `width * height * 4` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn apps_media_read(
+    handle: *mut c_void,
+    width: u32,
+    height: u32,
+    pixels: *mut u8,
+) -> bool {
+    unsafe { apps_ffmpeg_read(handle, width as c_int, height as c_int, pixels) >= 0 }
+}
+
+/// # Safety
+/// `handle` comes from a frame, and nothing uses it after this.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn apps_media_release(handle: *mut c_void) {
+    unsafe { apps_ffmpeg_release(handle) }
 }
 
 /// Gives the pixels of a frame from `apps_media_frame` back to element `id`, so its next frames reuse
@@ -1415,6 +1495,7 @@ pub unsafe extern "C" fn apps_media_recycle(
         width,
         height,
         time: 0.,
+        surface: None,
     };
     if let Some(player) = media.players.get(&id) {
         let mut state = lock(&player.shared.state);

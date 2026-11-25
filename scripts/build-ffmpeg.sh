@@ -82,7 +82,11 @@ case "$system" in
     [[ $arch == aarch64 ]] && options+=(--cc=clang --arch=aarch64)
     ;;
   linux)
-    options+=("--extra-cflags=-ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables")
+    options+=(
+      "--extra-cflags=-ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables"
+      --enable-vaapi
+      --enable-hwaccel=h264_vaapi,hevc_vaapi,vp8_vaapi,vp9_vaapi,av1_vaapi
+    )
     ;;
 esac
 options+=("$@")
@@ -110,6 +114,8 @@ config=$build/ffbuild/config.mak
 cc=$(sed -n 's/^CC=//p' "$config")
 "$cc" -c "$root/crates/media/native/ffmpeg.c" -I"$build/install/include" -o "$build/ffmpeg.o"
 symbols=($(nm -u "$build/ffmpeg.o" | awk '{print $NF}' | grep -E '^_?(av|sws|swr)'))
+objects=()
+libs=$(sed -n 's/^EXTRALIBS[^=]*=//p' "$config")
 case "$system" in
   macos)
     printf '%s\n' "${symbols[@]}" > "$build/exports"
@@ -121,6 +127,12 @@ case "$system" in
     link=("$build/exports.def" -shared -static-libgcc -s -Wl,--out-implib,"$lib/ffmpeg.lib" -o "$lib/ffmpeg.dll")
     ;;
   linux)
+    # libva.c takes the place of libva, which the library must not need to load.
+    nm -u "$build"/lib{avcodec,avutil}/*.a | awk '$2 ~ /^va[A-Z]/ && $2 != "vaGetDisplayDRM" { print "LIBVA(" $2 ")" }' |
+      sort -u > "$build/libva.inc"
+    "$cc" -c -Os -fPIC "$root/crates/media/native/libva.c" -I"$build" -o "$build/libva.o"
+    objects+=("$build/libva.o")
+    libs=$(sed -E 's/(^| )-lva(-drm)?( |$)/ /g; s/(^| )-lva(-drm)?( |$)/ /g' <<< "$libs")
     { printf '{ global:\n'; printf '%s;\n' "${symbols[@]}"; printf 'local: *; };\n'; } > "$build/exports"
     link=(-shared -s -Wl,-soname,libffmpeg.so -Wl,-Bsymbolic -Wl,--gc-sections
       -Wl,--version-script="$build/exports" -o "$lib/libffmpeg.so")
@@ -129,13 +141,13 @@ esac
 "$cc" $(sed -n 's/^LDFLAGS=//p' "$config") "${link[@]}" "${symbols[@]/#/-Wl,-u,}" \
   "$build/libavformat/libavformat.a" "$build/libavcodec/libavcodec.a" "$build/libswscale/libswscale.a" \
   "$build/libswresample/libswresample.a" "$build/libavutil/libavutil.a" \
-  $(sed -n 's/^EXTRALIBS[^=]*=//p' "$config")
+  ${objects[@]+"${objects[@]}"} $libs
 
 {
   printf 'FFmpeg %s from https://ffmpeg.org/releases/ffmpeg-%s.tar.xz\n' "$version" "$version"
   printf 'is licensed under the GNU Lesser General Public License version 2.1 or later.\n'
   printf 'It was built unmodified by scripts/build-ffmpeg.sh with:\n\n  configure %s\n\n' "${options[*]}"
-  printf 'Its static libraries were linked into one shared library that exports:\n\n  %s\n\n' "${symbols[*]}"
+  printf 'Its static libraries were linked, on Linux with a loader for libva, into one shared library that exports:\n\n  %s\n\n' "${symbols[*]}"
   printf 'The app loads that library next to this file. You may replace it with your own\n'
   printf 'build of the same FFmpeg version that exports the same functions.\n\n'
   cat "$source_dir/COPYING.LGPLv2.1"

@@ -2,10 +2,21 @@
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/time.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 #include <math.h>
 #include <string.h>
+
+#ifdef __linux__
+#include <dlfcn.h>
+#include <libavutil/hwcontext_vaapi.h>
+#include <unistd.h>
+#include <va/va_drmcommon.h>
+#endif
+
+// The decoder has this many frames more than it needs, which surfaces can hold.
+#define SURFACES 6
 
 typedef struct {
   double duration;
@@ -33,7 +44,11 @@ typedef struct {
   struct SwsContext *scale;
   SwrContext *resample;
   AVChannelLayout layout, input;
-  int rate, input_format, input_rate, width, height, read_end;
+  int rate, input_format, input_rate, width, height, read_end, software_only, slow;
+  // Frames and audio packets up to these times came before the video changed to software.
+  // Each surface holds a reference.
+  AVBufferRef *surfaces;
+  int64_t video_resume, audio_resume, audio_read;
   double speed;
   float *samples;
   int capacity;
@@ -82,13 +97,13 @@ static int open_track(AppsMedia *m, Track *track, enum AVMediaType type) {
   codec->pkt_timebase = stream->time_base;
   codec->thread_count = 0;
   codec->opaque = m;
-  if (type == AVMEDIA_TYPE_VIDEO) {
+  if (type == AVMEDIA_TYPE_VIDEO && !m->software_only) {
 #if defined(__APPLE__)
     enum AVHWDeviceType device = AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
 #elif defined(_WIN32)
     enum AVHWDeviceType device = AV_HWDEVICE_TYPE_D3D11VA;
 #else
-    enum AVHWDeviceType device = AV_HWDEVICE_TYPE_NONE;
+    enum AVHWDeviceType device = AV_HWDEVICE_TYPE_VAAPI;
 #endif
     for (int i = 0;; i++) {
       const AVCodecHWConfig *config = avcodec_get_hw_config(decoder, i);
@@ -98,6 +113,7 @@ static int open_track(AppsMedia *m, Track *track, enum AVMediaType type) {
         m->hardware = config->pix_fmt;
         codec->hw_device_ctx = av_buffer_ref(m->device);
         codec->get_format = pick_format;
+        if (device == AV_HWDEVICE_TYPE_VAAPI) codec->extra_hw_frames = SURFACES;
         break;
       }
     }
@@ -120,14 +136,16 @@ AppsMedia *apps_ffmpeg_open(const char *path, const uint8_t *data, int64_t size,
   int status = AVERROR(ENOMEM);
   if (!m) goto fail;
   m->speed = 1;
+  m->video_resume = m->audio_resume = m->audio_read = INT64_MIN;
   m->rate = rate;
   av_channel_layout_default(&m->layout, channels > 0 ? channels : 2);
+  m->surfaces = av_buffer_allocz(1);
   m->format = avformat_alloc_context();
   m->frame = av_frame_alloc();
   m->software = av_frame_alloc();
   m->picture = av_frame_alloc();
   m->packet = av_packet_alloc();
-  if (!m->format || !m->frame || !m->software || !m->picture || !m->packet) goto fail;
+  if (!m->surfaces || !m->format || !m->frame || !m->software || !m->picture || !m->packet) goto fail;
   if (data) {
     m->data = data;
     m->size = size;
@@ -276,6 +294,11 @@ int apps_ffmpeg_next(AppsMedia *m, int want, double *time, int *width, int *heig
       }
       if (status == 0) {
         if (kind == 2) return audio(m, samples, count, time);
+        if (m->frame->best_effort_timestamp != AV_NOPTS_VALUE && m->frame->best_effort_timestamp <= m->video_resume) {
+          av_frame_unref(m->frame);
+          waiting |= 1;
+          continue;
+        }
         *time = seconds(m, track, m->frame->best_effort_timestamp);
         av_frame_unref(m->picture);
         av_frame_move_ref(m->picture, m->frame);
@@ -299,6 +322,10 @@ int apps_ffmpeg_next(AppsMedia *m, int want, double *time, int *width, int *heig
     Track *track = m->video.stream && m->packet->stream_index == m->video.stream->index ? &m->video
                    : m->audio.stream && m->packet->stream_index == m->audio.stream->index ? &m->audio
                                                                                            : NULL;
+    if (track == &m->audio && m->packet->dts != AV_NOPTS_VALUE) {
+      if (m->packet->dts <= m->audio_resume) track = NULL;
+      else m->audio_read = m->packet->dts;
+    }
     if (track && (status = push(track, m->packet)) < 0) return status;
     av_packet_unref(m->packet);
     // Packets of a track that is not wanted stay in memory, so the caller decodes that track first.
@@ -307,30 +334,153 @@ int apps_ffmpeg_next(AppsMedia *m, int want, double *time, int *width, int *heig
   }
 }
 
+static int color_matrix(const AVFrame *frame) {
+  return frame->colorspace == AVCOL_SPC_BT709 ? SWS_CS_ITU709
+         : frame->colorspace == AVCOL_SPC_BT2020_NCL || frame->colorspace == AVCOL_SPC_BT2020_CL ? SWS_CS_BT2020
+         : frame->colorspace == AVCOL_SPC_UNSPECIFIED && frame->height >= 720                    ? SWS_CS_ITU709
+                                                                                                  : SWS_CS_DEFAULT;
+}
+
+static int convert(struct SwsContext **scale, const AVFrame *frame, int width, int height, uint8_t *pixels) {
+  *scale = sws_getCachedContext(*scale, frame->width, frame->height, frame->format, width, height, AV_PIX_FMT_BGRA,
+                                SWS_BILINEAR, NULL, NULL, NULL);
+  if (!*scale) return AVERROR(EINVAL);
+  sws_setColorspaceDetails(*scale, sws_getCoefficients(color_matrix(frame)), frame->color_range == AVCOL_RANGE_JPEG,
+                           sws_getCoefficients(SWS_CS_DEFAULT), 1, 0, 1 << 16, 1 << 16);
+  uint8_t *planes[4] = {pixels};
+  int strides[4] = {width * 4};
+  int rows = sws_scale(*scale, (const uint8_t *const *)frame->data, frame->linesize, 0, frame->height, planes, strides);
+  return rows == height ? 0 : AVERROR(EINVAL);
+}
+
+// A decoded frame in GPU memory. Change `Surface` in lib.rs and player.rs together with this.
+typedef struct {
+  void *handle;
+  uint32_t width, height, matrix, full_range;
+  int32_t fds[2];
+  uint32_t offsets[2], pitches[2];
+  uint64_t modifiers[2];
+} AppsSurface;
+
+typedef struct {
+  AVFrame *frame;
+  AVBufferRef *count;
+  int fds[2];
+} Held;
+
+void apps_ffmpeg_release(void *handle) {
+  Held *held = handle;
+#ifdef __linux__
+  for (int i = 0; i < 2; i++)
+    if (held->fds[i] >= 0) close(held->fds[i]);
+#endif
+  av_frame_free(&held->frame);
+  av_buffer_unref(&held->count);
+  av_free(held);
+}
+
+int apps_ffmpeg_read(void *handle, int width, int height, uint8_t *pixels) {
+  Held *held = handle;
+  struct SwsContext *scale = NULL;
+  AVFrame *frame = av_frame_alloc();
+  int status = frame ? av_hwframe_transfer_data(frame, held->frame, 0) : AVERROR(ENOMEM);
+  if (status >= 0) status = av_frame_copy_props(frame, held->frame);
+  if (status >= 0) status = convert(&scale, frame, width, height, pixels);
+  sws_freeContext(scale);
+  av_frame_free(&frame);
+  return status;
+}
+
+// Returns 0 when the GPU can't read the picture in place.
+int apps_ffmpeg_surface(AppsMedia *m, AppsSurface *out) {
+#ifdef __linux__
+  AVFrame *frame = m->picture;
+  if (frame->format != AV_PIX_FMT_VAAPI || !frame->hw_frames_ctx) return 0;
+  AVHWFramesContext *frames = (AVHWFramesContext *)frame->hw_frames_ctx->data;
+  if (frames->sw_format != AV_PIX_FMT_NV12) return 0;
+  // FFmpeg has loaded libva.
+  void *va = dlopen("libva.so.2", RTLD_NOW | RTLD_NOLOAD);
+  if (!va) return 0;
+  __typeof__(&vaSyncSurface) sync = (__typeof__(&vaSyncSurface))dlsym(va, "vaSyncSurface");
+  __typeof__(&vaExportSurfaceHandle) export =
+      (__typeof__(&vaExportSurfaceHandle))dlsym(va, "vaExportSurfaceHandle");
+  dlclose(va);
+  if (!sync || !export) return 0;
+  if (av_buffer_get_ref_count(m->surfaces) > SURFACES) return 0;
+  Held *held = av_mallocz(sizeof(Held));
+  if (!held) return 0;
+  *held = (Held){av_frame_clone(frame), av_buffer_ref(m->surfaces), {-1, -1}};
+  if (!held->frame || !held->count) {
+    apps_ffmpeg_release(held);
+    return 0;
+  }
+  VADisplay display = ((AVVAAPIDeviceContext *)frames->device_ctx->hwctx)->display;
+  VASurfaceID id = (VASurfaceID)(uintptr_t)frame->data[3];
+  VADRMPRIMESurfaceDescriptor planes;
+  if (sync(display, id) != VA_STATUS_SUCCESS ||
+      export(display, id, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+             VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS, &planes) != VA_STATUS_SUCCESS) {
+    apps_ffmpeg_release(held);
+    return 0;
+  }
+  int usable = planes.num_layers == 2 && planes.layers[0].num_planes == 1 && planes.layers[1].num_planes == 1;
+  *out = (AppsSurface){held, frame->width, frame->height, color_matrix(frame), frame->color_range == AVCOL_RANGE_JPEG, {-1, -1}, {0}, {0}, {0}};
+  for (int i = 0; usable && i < 2; i++) {
+    uint32_t object = planes.layers[i].object_index[0];
+    held->fds[i] = out->fds[i] = dup(planes.objects[object].fd);
+    out->offsets[i] = planes.layers[i].offset[0];
+    out->pitches[i] = planes.layers[i].pitch[0];
+    out->modifiers[i] = planes.objects[object].drm_format_modifier;
+    usable = held->fds[i] >= 0;
+  }
+  for (uint32_t i = 0; i < planes.num_objects; i++) close(planes.objects[i].fd);
+  if (!usable) apps_ffmpeg_release(held);
+  return usable;
+#else
+  return 0;
+#endif
+}
+
+// Decodes the rest of the video in software, while the audio goes on.
+static void use_software(AppsMedia *m) {
+  AVCodecContext *codec = m->video.codec;
+  int64_t time = m->picture->best_effort_timestamp;
+  m->software_only = 1;
+  // FFmpeg decodes AV1 only in hardware.
+  if (codec->codec_id == AV_CODEC_ID_AV1 || time == AV_NOPTS_VALUE ||
+      !open_track(m, &m->video, AVMEDIA_TYPE_VIDEO))
+    return;
+  if (avformat_seek_file(m->format, m->video.stream->index, INT64_MIN, time, time, 0) < 0) {
+    avcodec_free_context(&m->video.codec);
+    m->video.codec = codec;
+    return;
+  }
+  avcodec_free_context(&codec);
+  av_buffer_unref(&m->device);
+  clear(&m->video);
+  m->read_end = 0;
+  m->video_resume = time;
+  m->audio_resume = m->audio_read;
+}
+
 int apps_ffmpeg_pixels(AppsMedia *m, uint8_t *pixels) {
   AVFrame *frame = m->picture;
   if (frame->format == m->hardware && frame->hw_frames_ctx) {
     av_frame_unref(m->software);
+    int64_t start = av_gettime_relative();
     int status = av_hwframe_transfer_data(m->software, frame, 0);
+    if (status >= 0) av_frame_copy_props(m->software, frame);
+    if (frame->format == AV_PIX_FMT_VAAPI && !m->software_only) {
+      // Some VA-API drivers give memory that the CPU reads slower than the video plays.
+      AVRational rate = av_guess_frame_rate(m->format, m->video.stream, NULL);
+      double limit = rate.num > 0 && rate.den > 0 ? 0.5 / (av_q2d(rate) * m->speed) : 1 / 60.;
+      m->slow = (av_gettime_relative() - start) / 1e6 > limit ? m->slow + 1 : 0;
+      if (status < 0 || m->slow == 4) use_software(m);
+    }
     if (status < 0) return status;
-    av_frame_copy_props(m->software, frame);
     frame = m->software;
   }
-  int stride = m->width * 4;
-  m->scale = sws_getCachedContext(m->scale, frame->width, frame->height, frame->format, m->width, m->height,
-                                  AV_PIX_FMT_BGRA, SWS_BILINEAR, NULL, NULL, NULL);
-  if (!m->scale) return AVERROR(EINVAL);
-  int matrix = frame->colorspace == AVCOL_SPC_BT709 ? SWS_CS_ITU709
-               : frame->colorspace == AVCOL_SPC_BT2020_NCL || frame->colorspace == AVCOL_SPC_BT2020_CL
-                   ? SWS_CS_BT2020
-               : frame->colorspace == AVCOL_SPC_UNSPECIFIED && frame->height >= 720 ? SWS_CS_ITU709
-                                                                                     : SWS_CS_DEFAULT;
-  sws_setColorspaceDetails(m->scale, sws_getCoefficients(matrix), frame->color_range == AVCOL_RANGE_JPEG,
-                           sws_getCoefficients(SWS_CS_DEFAULT), 1, 0, 1 << 16, 1 << 16);
-  uint8_t *planes[4] = {pixels};
-  int strides[4] = {stride};
-  int rows = sws_scale(m->scale, (const uint8_t *const *)frame->data, frame->linesize, 0, frame->height, planes, strides);
-  return rows == m->height ? 0 : AVERROR(EINVAL);
+  return convert(&m->scale, frame, m->width, m->height, pixels);
 }
 
 int apps_ffmpeg_seek(AppsMedia *m, double time) {
@@ -344,6 +494,7 @@ int apps_ffmpeg_seek(AppsMedia *m, double time) {
   clear(&m->audio);
   av_frame_unref(m->picture);
   m->read_end = 0;
+  m->video_resume = m->audio_resume = m->audio_read = INT64_MIN;
   swr_free(&m->resample);
   return status;
 }
@@ -369,6 +520,7 @@ void apps_ffmpeg_close(AppsMedia *m) {
   av_frame_free(&m->picture);
   av_packet_free(&m->packet);
   av_buffer_unref(&m->device);
+  av_buffer_unref(&m->surfaces);
   sws_freeContext(m->scale);
   swr_free(&m->resample);
   av_channel_layout_uninit(&m->layout);
