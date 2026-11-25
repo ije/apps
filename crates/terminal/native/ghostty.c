@@ -249,6 +249,9 @@ Vt *vt_new(uint16_t cols, uint16_t rows, const VtHost *host) {
   }
   // Images need a cell size before the first frame gives the real one.
   ghostty_terminal_resize(terminal, cols, rows, vt->cell_w, vt->cell_h);
+  // The default keeps one page, which is only some hundred rows.
+  size_t scrollback = 10 * 1000 * 1000;
+  ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES, &scrollback);
   ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_USERDATA, vt);
   ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_WRITE_PTY, (const void *)on_write);
   ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_BELL, (const void *)on_bell);
