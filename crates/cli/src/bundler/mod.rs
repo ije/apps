@@ -394,6 +394,9 @@ impl Shared {
             if let Some(features) = package.get("features") {
                 metadata["features"] = features.clone();
             }
+            if sources.iter().any(|path| embeds_web_view(path)) {
+                metadata["webview"] = true.into();
+            }
             files.insert("package.json".into(), metadata.to_string());
         }
         Ok(())
@@ -580,6 +583,42 @@ impl Builder {
             .to_string_lossy()
             .replace('\\', "/"))
     }
+}
+
+// Packages are left out, because React DOM and others name all HTML tags.
+fn embeds_web_view(path: &Path) -> bool {
+    const MARKS: [&str; 9] = [
+        "WebContentsView",
+        "<iframe",
+        "<webview",
+        "'iframe'",
+        "'webview'",
+        "\"iframe\"",
+        "\"webview\"",
+        "`iframe`",
+        "`webview`",
+    ];
+    !resolve::in_packages(path)
+        && path.extension().is_some_and(|extension| {
+            matches!(
+                extension.to_str(),
+                Some(
+                    "ts" | "tsx"
+                        | "mts"
+                        | "cts"
+                        | "js"
+                        | "jsx"
+                        | "mjs"
+                        | "cjs"
+                        | "html"
+                        | "htm"
+                        | "vue"
+                        | "svelte"
+                )
+            )
+        })
+        && fs::read_to_string(path)
+            .is_ok_and(|source| MARKS.iter().any(|mark| source.contains(mark)))
 }
 
 fn app_relative(root: &Path, path: &Path) -> PathBuf {

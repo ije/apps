@@ -28,7 +28,7 @@ impl Window {
         if let Some(parent) = parent {
             ensure!(
                 matches!(parent, RawWindowHandle::Xlib(_) | RawWindowHandle::Xcb(_)),
-                "WebKitGTK embedding requires X11 or XWayland; start the app with WAYLAND_DISPLAY unset and GDK_BACKEND=x11"
+                "WebKitGTK embedding requires X11 or XWayland; on Wayland, install XWayland or start the app with WAYLAND_DISPLAY unset"
             );
         }
         if !gtk::is_initialized() {
@@ -108,7 +108,7 @@ impl Window {
             RawWindowHandle::Xlib(parent) => parent.window,
             RawWindowHandle::Xcb(parent) => parent.window.get() as _,
             _ => bail!(
-                "WebKitGTK embedding requires X11 or XWayland; start the app with WAYLAND_DISPLAY unset and GDK_BACKEND=x11"
+                "WebKitGTK embedding requires X11 or XWayland; on Wayland, install XWayland or start the app with WAYLAND_DISPLAY unset"
             ),
         };
         let display = self

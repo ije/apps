@@ -34,6 +34,7 @@ pub fn package_app(
         version,
         identifier,
         features,
+        ..
     } = apps_runtime::bundle::Package::parse(files.get("package.json").map(String::as_str))?;
     let library_name = apps_runtime::jsc::library_name(target.platform)?;
     let enabled = |feature| features.has(feature);
