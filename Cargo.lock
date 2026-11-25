@@ -137,6 +137,7 @@ name = "apps-renderer"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "ash",
  "block2",
  "core-foundation-sys",
  "cosmic-text",

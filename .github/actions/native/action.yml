@@ -8,7 +8,7 @@ runs:
   steps:
     - if: runner.os == 'Linux'
       shell: bash
-      run: sudo apt-get update && sudo apt-get install -y clang-19 ninja-build ruby nasm libicu-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev libfreetype6-dev libasound2-dev libudev-dev libglib2.0-dev libwebkit2gtk-4.1-dev libvulkan-dev xvfb xauth
+      run: sudo apt-get update && sudo apt-get install -y clang-19 ninja-build ruby nasm libicu-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev libfreetype6-dev libasound2-dev libudev-dev libglib2.0-dev libwebkit2gtk-4.1-dev libvulkan-dev libva-dev xvfb xauth
 
     # Each cache is saved right after its build, so a later failure of the job doesn't lose it.
     # The caches hold only the build results. The source and build folders stay out.
@@ -66,7 +66,7 @@ runs:
       id: ffmpeg
       with:
         path: target/ffmpeg/*-*
-        key: ffmpeg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-ffmpeg.sh', 'crates/media/native/ffmpeg.c') }}
+        key: ffmpeg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-ffmpeg.sh', 'crates/media/native/ffmpeg.c', 'crates/media/native/libva.c') }}
     - if: steps.ffmpeg.outputs.cache-hit != 'true' && runner.os == 'Windows'
       uses: msys2/setup-msys2@v2
       with:

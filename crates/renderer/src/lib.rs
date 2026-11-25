@@ -22,7 +22,8 @@ pub use control::*;
 pub use geometry::*;
 pub use gpu::Snapshot;
 pub(crate) use gpu::scene::Scene;
-pub use gpu::scene::{Backdrop, BlendMode, Glass, PaintEffect, RenderImage};
+pub use gpu::scene::{Backdrop, BlendMode, ColorMatrix, Glass, PaintEffect};
+pub use gpu::scene::{Planes, RenderImage, Surface};
 pub use input::*;
 #[cfg(target_os = "linux")]
 pub use platform::PREFER_X11;
@@ -37,6 +38,18 @@ pub use text::{
     Paragraph, SUBPIXEL_STEPS, SharedString, TextAlign, TextLine, TextOverrides, TextRun,
     TextStyle, TextSystem, TextWrap, WhiteSpace, WordBreak, Wrapping, warm, widest_piece,
 };
+
+/// True when images can be surfaces.
+pub extern "C" fn supports_surfaces() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        platform::SURFACES.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
 
 pub fn supports_glass() -> bool {
     #[cfg(target_os = "macos")]

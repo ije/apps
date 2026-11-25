@@ -656,6 +656,8 @@ impl Window {
     }
 
     fn image_tile(&self, image: &RenderImage) -> Option<crate::gpu::atlas::Tile> {
+        #[cfg(target_os = "linux")]
+        self.atlas.insert_surface(image);
         self.atlas
             .get_or_insert_with(&TileKey::Image(image.id), &mut || {
                 let size = image.size();
