@@ -83,7 +83,10 @@ pub(super) fn lint(
                     Prop::FILTER if value.contains("url(") && !value.contains("url(#") => {
                         "only filters defined in the page are supported"
                     }
-                    _ if name.ends_with("text-size-adjust")
+                    // Shorthands set their other longhands to the initial values, which change nothing.
+                    _ if name.starts_with("-internal-")
+                        || css::value::grammar::initial(name) == Some(value)
+                        || name.ends_with("text-size-adjust")
                         || name.ends_with("print-color-adjust")
                         || name.starts_with("page-break-")
                         || name.starts_with("break-")

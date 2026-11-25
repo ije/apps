@@ -4,7 +4,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 pub enum Parent<W> {
-    Ready(W),
+    // The window and its scale factor.
+    Ready(W, f64),
     Waiting,
     Gone,
 }
@@ -109,11 +110,11 @@ impl State {
     ) {
         for (id, window) in std::mem::take(&mut self.attaches) {
             let result = match parent(window) {
-                Parent::Ready(handle) => self
+                Parent::Ready(handle, scale) => self
                     .views
                     .get(&id)
                     .context("Browser is destroyed")
-                    .and_then(|browser| browser.attach(&handle)),
+                    .and_then(|browser| browser.attach(&handle, scale)),
                 Parent::Waiting => {
                     self.attaches.push((id, window));
                     Ok(())

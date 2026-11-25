@@ -5,7 +5,7 @@
   "main": "main.js",
   "preload": "./preload.js",
   "files": [
-    "./build/Release/math.dylib"
+    "./build/Release"
   ],
   "scripts": {
     "dev": "apps run --watch",

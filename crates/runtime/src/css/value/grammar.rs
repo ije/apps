@@ -10,6 +10,13 @@ pub(super) fn grammar(name: &str) -> Option<&'static str> {
     }
 }
 
+pub(crate) fn initial(name: &str) -> Option<&'static str> {
+    INITIAL
+        .binary_search_by(|(property, _)| (*property).cmp(name))
+        .ok()
+        .map(|index| INITIAL[index].1)
+}
+
 pub(crate) fn supports(name: &str, value: &str) -> Option<bool> {
     let name = Prop::unprefixed(name).unwrap_or(name);
     let value = value.trim();
@@ -229,7 +236,7 @@ pub(crate) fn fold(name: &str, value: &str) -> Option<String> {
 }
 
 // Keep sorted.
-pub(crate) const INITIAL: &[(&str, &str)] = &[
+const INITIAL: &[(&str, &str)] = &[
     ("-macos-glass", "none"),
     ("-macos-glass-interactive", "false"),
     ("-macos-glass-tint-color", "transparent"),
@@ -347,6 +354,7 @@ pub(crate) const INITIAL: &[(&str, &str)] = &[
     ("float", "none"),
     ("font-family", "system-ui"),
     ("font-size", "16px"),
+    ("font-size-adjust", "none"),
     ("font-stretch", "100%"),
     ("font-style", "normal"),
     ("font-weight", "400"),
