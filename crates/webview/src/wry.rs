@@ -388,6 +388,20 @@ mod tests {
     #[test]
     #[ignore = "requires a desktop display and the installed WebKitGTK or WebView2 runtime"]
     fn system_webview() {
+        // WebKitGTK can hang when the thread that uses it ends, so this thread stays until the process exits.
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(std::panic::catch_unwind(check_system_webview));
+            loop {
+                std::thread::park();
+            }
+        });
+        if let Err(panic) = result.recv().unwrap() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn check_system_webview() {
         let parent = Window::new(None, 1., &json!({"show":true}), Arc::default()).unwrap();
         let browser =
             Browser::new(None, 1., &json!({"show":false,"partition":"browser-smoke"})).unwrap();
