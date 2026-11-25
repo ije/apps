@@ -1,7 +1,15 @@
 use anyhow::{Context, Result, bail, ensure};
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use serde_json::{Value, json};
-use std::{collections::HashMap, io::Write, sync::mpsc};
+use std::{
+    collections::HashMap,
+    io::Write,
+    sync::mpsc,
+    time::{Duration, Instant},
+};
+
+// Like node-pty, an exit waits this long for the last output.
+const EXIT_WAIT: Duration = Duration::from_millis(200);
 
 struct Session {
     master: Box<dyn MasterPty + Send>,
@@ -11,6 +19,8 @@ struct Session {
     pending: Vec<u8>,
     eof: bool,
     exited: bool,
+    // The exit event that waits for the output, and its deadline.
+    exit: Option<(Value, Instant)>,
 }
 
 #[cfg(all(test, unix))]
@@ -162,6 +172,7 @@ impl State {
                         pending: Vec::new(),
                         eof: false,
                         exited: false,
+                        exit: None,
                     },
                 );
                 Ok(json!({"id":self.next,"pid":pid}))
@@ -198,10 +209,26 @@ impl State {
                         && let Some(child) = &mut session.child
                         && let Some(status) = child.try_wait()?
                     {
-                        events.push(json!({"id":id,"type":"exit","exitCode":status.exit_code(),"signal":status.signal()}));
+                        let event = json!({"id":id,"type":"exit","exitCode":status.exit_code(),"signal":status.signal()});
+                        session.exit = Some((event, Instant::now() + EXIT_WAIT));
                         session.exited = true;
+                        if !session.eof {
+                            let waker = crate::jsc::Waker::current();
+                            std::thread::Builder::new()
+                                .name("apps-pty-exit".into())
+                                .spawn(move || {
+                                    std::thread::sleep(EXIT_WAIT);
+                                    waker.wake();
+                                })?;
+                        }
                     }
-                    if session.exited && session.eof {
+                    if let Some((event, _)) = session
+                        .exit
+                        .take_if(|(_, deadline)| session.eof || Instant::now() >= *deadline)
+                    {
+                        events.push(event);
+                    }
+                    if session.exited && session.exit.is_none() && session.eof {
                         events.push(json!({"id":id,"type":"close"}));
                         closed.push(id);
                     }

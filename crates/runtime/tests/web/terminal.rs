@@ -2,7 +2,7 @@ use apps_runtime::{
     dom::Document, host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role,
     render::Page,
 };
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use std::{cell::RefCell, rc::Rc};
 
 /// A preload script that makes sessions for its page, and the page.
 struct Contexts {
@@ -60,7 +60,7 @@ impl Contexts {
             if self.page.eval(ready, "terminal-test").unwrap() == "true" {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(2));
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
         panic!("The terminal did not finish: {ready}");
     }

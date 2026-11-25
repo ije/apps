@@ -80,13 +80,25 @@ impl Window {
             true
         });
         let loads = events.clone();
+        let count = Rc::new(Cell::new(0u64));
         webkit.connect_load_changed(move |view, event| {
             match event {
                 LoadEvent::Started => {
                     failed.set(false);
+                    count.set(count.get() + 1);
                     loads.push(json!({"type":"did-start-loading", "url":view.uri().unwrap_or_default().as_str()}));
                 }
-                LoadEvent::Finished if !failed.get() => loads.push(json!({"type":"did-finish-load", "url":view.uri().unwrap_or_default().as_str(), "title":view.title().unwrap_or_default().as_str(), "canGoBack":view.can_go_back(), "canGoForward":view.can_go_forward()})),
+                LoadEvent::Finished if !failed.get() => {
+                    // WebKitGTK 2.52 can send the title after the end of the load.
+                    // The answer of a script comes after it.
+                    let (loads, count, load) = (loads.clone(), count.clone(), count.get());
+                    let page = view.clone();
+                    view.run_javascript_in_world("0", "apps", None::<&gio::Cancellable>, move |_| {
+                        if count.get() == load {
+                            loads.push(json!({"type":"did-finish-load", "url":page.uri().unwrap_or_default().as_str(), "title":page.title().unwrap_or_default().as_str(), "canGoBack":page.can_go_back(), "canGoForward":page.can_go_forward()}));
+                        }
+                    });
+                }
                 _ => {}
             }
         });
