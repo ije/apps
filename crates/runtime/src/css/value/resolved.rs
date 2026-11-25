@@ -262,8 +262,16 @@ pub(crate) fn resolved(
             .map(get);
             return if start == end { start } else { String::new() };
         }
-        "margin-block" | "margin-inline" | "padding-block" | "padding-inline" | "inset-block"
-        | "inset-inline" => {
+        "margin-block"
+        | "margin-inline"
+        | "padding-block"
+        | "padding-inline"
+        | "inset-block"
+        | "inset-inline"
+        | "scroll-margin-block"
+        | "scroll-margin-inline"
+        | "scroll-padding-block"
+        | "scroll-padding-inline" => {
             let mut sides = Vec::new();
             expand(name, "0 1", &mut sides);
             let [start, end] = [0, sides.len().saturating_sub(1)].map(|index| {

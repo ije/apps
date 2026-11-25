@@ -27,6 +27,12 @@ pub(crate) fn layout_flags(doc: &mut Document, state: &mut PageState, viewport: 
 pub(super) fn scroll_events(state: &mut PageState) -> Result<Value> {
     let changed = state.geometry.scroll_events();
     let mut changed = json!(changed);
+    let snaps = state.geometry.snap_events();
+    if !snaps.is_empty()
+        && let Some(list) = changed.as_array_mut()
+    {
+        list.push(json!({ "snaps": snaps }));
+    }
     let skips = state.layout.take_skip_events();
     if !skips.is_empty()
         && let Some(list) = changed.as_array_mut()
@@ -63,11 +69,12 @@ pub(super) fn hit_test(
     ))
 }
 
-// The renderer doesn't snap, so a box with no scroll offset, and none to come, is at 0 after any layout.
+// A box that doesn't snap, with no scroll offset, and none to come, is at 0 after any layout.
 pub(super) fn scrolled(id: usize, state: &mut PageState) -> Result<Value> {
     Ok(json!(state.geometry.scroll.get(&id).is_some_and(
         |handle| {
-            handle.offset() != renderer::Point::default()
+            handle.snaps()
+                || handle.offset() != renderer::Point::default()
                 || handle.target() != renderer::Point::default()
         }
     )))
@@ -120,6 +127,15 @@ pub(super) fn scroll(
         &handle,
         renderer::point(axis(&args[1], previous.x), axis(&args[2], previous.y)),
     );
+    let from = (args[4].as_bool() == Some(true)).then(|| handle.target());
+    // A script can turn snapping off and scroll before the next layout.
+    let snaps = handle.snaps()
+        && (state.restyle(doc, viewport).values[id].get(Prop::SCROLL_SNAP_TYPE))
+            .is_some_and(|kind| kind != "none");
+    let target = match snaps {
+        true => handle.snap(target, from),
+        false => target,
+    };
     if target != handle.target() {
         let smooth = handle.extent() != renderer::Point::default()
             && match args[3].as_str() {
@@ -211,33 +227,9 @@ pub(super) fn client(
     let padding = units
         .edges(now, css::properties::PADDING, base)
         .map(|value| value.max(0.));
-    let bars = state
-        .geometry
-        .scroll
-        .get(&id)
-        .and_then(|handle| {
-            let look = crate::render::paint::scrollbar::Look::new(
-                style,
-                computed.extras(id).scrollbars.as_deref(),
-                units,
-                None,
-            )?;
-            let scrolls = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y].map(|prop| {
-                style
-                    .get(prop)
-                    .is_some_and(|value| matches!(value, "auto" | "scroll"))
-            });
-            Some(look.space(look.shown(scrolls, handle.extent())))
-        })
-        .unwrap_or_default();
-    let gutters = if style
-        .get(Prop::SCROLLBAR_GUTTER)
-        .is_some_and(|value| value.contains("both-edges"))
-    {
-        2.
-    } else {
-        1.
-    };
+    let bars = (state.geometry.scroll.get(&id)).map_or([0.; 4], |handle| {
+        crate::render::paint::scrollbar::room(style, computed.extras(id), units, handle.extent())
+    });
     // Like offsetWidth, client sizes ignore transforms, so a transformed box takes its layout size,
     // and the shift from its bounds to its own untransformed corner.
     let transformed = state.geometry.mirror.is_transformed(id);
@@ -272,8 +264,8 @@ pub(super) fn client(
     Ok(json!([
         borders[3],
         borders[0],
-        (size[0] - borders[1] - borders[3] - bars[1] * gutters).max(0.),
-        (size[1] - borders[0] - borders[2] - bars[0]).max(0.),
+        (size[0] - borders[1] - borders[3] - bars[1] - bars[3]).max(0.),
+        (size[1] - borders[0] - borders[2] - bars[2]).max(0.),
         padding[0],
         padding[1],
         padding[2],

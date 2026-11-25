@@ -190,6 +190,25 @@ impl Look {
     }
 }
 
+// The room that the bars of a box take at its top, right, bottom and left sides.
+pub(crate) fn room(
+    style: &Style,
+    extras: &crate::style::Extras,
+    units: &css::value::units::Lengths,
+    extent: Point<Pixels>,
+) -> [f32; 4] {
+    let Some(look) = Look::new(style, extras.scrollbars.as_deref(), units, None) else {
+        return [0.; 4];
+    };
+    let scrolls = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+        .map(|prop| (style.get(prop)).is_some_and(|value| matches!(value, "auto" | "scroll")));
+    let [bottom, right] = look.space(look.shown(scrolls, extent));
+    let both = style
+        .get(Prop::SCROLLBAR_GUTTER)
+        .is_some_and(|value| value.contains("both-edges"));
+    [0., right, bottom, if both { right } else { 0. }]
+}
+
 // What the pointer does to the bars. A drag keeps its bar until the button goes up, wherever the pointer is.
 #[derive(Clone, Copy, Default, PartialEq)]
 enum Pointer {
@@ -557,6 +576,7 @@ impl Scrollbar {
                                     offset.y = to;
                                 }
                                 handle.set_offset(offset);
+                                handle.grab();
                                 window.refresh();
                             }
                             return;
@@ -583,6 +603,7 @@ impl Scrollbar {
                         // The pointer left no hover behind: it can be anywhere now, also outside the window.
                         state.pointer = Pointer::over(&bars, position, window);
                         state.active = Some(Instant::now());
+                        handle.settle(window);
                         window.refresh();
                     }
                     _ => {}
@@ -621,6 +642,7 @@ impl Scrollbar {
                 };
                 *value = (*value + px(step)).clamp(px(bar.range[0]), px(bar.range[1]));
                 handle.animate_to(offset, false);
+                handle.settle(window);
             }
             window.refresh();
         });

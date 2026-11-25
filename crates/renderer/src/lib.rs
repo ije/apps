@@ -13,6 +13,7 @@ pub use app::window::node::{
     shared, text,
 };
 pub use app::window::scroll::ScrollRef;
+pub use app::window::snap::{ScrollSnaps, SnapArea};
 pub use app::window::tree::Tree;
 pub use app::window::*;
 pub use app::{App, THREAD_PER_APP, run, spawn};

@@ -1463,3 +1463,78 @@ fn wide_gamut_colors_draw_in_display_p3() {
         &page,
     );
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn scroll_containers_snap_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('snap.html');
+        console.log('SNAP ' + await run(`(() => {
+            const box = document.getElementById('box'), out = [];
+            for (const value of [41, 130, 999]) { box.scrollTop = value; out.push(box.scrollTop); }
+            box.scrollTop = 80; box.scrollBy(0, 10); out.push(box.scrollTop);
+            box.children[0].style.height = '120px'; out.push(box.scrollTop);
+            box.style.scrollSnapType = 'none'; box.scrollTop = 50; out.push(box.scrollTop);
+            box.style.scrollSnapType = ''; out.push(box.scrollTop);
+            return out.join();
+        })()`));
+        "#,
+        &[(
+            "snap.html",
+            "<body style='margin:0'><style>#box{width:200px;height:100px;overflow:auto;scroll-snap-type:y mandatory}#box>div{height:80px;scroll-snap-align:start}</style>\
+             <div id=box><div></div><div></div><div></div><div></div><div></div><div></div><div></div><div></div></div></body>",
+        )],
+    );
+    assert!(text.contains("SNAP 80,160,540,160,200,50,20"), "{text}");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn scroll_snaps_fire_events_and_reach_into_shadow_trees() {
+    let text = run_hidden(
+        r#"
+        await load('snap.html');
+        const step = async (name, code) => {
+            await run(code + ';0');
+            for (let i = 0; i < 4; i++) { await win.webContents.capturePage(); await run('new Promise(done => setTimeout(done, 20))'); }
+            console.log('SNAP ' + name + ' ' + await run("log.splice(0).join(' ')"));
+        };
+        await step('load', '');
+        await step('scroll', 'box.scrollTop = 50');
+        await step('same', 'box.scrollTop = 90');
+        await step('layout', "first.style.height = '100px'");
+        await step('hide', "box.style.display = 'none'");
+        await step('show', "box.style.display = ''");
+        await step('off', "box.style.scrollSnapType = 'none'");
+        await step('bars', "box.style.scrollSnapType = ''; bars.scrollTop = 110; log.splice(0); log.push(bars.scrollTop)");
+        "#,
+        &[(
+            "snap.html",
+            "<body style='margin:0'><style>.s{width:200px;height:100px;overflow:auto;scroll-snap-type:y mandatory}#bars{overflow:scroll;scroll-snap-type:y proximity}#bars::-webkit-scrollbar{width:20px;height:20px}#bars>div{height:60px;margin-bottom:80px;scroll-snap-align:end}</style>\
+             <div class=s id=box><div id=host></div></div><div class=s id=bars><div id=b0></div><div id=b1></div><div id=b2></div></div><script>\
+             globalThis.log = []; globalThis.box = document.getElementById('box'); globalThis.bars = document.getElementById('bars');\
+             const root = document.getElementById('host').attachShadow({ mode: 'open' });\
+             root.innerHTML = '<style>p{margin:0;height:80px;scroll-snap-align:start}</style>' + [0, 1, 2, 3].map(i => '<p id=p' + i + '></p>').join('');\
+             globalThis.first = root.getElementById('p0');\
+             for (const type of ['scrollsnapchanging', 'scrollsnapchange']) box['on' + type] = event => log.push(type.slice(10) + ':' + event.snapTargetBlock?.id + ',' + event.snapTargetInline + '@' + box.scrollTop);\
+             </script></body>",
+        )],
+    );
+    for line in [
+        "load change:p0,null@0",
+        "scroll changing:p1,null@80 change:p1,null@80",
+        "same ",
+        "layout ",
+        "hide ",
+        "show change:p1,null@100",
+        "off change:undefined,null@100",
+        "bars 120 change:p1,null@100",
+    ] {
+        assert!(
+            text.lines()
+                .any(|out| out.trim_end() == format!("SNAP {line}").trim_end()),
+            "{line}: {text}"
+        );
+    }
+}

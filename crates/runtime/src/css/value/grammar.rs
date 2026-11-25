@@ -109,6 +109,14 @@ pub(crate) fn supports(name: &str, value: &str) -> Option<bool> {
         }
         return Some(axes == 1 || axes == 2 && axis == "size");
     }
+    // An axis, and then how strict it is.
+    if name == "scroll-snap-type"
+        && let parts = components(&lower, ' ')
+        && (matches!(parts[..], ["mandatory" | "proximity", ..])
+            || parts.len() == 2 && !matches!(parts[1], "mandatory" | "proximity"))
+    {
+        return Some(false);
+    }
     let grammar = grammar(name)?;
     // Like Chrome, a border, outline or column rule takes no negative width.
     if (matches!(name, "column-rule" | "outline" | "border")
@@ -433,6 +441,9 @@ const INITIAL: &[(&str, &str)] = &[
     ("scroll-padding-top", "auto"),
     ("scrollbar-color", "auto"),
     ("scrollbar-gutter", "auto"),
+    ("scroll-snap-align", "none"),
+    ("scroll-snap-stop", "normal"),
+    ("scroll-snap-type", "none"),
     ("scrollbar-width", "auto"),
     ("stroke", "none"),
     ("stroke-dasharray", "none"),

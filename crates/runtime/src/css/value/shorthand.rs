@@ -226,7 +226,7 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
             .map_or(Some((rest, "")), Some)
             .filter(|(side, _)| matches!(*side, "start" | "end"))
     {
-        if key.contains("-inline-") && !property.starts_with("scroll") {
+        if key.contains("-inline-") {
             if property == "border" && rest.is_empty() {
                 let mut parts = Vec::new();
                 expand("border-top", value, &mut parts);
@@ -298,6 +298,10 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
         | "padding-inline"
         | "margin-block"
         | "padding-block"
+        | "scroll-margin-inline"
+        | "scroll-margin-block"
+        | "scroll-padding-inline"
+        | "scroll-padding-block"
         | "inset-inline"
         | "inset-block"
         | "border-inline-width"

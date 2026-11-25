@@ -26,6 +26,7 @@ pub(crate) mod node;
 mod paint;
 mod retain;
 pub(crate) mod scroll;
+pub(crate) mod snap;
 pub(crate) mod tree;
 pub use paint::*;
 
@@ -1286,9 +1287,11 @@ impl Window {
         }
         if matches!(phase, WheelPhase::Ended | WheelPhase::MomentumEnded)
             && let Some(handle) = self.gesture.latch.clone()
-            && handle.release(self.gesture.speed, self)
         {
-            self.gesture.spent = true;
+            if handle.release(self.gesture.speed, self) {
+                self.gesture.spent = true;
+            }
+            handle.settle(self);
         }
         if phase == WheelPhase::MomentumEnded {
             self.gesture.latch = None;

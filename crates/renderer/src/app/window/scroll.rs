@@ -1,3 +1,4 @@
+use super::snap::ScrollSnaps;
 use crate::{
     App, Length, Overflow, Overscroll, Pixels, Point, Rect, Region, Size, Style, WheelPhase,
     Window, point, px,
@@ -84,6 +85,7 @@ impl Wheel {
             if to != from {
                 app.stop_event();
                 handle.animate_to(to, true);
+                handle.settle(window);
                 handle.drive(window);
             } else if stops {
                 app.stop_event();
@@ -92,6 +94,12 @@ impl Wheel {
         }
         let momentum = phase == WheelPhase::Momentum;
         if momentum && window.gesture.spent {
+            app.stop_event();
+            return;
+        }
+        if momentum && latched == Some(true) && handle.fling(window.gesture.speed, moved) {
+            window.gesture.spent = true;
+            handle.drive(window);
             app.stop_event();
             return;
         }
@@ -125,8 +133,10 @@ impl Wheel {
             app.stop_event();
         }
         if panned {
+            handle.grab();
             if phase == WheelPhase::None {
                 handle.loosen(window);
+                handle.settle(window);
             }
             handle.drive(window);
             window.refresh();
@@ -151,6 +161,18 @@ struct ScrollState {
     loose: bool,
     glide: Option<Glide>,
     anchor: Option<Anchor>,
+    snaps: Option<Rc<ScrollSnaps>>,
+    // The areas that the box is at on each axis.
+    snapped: [Option<u64>; 2],
+    // A gesture moves the box, which snaps when it ends.
+    grabbed: bool,
+    // The box snaps when it comes to rest.
+    settling: bool,
+    // The areas of the last `scrollsnapchange` and `scrollsnapchanging`.
+    reported: [Option<u64>; 2],
+    aimed: [Option<u64>; 2],
+    // A scroll, and not only layouts, moved the box since it was at rest.
+    scrolled: bool,
 }
 
 // The scroll anchor: a box that keeps its place in the scroll viewport when the content above it changes size.
@@ -325,6 +347,33 @@ impl ScrollState {
         self.glide = None;
     }
 
+    // Where the box is when the running scroll ends.
+    fn end(&self) -> Point<Pixels> {
+        match (&self.animation, &self.glide) {
+            (Some(animation), _) => animation.to,
+            (None, Some(glide)) => glide.to,
+            (None, None) => self.offset,
+        }
+    }
+
+    fn busy(&self) -> bool {
+        self.grabbed
+            || self.settling
+            || self.animation.is_some()
+            || self.stretch != Point::default()
+            || (self.glide.as_ref()).is_some_and(|glide| glide.to != self.offset)
+    }
+
+    fn snap(&mut self) {
+        if let Some(snaps) = &self.snaps {
+            let (to, ids) = snaps.find(self.offset, None, self.range);
+            self.snapped = ids;
+            if to != self.offset {
+                self.animate_to(to, false);
+            }
+        }
+    }
+
     fn advance(&mut self, now: Instant, idle: bool) -> bool {
         self.driven = false;
         let mut moved = false;
@@ -336,7 +385,8 @@ impl ScrollState {
                 self.animation = None;
                 to
             };
-            moved = offset != self.offset;
+            // The snap events wait for a frame at rest.
+            moved = offset != self.offset || self.animation.is_none() && self.snaps.is_some();
             self.offset = offset;
         }
         if let Some(glide) = &mut self.glide
@@ -354,6 +404,16 @@ impl ScrollState {
             };
             glide.from = glide.from.max(now);
             moved |= self.offset != from;
+        }
+        let resting = self.animation.is_none()
+            && self
+                .glide
+                .as_ref()
+                .is_none_or(|glide| glide.to == self.offset);
+        if self.settling && resting && idle && self.stretch == Point::default() {
+            self.settling = false;
+            self.snap();
+            moved = true;
         }
         if self.loose && idle {
             self.loose = false;
@@ -453,6 +513,146 @@ impl ScrollRef {
         self.0.borrow_mut().animate_to(offset, wheel);
     }
 
+    /// Where a scroll to `to` ends. A scroll from `from` snaps in its direction.
+    pub fn snap(&self, to: Point<Pixels>, from: Option<Point<Pixels>>) -> Point<Pixels> {
+        let scroll = &mut *self.0.borrow_mut();
+        let Some(snaps) = &scroll.snaps else {
+            return to;
+        };
+        let (mut found, mut ids) = snaps.find(to, from, scroll.range);
+        // Like Chrome, an axis that the scroll doesn't move keeps its area.
+        let now = scroll.end();
+        if to.x == now.x && scroll.snapped[0].is_some() {
+            (found.x, ids[0]) = (to.x, scroll.snapped[0]);
+        }
+        if to.y == now.y && scroll.snapped[1].is_some() {
+            (found.y, ids[1]) = (to.y, scroll.snapped[1]);
+        }
+        (scroll.snapped, scroll.grabbed, scroll.settling) = (ids, false, false);
+        scroll.scrolled = true;
+        found
+    }
+
+    pub fn snaps(&self) -> bool {
+        self.0.borrow().snaps.is_some()
+    }
+
+    /// Takes the snap areas of a new layout. True when the offset moved to one.
+    pub fn set_snaps(&self, snaps: Option<ScrollSnaps>) -> bool {
+        let scroll = &mut *self.0.borrow_mut();
+        if scroll.snaps.as_deref() == snaps.as_ref() {
+            return false;
+        }
+        scroll.snaps = snaps.map(Rc::new);
+        let Some(snaps) = &scroll.snaps else {
+            (scroll.snapped, scroll.settling) = ([None; 2], false);
+            return false;
+        };
+        if scroll.busy() {
+            scroll.settling |= !scroll.grabbed;
+            return false;
+        }
+        let (to, ids) = snaps.follow(scroll.offset, scroll.snapped, scroll.range);
+        scroll.snapped = ids;
+        let moved = to != scroll.offset;
+        scroll.offset = to;
+        scroll.glide = None;
+        moved
+    }
+
+    /// A box without a layout snaps to nothing, which is no event.
+    pub fn forget_snaps(&self) {
+        let scroll = &mut *self.0.borrow_mut();
+        (scroll.snaps, scroll.settling, scroll.scrolled) = (None, false, false);
+        (scroll.snapped, scroll.reported, scroll.aimed) = Default::default();
+    }
+
+    /// Whether the box still scrolls to a snap area, or has the event for it to fire.
+    pub fn snapping(&self) -> bool {
+        let scroll = self.0.borrow();
+        scroll.snaps.is_some() && (scroll.busy() || scroll.snapped != scroll.reported)
+    }
+
+    /// The areas, on the x and y axes, of the `scrollsnapchanging` and the `scrollsnapchange` event to fire.
+    pub fn snap_events(&self) -> [Option<[Option<u64>; 2]>; 2] {
+        let scroll = &mut *self.0.borrow_mut();
+        if scroll.snaps.is_none() && scroll.reported == [None; 2] {
+            return [None; 2];
+        }
+        let aim = match &scroll.snaps {
+            Some(snaps) if scroll.grabbed || scroll.settling => {
+                snaps.find(scroll.end(), None, scroll.range).1
+            }
+            _ => scroll.snapped,
+        };
+        let changing = scroll.scrolled && aim != scroll.aimed;
+        if changing {
+            scroll.aimed = aim;
+        }
+        let rests = !scroll.busy();
+        let change = rests && scroll.snapped != scroll.reported;
+        if rests {
+            (scroll.reported, scroll.aimed) = (scroll.snapped, scroll.snapped);
+            scroll.scrolled = false;
+        }
+        [changing.then_some(aim), change.then_some(scroll.snapped)]
+    }
+
+    pub fn grab(&self) {
+        let scroll = &mut *self.0.borrow_mut();
+        scroll.scrolled = true;
+        (scroll.grabbed, scroll.settling) = (true, false);
+        scroll.snapped = [None; 2];
+    }
+
+    /// The user let the box go, so it snaps when it comes to rest.
+    pub fn settle(&self, window: &mut Window) {
+        {
+            let scroll = &mut *self.0.borrow_mut();
+            scroll.grabbed = false;
+            scroll.settling = scroll.snaps.is_some();
+            scroll.scrolled = true;
+        }
+        self.drive(window);
+    }
+
+    // The first event of the momentum tells where it ends. True when the box goes to a snap area there instead.
+    fn fling(&self, speed: Point<f32>, moved: Point<Pixels>) -> bool {
+        // The time that macOS momentum takes to lose most of its speed.
+        const DECAY: f32 = 0.325;
+        let scroll = &mut *self.0.borrow_mut();
+        let Some(snaps) = scroll.snaps.clone() else {
+            return false;
+        };
+        if scroll.stretch != Point::default() || moved == Point::default() {
+            return false;
+        }
+        let speed = point(
+            if moved.x.is_zero() { 0. } else { speed.x },
+            if moved.y.is_zero() { 0. } else { speed.y },
+        );
+        let from = scroll.offset;
+        let end = from + speed.map(|value| px(value * DECAY));
+        let (to, ids) = snaps.find(end, Some(from), scroll.range);
+        let axis = usize::from(moved.x.is_zero());
+        if ids[axis].is_none() || to == from {
+            return false;
+        }
+        scroll.animate_to(to, false);
+        if let Some(animation) = &mut scroll.animation {
+            let distance = (to.x - from.x).abs().max((to.y - from.y).abs()).0;
+            let seconds = (distance.sqrt() / 40.).clamp(0.15, 0.6);
+            let slope = |delta: Pixels, speed: f32| match delta.is_zero() {
+                true => 0.,
+                false => (speed * seconds / delta.0).clamp(0., 3.),
+            };
+            animation.duration = Duration::from_secs_f32(seconds);
+            animation.slope = point(slope(to.x - from.x, speed.x), slope(to.y - from.y, speed.y));
+        }
+        (scroll.snapped, scroll.grabbed, scroll.settling) = (ids, false, false);
+        true
+    }
+
     pub(crate) fn anchor(&self) -> Option<Anchor> {
         self.0.borrow().anchor
     }
@@ -529,8 +729,11 @@ impl ScrollRef {
         {
             let scroll = &mut *self.0.borrow_mut();
             let gliding = (scroll.glide.as_ref()).is_some_and(|glide| glide.to != scroll.offset);
-            let busy =
-                scroll.animation.is_some() || scroll.spring.is_some() || scroll.loose || gliding;
+            let busy = scroll.animation.is_some()
+                || scroll.spring.is_some()
+                || scroll.loose
+                || scroll.settling
+                || gliding;
             if scroll.driven || !busy {
                 return;
             }

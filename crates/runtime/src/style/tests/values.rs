@@ -434,6 +434,38 @@ fn registered_properties_follow_syntax_inheritance_and_initial_values() {
 }
 
 #[test]
+fn scroll_spacing_parses_like_chrome() {
+    for (name, value, valid) in [
+        ("scroll-margin-top", "-5px", true),
+        ("scroll-margin-top", "5%", false),
+        ("scroll-margin-block", "5px 6px", true),
+        ("scroll-margin-inline-start", "auto", false),
+        ("scroll-padding-top", "10%", true),
+        ("scroll-padding-top", "-2px", false),
+        ("scroll-padding-inline", "auto 5px", true),
+    ] {
+        assert_eq!(supports(name, value), Some(valid), "{name}: {value}");
+    }
+    let doc = Document::parse(
+        "<style>div{scroll-margin-inline-start:5px;scroll-margin-block:3px 4px;scroll-padding-inline:1px 2px}</style><div id=l></div><div id=r dir=rtl><p id=p></p></div>",
+    );
+    let styles = styles(&doc, 800., 600.);
+    let get = |selector, name| styles[element(&doc, selector)].get(name).cloned();
+    for (id, name, value) in [
+        ("#l", "scroll-margin-left", "5px"),
+        ("#l", "scroll-margin-top", "3px"),
+        ("#l", "scroll-margin-bottom", "4px"),
+        ("#l", "scroll-padding-left", "1px"),
+        ("#r", "scroll-margin-right", "5px"),
+        ("#r", "scroll-padding-right", "1px"),
+        ("#r", "scroll-padding-left", "2px"),
+    ] {
+        assert_eq!(get(id, name).as_deref(), Some(value), "{id} {name}");
+    }
+    assert_eq!(get("#p", "scroll-margin-top"), None);
+}
+
+#[test]
 fn inline_logical_properties_follow_the_direction() {
     let doc = Document::parse(
         "<style>.m{margin-inline-start:50px;padding-inline:1px 2px;border-inline-start:3px solid red;inset-inline-end:4px;border-start-start-radius:5px}.override{margin-inline-start:50px}.override{margin-right:7px}</style><div id=l class=m></div><div dir=rtl><div id=r class=m></div><p id=o class=override></p></div><div style='direction:rtl'><span id=s class=m></span></div>",

@@ -4,6 +4,7 @@ mod lint;
 mod motion;
 mod page;
 mod patch;
+pub(crate) mod snap;
 mod visibility;
 
 use super::element::{Build, element};

@@ -1,5 +1,6 @@
 use super::super::element::{self, Build, element};
 use super::Cx;
+use super::snap;
 use crate::css;
 use crate::css::properties::{Prop, Style};
 use crate::render::paint::{background, scrollbar, spacer};
@@ -204,14 +205,18 @@ pub(super) fn node(
         .child({
             // Refresh the layout mirror after prepaint: scroll ranges change after the initial
             // sync_scroll.
-            let data = view.clone();
+            let (data, space) = (view.clone(), viewport.space);
             renderer::canvas(
-                move |_, _| {
+                move |_, window| {
                     if let Ok(mut store) = data.store.try_borrow_mut()
-                        && let Some(dom) = store.page_state_mut(data.id)
+                        && let Some(page) = store.pages.get_mut(&data.id)
                     {
-                        dom.geometry.sync_scroll();
+                        let dom = &mut page.state;
                         dom.geometry.prepainted(dom.pixel_ratio);
+                        if snap::update(&page.doc, dom, space) {
+                            window.redraw();
+                        }
+                        dom.geometry.sync_scroll();
                     }
                 },
                 |_, _, _| (),

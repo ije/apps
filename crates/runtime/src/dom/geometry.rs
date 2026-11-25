@@ -34,6 +34,7 @@ pub struct Geometry {
     pub(crate) layout_epoch: u64,
     pub(crate) drawn: rustc_hash::FxHashMap<usize, Drawn>,
     pub(crate) drawn_order: u32,
+    pub(crate) snaps: rustc_hash::FxHashMap<usize, crate::render::frame::snap::Key>,
 }
 
 impl Geometry {
@@ -130,6 +131,20 @@ impl Geometry {
         }
         self.sync_scroll();
         changed
+    }
+
+    // The snap events to fire, by scroll container: whether it is `scrollsnapchange`, and the block and the inline area.
+    pub(crate) fn snap_events(&self) -> Vec<(usize, bool, Option<u64>, Option<u64>)> {
+        let mut events: Vec<_> = (self.scroll.iter())
+            .flat_map(|(&id, handle)| {
+                let [changing, change] = handle.snap_events();
+                [(false, changing), (true, change)]
+                    .into_iter()
+                    .filter_map(move |(done, areas)| areas.map(|[x, y]| (id, done, y, x)))
+            })
+            .collect();
+        events.sort_unstable_by_key(|&(id, done, ..)| (done, id));
+        events
     }
 
     // Moves the mirror for the user scrolls since the last prepaint, when a script reads geometry. True when the
@@ -284,6 +299,7 @@ impl Geometry {
         self.fragments.remove(&id);
         self.pieces.remove(&id);
         self.scroll.remove(&id);
+        self.snaps.remove(&id);
         self.scroll_offsets.remove(&id);
         self.drawn.remove(&id);
     }

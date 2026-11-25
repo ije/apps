@@ -96,10 +96,10 @@
   };
   // As in Chrome, a scroll lays out a box that was no scroll box in the last layout, so it scrolls only if it can,
   // and its offset stays in its range.
-  const scrollTo = (node, left, top, behavior = null) => {
+  const scrollTo = (node, left, top, behavior = null, by = false) => {
     const fresh = !rootElement(node) && !(marks?.[node._id] & 2);
     if (fresh) layout();
-    const offset = call('dom.scroll', node._id, left, top, behavior);
+    const offset = call('dom.scroll', node._id, left, top, behavior, by);
     if (fresh) layout();
     return offset;
   };
@@ -1068,7 +1068,7 @@
     get scrollWidth() { return pageScroller(this) ? Math.round(innerWidth + metric(document, 6)) : extent(this, 0); } get scrollHeight() { return pageScroller(this) ? Math.round(innerHeight + metric(document, 7)) : extent(this, 1); }
     scrollTo(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); scrollTo(this, left ?? null, top ?? null, behavior); }
     scroll(left, top) { this.scrollTo(left, top); }
-    scrollBy(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); this.scrollTo({ left: this.scrollLeft + (left ?? 0), top: this.scrollTop + (top ?? 0), behavior }); }
+    scrollBy(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); scrollTo(this, this.scrollLeft + (Number(left) || 0), this.scrollTop + (Number(top) || 0), behavior, true); }
     scrollIntoView(options = {}) {
       if (typeof options === 'boolean') options = { block: options ? 'start' : 'end' };
       const target = this.getBoundingClientRect(), own = getComputedStyle(this), margin = side => parseFloat(own['scrollMargin' + side]) || 0;
@@ -1884,6 +1884,12 @@
   class HashChangeEvent extends Event { constructor(type, options = {}) { super(type, options); this.oldURL = String(options.oldURL ?? ''); this.newURL = String(options.newURL ?? ''); } }
   class PopStateEvent extends Event { constructor(type, options = {}) { super(type, options); this.state = options.state ?? null; this.hasUAVisualTransition = !!options.hasUAVisualTransition; } }
   class PageTransitionEvent extends Event { constructor(type, options = {}) { super(type, options); this.persisted = !!options.persisted; } }
+  const snapTargets = new WeakMap();
+  class SnapEvent extends Event {
+    constructor(token, type, init) { if (token !== snapTargets) throw new TypeError("Failed to construct 'SnapEvent': Illegal constructor"); super(type, init); }
+    get snapTargetBlock() { return snapTargets.get(this)[0]; }
+    get snapTargetInline() { return snapTargets.get(this)[1]; }
+  }
   class StorageEvent extends Event { constructor(type, options = {}) { super(type, options); this.key = options.key ?? null; this.oldValue = options.oldValue ?? null; this.newValue = options.newValue ?? null; this.url = String(options.url ?? ''); this.storageArea = options.storageArea ?? null; } }
   class FormDataEvent extends Event { constructor(type, options = {}) { if (!(options?.formData instanceof FormData)) throw new TypeError('formData is required'); super(type, options); this.formData = options.formData; } }
   class BeforeUnloadEvent extends Event { returnValue = ''; }
@@ -3453,7 +3459,7 @@
   globalThis.window = globalThis; globalThis.self = globalThis;
   selection = new Selection(); attachDeclarative();
   for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) globalThis[name] = Node.prototype[name].bind(globalThis);
-  Object.assign(globalThis, { ContentVisibilityAutoStateChangeEvent, ElementImage, CanvasPaintEvent, ElementGeometryUpdateEvent, ImageBitmap, ImageBitmapRenderingContext, OffscreenCanvas, OffscreenCanvasRenderingContext2D, Screen, ScreenOrientation, CanvasGradient, Path2D, CanvasPattern, DOMMatrix, DOMMatrixReadOnly, DOMPoint, DOMPointReadOnly, TextMetrics, AudioContext, OfflineAudioContext, AudioNode, AudioParam, AudioScheduledSourceNode, GainNode, BiquadFilterNode, OscillatorNode, PeriodicWave, AudioBuffer, AudioBufferSourceNode, AudioDestinationNode, Node, CharacterData, Text, Comment, DocumentType, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, SVGAnimatedString, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, CommandEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, FileList, ClipboardEvent, DragEvent, StaticRange, customElements, ShadowRoot, CSSStyleSheet, DOMParser, CSS, StyleSheet, StyleSheetList, MediaList, CSSRule, CSSRuleList, CSSGroupingRule, CSSStyleRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule, CSSLayerStatementRule, CSSKeyframesRule, CSSKeyframeRule, CSSFontFaceRule, CSSPropertyRule, CSSImportRule, CSSStyleDeclaration, AnimationEvent, BeforeUnloadEvent, ElementInternals, FormDataEvent, HashChangeEvent, PageTransitionEvent, PopStateEvent, RadioNodeList, StorageEvent, TransitionEvent });
+  Object.assign(globalThis, { ContentVisibilityAutoStateChangeEvent, SnapEvent, ElementImage, CanvasPaintEvent, ElementGeometryUpdateEvent, ImageBitmap, ImageBitmapRenderingContext, OffscreenCanvas, OffscreenCanvasRenderingContext2D, Screen, ScreenOrientation, CanvasGradient, Path2D, CanvasPattern, DOMMatrix, DOMMatrixReadOnly, DOMPoint, DOMPointReadOnly, TextMetrics, AudioContext, OfflineAudioContext, AudioNode, AudioParam, AudioScheduledSourceNode, GainNode, BiquadFilterNode, OscillatorNode, PeriodicWave, AudioBuffer, AudioBufferSourceNode, AudioDestinationNode, Node, CharacterData, Text, Comment, DocumentType, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, SVGAnimatedString, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, CommandEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, FileList, ClipboardEvent, DragEvent, StaticRange, customElements, ShadowRoot, CSSStyleSheet, DOMParser, CSS, StyleSheet, StyleSheetList, MediaList, CSSRule, CSSRuleList, CSSGroupingRule, CSSStyleRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule, CSSLayerStatementRule, CSSKeyframesRule, CSSKeyframeRule, CSSFontFaceRule, CSSPropertyRule, CSSImportRule, CSSStyleDeclaration, AnimationEvent, BeforeUnloadEvent, ElementInternals, FormDataEvent, HashChangeEvent, PageTransitionEvent, PopStateEvent, RadioNodeList, StorageEvent, TransitionEvent });
   Object.defineProperty(ShadowRoot.prototype, 'adoptedStyleSheets', adoptedProperty);
   Object.defineProperty(Document.prototype, 'adoptedStyleSheets', adoptedProperty);
   Object.defineProperty(Document.prototype, 'styleSheets', { configurable: true, get() { return styleSheetsOf(this); } });
@@ -3479,7 +3485,7 @@
       } };
       this.addEventListener(name, created.listener);
     } });
-  const globalHandlers = 'abort auxclick beforeinput beforematch beforetoggle blur cancel canplay canplaythrough change click close command contentvisibilityautostatechange contextlost contextmenu contextrestored copy cuechange cut dblclick drag dragend dragenter dragleave dragover dragstart drop durationchange emptied ended error focus formdata input invalid keydown keypress keyup load loadeddata loadedmetadata loadstart mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup paste pause play playing progress ratechange reset resize scroll scrollend securitypolicyviolation seeked seeking select selectionchange selectstart slotchange stalled submit suspend timeupdate toggle volumechange waiting wheel animationstart animationiteration animationend animationcancel transitionrun transitionstart transitionend transitioncancel gotpointercapture lostpointercapture pointerdown pointermove pointerrawupdate pointerup pointercancel pointerover pointerout pointerenter pointerleave'.split(' ');
+  const globalHandlers = 'abort auxclick beforeinput beforematch beforetoggle blur cancel canplay canplaythrough change click close command contentvisibilityautostatechange contextlost contextmenu contextrestored copy cuechange cut dblclick drag dragend dragenter dragleave dragover dragstart drop durationchange emptied ended error focus formdata input invalid keydown keypress keyup load loadeddata loadedmetadata loadstart mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup paste pause play playing progress ratechange reset resize scroll scrollend scrollsnapchange scrollsnapchanging securitypolicyviolation seeked seeking select selectionchange selectstart slotchange stalled submit suspend timeupdate toggle volumechange waiting wheel animationstart animationiteration animationend animationcancel transitionrun transitionstart transitionend transitioncancel gotpointercapture lostpointercapture pointerdown pointermove pointerrawupdate pointerup pointercancel pointerover pointerout pointerenter pointerleave'.split(' ');
   for (const name of globalHandlers) for (const target of [HTMLElement.prototype, SVGElement.prototype, Document.prototype]) handler(target, name);
   handler(Document.prototype, 'readystatechange'); handler(Document.prototype, 'visibilitychange');
   handler(Screen.prototype, 'change'); handler(ScreenOrientation.prototype, 'change');
@@ -4143,11 +4149,12 @@
       const unit = value => Math.round(value * 64) / 64; [borderWidth, borderHeight, width, height] = [borderWidth, borderHeight, width, height].map(unit);
       const value = observer._boxes?.get(target) === 'border-box' ? borderWidth + ':' + borderHeight : width + ':' + height; observer.targets.set(key, [rect.width, rect.height, at, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: borderWidth, blockSize: borderHeight }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) try { observer.callback(entries, observer); } catch (error) { report(error); } }
     // Resize observers measure the last frame before scroll listeners change the page, so its styles are still computed.
-    // `scrollend` fires when a box has not scrolled for 100 ms, and only pages that listen for it pay for the timers.
+    // `scrollend` fires when a box has not scrolled for 100 ms and is not on the way to a snap area, and only pages that listen for it pay for the timers.
     for (const id of call('dom.scrollEvents')) {
       // The last item can list `content-visibility: auto` boxes, each with whether it skips its contents now.
+      if (id.snaps) { for (const [box, done, block, inline] of id.snaps) { const event = new SnapEvent(snapTargets, done ? 'scrollsnapchange' : 'scrollsnapchanging', { bubbles: !box }); snapTargets.set(event, [block, inline].map(area => area === null ? null : wrap(area))); wrap(box)?.dispatchEvent(event); } continue; }
       if (typeof id !== 'number') { for (let i = 0; i < id.length; i += 2) wrap(id[i])?.dispatchEvent(new ContentVisibilityAutoStateChangeEvent('contentvisibilityautostatechange', { bubbles: true, skipped: !!id[i + 1] })); continue; }
-      const node = wrap(id); if (!node) continue; hoverVersion = -1; node.dispatchEvent(new Event('scroll', { bubbles: !id })); if (ending) { clearTimeout(scrollEnds.get(node)); scrollEnds.set(node, setTimeout(() => { scrollEnds.delete(node); node.dispatchEvent(new Event('scrollend', { bubbles: !id })); }, 100)); } }
+      const node = wrap(id); if (!node) continue; hoverVersion = -1; node.dispatchEvent(new Event('scroll', { bubbles: !id })); if (ending) { clearTimeout(scrollEnds.get(node)); const end = () => { if (call('dom.snapping', id)) { scrollEnds.set(node, setTimeout(end, 100)); return; } scrollEnds.delete(node); node.dispatchEvent(new Event('scrollend', { bubbles: !id })); }; scrollEnds.set(node, setTimeout(end, 100)); } }
     __appsMediaChanged();
     if(!intersectionObservers.size)return;
     call('dom.layout',false,true);
