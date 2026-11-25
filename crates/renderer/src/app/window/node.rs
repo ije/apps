@@ -196,13 +196,15 @@ pub trait Hooks: 'static {
     fn skip(&self, _exact: Rect, _window: &mut Window) -> bool {
         false
     }
-    // Return true if `skip` must run also when a box around this one skips.
+    // Return true if `skip_inside` and `shift_inside` must run when a box around this one skips or shifts.
     fn skips_inside(&self) -> bool {
         false
     }
+    // Like `skip` and `shift`, but a box around this one took the call, and what this one gives its ancestors.
+    fn skip_inside(&self, _exact: Rect, _window: &mut Window) {}
+    fn shift_inside(&self, _by: Point<Pixels>, _exact: Rect, _window: &mut Window) {}
     // Called instead of the prepaint of a box whose boxes all moved together by the scroll offset `by`, with its
-    // exact bounds there. Return true if it moved what they gave the page, so the boxes inside are skipped. Boxes
-    // in it with `skips_inside` get it too.
+    // exact bounds there. Return true if it moved what they gave the page, so the boxes inside are skipped.
     fn shift(&self, _by: Point<Pixels>, _exact: Rect, _window: &mut Window) -> bool {
         false
     }
@@ -313,6 +315,16 @@ impl Hooks for Chain {
 
     fn skips_inside(&self) -> bool {
         self.0.skips_inside() || self.1.skips_inside()
+    }
+
+    fn skip_inside(&self, exact: Rect, window: &mut Window) {
+        self.0.skip_inside(exact, window);
+        self.1.skip_inside(exact, window);
+    }
+
+    fn shift_inside(&self, by: Point<Pixels>, exact: Rect, window: &mut Window) {
+        self.0.shift_inside(by, exact, window);
+        self.1.shift_inside(by, exact, window);
     }
 
     fn reach(&self, size: Size<Pixels>, corners: [Point<Pixels>; 2]) -> [Point<Pixels>; 2] {
@@ -612,9 +624,13 @@ where
         false
     }
 
-    // A watching canvas prepares again when a box around it skips or shifts.
+    // A watching canvas prepares again when a box around it shifts.
     fn skips_inside(&self) -> bool {
         self.watches
+    }
+
+    fn shift_inside(&self, by: Point<Pixels>, exact: Rect, window: &mut Window) {
+        self.shift(by, exact, window);
     }
 
     fn cached(&self) -> bool {

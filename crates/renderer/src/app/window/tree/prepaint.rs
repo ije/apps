@@ -729,16 +729,16 @@ impl Tree {
                     placed.mask.rounded.origin += lag;
                 }
             }
-            // Boxes with hooks that skip inside moved with the box that a scroll moved, like their text.
-            if !(slot.hooks.as_ref()).is_some_and(|hooks| hooks.skips_inside()) {
-                if let Some(hooks) = slot.hooks.clone() {
-                    hooks.lag(lag);
-                }
-                if let Some(state) =
+            let hooks = slot.hooks.clone();
+            if let Some(hooks) = &hooks {
+                hooks.lag(lag);
+            }
+            // The text of boxes with hooks that skip inside moved with the box that a scroll moved.
+            if !hooks.is_some_and(|hooks| hooks.skips_inside())
+                && let Some(state) =
                     (slot.state.as_ref()).and_then(|state| state.downcast_ref::<TextState>())
-                {
-                    state.layout.shift(lag);
-                }
+            {
+                state.layout.shift(lag);
             }
         }
     }
@@ -844,7 +844,7 @@ impl Tree {
                     if inside != index
                         && let Some(hooks) = slot.hooks.clone()
                     {
-                        hooks.shift(by, slot.exact, window);
+                        hooks.shift_inside(by, slot.exact, window);
                     }
                 }
                 self.calm(index);
@@ -886,16 +886,16 @@ impl Tree {
             && (first == last || pass == self.last_touched.0 && last <= self.last_touched.1.len())
             && let Some(start) = window.copy_regions(pass, regions)
         {
-            let skip = |slot: &Slot, window: &mut Window| {
-                (slot.hooks.clone()).is_some_and(|hooks| hooks.skip(slot.exact, window))
-            };
-            if skip(slot, window) {
+            if (slot.hooks.clone()).is_some_and(|hooks| hooks.skip(slot.exact, window)) {
                 let touched = self.touched.len() as u32;
                 for at in first..last {
                     let inside = self.last_touched.1[at];
                     self.touched.push(inside);
-                    if inside != index {
-                        skip(&self.slots[inside as usize], window);
+                    let slot = &self.slots[inside as usize];
+                    if inside != index
+                        && let Some(hooks) = slot.hooks.clone()
+                    {
+                        hooks.skip_inside(slot.exact, window);
                     }
                 }
                 self.calm(index);

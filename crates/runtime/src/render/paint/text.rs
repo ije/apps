@@ -894,6 +894,14 @@ impl renderer::Hooks for InlineText {
         true
     }
 
+    fn skip_inside(&self, exact: Rect<Pixels>, window: &mut Window) {
+        self.skip(exact, window);
+    }
+
+    fn shift_inside(&self, by: Point<Pixels>, exact: Rect<Pixels>, window: &mut Window) {
+        self.shift(by, exact, window);
+    }
+
     // The layouts go back into the mirror, which each frame clears.
     fn shifts(&self) -> bool {
         true

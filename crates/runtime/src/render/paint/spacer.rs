@@ -22,7 +22,7 @@ pub(crate) fn spacer(
         clear,
     } = run;
     let parent = path.last().copied().unwrap_or_default();
-    let (first, last) = (Cell::new(None), Cell::new([left, top]));
+    let (first, last) = (Cell::new(None), Cell::new(([left, top], None::<[f32; 2]>)));
     // It wakes the blocks that it stands for, and moves their places, so each move prepares it again.
     let mut spacer = renderer::canvas_watching(
         move |bounds, window| {
@@ -66,9 +66,28 @@ pub(crate) fn spacer(
                 dom.layout.cull.off |= resized || reflowed;
                 wake(view, &path, shown, window);
             }
-            let delta = [at[0] - last.get()[0], at[1] - last.get()[1]];
-            last.set(at);
-            if delta != [0., 0.] {
+            // The shift of a box around it already moved these blocks in the mirror.
+            let place = members.iter().find_map(|id| {
+                let rect = dom
+                    .geometry
+                    .mirror
+                    .get(id)
+                    .filter(|rect| **rect != [0.; 4])?;
+                Some([rect[0], rect[1]])
+            });
+            let (from, was) = last.get();
+            let delta = [0, 1].map(|axis| {
+                let moved = place
+                    .zip(was)
+                    .map_or(0., |(now, was)| now[axis] - was[axis]);
+                at[axis] - from[axis] - moved
+            });
+            let moves = delta.iter().any(|by| by.abs() > 0.01);
+            if moves || was.is_none() {
+                let by = if moves { delta } else { [0.; 2] };
+                last.set((at, place.map(|[x, y]| [x + by[0], y + by[1]])));
+            }
+            if moves {
                 shift(
                     &page.doc,
                     &dom.tree.shadows,
