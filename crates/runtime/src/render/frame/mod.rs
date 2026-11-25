@@ -548,6 +548,7 @@ impl ViewState {
                 && !window.redrawing();
             kept.0 = frame;
         }
+        self.store.borrow_mut().state(self.id).layout.builds += 1;
         #[cfg(debug_assertions)]
         let zone = build.zone.clone();
         let port = build.port;

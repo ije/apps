@@ -39,7 +39,7 @@ impl Tree {
                 let at = point(at.x.0, at.y.0) * window.scale_factor();
                 if (shift.x - at.x).abs() > 0.05 || (shift.y - at.y).abs() > 0.05 {
                     *shift = at;
-                    window.redraw();
+                    window.rebar();
                 }
             }
         }
@@ -526,7 +526,7 @@ impl Tree {
         if descend {
             for child in 0..self.slots[index as usize].children.len() {
                 let child = index_of(self.slots[index as usize].children[child]);
-                if self.slots[child as usize].style.escape & (Escape::FIXED | Escape::OUTLINE) == 0
+                if self.slots[child as usize].style.escape & Escape::OUTLINE == 0
                     && !self.unscrolled(child)
                 {
                     let [child_near, child_far] = self.far(child, scale, nested);
@@ -547,23 +547,25 @@ impl Tree {
         placed(corners)
     }
 
-    // Whether a scroll container around an absolute box is inside its containing block, so it doesn't scroll the box.
-    // The page scrolls the boxes without another containing block.
+    // Whether a scroll container around an out-of-flow box is inside its containing block, so it doesn't scroll the
+    // box. The page scrolls the absolute boxes without another containing block.
     fn unscrolled(&self, index: u32) -> bool {
         let slot = &self.slots[index as usize];
         let clips = |style: &Style| {
             style.overflow.x != Overflow::Visible || style.overflow.y != Overflow::Visible
         };
-        if slot.style.escape & Escape::ABSOLUTE == 0 {
+        let escape = slot.style.escape & Escape::PLACED;
+        if escape == 0 {
             return false;
         }
         let up = |at: u32| Some(self.slots[at as usize].parent).filter(|&at| at != NONE);
         let mut outer = std::iter::successors(up(index), |&at| up(at))
             .map(|at| &*self.slots[at as usize].style);
-        outer
-            .find(|style| style.contains & Escape::ABSOLUTE != 0 || clips(style))
-            .is_some_and(|style| style.contains & Escape::ABSOLUTE == 0)
-            && outer.any(|style| clips(style))
+        match outer.find(|style| style.contains & escape != 0 || clips(style)) {
+            Some(style) if style.contains & escape != 0 => false,
+            _ if escape == Escape::FIXED => true,
+            found => found.is_some() && outer.any(|style| clips(style)),
+        }
     }
 
     // Like Chrome, lines take the boxes where layout placed them, and the overflow takes them where they paint.
@@ -575,19 +577,20 @@ impl Tree {
         corners: [Point<f32>; 2],
     ) -> [Point<f32>; 2] {
         let slot = &self.slots[index as usize];
-        // An absolute box whose containing block is outside the scroll container counts where layout placed it.
-        let escapes = slot.style.escape & Escape::ABSOLUTE != 0
+        // An out-of-flow box whose containing block is outside the scroll container counts where layout placed it.
+        let escape = slot.style.escape & Escape::PLACED;
+        let escapes = escape != 0
             && std::iter::successors(Some(slot.parent), |&at| {
                 Some(self.slots[at as usize].parent)
             })
             .take_while(|&at| at != NONE)
             .map(|at| &self.slots[at as usize].style)
             .find(|style| {
-                style.contains & Escape::ABSOLUTE != 0
+                style.contains & escape != 0
                     || style.overflow.x != Overflow::Visible
                     || style.overflow.y != Overflow::Visible
             })
-            .is_none_or(|style| style.contains & Escape::ABSOLUTE == 0);
+            .is_none_or(|style| style.contains & escape == 0);
         match slot.hooks.as_ref().filter(|_| nested && !escapes) {
             Some(hooks) => hooks
                 .reach(
@@ -631,7 +634,7 @@ impl Tree {
             let id = index_of(self.slots[index as usize].children[child]);
             let child = &self.slots[id as usize];
             let (layout, absolute) = (child.layout, child.style.position == Position::Absolute);
-            if child.style.escape & (Escape::FIXED | Escape::OUTLINE) != 0
+            if child.style.escape & Escape::OUTLINE != 0
                 || layout.size.width == 0. && layout.size.height == 0. && child.children.is_empty()
                 || self.unscrolled(id)
             {

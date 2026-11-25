@@ -348,7 +348,8 @@ pub(super) fn props(
             }
             Prop::POSITION if matches!(value, "absolute" | "fixed") => el = el.absolute(),
             Prop::LEFT | Prop::RIGHT | Prop::TOP | Prop::BOTTOM
-                if matches!(position, "relative" | "absolute") =>
+                if matches!(position, "relative" | "absolute")
+                    || position == "fixed" && cx.positioner.is_some() =>
             {
                 // Like Chrome, a percent offset of a relative box against a parent of auto height is `auto`.
                 let fraction = !(position == "relative"
@@ -666,7 +667,7 @@ pub(super) fn new_box(cx: &Cx<'_>) -> renderer::Node {
         "fixed" => renderer::Escape::FIXED,
         _ => 0,
     };
-    if position == "absolute" {
+    if el.style().escape != 0 {
         el.style().placed = inset_axes(style);
     }
     el.style().scroll_anchor = (u8::from(style.get(Prop::OVERFLOW_ANCHOR) == Some("none"))

@@ -22,6 +22,7 @@ pub(crate) struct InlineText {
     /// The ranges of inline boxes with an outline.
     pub outlines: Vec<usize>,
     pub atoms: Vec<Atom>,
+    pub marks: Vec<Mark>,
     pub cursors: Vec<(usize, renderer::Cursor)>,
     pub shadows: Vec<(f32, f32, f32, renderer::Color)>,
     pub first_line: Option<Box<(renderer::TextRun, renderer::TextRun, Option<String>)>>,
@@ -86,6 +87,19 @@ pub(crate) fn atom_key(node: usize, pseudo: u8) -> usize {
     node | usize::from(pseudo) << 30
 }
 
+/// The static place of an out-of-flow box in the text.
+#[derive(Clone, Copy)]
+pub(crate) struct Mark {
+    pub key: usize,
+    /// Past the end of the text when a line break that the text drops comes before it.
+    pub at: usize,
+    /// The box was a block, so its place is at the start of its line, or of the next line after `opened` edges or text.
+    pub block: bool,
+    pub opened: bool,
+    /// The edges of inline boxes between the mark and the next character.
+    pub trail: f32,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct InlineBox {
     pub index: usize,
@@ -116,12 +130,9 @@ pub(crate) fn placed_out_of_flow(style: &Style) -> bool {
             })
 }
 
-/// Whether an out-of-flow box keeps its static place in a line, as a box that was inline. The text holds an empty
-/// atom there, which the box follows.
-pub(crate) fn static_inline(style: &Style) -> bool {
-    matches!(style.get(Prop::POSITION), Some("absolute" | "fixed"))
-        && style.contains(Prop::INTERNAL_STATIC_INLINE)
-        && !placed_out_of_flow(style)
+/// Whether an out-of-flow box takes a static place. Its text has a mark there, which the box follows.
+pub(crate) fn static_place(style: &Style) -> bool {
+    matches!(style.get(Prop::POSITION), Some("absolute" | "fixed")) && !placed_out_of_flow(style)
 }
 
 /// Whether the `::before` and `::after` of the inline box `id` that draw are all out of flow and placed on both axes,
@@ -158,7 +169,8 @@ pub(crate) fn lifts_pseudos(
 pub(crate) fn static_after(styles: &ComputedStyles, id: usize) -> bool {
     styles.generated(id).is_some_and(|pseudos| {
         let after = &pseudos[1];
-        static_inline(after)
+        static_place(after)
+            && after.contains(Prop::INTERNAL_STATIC_INLINE)
             && after
                 .get(Prop::CONTENT)
                 .is_some_and(|value| !matches!(value, "none" | "normal"))
@@ -838,20 +850,31 @@ pub(crate) fn inline_text(
             .get(Prop::DISPLAY)
             .is_some_and(|value| value.ends_with("flex") || value.ends_with("grid"));
     let mut opening = 0f32;
-    let mut marks: Vec<(f32, Option<(usize, f32)>)> = Vec::new();
+    let mut leads: Vec<(f32, Option<(usize, f32)>)> = Vec::new();
+    // The static places, with the run that comes next and the edges that are open before it.
+    let mut marks: Vec<(Mark, usize, f32)> = Vec::new();
+    let mark = |key, block, at, runs: &[renderer::TextRun], opening: f32| {
+        let trail = runs.last().map_or(0., |run| f32::from(run.inset[1])) + opening;
+        let opened = opening > 0.;
+        let trailed = Mark {
+            key,
+            at,
+            block,
+            opened,
+            trail: 0.,
+        };
+        (trailed, runs.len(), trail)
+    };
     let mut led = 0;
     let mut cursors = Vec::new();
     // In-flow inline `::before` and `::after` are a part of the text: plain text as runs, and boxes as atoms.
-    // Absolute boxes at their static place in a line are empty atoms of the paragraph of a block. An inline box is
-    // too narrow to lay them out in.
-    let markers = run.is_empty() && atomic_allowed && !shares;
+    // The paragraph of a block marks the static places of out-of-flow boxes. An inline box is too narrow to lay them
+    // out in.
+    let markers = atomic_allowed && !shares;
     // Out-of-flow boxes in the paragraph that its element builds beside it: nodes, or `::before` (1) and `::after`
     // (2) of inline boxes.
     let mut lifted: Vec<(usize, u8)> = Vec::new();
     let parts: [Option<(String, bool)>; 2] = [0, 1].map(|index| {
-        if index == 1 && markers && static_after(styles, id) {
-            return Some((String::new(), true));
-        }
         let pseudo = &styles.generated(id).filter(|_| atomic_allowed)?[index];
         let content = pseudo
             .get(Prop::CONTENT)
@@ -1042,7 +1065,7 @@ pub(crate) fn inline_text(
                     opening += right + margin;
                 } else if let Some(last) = runs.len().checked_sub(1) {
                     runs[last].inset[1] += renderer::px(right);
-                    marks[at].1 = Some((last, f32::from(runs[last].inset[1])));
+                    leads[at].1 = Some((last, f32::from(runs[last].inset[1])));
                     runs[last].inset[1] += renderer::px(margin);
                 }
             }
@@ -1104,9 +1127,16 @@ pub(crate) fn inline_text(
                 }
                 continue 'nodes;
             }
-            if markers && static_inline(style) && !layered_after(doc, styles, id, child) {
+            if markers && static_place(style) && !layered_after(doc, styles, id, child) {
                 lifted.push((child, 0));
-                break 'source ("", &**style, None, units, Some(child));
+                marks.push(mark(
+                    child,
+                    !style.contains(Prop::INTERNAL_STATIC_INLINE),
+                    text.len(),
+                    &runs,
+                    opening,
+                ));
+                continue 'nodes;
             }
             if node.tag == "br" {
                 if text.ends_with(' ')
@@ -1115,6 +1145,9 @@ pub(crate) fn inline_text(
                         .is_some_and(|value| matches!(value, "pre" | "pre-wrap" | "break-spaces"))
                 {
                     pop(&mut text, &mut runs, &mut ranges);
+                    for (mark, ..) in &mut marks {
+                        mark.at = mark.at.min(text.len());
+                    }
                 }
                 ranges.push((child, text.len()..text.len()));
                 text.push('\n');
@@ -1242,7 +1275,7 @@ pub(crate) fn inline_text(
                             .is_some_and(|value| value != "none")
                 {
                     opening += margin[3];
-                    marks.push((opening, None));
+                    leads.push((opening, None));
                     opening += edges[3];
                     let faded = fade(child);
                     boxes.push(InlineBox {
@@ -1293,7 +1326,7 @@ pub(crate) fn inline_text(
             run.nowrap = style.get(Prop::WHITE_SPACE) == Some("nowrap");
             run.font_size = Some(renderer::px(0.));
             run.inset[0] = renderer::px(opening);
-            for (inline, (mark, _)) in boxes[led..].iter_mut().zip(&marks[led..]) {
+            for (inline, (mark, _)) in boxes[led..].iter_mut().zip(&leads[led..]) {
                 inline.lead = opening - mark;
             }
             led = boxes.len();
@@ -1306,8 +1339,7 @@ pub(crate) fn inline_text(
             });
             runs.push(run);
             line_heights.push((text.len(), LineHeight::Fixed(0.)));
-            // Spaces collapse across an absolute box, as if it were not there.
-            space &= static_inline(style);
+            space = false;
             continue;
         }
         if !node_text.is_empty() {
@@ -1402,7 +1434,7 @@ pub(crate) fn inline_text(
                 }
                 run.nowrap = mode == "nowrap";
                 run.inset[0] = renderer::px(opening);
-                for (inline, (mark, _)) in boxes[led..].iter_mut().zip(&marks[led..]) {
+                for (inline, (mark, _)) in boxes[led..].iter_mut().zip(&leads[led..]) {
                     inline.lead = opening - mark;
                 }
                 led = boxes.len();
@@ -1428,6 +1460,9 @@ pub(crate) fn inline_text(
             }
         }
     }
+    if markers && run.is_empty() && (cuts.is_empty() || ends[1]) && static_after(styles, id) {
+        marks.push(mark(atom_key(id, 2), false, text.len(), &runs, opening));
+    }
     if text.contains('\r') {
         return None;
     }
@@ -1438,7 +1473,11 @@ pub(crate) fn inline_text(
             .is_some_and(|value| matches!(value, "pre" | "pre-wrap" | "break-spaces"))
         || text.ends_with('\n')
     {
+        let space = text.ends_with(' ');
         pop(&mut text, &mut runs, &mut ranges);
+        for (mark, ..) in marks.iter_mut().filter(|_| space) {
+            mark.at = mark.at.min(text.len());
+        }
     }
     // Like Chrome, the edges of a spliced box next to a block make a line of their own, which an empty object holds.
     if text.is_empty() && !cuts.is_empty() && (run.is_empty() || opening > 0.) {
@@ -1447,7 +1486,7 @@ pub(crate) fn inline_text(
         run.color = renderer::Color::TRANSPARENT;
         run.font_size = Some(renderer::px(0.));
         run.inset[0] = renderer::px(opening);
-        for (inline, (mark, _)) in boxes[led..].iter_mut().zip(&marks[led..]) {
+        for (inline, (mark, _)) in boxes[led..].iter_mut().zip(&leads[led..]) {
             inline.lead = opening - mark;
         }
         opening = 0.;
@@ -1459,6 +1498,7 @@ pub(crate) fn inline_text(
     }
     // A line of element boxes only lays out as boxes. Pseudo-element boxes only exist in the text.
     if !atoms.is_empty()
+        && marks.is_empty()
         && atoms.iter().all(|atom| atom.pseudo == 0)
         && text.chars().all(|c| c == '\u{fffc}' || c.is_whitespace())
     {
@@ -1469,7 +1509,19 @@ pub(crate) fn inline_text(
         last.inset[1] += renderer::px(opening);
     }
     // Before `::first-letter` splits runs, which moves their indices.
-    for (inline, (mark, closed)) in boxes.iter_mut().zip(&marks) {
+    let marks = marks
+        .into_iter()
+        .map(|(mark, next, trail)| {
+            let before = next.checked_sub(1).and_then(|run| runs.get(run));
+            let edges = before.map_or(0., |run| f32::from(run.inset[1]))
+                + runs.get(next).map_or(0., |run| f32::from(run.inset[0]));
+            Mark {
+                trail: edges - trail,
+                ..mark
+            }
+        })
+        .collect();
+    for (inline, (mark, closed)) in boxes.iter_mut().zip(&leads) {
         if inline.lead.is_nan() {
             inline.lead = opening - mark;
         }
@@ -1572,6 +1624,7 @@ pub(crate) fn inline_text(
         boxes,
         outlines,
         atoms,
+        marks,
         cursors,
         shadows,
         line_heights,

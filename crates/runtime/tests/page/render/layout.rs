@@ -1785,3 +1785,55 @@ fn static_places_of_out_of_flow_boxes_follow_chrome() {
         assert!(text.contains(&format!("STATIC {line}\n")), "{line}: {text}");
     }
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn static_places_in_lines_follow_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('lines.html');
+        const step = async (name, code) => console.log('STATIC ' + name + ' ' + await run(code));
+        for (const id of ['end', 'br', 'block', 'center', 'wrap', 'mixed', 'tall']) await step(id, `at('${id}')`);
+        for (const position of ['static', 'absolute', 'static', 'absolute']) {
+            await step('table', `cell.style.position = '${position}'; first.offsetHeight`);
+            await win.webContents.capturePage();
+        }
+        await step('range', "[auto.scrollHeight, deep.scrollHeight, deep.scrollWidth, out.scrollHeight].join()");
+        "#,
+        &[(
+            "lines.html",
+            "<body style='margin:0'><style>body{font:16px/20px Helvetica}.s,.f{position:absolute;width:10px;height:10px}.f{position:fixed}\
+             .sc{overflow:auto;width:100px;height:50px;scrollbar-width:none}.l{width:100px}table{border-spacing:0}td{padding:0}</style>\
+             <div class=l>one <span class=s id=end></span> </div><div class=l>one <span class=s id=br></span><br>two</div>\
+             <div class=l>one <b>two <div class=s id=block></div></b> x</div>\
+             <div class=l style='text-align:center'>one <div class=s id=center></div> x</div>\
+             <div class=l>one two three <div class=s id=wrap></div>four</div>\
+             <div class=l>one <b>x <div class=s id=mixed></div></b><p style='margin:0'>block</p></div>\
+             <div class=l><u style='display:inline-block;width:20px;height:40px'></u> x<div class=s id=tall></div></div>\
+             <table id=first><tr><td>a<td>b <div class=s id=cell style='height:60px'></div></table>\
+             <div class=sc id=auto style='transform:translate(1px)'><p style='margin:0;height:45px'></p><div class=f></div></div>\
+             <div class=sc id=deep style='transform:translate(1px)'><div style='position:relative'><div class=f style='top:150px;left:190px'></div></div></div>\
+             <div class=sc id=out><div class=f style='top:150px'></div></div><script>\
+             for (const id of ['first', 'cell', 'auto', 'deep', 'out']) globalThis[id] = document.getElementById(id);\
+             globalThis.at = id => { const box = document.getElementById(id), line = box.closest('.l').getBoundingClientRect(), r = box.getBoundingClientRect();\
+             return Math.round(r.x - line.x) + ',' + Math.round(r.y - line.y); };</script></body>",
+        )],
+    );
+    for line in [
+        "end 27,0",
+        "br 27,0",
+        "block 0,20",
+        "center 0,20",
+        "wrap 0,20",
+        "mixed 0,20",
+        "tall 0,45",
+        "range 55,160,200,50",
+    ] {
+        assert!(text.contains(&format!("STATIC {line}\n")), "{line}: {text}");
+    }
+    let heights: Vec<_> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("STATIC table "))
+        .collect();
+    assert_eq!(heights, ["80", "20", "80", "20"], "{text}");
+}

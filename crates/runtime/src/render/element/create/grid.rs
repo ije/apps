@@ -156,7 +156,13 @@ pub(super) fn grid_container(
             let last = {
                 let mut store = view.store.borrow_mut();
                 let dom = store.state(view.id);
-                let same = dom.layout.grid_widest.insert(id, max) == Some(max);
+                let build = dom.layout.builds;
+                let widest = dom.layout.grid_widest.entry(id).or_insert((max, build));
+                if widest.0 != max {
+                    *widest = (max, build);
+                }
+                // A second build before the next layout must not read the width of the old content.
+                let same = widest.1 != build;
                 same.then(|| dom.layout.cull.widths.get(&id).map(|size| size[0].max(0.)))
                     .flatten()
             };

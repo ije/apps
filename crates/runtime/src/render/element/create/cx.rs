@@ -454,6 +454,10 @@ impl Cx<'_> {
                         && own
                             .get(Prop::POSITION)
                             .is_none_or(|value| !matches!(value, "absolute" | "fixed"))
+                    // The text marks the static place of an out-of-flow box.
+                    || !self.multicol
+                        && crate::render::inline::static_place(own)
+                        && !crate::render::inline::layered_after(doc, styles, id, child)
                     // A float in a spliced box goes beside the line that holds its place.
                     || floated(child)
                         && !cuts.is_empty()
@@ -466,7 +470,8 @@ impl Cx<'_> {
 
     pub(super) fn content(&self, child: usize) -> bool {
         let info = self.build.info;
-        self.in_run(child) || !self.floated(child) && info[child].flags & cull::OUT_OF_FLOW == 0
+        self.in_run(child) && !crate::render::inline::static_place(&self.build.styles.values[child])
+            || !self.floated(child) && info[child].flags & cull::OUT_OF_FLOW == 0
     }
 
     // The text of the run of `flat` from `index` to `end`, which the first and last runs share with the
@@ -495,8 +500,8 @@ impl Cx<'_> {
             .entry(index)
             .or_insert_with(|| {
                 let ends = [
-                    !run.is_empty() && first_content == Some(index),
-                    !run.is_empty() && last_content == Some(end.saturating_sub(1)),
+                    first_content.is_some_and(|at| (index..end).contains(&at)),
+                    last_content.is_some_and(|at| (index..end).contains(&at)),
                 ];
                 (run.is_empty()
                     || run.iter().any(|&kid| {
@@ -621,7 +626,6 @@ impl Cx<'_> {
             size,
             align: self.align_of(child),
             at: std::cell::Cell::new(point(px(0.), px(0.))),
-            mark: false,
         }
     }
 

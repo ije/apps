@@ -759,7 +759,7 @@ impl Tree {
             }
         }
         slot.kind = kind;
-        if styled.escape & Escape::ABSOLUTE != 0 && styled.placed != 0 || styled.follow.is_some() {
+        if styled.escape & Escape::PLACED != 0 && styled.placed != 0 || styled.follow.is_some() {
             self.escaping.insert(index);
         }
         if let Some(mark) = styled.mark {

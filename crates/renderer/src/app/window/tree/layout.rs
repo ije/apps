@@ -56,7 +56,7 @@ impl Tree {
             let Some(slot) = tree.slots.get(index as usize) else {
                 return false;
             };
-            let escape = slot.style.escape & (Escape::ABSOLUTE | Escape::FIXED);
+            let escape = slot.style.escape & Escape::PLACED;
             let (Some(old), true, true) =
                 (slot.room, slot.live, escape != 0 && slot.parent != NONE)
             else {
@@ -124,7 +124,7 @@ impl Tree {
         self.escaping.retain(|&index| {
             slots.get(index as usize).is_some_and(|slot| {
                 slot.live
-                    && (slot.style.escape & Escape::ABSOLUTE != 0 && slot.style.placed != 0
+                    && (slot.style.escape & Escape::PLACED != 0 && slot.style.placed != 0
                         || slot.style.follow.is_some())
             })
         });
@@ -162,7 +162,9 @@ impl Tree {
                     at = inner.parent;
                 }
                 let mut location = layout.location;
-                if at == parent && follow.axes & 1 != 0 {
+                // A block is at the start of its line, which only a text knows.
+                let across = !follow.below || marked.style.mark.is_some_and(|mark| mark.inline);
+                if at == parent && follow.axes & 1 != 0 && across {
                     location.x = match follow.rtl {
                         true => place.x - layout.margin.right - layout.size.width,
                         false => place.x + layout.margin.left,
@@ -178,9 +180,10 @@ impl Tree {
                 }
             }
             let slot = &slots[index as usize];
-            if slot.style.escape & Escape::ABSOLUTE == 0
+            let escape = slot.style.escape & Escape::PLACED;
+            if escape == 0
                 || slot.style.placed == 0
-                || slots[parent as usize].style.contains & Escape::ABSOLUTE != 0
+                || slots[parent as usize].style.contains & escape != 0
             {
                 continue;
             }
@@ -188,7 +191,7 @@ impl Tree {
             let (mut at, mut block) = ([0f32; 2], parent);
             loop {
                 let outer = &slots[block as usize];
-                if outer.style.contains & Escape::ABSOLUTE != 0 || outer.parent == NONE {
+                if outer.style.contains & escape != 0 || outer.parent == NONE {
                     break;
                 }
                 at = [
@@ -198,7 +201,12 @@ impl Tree {
                 block = outer.parent;
             }
             let outer = &slots[block as usize];
-            let [origin, size] = match outer.style.contains & Escape::ABSOLUTE != 0 {
+            let contained = outer.style.contains & escape != 0;
+            // Paint places the fixed boxes of the viewport, which no scroll range counts.
+            if !contained && escape == Escape::FIXED {
+                continue;
+            }
+            let [origin, size] = match contained {
                 true => {
                     let (border, size) = (outer.layout.border, outer.layout.size);
                     [

@@ -170,7 +170,7 @@ pub(super) fn finish(
         }
         follow = Some(renderer::Follow {
             mark: id as u64,
-            axes: u8::from(axes[0] && !block) | u8::from(axes[1]) << 1,
+            axes: u8::from(axes[0]) | u8::from(axes[1]) << 1,
             below: block,
             rtl: reader.parent(id, Prop::DIRECTION) == Some("rtl"),
         });

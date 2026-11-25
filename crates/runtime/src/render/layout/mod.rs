@@ -58,7 +58,9 @@ pub struct Layout {
         ),
     >,
     pub(in crate::render) flexed_grids: rustc_hash::FxHashMap<usize, [Option<(f32, f32)>; 2]>,
-    pub(in crate::render) grid_widest: rustc_hash::FxHashMap<usize, f32>,
+    // The max-content width of each shrink-to-fit grid, and the build that changed it.
+    pub(in crate::render) grid_widest: rustc_hash::FxHashMap<usize, (f32, u64)>,
+    pub(in crate::render) builds: u64,
     // The used columns and rows of the last layout of each grid, for `getComputedStyle()`.
     pub(in crate::render) tracks: rustc_hash::FxHashMap<usize, [Box<[f32]>; 2]>,
     // The grid area of each grid item at its last build, for `getComputedStyle()`.

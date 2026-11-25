@@ -573,10 +573,12 @@ pub(super) fn children(
                     .zip(&mut atom_elements)
                     .map(|(atom, child)| cx.atom_slot(atom, child, content[0], &|| [0.; 3]))
                     .collect();
+                let marks: Rc<[_]> = data.marks.iter().map(|_| Default::default()).collect();
                 let mut paragraph = renderer::Node::from(InlineText {
                     data: data.clone(),
                     mixed: data.mixed(build.text),
                     atoms: atom_slots.clone(),
+                    marks: Rc::clone(&marks),
                     view: view.clone(),
                     shaped: Default::default(),
                     prepainted: Default::default(),
@@ -626,7 +628,10 @@ pub(super) fn children(
                         Some(kid)
                     );
                 }
-                place!(block, None);
+                place!(
+                    block.children(super::paragraph::beside(cx, fr, &data, &marks, [0.; 4])),
+                    None
+                );
                 (carry.strut_due, carry.strut_next) = struts;
                 if !run.is_empty() {
                     run_end = end;

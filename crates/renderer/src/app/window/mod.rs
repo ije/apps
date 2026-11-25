@@ -667,8 +667,8 @@ impl Window {
         }
     }
 
-    /// Scroll bars came or went, which can make other bars come or go, so this pass is followed by another one, up to
-    /// a few in a frame.
+    /// Scroll bars came or went, which can make other bars come or go, or a text moved a mark, so this pass is
+    /// followed by another one, up to a few in a frame.
     pub fn rebar(&mut self) {
         self.redraw();
         self.rebar = self.drawing;

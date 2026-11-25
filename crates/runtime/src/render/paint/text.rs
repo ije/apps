@@ -650,6 +650,8 @@ pub(crate) struct InlineText {
     pub(crate) mixed: bool,
     pub(crate) view: Rc<super::super::ViewState>,
     pub(crate) atoms: Rc<[AtomSlot]>,
+    // The static places in the text.
+    pub(crate) marks: Rc<[std::cell::Cell<Point<Pixels>>]>,
     pub(crate) justify: Option<bool>,
     /// Right-to-left text: indents and rows that overflow start at the right.
     pub(crate) rtl: bool,
@@ -674,8 +676,29 @@ pub(crate) struct AtomSlot {
     pub(crate) size: [f32; 3],
     pub(crate) align: Option<AlignItems>,
     pub(crate) at: std::cell::Cell<Point<Pixels>>,
-    // The static place of an out-of-flow box.
-    pub(crate) mark: bool,
+}
+
+// Moves the mark of a static place to where the text has it. A box that was a block is at the start of the line.
+pub(crate) struct MarkBox {
+    pub(crate) marks: Rc<[std::cell::Cell<Point<Pixels>>]>,
+    pub(crate) index: usize,
+    pub(crate) key: usize,
+    pub(crate) block: bool,
+}
+
+impl renderer::Hooks for MarkBox {
+    fn cached(&self) -> bool {
+        true
+    }
+
+    fn prepaint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        let mut by = self.marks[self.index].get() - cx.exact.origin;
+        if self.block {
+            by.x = px(0.);
+        }
+        cx.window.place_mark(self.key as u64, by);
+        inner(cx.window);
+    }
 }
 
 pub(crate) struct AtomBox {
@@ -710,10 +733,6 @@ impl renderer::Hooks for AtomBox {
     fn prepaint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let slot = &self.slots[self.index];
         let offset = slot.at.get() - cx.bounds.origin;
-        if slot.mark {
-            let by = slot.at.get() - cx.exact.origin;
-            cx.window.place_mark(self.node as u64, by);
-        }
         // The filler reports its width in its own prepaint, so the children go first.
         cx.window
             .scope(renderer::Scope::Offset(offset), |window| inner(window));
@@ -956,6 +975,87 @@ fn unplace(dom: &mut crate::render::PageState, data: &crate::render::inline::Inl
 }
 
 impl InlineText {
+    // Places the marks of static places where Chrome has them. A box that was inline is after the character before
+    // it, and a space that hangs at the end of its row is not between them. A box that was a block is at the start
+    // of the row, below it when the row has content before the mark.
+    fn place_marks(
+        &self,
+        layout: &renderer::Paragraph,
+        rows: &[crate::render::layout::Row],
+        extents: &[[Pixels; 2]],
+        style: &renderer::TextStyle,
+        origin: Point<Pixels>,
+    ) {
+        let (text, height, bounds) = (&*self.data.text, layout.line_height(), layout.bounds());
+        // The start of each row, and whether the row before it is wider than the text with its last space.
+        let mut starts = Vec::new();
+        let mut offset = 0;
+        for line in layout.lines().iter() {
+            starts.push((offset, false));
+            let mut left = px(0.);
+            for &at in line.breaks.iter() {
+                let glyph = &line.line.glyphs[at as usize];
+                let wide = glyph.x - left > bounds.size.width + px(0.01);
+                starts.push((offset + glyph.index as usize, wide));
+                left = glyph.x;
+            }
+            offset += line.len() + 1;
+        }
+        for (mark, place) in self.data.marks.iter().zip(&*self.marks) {
+            let at = mark.at;
+            let mut row = starts
+                .partition_point(|&(start, _)| start < at)
+                .saturating_sub(1);
+            let mut x = None;
+            if at > text.len() {
+                row = starts.len();
+            } else if let Some(&(_, wide)) = starts.get(row + 1).filter(|next| next.0 == at) {
+                let before = text.get(..at).unwrap_or_default();
+                let visible = before.trim_end_matches(' ').len();
+                // A space that doesn't fit takes the mark to the next row.
+                if before.ends_with('\n') || wide && visible < at {
+                    row += 1;
+                } else {
+                    x = text_position(layout, text, rows, visible).map(|at| at.x);
+                }
+            }
+            let start = starts.get(row).map_or(at, |start| start.0);
+            let placed = rows.get(row).copied().unwrap_or_default();
+            let [above, below] = extents.get(row).copied().unwrap_or_default();
+            let mut y = bounds.top() + height * row as f32;
+            y += match rows.get(row).or(rows.last()) {
+                Some(last) if row < starts.len() => last.drop - last.above,
+                Some(last) => last.drop + extents.last().map_or(px(0.), |extent| extent[1]),
+                None => px(0.),
+            };
+            let x = if mark.block {
+                if start < at.min(text.len()) || mark.opened {
+                    y += above + height + below;
+                }
+                px(0.)
+            } else if row == starts.len() || start == at && text.is_empty() {
+                match style.text_align {
+                    renderer::TextAlign::Left => bounds.left(),
+                    renderer::TextAlign::Center => bounds.center().x,
+                    renderer::TextAlign::Right => bounds.right(),
+                }
+            } else if self.rtl
+                && (text.get(at..starts.get(row + 1).map_or(text.len(), |next| next.0)))
+                    .is_none_or(|rest| rest.trim().is_empty())
+            {
+                bounds.left() + placed.shift
+            } else if let Some(x) = x {
+                x
+            } else if start == at && row > 0 {
+                bounds.left() + placed.shift
+            } else {
+                text_position(layout, text, rows, at)
+                    .map_or(bounds.left(), |at| at.x - px(mark.trail))
+            };
+            place.set(point(x, y) - bounds.origin + origin);
+        }
+    }
+
     fn cursors<'a>(
         &'a self,
         layout: &'a renderer::Paragraph,
@@ -1280,6 +1380,9 @@ impl renderer::Hooks for InlineText {
                 slot.at.set(point(a.x, y));
             }
         }
+        if !self.data.marks.is_empty() {
+            self.place_marks(layout, &rows, &extents, &style, exact.origin);
+        }
         let hitboxes = self
             .cursors(layout, &rows, bounds)
             .map(|(rect, cursor)| (window.add_region(rect, renderer::Hit::Pass), cursor))
@@ -1486,6 +1589,7 @@ impl renderer::Hooks for InlineText {
 
     fn volatile(&self) -> bool {
         !self.atoms.is_empty()
+            || !self.marks.is_empty()
             || self.data.first_line.is_some()
             || self.data.runs.iter().any(|run| run.font_size.is_some())
     }

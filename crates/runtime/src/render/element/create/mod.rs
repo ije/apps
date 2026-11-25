@@ -1514,7 +1514,7 @@ pub(super) fn create(
     {
         el.text_style().set_text_overflow(Some("…".into()));
     }
-    if position == "fixed" {
+    if position == "fixed" && positioner.is_none() {
         let viewport = viewport();
         let inset = [Prop::LEFT, Prop::RIGHT, Prop::TOP, Prop::BOTTOM].map(|prop| {
             style.get(prop).and_then(|v| {

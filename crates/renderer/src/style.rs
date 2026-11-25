@@ -313,7 +313,7 @@ pub struct Mark {
 pub struct Follow {
     pub mark: u64,
     pub axes: u8,
-    /// Below the mark, not at its top.
+    /// Below the mark, not at its top. Only a mark in a text gives such a box its place across.
     pub below: bool,
     /// The right margin edge is at the mark.
     pub rtl: bool,
@@ -376,6 +376,7 @@ impl Escape {
     pub const FIXED: u8 = 2;
     /// An outline: only the clips around its box apply, and it doesn't scroll with the content of the box.
     pub const OUTLINE: u8 = 4;
+    pub const PLACED: u8 = Self::ABSOLUTE | Self::FIXED;
 }
 
 impl Style {

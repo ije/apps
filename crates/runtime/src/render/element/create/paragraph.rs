@@ -5,7 +5,7 @@ use super::super::{Build, element};
 use super::create;
 use super::cx::{Carry, Cx, Frame};
 use crate::css::properties::Prop;
-use crate::render::paint::text::InlineText;
+use crate::render::paint::text::{AtomSlot, InlineText, MarkBox};
 use renderer::{px, relative};
 use std::rc::Rc;
 
@@ -60,18 +60,10 @@ pub(super) fn paragraph(
     #[cfg(debug_assertions)]
     reader.extra.set(super::super::kept::hashed(&*data.text));
     let atom_containing = content_box();
-    // An absolute box at its static place in a line has an empty atom there, which gives it its place.
-    let marker = |atom: &crate::render::inline::Atom| {
-        crate::render::inline::static_inline(match atom.pseudo {
-            0 => &styles.values[atom.node],
-            pseudo => &styles.generated(id).unwrap()[usize::from(pseudo - 1)],
-        })
-    };
     let mut atom_elements: Vec<renderer::Child> = data
         .atoms
         .iter()
         .map(|atom| match atom.pseudo {
-            _ if marker(atom) => static_mark(atom.key(), 0., true).into(),
             0 => element(build, atom.node, atom_containing, container, None),
             pseudo => pseudo_atoms[usize::from(pseudo - 1)]
                 .take()
@@ -79,20 +71,11 @@ pub(super) fn paragraph(
                 .into(),
         })
         .collect();
-    let atom_slots: Rc<[crate::render::paint::text::AtomSlot]> = data
+    let atom_slots: Rc<[AtomSlot]> = data
         .atoms
         .iter()
         .zip(&mut atom_elements)
         .map(|(atom, child)| {
-            if marker(atom) {
-                // At the top of its line, as Chrome places the box.
-                return crate::render::paint::text::AtomSlot {
-                    size: [0.; 3],
-                    align: Some(renderer::AlignItems::FlexStart),
-                    at: Default::default(),
-                    mark: true,
-                };
-            }
             cx.atom_slot(atom, child, containing[0], &|| {
                 crate::render::layout::grid::intrinsic::pseudo_atom(
                     doc,
@@ -108,6 +91,7 @@ pub(super) fn paragraph(
             })
         })
         .collect();
+    let marks: Rc<[_]> = data.marks.iter().map(|_| Default::default()).collect();
     let text_box = style.get(Prop::TEXT_BOX).unwrap_or("");
     let trim = style.get(Prop::TEXT_BOX_TRIM).unwrap_or(text_box);
     let edge = style.get(Prop::TEXT_BOX_EDGE).unwrap_or(text_box);
@@ -164,6 +148,7 @@ pub(super) fn paragraph(
         data: data.clone(),
         mixed: data.mixed(build.text),
         atoms: atom_slots.clone(),
+        marks: marks.clone(),
         view: view.clone(),
         shaped: Default::default(),
         prepainted: Default::default(),
@@ -261,6 +246,54 @@ pub(super) fn paragraph(
         };
         el = el.child(element(build, child, containing, container, None));
     }
+    for child in beside(cx, fr, &data, &marks, padding) {
+        el = el.child(child);
+    }
+    el
+}
+
+/// The marks of the static places in a text, and its out-of-flow boxes, which lay out beside it. `padding` is around
+/// the text in the box that holds them.
+pub(super) fn beside(
+    cx: &Cx<'_>,
+    fr: &Frame,
+    data: &crate::render::inline::InlineText,
+    marks: &Rc<[std::cell::Cell<renderer::Point<renderer::Pixels>>]>,
+    padding: [f32; 4],
+) -> Vec<renderer::Child> {
+    let Cx {
+        build,
+        id,
+        container,
+        rtl,
+        ..
+    } = *cx;
+    let Build {
+        styles,
+        doc,
+        top_layer,
+        ..
+    } = *build;
+    let made = cx.parsed.made;
+    let mut children: Vec<renderer::Child> = Vec::new();
+    for (index, mark) in data.marks.iter().enumerate() {
+        let at = match rtl && mark.block {
+            true => renderer::node().right(px(padding[1])),
+            false => renderer::node().left(px(padding[3])),
+        };
+        children.push(
+            at.absolute()
+                .top(px(padding[0]))
+                .hooks(MarkBox {
+                    marks: marks.clone(),
+                    index,
+                    key: mark.key,
+                    block: mark.block,
+                })
+                .child(static_mark(mark.key, 0., true))
+                .into(),
+        );
+    }
     // Out-of-flow boxes inside the inline boxes of the text, and at their static place: they lay out beside it,
     // with the inline boxes around them as ancestors.
     for &(node, pseudo) in &data.lifted {
@@ -287,13 +320,17 @@ pub(super) fn paragraph(
             plan: Default::default(),
             ..*build
         };
-        let content = content_box();
+        let (content, padding) = (fr.content_box(cx), fr.padding);
         let padded = [
             content[0] + padding[1] + padding[3],
             content[1] + padding[0] + padding[2],
         ];
-        let containing = if made.absolute { padded } else { content };
-        el = el.child(match pseudo {
+        let contains = match (pseudo, styles.values[node].get(Prop::POSITION)) {
+            (0, Some("fixed")) => made.fixed,
+            _ => made.absolute,
+        };
+        let containing = if contains { padded } else { content };
+        children.push(match pseudo {
             0 => element(&lifted, node, containing, container, None),
             pseudo => create(
                 &lifted,
@@ -305,5 +342,5 @@ pub(super) fn paragraph(
             ),
         });
     }
-    el
+    children
 }
