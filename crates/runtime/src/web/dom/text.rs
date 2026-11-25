@@ -561,6 +561,15 @@ pub(super) fn selection(
     doc: &mut Document,
     state: &mut PageState,
 ) -> Result<Value> {
+    // A tree change that moves the document selection leaves the selection of the focused field.
+    if args[3].as_bool() == Some(true)
+        && state.interaction.focus.is_some_and(|focus| {
+            state.interaction.selection.contains_key(&focus)
+                && matches!(doc.nodes[focus].tag.as_str(), "input" | "textarea")
+        })
+    {
+        return Ok(Value::Null);
+    }
     state.interaction.selection.clear();
     state.interaction.selection_caret = None;
     if let Some(ranges) = args[1].as_array() {

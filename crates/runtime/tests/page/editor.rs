@@ -434,3 +434,42 @@ fn contenteditable_spaces_block_joins_and_typing_style_like_chrome() {
         assert($('t').innerHTML==='<p>bee</p>'&&$('r').lastChild.localName==='hr','A canceled composition leaves no open step: '+$('t').innerHTML+$('r').innerHTML);
     "#, "contenteditable-editing").unwrap();
 }
+
+#[test]
+fn focused_fields_keep_their_caret_when_the_tree_changes() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow().store.borrow_mut().pages.insert(
+        1,
+        Page {
+            doc: Document::parse("<div contenteditable>x</div><input value=abc>"),
+            dirty: false,
+            ..Default::default()
+        },
+    );
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
+    // The removal moves the document selection in a microtask, after the field has the focus.
+    let id: usize = engine
+        .eval("const editor=document.querySelector('div'),field=document.querySelector('input');editor.focus();getSelection().collapse(editor.firstChild,1);editor.remove();field.focus();field._id", "test")
+        .unwrap()
+        .parse()
+        .unwrap();
+    engine.eval("0", "test").unwrap();
+    let at: usize = engine
+        .eval("field.selectionStart", "test")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        host.borrow().store.borrow().pages[&1]
+            .state
+            .interaction
+            .selection
+            .get(&id),
+        Some(&[at, at])
+    );
+}

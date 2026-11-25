@@ -493,7 +493,7 @@
     for (const ref of set) {
       const range = ref.deref();
       if (!range) { set.delete(ref); continue; }
-      if (fn(range) && selection?.ranges[0] === range && !rangeSync) { rangeSync = true; queueMicrotask(() => { rangeSync = false; if (selection.ranges[0]?.startContainer.isConnected) selection._setRange(selection.ranges[0], selection.direction, true); }); }
+      if (fn(range) && selection?.ranges[0] === range && !rangeSync) { rangeSync = true; queueMicrotask(() => { rangeSync = false; if (selection.ranges[0]?.startContainer.isConnected) { selection._x = undefined; selection._send(true); selectionChanged(); } }); }
     }
     if (!set.size) anchors.delete(rec);
   };
@@ -1113,6 +1113,7 @@
         if (active || !this.isConnected) return;
       }
       active = this; navStart = [this]; call('dom.focus', path(this).map(node => node._id), ring = options?.focusVisible ?? showsRing(this), !windowFocused);
+      if (editable(this)) call('dom.selection', this._id, this._start ?? 0, this._end ?? 0);
       if (!options?.preventScroll) this.scrollIntoView({ block: 'if-needed', inline: 'if-needed' });
       // Like Chrome, an editing host that gets focus without the selection in it gets a caret at its start.
       if (this.isContentEditable && !this.contains(selection.anchorNode)) selection.collapse(document.createTreeWalker(this, 4).nextNode() ?? this, 0);
@@ -1883,13 +1884,13 @@
   class AnimationEvent extends Event { constructor(type, options = {}) { super(type, options); this.animationName = String(options.animationName ?? ''); this.elapsedTime = Number(options.elapsedTime ?? 0); this.pseudoElement = String(options.pseudoElement ?? ''); } }
   class HashChangeEvent extends Event { constructor(type, options = {}) { super(type, options); this.oldURL = String(options.oldURL ?? ''); this.newURL = String(options.newURL ?? ''); } }
   class PopStateEvent extends Event { constructor(type, options = {}) { super(type, options); this.state = options.state ?? null; this.hasUAVisualTransition = !!options.hasUAVisualTransition; } }
-  class PageTransitionEvent extends Event { constructor(type, options = {}) { super(type, options); this.persisted = !!options.persisted; } }
   const snapTargets = new WeakMap();
   class SnapEvent extends Event {
     constructor(token, type, init) { if (token !== snapTargets) throw new TypeError("Failed to construct 'SnapEvent': Illegal constructor"); super(type, init); }
     get snapTargetBlock() { return snapTargets.get(this)[0]; }
     get snapTargetInline() { return snapTargets.get(this)[1]; }
   }
+  class PageTransitionEvent extends Event { constructor(type, options = {}) { super(type, options); this.persisted = !!options.persisted; } }
   class StorageEvent extends Event { constructor(type, options = {}) { super(type, options); this.key = options.key ?? null; this.oldValue = options.oldValue ?? null; this.newValue = options.newValue ?? null; this.url = String(options.url ?? ''); this.storageArea = options.storageArea ?? null; } }
   class FormDataEvent extends Event { constructor(type, options = {}) { if (!(options?.formData instanceof FormData)) throw new TypeError('formData is required'); super(type, options); this.formData = options.formData; } }
   class BeforeUnloadEvent extends Event { returnValue = ''; }
@@ -2484,12 +2485,12 @@
       this._send();
       selectionChanged();
     }
-    _send() {
+    _send(sync = false) {
       const range = this.ranges[0], caret = !!range?.collapsed && !!active?.isContentEditable && active.contains(range.startContainer);
       if (!range) return;
       const nodes = rangeNodes(range).map(({node,start,end}) => [node._id,start,end]);
       if (caret && !nodes.length) { const { startContainer: parent, startOffset: offset } = range, child = parent.nodeType === 1 ? parent.childNodes[offset] ?? parent.lastChild : null; if (child?.localName === 'br') nodes.push([child._id, 0, 0]); }
-      call('dom.selection', 0, nodes, caret);
+      call('dom.selection', 0, nodes, caret, sync);
     }
     addRange(range) { if (!this.rangeCount && range.startContainer.isConnected) this._setRange(range); }
     removeRange(range) { if (this.ranges[0] !== range) throw new DOMException('Range is not selected', 'NotFoundError'); this.removeAllRanges(); }
@@ -4151,8 +4152,8 @@
     // Resize observers measure the last frame before scroll listeners change the page, so its styles are still computed.
     // `scrollend` fires when a box has not scrolled for 100 ms and is not on the way to a snap area, and only pages that listen for it pay for the timers.
     for (const id of call('dom.scrollEvents')) {
-      // The last item can list `content-visibility: auto` boxes, each with whether it skips its contents now.
       if (id.snaps) { for (const [box, done, block, inline] of id.snaps) { const event = new SnapEvent(snapTargets, done ? 'scrollsnapchange' : 'scrollsnapchanging', { bubbles: !box }); snapTargets.set(event, [block, inline].map(area => area === null ? null : wrap(area))); wrap(box)?.dispatchEvent(event); } continue; }
+      // The last item can list `content-visibility: auto` boxes, each with whether it skips its contents now.
       if (typeof id !== 'number') { for (let i = 0; i < id.length; i += 2) wrap(id[i])?.dispatchEvent(new ContentVisibilityAutoStateChangeEvent('contentvisibilityautostatechange', { bubbles: true, skipped: !!id[i + 1] })); continue; }
       const node = wrap(id); if (!node) continue; hoverVersion = -1; node.dispatchEvent(new Event('scroll', { bubbles: !id })); if (ending) { clearTimeout(scrollEnds.get(node)); const end = () => { if (call('dom.snapping', id)) { scrollEnds.set(node, setTimeout(end, 100)); return; } scrollEnds.delete(node); node.dispatchEvent(new Event('scrollend', { bubbles: !id })); }; scrollEnds.set(node, setTimeout(end, 100)); } }
     __appsMediaChanged();
@@ -4932,7 +4933,6 @@
         if (all) node.setSelectionRange(0, node.value.length, 'none', true);
         if (node && node !== active) mouseFocus = false;
         node?.focus();
-        if (all && active === node) call('dom.selection', node._id, node._start, node._end);
         return false;
       }
       return true;
