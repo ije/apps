@@ -974,6 +974,9 @@ impl Desktop {
                 renderer::spawn(move |cx| Self::start(template, link, queue, Some(id), cx));
             }));
         }
+        // WebKitGTK can only embed in X11 windows.
+        #[cfg(target_os = "linux")]
+        renderer::PREFER_X11.store(template.app.webview, Ordering::Relaxed);
         let exit = link.clone();
         renderer::run(move || {
             let pending = Arc::new(AtomicBool::new(false));

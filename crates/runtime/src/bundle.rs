@@ -82,6 +82,8 @@ pub struct Package {
     pub version: String,
     pub identifier: String,
     pub features: Features,
+    // The bundler found system web views in the app code.
+    pub webview: bool,
 }
 
 impl Package {
@@ -171,6 +173,7 @@ impl Package {
             version: version.into(),
             identifier,
             features,
+            webview: package["webview"] == true,
         })
     }
 }
@@ -288,6 +291,7 @@ pub struct AppInfo {
     pub packaged: bool,
     pub rust_main: bool,
     pub features: Features,
+    pub webview: bool,
     pub scripts: std::sync::Arc<HashMap<String, bytes::Bytes>>,
     pub assets: std::sync::Arc<HashMap<String, std::path::PathBuf>>,
     pub native_modules: HashMap<String, std::path::PathBuf>,
@@ -314,6 +318,7 @@ impl AppInfo {
             packaged: bundle.packaged,
             rust_main,
             features: package.features,
+            webview: package.webview,
             scripts: std::sync::Arc::new(std::mem::take(&mut bundle.scripts)),
             assets: std::sync::Arc::new(assets),
             native_modules: HashMap::new(),

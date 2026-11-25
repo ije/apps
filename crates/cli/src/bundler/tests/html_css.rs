@@ -782,3 +782,28 @@ fn fallback_page_names_do_not_collide() {
         );
     }
 }
+
+#[test]
+fn package_marks_system_web_views_of_app_code() {
+    for (page, webview) in [
+        ("document.createElement('iframe')", true),
+        ("import 'lib'", false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("node_modules/lib");
+        fs::create_dir_all(&lib).unwrap();
+        fs::write(lib.join("package.json"), "{}").unwrap();
+        fs::write(lib.join("index.js"), "globalThis.tags = ['iframe'];").unwrap();
+        fs::write(dir.path().join("page.ts"), page).unwrap();
+        fs::write(
+            dir.path().join("index.html"),
+            "<script type=module src=page.ts></script>",
+        )
+        .unwrap();
+        let entry = dir.path().join("app.ts");
+        fs::write(&entry, "import.meta.resolve('./index.html')").unwrap();
+        let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
+        let package = files["package.json"].as_str();
+        assert_eq!(package.contains(r#""webview":true"#), webview, "{page}");
+    }
+}

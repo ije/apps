@@ -23,6 +23,8 @@ pub use gpu::Snapshot;
 pub(crate) use gpu::scene::Scene;
 pub use gpu::scene::{Backdrop, BlendMode, Glass, PaintEffect, RenderImage};
 pub use input::*;
+#[cfg(target_os = "linux")]
+pub use platform::PREFER_X11;
 pub use platform::{
     CARET_BLINK, Timer, WindowChange, WindowControl, WindowId, WindowOptions, WindowState,
     activate, before_exit, control_size, native, post_main, post_main_after, prewarm, quit,

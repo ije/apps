@@ -18,6 +18,7 @@ use gpu::Capture;
 use raw_window_handle::RawWindowHandle;
 use rustc_hash::FxHashMap;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::{cell::Cell, cell::RefCell, collections::BTreeMap, collections::VecDeque};
 use std::{rc::Rc, rc::Weak, time::Duration, time::Instant};
@@ -128,6 +129,9 @@ trait Native {
     fn handle(&self) -> RawWindowHandle;
 }
 
+/// Connects to X11 before Wayland, when both are available.
+pub static PREFER_X11: AtomicBool = AtomicBool::new(false);
+
 pub(crate) struct Platform {
     display: Rc<dyn Display>,
 }
@@ -144,7 +148,7 @@ impl Platform {
         let named = |name| std::env::var(name).is_ok_and(|value| !value.is_empty());
         let x11 = named("DISPLAY");
         let wayland = named("WAYLAND_DISPLAY") || std::env::var_os("WAYLAND_SOCKET").is_some();
-        // Wayland first, and X11 when Wayland is missing or fails.
+        // Wayland first, unless the app prefers X11. The other one when the first is missing or fails.
         let mut reasons = Vec::new();
         let mut attempt = |wanted: bool, connect: &dyn Fn() -> Result<Rc<dyn Display>>| {
             let connected = wanted.then(connect)?;
@@ -152,8 +156,15 @@ impl Platform {
                 .inspect_err(|error| reasons.push(format!("{error:#}")))
                 .ok()
         };
-        let display = attempt(wayland, &|| Ok(wayland::Client::connect(x11)?))
-            .or_else(|| attempt(x11, &|| Ok(x11::Client::connect()?)));
+        let mut connect = |use_x11: bool| {
+            if use_x11 {
+                attempt(x11, &|| Ok(x11::Client::connect()?))
+            } else {
+                attempt(wayland, &|| Ok(wayland::Client::connect(x11)?))
+            }
+        };
+        let prefer_x11 = PREFER_X11.load(Ordering::Relaxed);
+        let display = connect(prefer_x11).or_else(|| connect(!prefer_x11));
         let Some(display) = display else {
             eprintln!("apps: no display: {}", reasons.join("; "));
             std::process::exit(1);

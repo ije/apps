@@ -15,9 +15,9 @@ pub(crate) use windows::*;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::WindowControl;
-#[cfg(target_os = "linux")]
 pub(crate) use linux::*;
+#[cfg(target_os = "linux")]
+pub use linux::{PREFER_X11, WindowControl};
 
 pub mod native;
 
