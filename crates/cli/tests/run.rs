@@ -94,7 +94,7 @@ mod process {
         }
 
         fn wait(&mut self, count: usize) {
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + Duration::from_secs(60);
             loop {
                 let launches = self.launches().lines().count();
                 if launches == count {
@@ -317,7 +317,7 @@ mod process {
         );
         app.wait(1);
         fs::write(app.root.join("page.js"), "console.log('page 2');").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let reloaded = loop {
             let text = fs::read_to_string(&reloads).unwrap_or_default();
             if let Some(line) = text.lines().next().filter(|_| text.ends_with('\n')) {

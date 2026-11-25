@@ -23,12 +23,19 @@ pub fn export_symbols(folder: &Path) -> String {
     for entry in fs::read_dir(folder).unwrap() {
         source += &fs::read_to_string(entry.unwrap().path()).unwrap();
     }
+    let target = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    // The MSVC linker fails in tests that don't link the runtime.
+    let key = if target == "windows" {
+        "rustc-link-arg-bins"
+    } else {
+        "rustc-link-arg"
+    };
     for arg in link_args(
         &source,
-        &env::var("CARGO_CFG_TARGET_OS").unwrap(),
+        &target,
         env::var("PROFILE").as_deref() == Ok("release"),
     ) {
-        println!("cargo:rustc-link-arg={arg}");
+        println!("cargo:{key}={arg}");
     }
     source
 }

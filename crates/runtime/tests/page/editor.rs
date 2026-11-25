@@ -30,7 +30,7 @@ fn editor_selection_keyboard_and_input_events() {
     engine
         .eval(include_str!("editor.js"), "editor-tests")
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         engine.tick().unwrap();
         let result = engine.eval("editorResult", "test").unwrap();

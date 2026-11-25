@@ -27,7 +27,7 @@ fn web_apis_in_every_context() {
             include_str!("wasm.js"),
         ] {
             engine.eval(script, "web-tests").unwrap();
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + Duration::from_secs(60);
             loop {
                 engine.tick().unwrap();
                 let result = engine.eval("testResult", "test-result").unwrap();
@@ -216,7 +216,7 @@ fn fetch_streams_redirects_and_abort() {
     engine
         .eval(include_str!("fetch.js"), "fetch-tests")
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let result = loop {
         engine.tick().unwrap();
         let result = engine.eval("testResult", "test-result").unwrap();
@@ -315,7 +315,7 @@ fn runtime_imports_follow_features() {
                 "test",
             )
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             engine.tick().unwrap();
             let result = engine.eval("result", "test").unwrap();

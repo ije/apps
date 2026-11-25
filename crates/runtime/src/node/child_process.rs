@@ -114,7 +114,7 @@ fn error_value(error: &io::Error) -> Value {
     json!({
         "message": error.to_string(),
         "code": crate::node::code(error),
-        "errno": error.raw_os_error().map(|code| -code.abs()),
+        "errno": crate::node::errno(error),
     })
 }
 

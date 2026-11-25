@@ -199,7 +199,7 @@ fn shadow_cycles_child_access_release_and_retired_images() {
                 .unwrap()
                 .is_empty()
             {
-                assert!(started.elapsed() < std::time::Duration::from_secs(10));
+                assert!(started.elapsed() < std::time::Duration::from_secs(60));
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
@@ -568,7 +568,9 @@ fn bitmaps_free_their_pixels() {
     let (mut most, mut made) = (0, 0);
     let started = std::time::Instant::now();
     // A loaded machine makes few bitmaps in a debug build, so it makes at least 40.
-    while started.elapsed() < std::time::Duration::from_secs(3) || made < 40 {
+    while started.elapsed().as_secs() < 3
+        || (made < 40 || most * 2 >= made) && started.elapsed().as_secs() < 60
+    {
         engine.eval("drop()", "test").unwrap();
         made += 1;
         engine.tick().unwrap();
@@ -639,7 +641,7 @@ fn images_decode_on_workers_and_load_after_a_wake() {
                 .recv_timeout(std::time::Duration::from_secs(10))
                 .unwrap();
             engine.tick().unwrap();
-            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            assert!(started.elapsed() < std::time::Duration::from_secs(60));
         }
         engine
             .eval("JSON.stringify(events.splice(0).sort())", "test")

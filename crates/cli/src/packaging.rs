@@ -552,8 +552,9 @@ mod tests {
             }
             let runtime = dir.path().join("runtime");
             fs::write(&runtime, b"runtime").unwrap();
-            let out = dir.path().join("dist");
             for production in [false, true] {
+                // Windows can't replace the bundle that the check maps.
+                let out = dir.path().join(format!("dist-{production}"));
                 let files = bundler::compile(
                     &entry,
                     bundler::Realm::Main,
@@ -703,6 +704,8 @@ mod tests {
         }
     }
 
+    // Windows has no terminal library yet.
+    #[cfg(unix)]
     #[test]
     fn terminal_library_ships_only_with_the_feature() {
         let target = BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap();

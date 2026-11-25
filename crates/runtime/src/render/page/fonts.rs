@@ -323,8 +323,8 @@ mod tests {
         );
         assert_eq!(state.fonts.files["missing.woff2"], None);
         assert!(!state.fonts.files.contains_key("cyrillic.woff2"));
-        // Added faces go under their CSS family, so no alias is needed.
-        assert!(!state.fonts.aliases.contains_key("Ranked"));
+        // Added faces go under their CSS family, so no alias is needed, except on Windows.
+        assert!(cfg!(windows) || !state.fonts.aliases.contains_key("Ranked"));
         let width = |state: &PageState, font: &str, text: &str| {
             crate::render::raster::canvas::text::line(
                 &system,
@@ -348,7 +348,13 @@ mod tests {
             "Missing, Brand, sans-serif".into(),
         )]));
         // The later installed families stay for the glyphs that the first lacks.
-        assert!(font.family.starts_with("Brand\n"), "{}", font.family);
+        // Windows finds an added face only by the family name in its file.
+        let first = if cfg!(windows) {
+            "H2O Test\n"
+        } else {
+            "Brand\n"
+        };
+        assert!(font.family.starts_with(first), "{}", font.family);
         assert!(!load(&mut doc, &mut state).0);
         assert_eq!(state.fonts.text.1.len(), 0x110000 / 64);
         let text = doc

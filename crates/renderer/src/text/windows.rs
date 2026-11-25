@@ -566,6 +566,9 @@ impl Library {
     }
 }
 
+/// DirectWrite makes empty analyses of glyphs from about 900 device pixels of font size.
+pub(super) const MAX_ANALYSIS: f32 = 800.;
+
 // Grayscale analyses give their coverage in the aliased texture type, one byte per pixel.
 const COVERAGE: DWRITE_TEXTURE_TYPE = DWRITE_TEXTURE_ALIASED_1x1;
 
@@ -924,7 +927,16 @@ impl TextSystem {
         // SAFETY: a plain analysis query.
         let [x, y, width, height] = extent(unsafe { analysis.GetAlphaTextureBounds(COVERAGE)? });
         if width <= 0 || height <= 0 {
-            return Ok(Rect::default());
+            let grow = glyph.size.0 * glyph.scale / MAX_ANALYSIS;
+            if grow <= 1. {
+                return Ok(Rect::default());
+            }
+            let small = self.raster_bounds(&GlyphRaster {
+                scale: glyph.scale / grow,
+                ..*glyph
+            })?;
+            let grow = |value: i32| (value as f32 * grow).round() as i32;
+            return Ok(Rect::new(small.origin.map(grow), small.size.map(grow)));
         }
         Ok(Rect::new(point(x, y), size(width, height)).outset(1))
     }

@@ -13,11 +13,12 @@ globalThis.__appsNet = (call, EventEmitter, streams, Buffer, { decode }) => {
     return [options, callback];
   };
   const errno = code => { const value = globalThis.__apps?.os.constants.errno[code]; return value === undefined ? undefined : -value; };
+  const descriptions = { EADDRINUSE: 'address already in use', EADDRNOTAVAIL: 'address not available', EACCES: 'permission denied' };
   const failure = event => {
     if (event.alert) return Object.assign(new Error(`SSL alert number ${event.alert}`), { code: 'ERR_SSL_' + ({ 40: 'SSLV3_ALERT_HANDSHAKE_FAILURE', 42: 'SSLV3_ALERT_BAD_CERTIFICATE', 46: 'SSLV3_ALERT_CERTIFICATE_UNKNOWN', 48: 'TLSV1_ALERT_UNKNOWN_CA', 70: 'TLSV1_ALERT_PROTOCOL_VERSION', 80: 'TLSV1_ALERT_INTERNAL_ERROR', 112: 'TLSV1_UNRECOGNIZED_NAME', 116: 'TLSV13_ALERT_CERTIFICATE_REQUIRED', 120: 'TLSV1_ALERT_NO_APPLICATION_PROTOCOL' }[event.alert] ?? 'TLS_ALERT_' + event.alert) });
     if (event.message) return Object.assign(new Error(event.message), { code: event.code });
     const target = event.syscall === 'getaddrinfo' ? ` ${event.hostname}` : event.port !== undefined ? ` ${event.address}:${event.port}` : event.address !== undefined ? ` ${event.address}` : '';
-    const message = event.syscall === 'listen' ? `listen ${event.code}: ${event.description}${target}` : `${event.syscall} ${event.code}${target}`;
+    const message = event.syscall === 'listen' ? `listen ${event.code}: ${descriptions[event.code] ?? event.description}${target}` : `${event.syscall} ${event.code}${target}`;
     const error = Object.assign(new Error(message), { errno: event.errno ?? errno(event.code), code: event.code, syscall: event.syscall });
     for (const name of ['address', 'port', 'hostname']) if (event[name] !== undefined) error[name] = event[name];
     return error;

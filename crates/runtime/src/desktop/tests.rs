@@ -135,12 +135,16 @@ fn loads_return_promises_and_failures_never_quit() {
             win.loadFile('missing.html').then(() => log.push('resolved'), error => log.push('rejected:' + [error.message, error.code, error.errno].join(' ')));
         });
     "#;
-    let mut desktop = app(code, &[], std::path::PathBuf::from("/app"));
+    let root = std::path::PathBuf::from(if cfg!(windows) { "C:/app" } else { "/app" });
+    let missing = url::Url::from_file_path(root.join("missing.html")).unwrap();
+    let mut desktop = app(code, &[], root);
     let eval = |desktop: &Desktop, script: &str| desktop.js().eval(script, "test").unwrap();
     assert!(!desktop.quit && desktop.views.contains_key(&1));
     assert_eq!(
         eval(&desktop, "log.join('|')"),
-        "did-fail-load:-6 ERR_FILE_NOT_FOUND file:///app/missing.html|did-stop-loading|rejected:ERR_FILE_NOT_FOUND (-6) loading 'file:///app/missing.html' ERR_FILE_NOT_FOUND -6"
+        format!(
+            "did-fail-load:-6 ERR_FILE_NOT_FOUND {missing}|did-stop-loading|rejected:ERR_FILE_NOT_FOUND (-6) loading '{missing}' ERR_FILE_NOT_FOUND -6"
+        )
     );
     eval(
         &desktop,

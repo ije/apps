@@ -184,10 +184,7 @@ fn failure((error, syscall, mut details): Failure) -> Value {
     let (code, errno) = if syscall == "getaddrinfo" {
         ("ENOTFOUND", Some(-3008))
     } else {
-        (
-            crate::node::code(&error),
-            error.raw_os_error().map(|code| -code.abs()),
-        )
+        (crate::node::code(&error), crate::node::errno(&error))
     };
     let mut text = error.to_string();
     text.truncate(text.find(" (os error").unwrap_or(text.len()));

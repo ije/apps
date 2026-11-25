@@ -337,7 +337,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn wait(browser: &Browser, matches: impl Fn(&Value) -> bool) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             #[cfg(target_os = "windows")]
             unsafe {

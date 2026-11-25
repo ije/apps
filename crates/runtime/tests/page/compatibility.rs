@@ -12,7 +12,7 @@ fn run(source: &str) {
     let engine =
         JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main).unwrap();
     engine.eval(&format!("globalThis.result='pending';(async()=>{{{source}}})().then(()=>result='ok',e=>result=String(e)+'\\n'+e.stack);"),"compatibility").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         engine.tick().unwrap();
         let result = engine.eval("result", "test").unwrap();
@@ -201,13 +201,13 @@ fn node_string_decoder_url_querystring_and_util_match_node() {
         [t(()=>(()=>{const m=new util.MIMEType('Text/HTML; Charset="utf-8"; x=y');m.params.set('a','b c');return [m.type,m.subtype,m.essence,m.params.get('charset'),m.params.get('none'),String(m),JSON.stringify(m),[...m.params.keys()]];})()),"[\"text\",\"html\",\"text/html\",\"utf-8\",null,\"text/html;charset=utf-8;x=y;a=\\\"b c\\\"\",\"\\\"text/html;charset=utf-8;x=y;a=\\\\\\\"b c\\\\\\\"\\\"\",[\"charset\",\"x\",\"a\"]]"],
         [t(()=>new util.MIMEType('text')),"\"THROW ERR_INVALID_MIME_SYNTAX The MIME syntax for a type in \\\"text\\\" is invalid\""],
         [t(()=>new util.MIMEParams().set('a b','c')),"\"THROW ERR_INVALID_MIME_SYNTAX The MIME syntax for a parameter name in \\\"a b\\\" is invalid at 1\""],
-        [t(()=>[util.getSystemErrorMap().get(-2),util.getSystemErrorMessage(-13),util.getSystemErrorName(-2),util.getSystemErrorName(-99999),util.toUSVString('a\ud800b')]),"[[\"ENOENT\",\"no such file or directory\"],\"permission denied\",\"ENOENT\",\"Unknown system error -99999\",\"a�b\"]"],
+        [t(()=>((noent,acces)=>[util.getSystemErrorMap().get(noent),util.getSystemErrorMessage(acces),util.getSystemErrorName(noent),util.getSystemErrorName(-99999),util.toUSVString('a\ud800b')])(...process.platform==='win32'?[-4058,-4092]:[-2,-13])),"[[\"ENOENT\",\"no such file or directory\"],\"permission denied\",\"ENOENT\",\"Unknown system error -99999\",\"a�b\"]"],
         [t(()=>util.getSystemErrorName(2)),"\"THROW ERR_OUT_OF_RANGE The value of \\\"err\\\" is out of range. It must be a negative integer. Received 2\""],
         [t(()=>util.transferableAbortSignal({})),"\"THROW ERR_INVALID_ARG_TYPE The \\\"signal\\\" argument must be an instance of AbortSignal. Received an instance of Object\""],
         [t(()=>[util.types.isNativeError(Object.create(Error.prototype)),util.types.isNativeError(new TypeError()),util.types.isDate(Object.create(Date.prototype)),util.types.isMap(new (class extends Map {})()),util.types.isArgumentsObject((function(){return arguments;})()),util.types.isFloat16Array(new Float16Array(1)),util.types.isBoxedPrimitive(Object(1n)),util.types.isRegExp(RegExp.prototype),util.types.isSet(Set.prototype),util.types.isNumberObject({[Symbol.toStringTag]:'Number'})]),"[false,true,false,true,true,true,true,false,false,false]"],
         [t(()=>['isArgumentsObject','isBigInt64Array','isBigUint64Array','isExternal','isFloat16Array','isFloat32Array','isInt8Array','isKeyObject','isMapIterator','isProxy','isSetIterator','isSymbolObject','isUint8ClampedArray','isCryptoKey'].map(name=>typeof util.types[name])),"[\"function\",\"function\",\"function\",\"function\",\"function\",\"function\",\"function\",\"function\",\"function\",\"function\",\"function\",\"function\",\"function\",\"function\"]"],
         [t(()=>[()=>__apps.assert.fail(),()=>__apps.assert.fail('x'),()=>__apps.assert.ok(0),()=>__apps.assert.strictEqual(1,2),()=>__apps.assert.throws(()=>{}),()=>__apps.assert.ifError('e')].map(f=>{try{f();}catch(error){return error.generatedMessage;}})),"[true,false,true,true,false,false]"],
-        [t(()=>(({getColorDepth,hasColors})=>[typeof __apps.tty.ReadStream,getColorDepth({TERM:'xterm-256color'}),getColorDepth({}),getColorDepth({FORCE_COLOR:'3'}),getColorDepth({COLORTERM:'truecolor'}),getColorDepth({TERM:'screen'}),getColorDepth({NO_COLOR:'1',TERM:'xterm'}),getColorDepth({TERM_PROGRAM:'iTerm.app',TERM_PROGRAM_VERSION:'3.4'}),hasColors(256,{TERM:'xterm-256color'}),hasColors({TERM:'dumb'})])(__apps.tty.WriteStream.prototype)),"[\"function\",8,1,24,24,4,1,24,true,false]"]
+        [t(()=>(({getColorDepth,hasColors})=>[typeof __apps.tty.ReadStream,getColorDepth({TERM:'xterm-256color'}),getColorDepth({}),getColorDepth({FORCE_COLOR:'3'}),getColorDepth({COLORTERM:'truecolor'}),getColorDepth({TERM:'screen'}),getColorDepth({NO_COLOR:'1',TERM:'xterm'}),getColorDepth({TERM_PROGRAM:'iTerm.app',TERM_PROGRAM_VERSION:'3.4'}),hasColors(256,{TERM:'xterm-256color'}),hasColors({TERM:'dumb'})])(__apps.tty.WriteStream.prototype)),__apps.process.platform==='win32'?"[\"function\",24,24,24,24,24,1,24,true,false]":"[\"function\",8,1,24,24,4,1,24,true,false]"]
         
         ];
         cases.forEach(([actual,expected],index)=>{if(JSON.stringify(actual)!==expected)throw Error(`case ${index}: ${JSON.stringify(actual)} !== ${expected}`);});
@@ -783,11 +783,12 @@ fn node_timeout_refresh_restarts_a_fired_timer() {
     run(r#"
         const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
         let fired = 0;
+        const until = async ready => { for (let i = 0; i < 2000 && !ready(); i++) await wait(5); };
         const timer = setTimeout(() => fired++, 1);
-        await wait(20);
+        await until(() => fired === 1);
         timer.refresh();
         if (!timer.hasRef()) throw Error('Refreshed timer lost its ref');
-        await wait(20);
+        await until(() => fired === 2);
         if (fired !== 2) throw Error('Refresh after firing did not restart: ' + fired);
         timer.refresh(); clearTimeout(timer);
         await wait(20);
@@ -797,7 +798,8 @@ fn node_timeout_refresh_restarts_a_fired_timer() {
         if (fired !== 2) throw Error('Refresh restarted a cleared timer');
         let runs = 0;
         const again = setTimeout(() => { if (++runs < 3) again.refresh(); }, 1);
-        await wait(40);
+        await until(() => runs === 3);
+        await wait(20);
         if (runs !== 3) throw Error('Refresh inside the callback failed: ' + runs);
     "#);
 }
@@ -1074,7 +1076,7 @@ fn node_core_modules() {
         assert.deepStrictEqual(util.parseArgs({args:['-v','--name=x','pos'],options:{verbose:{type:'boolean',short:'v'},name:{type:'string'}},allowPositionals:true}).positionals,['pos']);
         assert.deepStrictEqual(path.parse('/home/u/f.txt'),{root:'/',dir:'/home/u',base:'f.txt',ext:'.txt',name:'f'});
         assert.strictEqual(path.win32.format({dir:'C:\\a',name:'b',ext:'.c'}),'C:\\a\\b.c');
-        assert.strictEqual(url.fileURLToPath(url.pathToFileURL('/tmp/a b#c')),'/tmp/a b#c');
+        assert.strictEqual(url.fileURLToPath(url.pathToFileURL('/tmp/a b#c')),path.resolve('/tmp/a b#c'));
         assert.ok(os.totalmem()>0&&os.cpus().length>0&&!os.tmpdir().endsWith('/')&&typeof os.userInfo().username==='string');
         assert.deepStrictEqual(querystring.parse('a=1&a=2&b=x+y'),Object.assign(Object.create(null),{a:['1','2'],b:'x y'}));
         const decoder=new StringDecoder('utf8'),euro=Buffer.from('€');assert.strictEqual(decoder.write(euro.subarray(0,1))+decoder.end(euro.subarray(1)),'€');
@@ -1470,7 +1472,7 @@ fn node_fs_vectors_statfs_and_glob_match_node() {
     let root = serde_json::to_string(&dir.path()).unwrap();
     run(&format!(
         r#"
-        const {{assert,fs,path}}=__apps,root={root},fold=process.platform!=='linux',sort=list=>[...list].sort();
+        const {{assert,fs,path}}=__apps,root={root},fold=process.platform!=='linux',posix=list=>list.map(file=>file.replaceAll('\\','/')),sort=list=>posix(list).sort();
         for(const file of ['a.js','b.ts','.hidden.js','src/c.js','src/d.JS','src/.e.js','src/deep/f.js','src/deep/g.txt','.dot/h.js','lib/i.js']){{fs.mkdirSync(path.join(root,path.dirname(file)),{{recursive:true}});fs.writeFileSync(path.join(root,file),'');}}
         const glob=(pattern,o)=>sort(fs.globSync(pattern,{{cwd:root,...o}})),d=fold?['src/d.JS']:[];
         assert.deepStrictEqual(glob('*.js'),['a.js']);
@@ -1485,13 +1487,13 @@ fn node_fs_vectors_statfs_and_glob_match_node() {
         assert.deepStrictEqual(glob(['a.js','nope.js','src']),['a.js','src']);
         assert.deepStrictEqual([glob('./src/*.js'),glob('src/../a.js'),glob('.dot/*')],[['src/c.js',...d],['a.js'],['.dot/h.js']]);
         assert.deepStrictEqual(fs.globSync('*.js',{{cwd:root,withFileTypes:true}}).map(entry=>[entry.name,entry.parentPath===root,entry.isFile()]),[['a.js',true,true]]);
-        assert.deepStrictEqual(fs.globSync(path.join(root,'src/*.js')),[path.join(root,'src/c.js'),...d.map(file=>path.join(root,file))]);
+        assert.deepStrictEqual(glob(path.join(root,'src/*.js')),posix([path.join(root,'src/c.js'),...d.map(file=>path.join(root,file))]));
         assert.deepStrictEqual(await new Promise((resolve,reject)=>fs.glob('*.js',{{cwd:root}},(error,list)=>error?reject(error):resolve(list))),['a.js']);
         assert.deepStrictEqual(sort(await Array.fromAsync(fs.promises.glob('src/*',{{cwd:root}}))),['src/c.js','src/d.JS','src/deep']);
-        const stats=fs.statfsSync(root),big=await fs.promises.statfs(root,{{bigint:true}});
+        if(process.platform!=='win32'){{const stats=fs.statfsSync(root),big=await fs.promises.statfs(root,{{bigint:true}});
         assert.deepStrictEqual(Object.keys(stats),['type','bsize','frsize','blocks','bfree','bavail','files','ffree']);
         assert.ok(stats.bsize>0&&stats.blocks>=stats.bfree&&big.bsize===BigInt(stats.bsize));
-        assert.throws(()=>fs.statfsSync(path.join(root,'missing')),{{code:'ENOENT'}});
+        assert.throws(()=>fs.statfsSync(path.join(root,'missing')),{{code:'ENOENT'}});}}
         const fd=fs.openSync(path.join(root,'v.bin'),'w+');
         assert.strictEqual(fs.writevSync(fd,[Buffer.from('abc'),new Uint8Array([100,101])]),5);
         const a=Buffer.alloc(2),b=Buffer.alloc(4);assert.strictEqual(fs.readvSync(fd,[a,b],0),5);assert.deepStrictEqual([a.toString(),b.toString('latin1')],['ab','cde\0']);

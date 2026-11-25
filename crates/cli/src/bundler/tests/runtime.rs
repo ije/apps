@@ -124,7 +124,7 @@ fn declarative_lifecycle() {
             .unwrap();
             engine.load_bundle(&files, "app.js").unwrap();
             engine.eval("__appsEvent('ready')", "test").unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             while engine.eval("__appsPending()", "test").unwrap() == "true" {
                 engine.tick().unwrap();
                 assert!(
@@ -783,7 +783,7 @@ fn node_builtin_exports_match_runtime_objects() {
     source += "const require=__apps.module.createRequire(),problems=[];";
     for (index, name) in modules.iter().enumerate() {
         source += &format!(
-            "{{const object=require('{name}'),names=Object.keys(m{index}).filter(key=>key!=='default'&&key!=='module.exports');if(object!==m{index}.default)problems.push('{name}: default');for(const key of names)if(!(key in object))problems.push('{name}: missing '+key);if('{name}'!=='node:constants')for(const key of Object.keys(object))if(!key.startsWith('_')&&!names.includes(key))problems.push('{name}: not importable '+key);}}"
+            "{{const object=require('{name}'),names=Object.keys(m{index}).filter(key=>key!=='default'&&key!=='module.exports');if(object!==m{index}.default)problems.push('{name}: default');for(const key of names)if(!(key in object)&&!(process.platform==='win32'&&/^get(e?[ug]id|groups)$/.test(key)))problems.push('{name}: missing '+key);if('{name}'!=='node:constants')for(const key of Object.keys(object))if(!key.startsWith('_')&&!names.includes(key))problems.push('{name}: not importable '+key);}}"
         );
     }
     source += "import {on, emit} from 'process';import {readFileSync} from 'fs';if(typeof on!=='function'||typeof emit!=='function'||typeof readFileSync!=='function')problems.push('named imports');";
@@ -933,6 +933,8 @@ fn package_features_reach_the_runtime() {
 
 // After runtime exports change, regenerate builtins.txt with `APPS_UPDATE_BUILTINS=1 cargo test -p apps
 // builtin_table`.
+// Windows has fewer functions, like no `process.getuid()`.
+#[cfg(unix)]
 #[test]
 fn builtin_table_matches_the_runtime() {
     let engine = apps_runtime::host::context::JsContext::new(

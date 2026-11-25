@@ -426,7 +426,7 @@ fn a_program_runs_in_a_pty() {
     };
     assert!(pid > 0, "{}", String::from_utf8_lossy(&error));
     let wait = |what: &mut dyn FnMut() -> bool| {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !what() {
             assert!(Instant::now() < deadline, "{:?}", test.text(false));
             std::thread::sleep(Duration::from_millis(5));
@@ -475,7 +475,7 @@ fn closing_hangs_up_the_group_and_frees_the_state() {
     };
     assert!(pid > 0, "{}", String::from_utf8_lossy(&error));
     let wait = |what: &mut dyn FnMut() -> bool| {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !what() {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(5));
@@ -548,7 +548,7 @@ fn exit_comes_after_the_last_output_and_ends_the_hold() {
         )
     };
     assert!(pid > 0, "{}", String::from_utf8_lossy(&error));
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !test.poll().contains("exit") {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(5));

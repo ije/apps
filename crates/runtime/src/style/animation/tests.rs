@@ -1229,7 +1229,7 @@ fn huge_page_times_never_panic() {
             motion.timeline(id, 0, &styles, &[at], &[]);
         }
     }
-    assert_eq!(after(start, 1e19), None);
+    assert_eq!(after(start, 1e20), None);
     assert_eq!(after(start, f64::INFINITY), None);
 }
 

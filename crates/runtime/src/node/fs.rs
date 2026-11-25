@@ -148,12 +148,29 @@ fn open_options(flag: &Value, fallback: &str, mode: &Value) -> Result<OpenOption
     Ok(options)
 }
 
+// Windows moves the position of the file also for reads and writes at an offset.
+#[cfg(windows)]
+fn keep_position(
+    mut file: &File,
+    run: impl FnOnce() -> std::io::Result<usize>,
+) -> std::io::Result<usize> {
+    use std::io::Seek;
+    let position = file.stream_position();
+    let result = run();
+    if let Ok(position) = position {
+        file.seek(std::io::SeekFrom::Start(position))?;
+    }
+    result
+}
+
 fn read(file: &File, out: &mut [u8], position: Option<u64>) -> std::io::Result<usize> {
     match position {
         #[cfg(unix)]
         Some(position) => std::os::unix::fs::FileExt::read_at(file, out, position),
         #[cfg(windows)]
-        Some(position) => std::os::windows::fs::FileExt::seek_read(file, out, position),
+        Some(position) => keep_position(file, || {
+            std::os::windows::fs::FileExt::seek_read(file, out, position)
+        }),
         None => (&*file).read(out),
     }
 }
@@ -179,7 +196,7 @@ impl Files {
                 return Ok(file);
             }
         }
-        Err(std::io::Error::from_raw_os_error(libc::EBADF).into())
+        Err(super::bad_file().into())
     }
 
     pub(crate) fn read_into(
@@ -212,10 +229,7 @@ impl Files {
         };
         match op {
             "constants" => {
-                #[cfg(unix)]
                 let errno: HashMap<_, _> = super::ERRNO.iter().copied().collect();
-                #[cfg(not(unix))]
-                let errno = HashMap::<&str, i32>::new();
                 #[cfg(unix)]
                 let dlopen = json!({"RTLD_LAZY":libc::RTLD_LAZY,"RTLD_NOW":libc::RTLD_NOW,"RTLD_GLOBAL":libc::RTLD_GLOBAL,"RTLD_LOCAL":libc::RTLD_LOCAL});
                 #[cfg(not(unix))]
@@ -589,7 +603,7 @@ impl Files {
                 #[cfg(not(unix))]
                 let closed = false;
                 if !removed && !closed {
-                    return Err(std::io::Error::from_raw_os_error(libc::EBADF).into());
+                    return Err(super::bad_file().into());
                 }
                 Ok(Value::Null)
             }
@@ -603,7 +617,7 @@ impl Files {
                         // error for the caller, and must not end the app.
                         let mut data = Vec::new();
                         data.try_reserve_exact(size)
-                            .map_err(|_| std::io::Error::from_raw_os_error(libc::ENOMEM))?;
+                            .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
                         data.resize(size, 0);
                         let count = read(&file, &mut data, args[2].as_u64())?;
                         data.truncate(count);
@@ -620,7 +634,7 @@ impl Files {
                             #[cfg(windows)]
                             {
                                 use std::os::windows::fs::FileExt;
-                                file.seek_write(data, position)?
+                                keep_position(&file, || file.seek_write(data, position))?
                             }
                         } else {
                             (&*file).write(data)?

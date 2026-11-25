@@ -9,7 +9,7 @@ license.workspace = true
 name = "Ghostty"
 crate-type = ["cdylib", "rlib"]
 
-[dependencies]
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [build-dependencies]

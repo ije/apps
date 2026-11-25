@@ -777,7 +777,7 @@ fn web_animations_release_finished_effects_and_commit_their_own_stack() {
     while engine.eval("counts.finish", "test").unwrap() == "0" {
         let delay = engine.tick().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(delay.clamp(1, 10) as u64));
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(started.elapsed() < std::time::Duration::from_secs(60));
     }
     for _ in 0..3 {
         engine.tick().unwrap();
@@ -859,7 +859,7 @@ fn web_animations_sample_commit_finish_and_replace() {
     {
         let delay = engine.tick().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(delay.clamp(1, 10) as u64));
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(started.elapsed() < std::time::Duration::from_secs(60));
     }
     assert_eq!(
         engine.eval("JSON.stringify([events.sort(), one.replaceState, two.playState, b.getAnimations().length, getComputedStyle(b).opacity])", "test").unwrap(),

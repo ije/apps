@@ -66,10 +66,13 @@ impl Contexts {
     }
 }
 
+#[cfg(unix)]
 const SETUP: &str = "globalThis.el = document.getElementById('parsed'); globalThis.events = [];
     globalThis.listen = session => { for (const type of ['data', 'titlechange', 'cwdchange', 'bell', 'exit', 'statuschange', 'resize', 'close'])
         session.addEventListener(type, event => events.push([type, event.data ?? event.exitCode ?? null])); return session; };";
 
+// Windows has no terminal library yet.
+#[cfg(unix)]
 #[test]
 fn pages_show_the_sessions_of_their_preload_script() {
     let contexts = contexts(r#"["terminal"]"#);

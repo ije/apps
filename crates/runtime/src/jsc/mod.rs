@@ -395,24 +395,47 @@ impl JavaScriptCore {
                 *library.get(b"JSContextGroupCreate\0")?;
             // Set JSC options before the first group and before other threads start. Only then is set_var
             // sound.
+            // JSC reads the environment of the C runtime, which `std::env` doesn't change on Windows.
+            let set_option = |name: &std::ffi::CStr, value: &std::ffi::CStr| {
+                #[cfg(windows)]
+                {
+                    unsafe extern "C" {
+                        fn _putenv_s(
+                            name: *const std::ffi::c_char,
+                            value: *const std::ffi::c_char,
+                        ) -> i32;
+                    }
+                    _putenv_s(name.as_ptr(), value.as_ptr());
+                }
+                #[cfg(unix)]
+                if value.is_empty() {
+                    libc::unsetenv(name.as_ptr());
+                } else {
+                    libc::setenv(name.as_ptr(), value.as_ptr(), 1);
+                }
+            };
             static OPTIONS: std::sync::Once = std::sync::Once::new();
             let mut group = None;
             OPTIONS.call_once(|| {
-                std::env::set_var("JSC_alwaysUseSharedArrayBuffer", "1");
-                // Limit heap growth to about 2x live size instead of 4x on machines with at least 16 GB.
-                std::env::set_var("JSC_heapGrowthMaxIncrease", "1");
-                // Sweep after each collection: JSC's timer never fires on the generic event loop, leaving
-                // dead cells resident.
-                std::env::set_var("JSC_sweepSynchronously", "1");
-                // In JSC's cell cage every block the heap holds stays resident. AOT images use wide
-                // references, which need no cage.
-                std::env::set_var("JSC_markedBlockCageSizeInMB", "0");
+                let options = [
+                    (c"JSC_alwaysUseSharedArrayBuffer", c"1"),
+                    // Limit heap growth to about 2x live size instead of 4x on machines with at least 16 GB.
+                    (c"JSC_heapGrowthMaxIncrease", c"1"),
+                    // Sweep after each collection: JSC's timer never fires on the generic event loop, leaving
+                    // dead cells resident.
+                    (c"JSC_sweepSynchronously", c"1"),
+                    // In JSC's cell cage every block the heap holds stays resident. AOT images use wide
+                    // references, which need no cage.
+                    (c"JSC_markedBlockCageSizeInMB", c"0"),
+                ];
+                for (name, value) in options {
+                    set_option(name, value);
+                }
                 let _ = aot::load(library, &image);
                 group = Some(group_create());
-                std::env::remove_var("JSC_alwaysUseSharedArrayBuffer");
-                std::env::remove_var("JSC_heapGrowthMaxIncrease");
-                std::env::remove_var("JSC_sweepSynchronously");
-                std::env::remove_var("JSC_markedBlockCageSizeInMB");
+                for (name, _) in options {
+                    set_option(name, c"");
+                }
             });
             Ok(Rc::new(Self {
                 aot: aot::load(library, &image)?,

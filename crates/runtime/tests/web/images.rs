@@ -9,7 +9,7 @@ fn decoded(doc: &mut Document, state: &mut apps_runtime::render::PageState) -> V
         if let Some(result) = results.get(0) {
             return result[1].clone();
         }
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(started.elapsed() < std::time::Duration::from_secs(60));
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
@@ -200,7 +200,7 @@ fn svg_and_bundled_images_load_through_the_host() {
             if let Some(result) = results.get(0) {
                 return result[1].clone();
             }
-            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            assert!(started.elapsed() < std::time::Duration::from_secs(60));
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     };

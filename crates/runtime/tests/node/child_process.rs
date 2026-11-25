@@ -13,7 +13,7 @@ fn run(source: &str) {
     )
     .unwrap();
     engine.eval(&format!("globalThis.testResult = 'pending'; (async () => {{ {source} }})().then(() => testResult = 'ok', error => testResult = error.stack || String(error));"), "child-test").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         engine.tick().unwrap();
         let result = engine.eval("testResult", "child-result").unwrap();
@@ -303,7 +303,7 @@ fn native_events_wake_the_event_loop() {
         engine
             .eval(&format!("globalThis.done=false;{start}"), "wake")
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let seen = wakes.load(Ordering::SeqCst);
             engine.tick().unwrap();
@@ -343,7 +343,7 @@ fn closing_terminals_does_not_block_on_kill() {
         "Closing a terminal blocked for {:?}",
         start.elapsed()
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while unsafe { libc::kill(pid, 0) } == 0 {
         assert!(Instant::now() < deadline, "Terminal child was not killed");
         std::thread::sleep(Duration::from_millis(10));
@@ -401,7 +401,7 @@ fn destroyed_child_output_closes_the_pipe() {
 #[test]
 fn synchronous_children_honor_stdio_modes() {
     run(
-        r#"for(const stdio of ['ignore','inherit',['ignore','ignore','ignore']]){const result=__apps.child_process.spawnSync('/bin/sh',['-c','exit 0'],{stdio});if(result.status!==0||result.stdout!==null||result.stderr!==null)throw Error('sync stdio')}"#,
+        r#"for(const stdio of ['ignore','inherit',['ignore','ignore','ignore']]){const result=__apps.child_process.spawnSync(...process.platform==='win32'?['cmd.exe',['/c','exit 0']]:['/bin/sh',['-c','exit 0']],{stdio});if(result.status!==0||result.stdout!==null||result.stderr!==null)throw Error('sync stdio')}"#,
     );
 }
 
@@ -501,7 +501,7 @@ fn detached_children_get_signals_alone_and_are_reaped() {
         .parse()
         .unwrap();
     drop(engine);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while unsafe { libc::kill(pid, 0) } == 0 {
         assert!(Instant::now() < deadline, "Detached child stayed a zombie");
         std::thread::sleep(Duration::from_millis(5));

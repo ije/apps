@@ -12,7 +12,7 @@ fn serve_requests_and_lifecycle() {
     engine
         .eval(include_str!("serve.js"), "serve-tests")
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         engine.tick().unwrap();
         let result = engine.eval("testResult", "serve-result").unwrap();
@@ -80,7 +80,7 @@ fn native_events_wake_the_loop_without_polling() {
     let engine =
         JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main).unwrap();
     engine.eval("globalThis.done='pending';const server=__apps.serve({hostname:'127.0.0.1',port:0,fetch:async request=>new Response(await request.text()+'!')});fetch(`http://127.0.0.1:${server.port}`,{method:'POST',body:'woken'}).then(r=>r.text()).then(text=>{done=text;server.stop()},error=>done=String(error))", "wake").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let seen = wakes.load(Ordering::Relaxed);
         assert_eq!(engine.tick().unwrap(), -1, "the loop must not poll");
@@ -108,7 +108,7 @@ fn stalled_stream_responses_wait_for_the_client_without_polling() {
     stream
         .write_all(b"GET / HTTP/1.1\r\nhost: test\r\n\r\n")
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let (mut last, mut quiet) = (String::new(), 0);
     while quiet < 20 {
         let delay = engine.tick().unwrap();

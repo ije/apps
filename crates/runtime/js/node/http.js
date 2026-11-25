@@ -91,8 +91,8 @@ globalThis.__appsHTTP = (serve, stream, EventEmitter, net) => {
     destroy(){}
   }
   const failure=(error,url)=>{
-    const message=String(error?.message??error),number=/os error (\d+)/.exec(message)?.[1],code=number&&Object.keys(globalThis.__apps?.os.constants.errno??{}).find(name=>globalThis.__apps.os.constants.errno[name]===+number);
-    if(code)return net.failure({code,errno:-number,syscall:/connect/i.test(message)?'connect':'read',address:url.hostname.replace(/^\[|\]$/g,''),port:+url.port||(url.protocol==='https:'?443:80)});
+    const message=String(error?.message??error),number=/os error (\d+)/.exec(message)?.[1],errnos=globalThis.__apps?.os.constants.errno??{},code=number&&({10051:'ENETUNREACH',10053:'ECONNABORTED',10054:'ECONNRESET',10060:'ETIMEDOUT',10061:'ECONNREFUSED',10065:'EHOSTUNREACH'}[number]??Object.keys(errnos).find(name=>errnos[name]===+number));
+    if(code)return net.failure({code,errno:-errnos[code],syscall:/connect/i.test(message)?'connect':'read',address:url.hostname.replace(/^\[|\]$/g,''),port:+url.port||(url.protocol==='https:'?443:80)});
     if(/dns error|lookup/i.test(message))return net.failure({code:'ENOTFOUND',errno:-3008,syscall:'getaddrinfo',hostname:url.hostname});
     if(/closed before message completed|connection reset/i.test(message))return fail(Error,'ECONNRESET','socket hang up');
     return error instanceof Error?error:new Error(message);

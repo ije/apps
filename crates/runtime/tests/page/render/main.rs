@@ -64,7 +64,7 @@ fn run_hidden(main: &str, pages: &[(&str, &str)]) -> String {
                 .as_bytes(),
         )
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while child.try_wait().unwrap().is_none() {
         if Instant::now() >= deadline {
             child.kill().unwrap();

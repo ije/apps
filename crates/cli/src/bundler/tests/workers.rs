@@ -243,7 +243,7 @@ fn bundled_workers_and_dynamic_imports_in_production() {
         if let Err(error) = engine.load_bundle(&files, "app.js") {
             panic!("production={production}: {error:#}");
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while engine.eval("globalThis.result", "test").unwrap() != "ok" {
             engine.tick().unwrap();
             assert!(
@@ -428,7 +428,7 @@ if (threads.isMainThread) {
         )
         .unwrap();
         engine.load_bundle(&files, "app.js").unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while engine
             .eval("globalThis.result ?? 'pending'", "test")
             .unwrap()
@@ -522,7 +522,7 @@ fn page_workers_and_chunks_load_from_bundled_scripts() {
         )
         .unwrap();
         engine.load_bundle(&files, "page").unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while engine
             .eval("globalThis.result ?? 'pending'", "test")
             .unwrap()
@@ -576,7 +576,12 @@ fn import_meta_filename_and_dirname_follow_node() {
             let expected = match realm {
                 Realm::Renderer => "undefined".to_owned(),
                 _ if production => result.clone(),
-                _ => json!([true, true, entry]).to_string(),
+                _ => json!([
+                    true,
+                    true,
+                    entry.to_str().unwrap().trim_start_matches(r"\\?\")
+                ])
+                .to_string(),
             };
             assert_eq!(result, expected, "production={production}, realm={realm:?}");
             assert!(

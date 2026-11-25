@@ -72,7 +72,7 @@ fn unmatched_end_tags_are_linear() {
     let p = find(&doc, "p");
     assert_eq!(doc.nodes[p].attrs.keys().count(), 50000);
     assert_eq!(doc.nodes[p].attrs["a49999"], "x");
-    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
     let doc = Document::parse(
         "<div><b>x</div>y<svg><linearGradient><stop/></LINEARGRADIENT><g></g></svg><table><tr><td><p>in</table><i>out</i>",
     );

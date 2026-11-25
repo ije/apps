@@ -7,7 +7,7 @@ on:
     paths-ignore: ['**.md']
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 jobs:
@@ -18,6 +18,7 @@ jobs:
         # The same Linux and Windows images as release.yml, so both workflows share the native library caches.
         os: [macos-15, ubuntu-24.04, windows-2025]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -29,14 +30,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/native
-      - if: runner.os != 'Windows'
-        run: cargo test --workspace --locked --no-fail-fast
-      - if: runner.os == 'Windows'
-        run: cargo test -p apps --test build --locked
-      - if: runner.os == 'Windows'
-        run: cargo test -p apps-runtime --test images --locked
-      - if: runner.os == 'Windows'
-        run: cargo test -p apps-runtime --lib jsc::tests::contexts_isolate_privileges_and_share_dom_only --locked
+      - run: cargo test --workspace --locked --no-fail-fast
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - if: runner.os == 'Linux'
         run: dbus-run-session -- xvfb-run -a cargo test -p apps-webview --lib wry::tests::system_webview --locked -- --ignored --test-threads=1

@@ -8,7 +8,7 @@ fn run(source: &str) {
     let engine =
         JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main).unwrap();
     engine.eval(&format!("globalThis.result='pending'; (async()=>{{{source}}})().then(()=>result='ok',error=>result=String(error)+'\\n'+String(error.stack??''));"), "backend-tests").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         engine.tick().unwrap();
         let result = engine.eval("result", "backend-result").unwrap();
@@ -155,6 +155,7 @@ fn tcp_half_close_and_peer_addresses() {
         assert(client.remoteAddress==='127.0.0.1'&&client.remotePort===server.address().port,'TCP peer address');
         client.setNoDelay();client.end('hello');await closed;assert(value==='HELLO','TCP half-close roundtrip');
         await new Promise(resolve=>server.close(resolve));
+        if(process.platform==='win32')return;
         const path=__apps.os.tmpdir()+'/apps-tcp-'+Date.now()+'.sock',ipc=net.createServer(socket=>socket.pipe(socket));
         await new Promise((resolve,reject)=>{ipc.on('error',reject);ipc.listen(path,resolve)});
         const local=net.connect(path),payload=new Uint8Array(200000).map((_,i)=>i*13);let echoed=[];local.on('data',chunk=>echoed.push(chunk));

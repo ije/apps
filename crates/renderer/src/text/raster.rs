@@ -33,6 +33,12 @@ impl Fonts {
     pub(crate) fn raster(&self, raster: &GlyphRaster, max: i32) -> Result<Option<Raster<Vec<u8>>>> {
         let full = self.backend.raster_bounds(raster)?;
         let stretch = full.size.width.max(full.size.height) as f32 / max as f32;
+        #[cfg(target_os = "windows")]
+        let stretch = if max < i32::MAX {
+            stretch.max(raster.size.0 * raster.scale / super::windows::MAX_ANALYSIS)
+        } else {
+            stretch
+        };
         let (raster, bounds) = if stretch > 1. {
             let small = GlyphRaster {
                 scale: raster.scale / stretch,
@@ -113,7 +119,7 @@ mod tests {
             stroke: 0.,
         };
         let full = text.backend.raster_bounds(&raster).unwrap();
-        assert!(full.size.width > 16384);
+        assert!(full.size.width > 16384, "{full:?}");
         let max = crate::text::MAX_GLYPH_SIDE;
         let (shown, size, bytes) = text.raster(&raster, max).unwrap().unwrap();
         assert!(size.width.max(size.height) <= max + 4);

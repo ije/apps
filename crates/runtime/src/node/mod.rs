@@ -108,6 +108,49 @@ const ERRNO: &[(&str, i32)] = &[
     ("EXDEV", libc::EXDEV),
 ];
 
+// The error numbers of libuv.
+#[cfg(windows)]
+const ERRNO: &[(&str, i32)] = &[
+    ("E2BIG", 4093),
+    ("EACCES", 4092),
+    ("EADDRINUSE", 4091),
+    ("EADDRNOTAVAIL", 4090),
+    ("EAGAIN", 4088),
+    ("EBADF", 4083),
+    ("EBUSY", 4082),
+    ("ECONNABORTED", 4079),
+    ("ECONNREFUSED", 4078),
+    ("ECONNRESET", 4077),
+    ("EEXIST", 4075),
+    ("EFBIG", 4036),
+    ("EHOSTUNREACH", 4073),
+    ("EINTR", 4072),
+    ("EINVAL", 4071),
+    ("EIO", 4070),
+    ("EISDIR", 4068),
+    ("ELOOP", 4067),
+    ("EMFILE", 4066),
+    ("EMLINK", 4032),
+    ("ENAMETOOLONG", 4064),
+    ("ENETUNREACH", 4062),
+    ("ENFILE", 4061),
+    ("ENOENT", 4058),
+    ("ENOMEM", 4057),
+    ("ENOSPC", 4055),
+    ("ENOSYS", 4054),
+    ("ENOTCONN", 4053),
+    ("ENOTDIR", 4052),
+    ("ENOTEMPTY", 4051),
+    ("ENOTSUP", 4049),
+    ("EPERM", 4048),
+    ("EPIPE", 4047),
+    ("EROFS", 4043),
+    ("ESRCH", 4040),
+    ("ETIMEDOUT", 4039),
+    ("ETXTBSY", 4038),
+    ("EXDEV", 4037),
+];
+
 #[cfg(unix)]
 pub(crate) const SIGNALS: &[(&str, i32)] = &[
     ("SIGHUP", libc::SIGHUP),
@@ -163,6 +206,22 @@ pub(crate) fn code(error: &std::io::Error) -> &'static str {
     {
         return name;
     }
+    #[cfg(windows)]
+    match error.raw_os_error() {
+        Some(6) => return "EBADF",
+        Some(10013) => return "EACCES",
+        Some(10024) => return "EMFILE",
+        Some(10048) => return "EADDRINUSE",
+        Some(10049) => return "EADDRNOTAVAIL",
+        Some(10051) => return "ENETUNREACH",
+        Some(10053) => return "ECONNABORTED",
+        Some(10054) => return "ECONNRESET",
+        Some(10057) => return "ENOTCONN",
+        Some(10060) => return "ETIMEDOUT",
+        Some(10061) => return "ECONNREFUSED",
+        Some(10065) => return "EHOSTUNREACH",
+        _ => {}
+    }
     match error.kind() {
         NotFound => "ENOENT",
         PermissionDenied => "EACCES",
@@ -186,6 +245,21 @@ pub(crate) fn code(error: &std::io::Error) -> &'static str {
         OutOfMemory => "ENOMEM",
         _ => "EIO",
     }
+}
+
+pub(crate) fn errno(error: &std::io::Error) -> Option<i32> {
+    #[cfg(unix)]
+    return error.raw_os_error().map(|code| -code.abs());
+    #[cfg(windows)]
+    {
+        let code = code(error);
+        let (_, errno) = ERRNO.iter().find(|(name, _)| *name == code)?;
+        Some(-errno)
+    }
+}
+
+pub(crate) fn bad_file() -> std::io::Error {
+    std::io::Error::from_raw_os_error(if cfg!(windows) { 6 } else { libc::EBADF })
 }
 
 pub(crate) fn hostname() -> String {
