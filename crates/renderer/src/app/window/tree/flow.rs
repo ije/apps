@@ -1644,9 +1644,11 @@ impl LayoutTree<'_> {
             .children
             .iter()
             .map(|&child| &self.slots[usize::from(child)])
+            // Like in CSS, floats give their block no baseline.
             .filter(|child| {
                 child.taffy().position != taffy::Position::Absolute
                     && child.taffy().display != taffy::Display::None
+                    && child.style.flow & Flow::FLOAT == 0
             });
         let at = |child: &Slot, value: f32| child.layout.location.y + value;
         let source = slot

@@ -1909,9 +1909,18 @@ impl LayoutPartialTree for LayoutTree<'_> {
             }
         }
         let old = mem::replace(&mut self.slots[index].layout, layout);
+        // Floats outside the parent can move a float or a box beside floats, so prepaint must visit it also when
+        // its parent stays.
+        let parent = self.slots[index].parent;
+        let beside = self.slots[index].style.flow & Flow::FLOAT != 0
+            || parent != NONE && self.slots[parent as usize].uncached;
         if !self.exact
             && (Layout {
-                location: old.location,
+                location: if beside {
+                    layout.location
+                } else {
+                    old.location
+                },
                 ..layout
             }) != old
         {

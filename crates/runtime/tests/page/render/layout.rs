@@ -1972,3 +1972,67 @@ fn content_heights_take_floats_canvases_margins_and_percentages_like_chrome() {
         )],
     );
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn floats_give_their_block_no_baseline_after_new_content() {
+    run_hidden(
+        r#"
+        await load('float.html');
+        await win.webContents.capturePage();
+        await run("document.getElementById('f').insertAdjacentHTML('afterbegin', '<ul><li>a<li>b</ul>')");
+        await win.webContents.capturePage();
+        // Like Chrome, an inline-block with only a float sits on its bottom edge.
+        const y = await run("document.getElementById('x').getBoundingClientRect().y");
+        if (y !== 51.5) fail('the text after the inline-block is at ' + y + ' instead of 51.5');
+        "#,
+        &[(
+            "float.html",
+            "<body style='margin:0'><div id=f style='float:left;width:40px;height:30px'></div>\
+             <div style='clear:both;font:20px/20px Helvetica'><span style='display:inline-block;width:50px;height:40px'>\
+             <div style='float:left'>a</div></span><b id=x>x</b></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn floats_follow_an_earlier_float_outside_their_block() {
+    run_hidden(
+        r#"
+        await load('float.html');
+        await win.webContents.capturePage();
+        await run("document.getElementById('a').style.height = '26px'");
+        await win.webContents.capturePage();
+        // A float is never higher than the top of an earlier float, also in another block.
+        const y = await run("document.getElementById('r').getBoundingClientRect().y");
+        if (y !== 26) fail('the right float is at ' + y + ' instead of 26');
+        "#,
+        &[(
+            "float.html",
+            "<body style='margin:0'><div style='height:20px'><div id=a style='height:22px'></div>\
+             <div style='height:0'><div style='float:left;width:40px;height:30px'></div></div></div>\
+             <div style='height:10px'><div id=r style='float:right;width:60px;height:50px'></div></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn lines_beside_a_float_move_when_it_changes_sides() {
+    run_hidden(
+        r#"
+        await load('float.html');
+        await win.webContents.capturePage();
+        await run("document.getElementById('f').style.float = 'right'");
+        await win.webContents.capturePage();
+        const x = await run("document.getElementById('i').getBoundingClientRect().x");
+        if (x !== 0) fail('the image is at ' + x + ' instead of 0');
+        "#,
+        &[(
+            "float.html",
+            "<body style='margin:0'><div id=f style='float:left;width:68px;height:42px'></div>\
+             <div><img id=i width=10 height=10><div></div></div></body>",
+        )],
+    );
+}
