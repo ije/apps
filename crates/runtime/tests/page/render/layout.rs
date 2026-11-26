@@ -739,6 +739,56 @@ fn negative_empty_and_container_margins_collapse_like_chrome() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn content_sized_max_heights_pass_the_last_margin_unless_they_cut_like_chrome() {
+    let boxes = [
+        "max-height:calc-size(max-content, size)",
+        "max-height:calc-size(fit-content, size * 2)",
+        "max-height:calc-size(calc-size(max-content, size), size)",
+        "max-height:calc-size(max-content, size - 5px)",
+        "max-height:calc-size(max-content, 5px)",
+        "max-height:max-content",
+    ];
+    let page = boxes
+        .iter()
+        .enumerate()
+        .map(|(n, style)| {
+            format!("<div class=w><div id=a{n} style='{style}'><i></i></div><b id=b{n}></b></div>")
+        })
+        .collect::<String>();
+    let (text, rects) = picture_rects(
+        "max.html",
+        &format!(
+            "<body style='margin:0'><style>.w{{display:flow-root}}i{{display:block;height:20px;margin-bottom:12px}}\
+             b{{display:block;height:2px}}</style>{page}</body>"
+        ),
+    );
+    for (n, [height, gap]) in [
+        [20., 12.],
+        [20., 12.],
+        [20., 12.],
+        [15., 0.],
+        [5., 0.],
+        [20., 12.],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let [a, b] = [format!("a{n}"), format!("b{n}")].map(|id| {
+            rects[&id]
+                .split(',')
+                .map(|v| v.parse::<f32>().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            a[3] == height && b[1] - a[1] - a[3] == gap,
+            "{} has height {height} and the margin {gap} below it, as in Chrome: {text}",
+            boxes[n]
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn hidden_table_rows_and_cells_leave_the_width_of_their_rows() {
     let text = run_hidden(
         r#"await load('rows.html');

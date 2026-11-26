@@ -411,8 +411,17 @@ pub(super) fn margin_collapses_through(
         && (side == 0
             || (side == 3
                 || style.get(Prop::HEIGHT).is_none_or(css::value::auto_size)
-                    && (style.get(Prop::MAX_HEIGHT))
-                        .is_none_or(|value| !value.starts_with("calc-size(")))
+                    && (style.get(Prop::MAX_HEIGHT)).is_none_or(|value| {
+                        // Like Chrome, only a `calc-size()` that can cut its content holds the last margin.
+                        css::value::calc_size(value).is_none_or(|(basis, size)| {
+                            css::value::auto_size(basis)
+                                && [0f32, 1e6].into_iter().all(|at| {
+                                    let calc = css::value::with_size(size, &format!("({at}px)"));
+                                    (styles.lengths[id].resolve(&format!("calc({calc})"), width))
+                                        .is_some_and(|got| got >= at)
+                                })
+                        })
+                    }))
                 && style
                     .get(Prop::MIN_HEIGHT)
                     .is_none_or(|value| value == "auto" || edge(Prop::MIN_HEIGHT) == 0.))
