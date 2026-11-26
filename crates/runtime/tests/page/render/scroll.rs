@@ -32,7 +32,13 @@ fn scroll_anchors_keep_the_content_in_view() {
     run_hidden(
         r#"
         await load('page.html');
-        const step = async code => { const out = await run(code); await win.webContents.capturePage(); return out; };
+        // The scroll events of a frame run at the start of the next frame, so a step whose events count draws one more.
+        const step = async (code, events = true) => {
+            const out = await run(code);
+            await win.webContents.capturePage();
+            if (events) await win.webContents.capturePage({ x: 0, y: 0, width: 1, height: 1 });
+            return out;
+        };
         const read = () => run(`[...'abcde'].map(id => document.getElementById(id).scrollTop).join()`);
         await step(`for (const id of 'abcd') document.getElementById(id).scrollTop = 60`);
         const sync = await step(`for (const id of 'abcde') document.getElementById(id + '1').style.height = '30px';
@@ -41,10 +47,10 @@ fn scroll_anchors_keep_the_content_in_view() {
         if (sync !== 70) fail('a layout for a script: ' + sync);
         const grown = await read();
         if (grown !== '70,60,60,70,0') fail('grown: ' + grown);
-        await step(`for (const id of 'abcd') document.getElementById(id + '2').style.height = '0'`);
+        await step(`for (const id of 'abcd') document.getElementById(id + '2').style.height = '0'`, false);
         const shrunk = await read();
         if (shrunk !== '50,60,60,50,0') fail('shrunk: ' + shrunk);
-        await step(`document.getElementById('a').scrollTop = 0; document.getElementById('a3').style.height = '50px'`);
+        await step(`document.getElementById('a').scrollTop = 0; document.getElementById('a3').style.height = '50px'`, false);
         const top = await read();
         if (top !== '0,60,60,50,0') fail('at the top: ' + top);
         await step('scrollTo(0, 300)');
