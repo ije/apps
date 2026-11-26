@@ -83,6 +83,8 @@ struct Slot {
     culled: u32,
     // A scroll container is in the box.
     nests: bool,
+    // The viewport that the box gave its content in the last prepaint, when it scrolls it in an interest area.
+    viewport: Option<Rect<Pixels>>,
     // Scroll viewports between its stacking context and its containing block cut the mask of the box.
     cuts: bool,
     reach: Option<Rect<Pixels>>,
@@ -233,6 +235,7 @@ impl Slot {
             lively: false,
             culled: u32::MAX,
             nests: false,
+            viewport: None,
             cuts: false,
             reach: None,
             escaped: None,
@@ -1416,6 +1419,8 @@ fn cache_input(free: [bool; 2], relative: bool, input: &LayoutInput) -> LayoutIn
 
 // A move by `by` from the mask `was` to `now`.
 type Mv = (Point<Pixels>, Clip<Pixels>, Clip<Pixels>);
+// A scroll container in a box that shifts: its regions, its viewport and its own region.
+type Inner = ([u32; 2], Rect<Pixels>, Option<Region>);
 // What a box keeps of the pass around it while the pass goes through it: `skips` and `nests`, `escapes`, the
 // containing block of the box itself, and `foreign`.
 type Outer = ([bool; 2], Option<usize>, Option<usize>, Option<usize>);

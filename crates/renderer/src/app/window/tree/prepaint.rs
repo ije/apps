@@ -309,6 +309,13 @@ impl Tree {
         self.shifting &= slot.flat;
     }
 
+    // Paint left the box out as it was outside its mask: the last paint, or an earlier one when the last paint did
+    // not go through the box. Below a transform or an effect, paint leaves out no box.
+    fn unpainted(&self, slot: &Slot) -> bool {
+        slot.culled == self.paints.0
+            || slot.culled != u32::MAX && slot.chunk.is_none_or(|chunk| chunk.pass != self.paints.0)
+    }
+
     // The box was calm in the last pass, or in the pass `visited` that last went through it: a skip or a shift of
     // a box around it kept it from the passes since, and they keep what is in a box.
     fn ran(&self, index: u32, visited: Option<u32>) -> bool {
@@ -432,6 +439,9 @@ impl Tree {
                     self.scrolled.push(self.scrolled(offset));
                 }
                 let interest = scroll.map(|_| (bounds.origin, offset));
+                self.slots[index as usize].viewport = (interest.is_some()
+                    && window.opens_interest())
+                .then(|| window.content_mask().bounds);
                 window.scope(Scope::Offset(offset), |window| {
                     window.with_interest(interest, |window| {
                         for child in 0..self.slots[index as usize].children.len() {
@@ -823,8 +833,8 @@ impl Tree {
     fn drift(&mut self, index: u32, lag: Point<Pixels>) {
         let slot = &mut self.slots[index as usize];
         if lag != Point::default() {
-            // A box without boxes in it is all at its new place.
-            if !slot.children.is_empty() {
+            // A box without hooks and boxes in it is all at its new place.
+            if slot.hooks.is_some() || !slot.children.is_empty() {
                 slot.lag += lag;
             }
             slot.painted.origin += lag;
@@ -937,25 +947,25 @@ impl Tree {
             && placement.transform == 0
             // Paint copies the box, or leaves it out, as it left it out in the last paint. Below a transform or an
             // effect, paint leaves out no box.
-            && ((slot.chunk).is_some_and(|chunk| {
+            && (slot.hooks.is_none() && slot.children.is_empty()
+                || (slot.chunk).is_some_and(|chunk| {
                 let since = match self.ran(index, visited) {
                     true => slot.since,
                     false => self.prepaints,
                 };
                 chunk.translates && chunk.pass == self.paints.0 && since <= chunk.prepass.wrapping_add(1)
             })
-                || slot.culled == self.paints.0
+                || self.unpainted(slot)
                     && (slot.reach)
                         .is_some_and(|reach| !(reach + by).intersects(placement.mask.bounds)))
             && self.relists(index, visited, (by, was, placement.mask), window)
             && stays
             && let Some((pass, regions)) = slot.regions
             && (first == last || pass == self.last_touched.0 && last <= self.last_touched.1.len())
-            && !slot.nests
             && self.rests(index, first..last)
             && self.based(index, by)
-            && let Some(start) =
-                window.shift_regions(pass, regions, by, self.viewport(index, placement.mask))
+            && let Some(inner) = self.viewports(index, first..last, (pass, regions), by)
+            && let Some(start) = window.shift_regions(pass, regions, by, &inner)
         {
             // The hooks of the scroll bars read the place of their scroll container.
             self.rested(index, first..last, Some(by));
@@ -996,14 +1006,21 @@ impl Tree {
                 slot.touched = [touched, self.touched.len() as u32];
                 (slot.own_regions, slot.own_touched) = (slot.regions, slot.touched);
                 slot.skipped = self.prepaints;
-                // Only the boxes inside keep their old places. A box without them has its new place, and its hooks
-                // moved theirs, so it can paint. The loop above moved its text if its hooks skip inside.
-                match slot.children.is_empty() {
+                self.remap(
+                    index,
+                    first..last,
+                    Some(by),
+                    (pass, regions[0], start),
+                    touched,
+                );
+                let slot = &mut self.slots[index as usize];
+                // Only the boxes inside keep their old places, and the hooks what they made for paint. A box without
+                // both has its new place, so it can paint.
+                match slot.hooks.is_none() && slot.children.is_empty() {
                     true => {
                         slot.lag = Point::default();
-                        if !(slot.hooks.as_ref()).is_some_and(|hooks| hooks.skips_inside())
-                            && let Some(state) = (slot.state.as_ref())
-                                .and_then(|state| state.downcast_ref::<TextState>())
+                        if let Some(state) = (slot.state.as_ref())
+                            .and_then(|state| state.downcast_ref::<TextState>())
                         {
                             state.layout.shift(by);
                         }
@@ -1062,6 +1079,8 @@ impl Tree {
                 slot.touched = [touched, self.touched.len() as u32];
                 (slot.own_regions, slot.own_touched) = (slot.regions, slot.touched);
                 slot.skipped = self.prepaints;
+                self.remap(index, first..last, None, (pass, regions[0], start), touched);
+                let slot = &mut self.slots[index as usize];
                 self.shifting &= slot.flat;
                 if slot.escaped.is_some() {
                     self.unescape(window);
@@ -1172,15 +1191,88 @@ impl Tree {
             })
     }
 
-    // The viewport that a scroll container in `mask` gives its content, as `begin_interest` does, and its region.
-    fn viewport(&self, index: u32, mask: Clip<Pixels>) -> Option<(Rect<Pixels>, Option<Region>)> {
+    // The scroll containers in a box that shifts by `by`, the box too: their regions among the `regions` of the
+    // box in the last pass, their viewports where the shift moves them, and their own regions. None when the
+    // regions of one of them are not known in that pass.
+    fn viewports(
+        &self,
+        index: u32,
+        touched: std::ops::Range<usize>,
+        (pass, regions): (u32, [u32; 2]),
+        by: Point<Pixels>,
+    ) -> Option<Vec<Inner>> {
+        let scrolls =
+            |slot: &Slot| (slot.events.as_ref()).is_some_and(|events| events.scroll.is_some());
         let slot = &self.slots[index as usize];
-        (slot.events.as_ref()).filter(|events| events.scroll.is_some())?;
-        let mask = match slot.style.overflow_mask(slot.bounds) {
-            Some(clip) => clip.intersect(&mask),
-            None => mask,
-        };
-        (mask.radii == Default::default()).then_some((mask.bounds, slot.region))
+        let mut inner = Vec::new();
+        if slot.nests {
+            for &inside in self.last_touched.1.get(touched)? {
+                let slot = &self.slots[inside as usize];
+                if inside == index || !scrolls(slot) {
+                    continue;
+                }
+                let (stamp, range) = slot.regions?;
+                if stamp != pass || range[0] < regions[0] || range[1] > regions[1] {
+                    return None;
+                }
+                if let Some(viewport) = slot.viewport {
+                    inner.push((range, viewport + by, slot.region));
+                }
+            }
+        }
+        if scrolls(slot)
+            && let Some(viewport) = slot.viewport
+        {
+            inner.push((regions, viewport + by, slot.region));
+        }
+        Some(inner)
+    }
+
+    // The scroll containers in a box that skipped, or shifted by `by`, have their regions and their touched boxes
+    // where the copies of the box put them: the regions of `from.0` that started at `from.1` start at `from.2`,
+    // and the touched boxes of the box start at `to`.
+    fn remap(
+        &mut self,
+        index: u32,
+        touched: std::ops::Range<usize>,
+        by: Option<Point<Pixels>>,
+        from: (u32, u32, u32),
+        to: u32,
+    ) {
+        let slot = &mut self.slots[index as usize];
+        let scrolls = (slot.events.as_ref()).is_some_and(|events| events.scroll.is_some());
+        if scrolls && let Some(by) = by {
+            slot.viewport = slot.viewport.map(|viewport| viewport + by);
+        }
+        if !slot.nests {
+            return;
+        }
+        for at in touched.start..touched.end.min(self.last_touched.1.len()) {
+            let inside = self.last_touched.1[at];
+            let slot = &mut self.slots[inside as usize];
+            if inside == index
+                || (slot.events.as_ref()).is_none_or(|events| events.scroll.is_none())
+            {
+                continue;
+            }
+            if let Some(by) = by {
+                slot.viewport = slot.viewport.map(|viewport| viewport + by);
+            }
+            let [first, last] = slot.touched.map(|at| at as usize);
+            let within = touched.start <= first && last <= touched.end;
+            slot.regions = match slot.regions {
+                Some((pass, range))
+                    if pass == from.0 && range[0] >= from.1 && (within || first == last) =>
+                {
+                    slot.touched = match within {
+                        true => (slot.touched).map(|at| at - touched.start as u32 + to),
+                        false => [to; 2],
+                    };
+                    Some((self.prepaints, range.map(|at| at - from.1 + from.2)))
+                }
+                _ => None,
+            };
+        }
     }
 
     // The scroll containers in a box that skips, or shifts by `by`, stay in the list of `anchor`, and move.
@@ -1247,7 +1339,7 @@ impl Tree {
                         chunk.translates
                             && chunk.pass == self.paints.0
                             && since <= chunk.prepass.wrapping_add(1)
-                    }) || slot.culled == self.paints.0
+                    }) || self.unpainted(slot)
                         && (slot.reach).is_some_and(|reach| !(reach + by).intersects(mask.bounds)))
             })
     }
@@ -1339,6 +1431,9 @@ impl Tree {
                     self.scrolled.push(self.scrolled(offset));
                 }
                 let interest = offset.map(|offset| (bounds.origin, offset));
+                self.slots[index as usize].viewport = (interest.is_some()
+                    && window.opens_interest())
+                .then(|| window.content_mask().bounds);
                 window.scope(Scope::Offset(offset.unwrap_or_default()), |window| {
                     window.with_interest(interest, |window| {
                         self.keep_children(index, origin, false, window)
