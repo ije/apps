@@ -335,6 +335,7 @@ pub(super) fn finish(
         reached_at: Default::default(),
         local: Default::default(),
         offset: Default::default(),
+        based: Default::default(),
         frame: node.tag == "iframe",
         anchored: anchored.is_some_and(|used| used.scrolls),
         hidden: Default::default(),

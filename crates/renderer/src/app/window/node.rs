@@ -187,6 +187,16 @@ pub trait Hooks: 'static {
     fn cached(&self) -> bool {
         false
     }
+    // Return false if a kept box at `exact` reads another place than in its last prepaint from state outside the
+    // tree, so `kept` runs for it. `unscroll` is as in `NodeCx`.
+    fn stays(&self, _exact: Rect, _unscroll: Point<Pixels>) -> bool {
+        true
+    }
+    // Return false if state outside the tree changed what the prepaint of the box gives, so no box around it skips
+    // or shifts. Only called for hooks that skip inside.
+    fn rests(&self) -> bool {
+        true
+    }
     // Return true only if a box whose boxes all stay where they were needs no prepaint, nor `kept`.
     fn skippable(&self) -> bool {
         false
@@ -295,6 +305,14 @@ impl Hooks for Chain {
 
     fn skippable(&self) -> bool {
         self.0.skippable() && self.1.skippable()
+    }
+
+    fn stays(&self, exact: Rect, unscroll: Point<Pixels>) -> bool {
+        self.0.stays(exact, unscroll) && self.1.stays(exact, unscroll)
+    }
+
+    fn rests(&self) -> bool {
+        self.0.rests() && self.1.rests()
     }
 
     fn skip(&self, exact: Rect, window: &mut Window) -> bool {

@@ -6,7 +6,7 @@ use renderer::{
     Window, point, px, size,
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -311,7 +311,27 @@ pub(crate) struct Scrollbar {
 
 type Prepainted = Option<(Rc<RefCell<State>>, Rc<[Option<Bar>; 2]>)>;
 
-struct Bars(Scrollbar, RefCell<Prepainted>);
+// The bars, what they read of their scroll container (its bounds, range, offset and stretch), and whether the
+// last paint drew them: the paint after they fade draws the box without them.
+struct Bars(
+    Scrollbar,
+    RefCell<Prepainted>,
+    Cell<Option<Read>>,
+    Cell<bool>,
+);
+
+type Read = (Rect<Pixels>, [Point<Pixels>; 4]);
+
+impl Bars {
+    fn read(&self) -> Read {
+        let handle = &self.0.handle;
+        let [low, high] = handle.range();
+        (
+            handle.bounds(),
+            [low, high, handle.offset(), handle.stretch()],
+        )
+    }
+}
 
 impl renderer::Hooks for Bars {
     fn volatile(&self) -> bool {
@@ -331,20 +351,86 @@ impl renderer::Hooks for Bars {
                 .look
                 .as_ref()
                 .is_some_and(|look| look.custom.is_some());
-        if bars
-            .as_ref()
-            .is_some_and(|(state, _)| custom || state.borrow().visible())
+        if self.3.get()
+            || bars
+                .as_ref()
+                .is_some_and(|(state, _)| custom || state.borrow().visible())
         {
             cx.window.unsettle();
         }
         *self.1.borrow_mut() = bars;
+        self.2.set(Some(self.read()));
     }
     fn kept(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         self.prepaint(cx, inner);
     }
+    // Hidden bars of a box at rest stay as they are, and a scroll around the box moves them with it.
+    fn skippable(&self) -> bool {
+        true
+    }
+    fn shifts(&self) -> bool {
+        true
+    }
+    fn skips_inside(&self) -> bool {
+        true
+    }
+    fn rests(&self) -> bool {
+        self.0
+            .look
+            .as_ref()
+            .is_none_or(|look| look.custom.is_none())
+            && !self.0.quiet
+            && !self.3.get()
+            && (self.1.borrow().as_ref()).is_none_or(|(state, _)| !state.borrow().visible())
+            && self.2.get() == Some(self.read())
+    }
+    // The regions of the bars are among those that the box around them copies. The window drops a state that
+    // a pass doesn't read.
+    fn skip(&self, _: Rect<Pixels>, window: &mut Window) -> bool {
+        window.keyed::<Rc<RefCell<State>>>(("scrollbar", self.0.id).into());
+        self.rests()
+    }
+    // The scroll of an outer box moved the scroll container, and so its bars. Its own scroll moves only the box
+    // of the bars.
+    fn shift(&self, by: Point<Pixels>, _: Rect<Pixels>, window: &mut Window) -> bool {
+        window.keyed::<Rc<RefCell<State>>>(("scrollbar", self.0.id).into());
+        let now = self.read();
+        match self.2.get() {
+            Some((bounds, rest)) if (bounds + by, rest) == now => self.2.set(Some(now)),
+            _ => return false,
+        }
+        if let Some((_, bars)) = &mut *self.1.borrow_mut() {
+            let along = [f32::from(by.x), f32::from(by.y)];
+            *bars = Rc::new([0, 1].map(|axis| {
+                let bar = bars[axis].as_ref()?;
+                let mut hitbox = bar.hitbox;
+                hitbox.bounds.origin += by;
+                Some(Bar {
+                    hitbox,
+                    zone: bar.zone + by,
+                    track: [bar.track[0] + along[axis], bar.track[1]],
+                    thumb: [bar.thumb[0] + along[axis], bar.thumb[1]],
+                    view: bar.view,
+                    range: bar.range,
+                })
+            }));
+        }
+        true
+    }
+    fn skip_inside(&self, exact: Rect<Pixels>, window: &mut Window) {
+        self.skip(exact, window);
+    }
+    fn shift_inside(&self, by: Point<Pixels>, exact: Rect<Pixels>, window: &mut Window) {
+        self.shift(by, exact, window);
+    }
     fn paint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         inner(cx.window);
-        self.0.draw(self.1.borrow().clone(), cx.window);
+        let bars = self.1.borrow().clone();
+        self.3.set(
+            bars.as_ref()
+                .is_some_and(|(state, _)| state.borrow().visible()),
+        );
+        self.0.draw(bars, cx.window);
     }
 }
 
@@ -358,7 +444,12 @@ impl From<Scrollbar> for renderer::Child {
         style.inset.top = px(bar.origin[1]).into();
         style.size.width = px(0.).into();
         style.size.height = px(0.).into();
-        let mut node = renderer::node().hooks(Bars(bar, RefCell::default()));
+        let mut node = renderer::node().hooks(Bars(
+            bar,
+            RefCell::default(),
+            Cell::default(),
+            Cell::default(),
+        ));
         *node.style() = style;
         node.into()
     }

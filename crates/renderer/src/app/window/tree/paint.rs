@@ -41,6 +41,7 @@ impl Tree {
         {
             if slot.listed == listed {
                 window.cull();
+                self.slots[index as usize].culled = self.paints.0;
             }
             return;
         }
@@ -58,7 +59,9 @@ impl Tree {
             .filter(|chunk| {
                 !matches!(slot.kind, Kind::Layers(_))
                     && !self.checked()
-                    && slot.calm == self.prepaints
+                    // No pass went through a box in a box that skipped since the pass that found it calm.
+                    && (slot.calm == self.prepaints
+                        || slot.placed.is_some_and(|(pass, ..)| pass == slot.calm))
                     && slot.since <= chunk.prepass.wrapping_add(1)
                     && Some(chunk.pass) == self.paints.1
                     && chunk.unbounded == outside

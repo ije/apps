@@ -165,6 +165,8 @@ struct ScrollState {
     grown: [bool; 2],
     animation: Option<Animation>,
     driven: bool,
+    // The offset and the stretch that the last prepaint of the box placed its content by.
+    rested: Option<[Point<Pixels>; 2]>,
     stretch: Point<Pixels>,
     spring: Option<Spring>,
     loose: bool,
@@ -937,7 +939,23 @@ impl ScrollRef {
         scroll.bounds = bounds;
         scroll.room = style.bars;
         scroll.painted = snap_offset(scroll.offset + scroll.stretch, scale);
+        scroll.rested = Some([scroll.offset, scroll.stretch]);
         scroll.painted
+    }
+
+    // Nothing moved the offset since the last prepaint of the box, and nothing is about to, so that prepaint holds.
+    pub(crate) fn rests(&self) -> bool {
+        let scroll = &*self.0.borrow();
+        !scroll.driven
+            && !scroll.busy()
+            && scroll.spring.is_none()
+            && !scroll.loose
+            && scroll.rested == Some([scroll.offset, scroll.stretch])
+    }
+
+    // A scroll around the box moved it by `by` without a prepaint.
+    pub(crate) fn shift(&self, by: Point<Pixels>) {
+        self.0.borrow_mut().bounds.origin += by;
     }
 }
 

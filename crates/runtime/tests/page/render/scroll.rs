@@ -727,3 +727,63 @@ fn hits_follow_clips_in_transforms_and_containment_like_chrome() {
         )],
     );
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn kept_boxes_follow_their_containing_blocks_scrollers_and_transforms() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const off = (id, block) => run(`(([a, c]) => [c.right - a.right, c.bottom - a.bottom].map(Math.round).join())(['${id}', '${block}'].map(id => document.getElementById(id).getBoundingClientRect()))`);
+        const turned = () => run(`(([b, t]) => [b.left - t.left, b.top - t.top].map(value => value.toFixed(1)).join())(['b', 't'].map(id => document.getElementById(id).getBoundingClientRect()))`);
+        const check = async name => {
+            for (const [id, block] of [['a', 'c'], ['a2', 'c2'], ['f', 'fc']]) {
+                const gap = await off(id, block);
+                if (gap !== '0,0') fail(name + ': ' + id + ' is not at the end of ' + block + ': ' + gap);
+            }
+        };
+        const start = await turned();
+        const steps = [
+            "scrollTo(0, 40)",
+            "scrollTo(0, 80); document.getElementById('a').getBoundingClientRect()",
+            "document.getElementById('c').style.height = '250px'",
+            "scrollTo(0, 100)",
+            "document.getElementById('s').scrollTop = 30",
+            "scrollTo(0, 140)",
+            "document.getElementById('c2').style.width = '120px'",
+            "scrollTo(0, 150); document.getElementById('s').scrollTop = 50",
+            "document.getElementById('fc').style.height = '40px'",
+            "scrollTo(0, 20)",
+            "document.getElementById('c').style.width = '260px'",
+            "scrollTo(0, 0)",
+        ];
+        for (const code of steps) {
+            await run("(() => { " + code + " })()");
+            await win.webContents.capturePage();
+            await check(code);
+            await win.webContents.capturePage();
+            await win.webContents.capturePage();
+            await check(code + ', later');
+            const now = await turned();
+            if (now !== start) fail(code + ': the box in the turned box moved: ' + start + ' ' + now);
+        }
+        const bar = await run("document.getElementById('s').scrollTop");
+        if (bar !== 50) fail('the inner scroll keeps its offset: ' + bar);
+        "#,
+        &[(
+            "page.html",
+            "<body style='margin:0;height:3000px'><style>\
+             .c{position:relative;width:200px;height:200px;margin:20px;background:#eee}\
+             .w{padding:10px} .a{position:absolute;right:0;bottom:0;width:10px;height:10px;background:red}\
+             .sr{position:absolute;width:1px;height:1px;overflow:hidden}\
+             .s{width:150px;height:60px;overflow:auto} .t{transform:rotate(10deg);width:50px;height:50px}\
+             </style><h1 class=sr>title</h1>\
+             <div class=c id=c><div class=w><div class=w><span class=a id=a></span><input class=sr>text</div></div>\
+             <div class=s id=s><div style='height:300px'><div class=c id=c2 style='margin:0;width:100px;height:40px'>\
+             <div class=w><i class=a id=a2></i></div></div></div></div>\
+             <div class=t id=t><b id=b>x</b></div></div>\
+             <div style='position:fixed;top:0;right:0;width:100px;height:60px'>\
+             <div class=c id=fc style='margin:0;width:80px;height:30px'><div class=w><u class=a id=f></u></div></div></div></body>",
+        )],
+    );
+}

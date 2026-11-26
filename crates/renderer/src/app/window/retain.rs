@@ -268,17 +268,25 @@ impl Window {
     }
 
     // Copies regions of the prepaint pass `pass` moved by a scroll offset `by`, and returns where they start.
+    // `inner` is the viewport of the box when it scrolls its content, and its own region outside that content.
+    // Regions under a transform keep the viewports of the transform, so there are none in such a box.
     pub(crate) fn shift_regions(
         &mut self,
         pass: u32,
         range: [u32; 2],
         by: Point<Pixels>,
+        inner: Option<(Rect, Option<Region>)>,
     ) -> Option<u32> {
         let at = self.copy_regions(pass, range)?;
         // The viewports of scrolls around the box can move with an outer scroll, so its regions see them anew.
         let viewports = self.viewport_bounds();
         let mut moved = Vec::new();
-        for placed in &mut self.pending.regions[at as usize..] {
+        let regions = &mut self.pending.regions[at as usize..];
+        if inner.is_some() && regions.iter().any(|placed| placed.transform.is_some()) {
+            self.pending.regions.truncate(at as usize);
+            return None;
+        }
+        for placed in regions {
             placed.region.bounds.origin += by;
             // The open mask inside a transform stays.
             if placed.clip.bounds.size.width.0 < OPEN {
@@ -286,6 +294,11 @@ impl Window {
             }
             if placed.transform.is_none() {
                 placed.view = placed.clip.bounds.intersect(viewports);
+            }
+            if let Some((viewport, own)) = inner
+                && own.is_none_or(|own| own.key != placed.region.key)
+            {
+                placed.view = placed.view.intersect(viewport);
             }
             if placed.clip.rounded.size != Size::default() {
                 placed.clip.rounded.origin += by;

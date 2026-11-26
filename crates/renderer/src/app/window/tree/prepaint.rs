@@ -182,7 +182,10 @@ impl Tree {
         // was built again since.
         let covered = !self.full && (covered || slot.skipped == prepaints.wrapping_sub(1));
         let outer = (
-            mem::replace(&mut self.skips, true),
+            [
+                mem::replace(&mut self.skips, true),
+                mem::replace(&mut self.nests, false),
+            ],
             self.escapes.take(),
             self.escape(index, window),
             self.foreign.take(),
@@ -266,8 +269,11 @@ impl Tree {
             (None, None, 0)
         };
         // A listed box paints in its stacking context, outside the scrolls between that and its containing block.
+        let cuts = escaped.is_some()
+            && slot.style.z_index.is_some()
+            && (self.depths.last()).is_some_and(|&(context, _)| context < cut as usize);
         let escaped = match self.depths.last() {
-            Some(&(context, _)) if slot.style.z_index.is_some() && context < cut as usize => {
+            Some(&(context, _)) if cuts => {
                 escaped.map(|mask| window.cut_between(mask, context, cut as usize))
             }
             _ => escaped,
@@ -278,6 +284,7 @@ impl Tree {
         }
         let slot = &mut self.slots[index as usize];
         (slot.escaped, slot.cut, slot.unscroll) = (escaped, cut, unscroll);
+        slot.cuts = cuts;
         depth
     }
 
@@ -302,12 +309,18 @@ impl Tree {
         self.shifting &= slot.flat;
     }
 
-    fn calm(&mut self, index: u32) {
-        let slot = &mut self.slots[index as usize];
-        if slot.calm != self.prepaints.wrapping_sub(1) {
-            slot.since = self.prepaints;
+    // The box was calm in the last pass, or in the pass `visited` that last went through it: a skip or a shift of
+    // a box around it kept it from the passes since, and they keep what is in a box.
+    fn ran(&self, index: u32, visited: Option<u32>) -> bool {
+        let calm = self.slots[index as usize].calm;
+        calm == self.prepaints.wrapping_sub(1) || Some(calm) == visited
+    }
+
+    fn calm(&mut self, index: u32, visited: Option<u32>) {
+        if !self.ran(index, visited) {
+            self.slots[index as usize].since = self.prepaints;
         }
-        slot.calm = self.prepaints;
+        self.slots[index as usize].calm = self.prepaints;
     }
 
     // Keeps what a prepaint of a box gave, for a skip of the box in a later pass.
@@ -316,7 +329,7 @@ impl Tree {
         index: u32,
         [regions, touched]: [u32; 2],
         listed: Option<usize>,
-        (outer, escapes, own, foreign): (bool, Option<usize>, Option<usize>, Option<usize>),
+        ([outer, around], escapes, own, foreign): Outer,
         window: &Window,
     ) {
         let slot = &mut self.slots[index as usize];
@@ -328,13 +341,10 @@ impl Tree {
         let inner_foreign = self.foreign;
         self.foreign = min(min(foreign, painted), inner_foreign);
         slot.contained = inner_foreign.is_none_or(|at| at > self.blocks.len());
-        // A scroll container drives its offset in each prepaint.
+        slot.escaping = inner
+            .filter(|&at| at <= self.blocks.len())
+            .map(|at| at as u32);
         let skips = mem::replace(&mut self.skips, outer)
-            && slot
-                .events
-                .as_ref()
-                .is_none_or(|events| events.scroll.is_none())
-            && inner.is_none_or(|at| at > self.blocks.len())
             && slot.hooks.as_ref().is_none_or(|hooks| hooks.skippable());
         let list = match (self.stacks.last(), listed) {
             (Some(list), Some(at)) => &list[at.min(list.len())..],
@@ -349,11 +359,13 @@ impl Tree {
         {
             slot.listing = list.iter().map(|entry| entry.1).collect();
         }
-        if slot
-            .hooks
-            .as_ref()
-            .is_some_and(|hooks| hooks.skips_inside())
-        {
+        // A scroll container drives its offset in each prepaint, so a skip of a box around it asks if it rests.
+        // The listed boxes in it take the cut of its viewport, which only its own prepaint gives.
+        let scrolls = (slot.events.as_ref()).is_some_and(|events| events.scroll.is_some());
+        let skips = skips && !(scrolls && !list.is_empty());
+        slot.nests = mem::replace(&mut self.nests, around);
+        self.nests |= slot.nests || scrolls;
+        if scrolls || (slot.hooks.as_ref()).is_some_and(|hooks| hooks.skips_inside()) {
             self.touched.push(index);
         }
         slot.skips = skips;
@@ -411,7 +423,9 @@ impl Tree {
                         window.content_mask(),
                         window.depth() as u32,
                         self.scrolled(offset),
+                        None,
                     ));
+                    self.slots[index as usize].inner = window.offset() + offset;
                 }
                 let scrolls = scroll.is_some();
                 if scrolls {
@@ -809,7 +823,10 @@ impl Tree {
     fn drift(&mut self, index: u32, lag: Point<Pixels>) {
         let slot = &mut self.slots[index as usize];
         if lag != Point::default() {
-            slot.lag += lag;
+            // A box without boxes in it is all at its new place.
+            if !slot.children.is_empty() {
+                slot.lag += lag;
+            }
             slot.painted.origin += lag;
             slot.bounds.origin += lag;
             slot.exact.origin += lag;
@@ -855,6 +872,7 @@ impl Tree {
         );
         let placement = window.placement();
         let slot = &mut self.slots[index as usize];
+        let visited = slot.placed.map(|(pass, ..)| pass);
         let was = slot
             .placed
             .map_or(placement.mask, |(_, _, placed)| placed.mask);
@@ -904,6 +922,11 @@ impl Tree {
         // must copy the box: if it can't, the frame starts again without such moves.
         let slot = &self.slots[index as usize];
         let [first, last] = slot.touched.map(|at| at as usize);
+        // Only the hooks of a box move what the boxes in it gave the page, and tell if the box reads another place.
+        let stays = match &slot.hooks {
+            Some(hooks) => hooks.stays(slot.exact, slot.unscroll),
+            None => slot.children.is_empty(),
+        };
         if let Some(by) = delta.filter(|by| *by != Point::default())
             && follows
             && !self.full
@@ -912,40 +935,56 @@ impl Tree {
             && slot.skips
             && slot.flat
             && placement.transform == 0
-            // Paint copies the box, or leaves it out.
+            // Paint copies the box, or leaves it out, as it left it out in the last paint. Below a transform or an
+            // effect, paint leaves out no box.
             && ((slot.chunk).is_some_and(|chunk| {
-                let since = match slot.calm == self.prepaints.wrapping_sub(1) {
+                let since = match self.ran(index, visited) {
                     true => slot.since,
                     false => self.prepaints,
                 };
                 chunk.translates && chunk.pass == self.paints.0 && since <= chunk.prepass.wrapping_add(1)
             })
-                || slot.reach.is_some_and(|reach| !(reach + by).intersects(placement.mask.bounds)))
-            && self.relists(index, (by, was, placement.mask), window)
-            && let Some(hooks) = slot.hooks.clone()
+                || slot.culled == self.paints.0
+                    && (slot.reach)
+                        .is_some_and(|reach| !(reach + by).intersects(placement.mask.bounds)))
+            && self.relists(index, visited, (by, was, placement.mask), window)
+            && stays
             && let Some((pass, regions)) = slot.regions
             && (first == last || pass == self.last_touched.0 && last <= self.last_touched.1.len())
-            && let Some(start) = window.shift_regions(pass, regions, by)
+            && !slot.nests
+            && self.rests(index, first..last)
+            && self.based(index, by)
+            && let Some(start) =
+                window.shift_regions(pass, regions, by, self.viewport(index, placement.mask))
         {
-            if hooks.shift(by, slot.exact, window) {
+            // The hooks of the scroll bars read the place of their scroll container.
+            self.rested(index, first..last, Some(by));
+            let slot = &self.slots[index as usize];
+            if (slot.hooks.clone()).is_none_or(|hooks| hooks.shift(by, slot.exact, window)) {
                 let touched = self.touched.len() as u32;
                 for at in first..last {
                     let inside = self.last_touched.1[at];
                     self.touched.push(inside);
                     let slot = &self.slots[inside as usize];
+                    let Some(hooks) = slot.hooks.clone().filter(|hooks| hooks.skips_inside())
+                    else {
+                        continue;
+                    };
                     if let Some(state) =
                         (slot.state.as_ref()).and_then(|state| state.downcast_ref::<TextState>())
                     {
                         state.layout.shift(by);
                     }
-                    if inside != index
-                        && let Some(hooks) = slot.hooks.clone()
-                    {
+                    if inside != index {
                         hooks.shift_inside(by, slot.exact, window);
                     }
                 }
-                self.calm(index);
-                self.relist(index, (by, was, placement.mask), window);
+                self.calm(index, visited);
+                self.relist(index, visited, (by, was, placement.mask), window);
+                self.nests |= self.slots[index as usize]
+                    .events
+                    .as_ref()
+                    .is_some_and(|events| events.scroll.is_some());
                 let slot = &mut self.slots[index as usize];
                 // Paint places the box where its hooks moved it, like a translate, so the scroll moves that place.
                 slot.painted.origin += by;
@@ -957,7 +996,20 @@ impl Tree {
                 slot.touched = [touched, self.touched.len() as u32];
                 (slot.own_regions, slot.own_touched) = (slot.regions, slot.touched);
                 slot.skipped = self.prepaints;
-                slot.lag += by;
+                // Only the boxes inside keep their old places. A box without them has its new place, and its hooks
+                // moved theirs, so it can paint. The loop above moved its text if its hooks skip inside.
+                match slot.children.is_empty() {
+                    true => {
+                        slot.lag = Point::default();
+                        if !(slot.hooks.as_ref()).is_some_and(|hooks| hooks.skips_inside())
+                            && let Some(state) = (slot.state.as_ref())
+                                .and_then(|state| state.downcast_ref::<TextState>())
+                        {
+                            state.layout.shift(by);
+                        }
+                    }
+                    false => slot.lag += by,
+                }
                 self.shifting &= slot.flat;
                 if slot.escaped.is_some() {
                     self.unescape(window);
@@ -978,25 +1030,33 @@ impl Tree {
         let slot = &self.slots[index as usize];
         if !clipped
             && slot.skips
+            && stays
             && !(self.unshift && slot.lag != Point::default())
             && let Some((pass, regions)) = slot.regions
             && (first == last || pass == self.last_touched.0 && last <= self.last_touched.1.len())
+            && self.rests(index, first..last)
+            && self.based(index, Point::default())
             && let Some(start) = window.copy_regions(pass, regions)
         {
-            if (slot.hooks.clone()).is_some_and(|hooks| hooks.skip(slot.exact, window)) {
+            self.rested(index, first..last, None);
+            let slot = &self.slots[index as usize];
+            if (slot.hooks.clone()).is_none_or(|hooks| hooks.skip(slot.exact, window)) {
                 let touched = self.touched.len() as u32;
                 for at in first..last {
                     let inside = self.last_touched.1[at];
                     self.touched.push(inside);
                     let slot = &self.slots[inside as usize];
                     if inside != index
-                        && let Some(hooks) = slot.hooks.clone()
+                        && let Some(hooks) = slot.hooks.clone().filter(|hooks| hooks.skips_inside())
                     {
                         hooks.skip_inside(slot.exact, window);
                     }
                 }
-                self.calm(index);
-                self.relist(index, (Point::default(), was, was), window);
+                self.calm(index, visited);
+                self.relist(index, visited, (Point::default(), was, was), window);
+                let slot = &self.slots[index as usize];
+                self.nests |= slot.nests
+                    || (slot.events.as_ref()).is_some_and(|events| events.scroll.is_some());
                 let slot = &mut self.slots[index as usize];
                 slot.regions = Some((self.prepaints, [start, window.regions_len()]));
                 slot.touched = [touched, self.touched.len() as u32];
@@ -1021,10 +1081,19 @@ impl Tree {
         self.lags
             .push(mem::take(&mut self.slots[index as usize].lag));
         let (outer, still, parent) = (
-            mem::replace(&mut self.skips, true),
+            [
+                mem::replace(&mut self.skips, true),
+                mem::replace(&mut self.nests, false),
+            ],
             mem::replace(&mut self.still, delta.is_some()),
             mem::replace(&mut self.delta, delta),
         );
+        // The box stayed with its mask, or a scroll moved both.
+        let based = match delta {
+            Some(by) if by == Point::default() => !clipped,
+            Some(_) => follows,
+            None => false,
+        };
         let (regions, listed) = (window.regions_len(), self.stacks.last().map(Vec::len));
         let (touched, mark) = (self.touched.len() as u32, window.prepaint_mark());
         let shifting = mem::replace(&mut self.shifting, true);
@@ -1032,7 +1101,7 @@ impl Tree {
             index,
             window,
             |hooks, cx, inner| hooks.kept(cx, inner),
-            |tree, style, window| tree.keep_box(index, style, moved, window),
+            |tree, style, window| tree.keep_box(index, style, [moved, based], window),
         );
         self.lags.pop();
         self.flatten(index, mark, shifting, window);
@@ -1049,7 +1118,7 @@ impl Tree {
         // takes the clip of its containing block, which can change while its parent stays.
         let calm = mem::replace(&mut self.still, still) && !(own.is_some() && clipped && !follows);
         if calm {
-            self.calm(index);
+            self.calm(index, visited);
         }
         self.still &= calm && delta == parent;
         self.recorded(
@@ -1061,33 +1130,130 @@ impl Tree {
         );
     }
 
+    // The out-of-flow boxes in a box that moves by `by` keep their places in it: this pass kept their containing
+    // blocks around the box, and moved the content of these blocks by `by` too. The initial containing block has
+    // no box that tells.
+    fn based(&self, index: u32, by: Point<Pixels>) -> bool {
+        let near = |a: Pixels, b: Pixels| (a - b).0.abs() < 1e-3;
+        self.slots[index as usize].escaping.is_none_or(|at| {
+            at > 0
+                && (self.blocks.get(at as usize - 1..)).is_some_and(|blocks| {
+                    blocks.iter().all(|block| {
+                        (block.4).is_some_and(|moved| near(moved.x, by.x) && near(moved.y, by.y))
+                    })
+                })
+        })
+    }
+
+    // The scroll containers in a box, and their scroll bars among the hooks that skip inside, are as their last
+    // prepaint left them.
+    fn rests(&self, index: u32, touched: std::ops::Range<usize>) -> bool {
+        let scroll = |slot: &Slot| {
+            (slot.events.as_ref())
+                .and_then(|events| events.scroll.as_ref())
+                .is_none_or(|scroll| scroll.rests())
+        };
+        let slot = &self.slots[index as usize];
+        if !slot.nests
+            && slot
+                .events
+                .as_ref()
+                .is_none_or(|events| events.scroll.is_none())
+        {
+            return true;
+        }
+        let inside = self.last_touched.1.get(touched).unwrap_or_default();
+        scroll(slot)
+            && inside.iter().all(|&inside| {
+                let slot = &self.slots[inside as usize];
+                scroll(slot)
+                    && (slot.hooks.as_ref())
+                        .is_none_or(|hooks| !hooks.skips_inside() || hooks.rests())
+            })
+    }
+
+    // The viewport that a scroll container in `mask` gives its content, as `begin_interest` does, and its region.
+    fn viewport(&self, index: u32, mask: Clip<Pixels>) -> Option<(Rect<Pixels>, Option<Region>)> {
+        let slot = &self.slots[index as usize];
+        (slot.events.as_ref()).filter(|events| events.scroll.is_some())?;
+        let mask = match slot.style.overflow_mask(slot.bounds) {
+            Some(clip) => clip.intersect(&mask),
+            None => mask,
+        };
+        (mask.radii == Default::default()).then_some((mask.bounds, slot.region))
+    }
+
+    // The scroll containers in a box that skips, or shifts by `by`, stay in the list of `anchor`, and move.
+    fn rested(&mut self, index: u32, touched: std::ops::Range<usize>, by: Option<Point<Pixels>>) {
+        let slot = &self.slots[index as usize];
+        if !slot.nests
+            && slot
+                .events
+                .as_ref()
+                .is_none_or(|events| events.scroll.is_none())
+        {
+            return;
+        }
+        for at in touched.start..touched.end.min(self.last_touched.1.len()) {
+            let slot = &mut self.slots[self.last_touched.1[at] as usize];
+            let Some(scroll) = (slot.events.as_ref()).and_then(|events| events.scroll.as_ref())
+            else {
+                continue;
+            };
+            if let Some(by) = by {
+                scroll.shift(by);
+            }
+            if slot.style.scroll_anchor & ScrollAnchor::NONE == 0
+                && mem::replace(&mut slot.anchoring, self.prepaints) != self.prepaints
+            {
+                self.anchoring.push(slot.key);
+            }
+        }
+    }
+
     // The listed boxes inside a box that a scroll moves by `by`, from mask `was` to `now`, can paint copies of their
     // chunks, or paint nothing.
-    fn relists(&self, index: u32, (by, was, now): Mv, window: &Window) -> bool {
+    fn relists(
+        &self,
+        index: u32,
+        visited: Option<u32>,
+        (by, was, now): Mv,
+        window: &Window,
+    ) -> bool {
         let depth = self.depths.last().map_or(0, |&(depth, _)| depth);
         let listing = &self.slots[index as usize].listing;
         (listing.is_empty() || !self.stacks.is_empty())
             && listing.iter().all(|&at| {
                 let slot = &self.slots[at as usize];
-                let since = match slot.calm == self.prepaints.wrapping_sub(1) {
+                // The viewports that cut the mask of an out-of-flow box don't move with the box.
+                if slot.cuts {
+                    return false;
+                }
+                let since = match self.ran(at, visited) {
                     true => slot.since,
                     false => self.prepaints,
                 };
-                let mask =
-                    window.cut_between(moved_mask(slot.list_mask, by, was, now), depth, usize::MAX);
+                // Paint leaves out a box outside its mask, and an out-of-flow box has the mask of its containing block.
+                let mask = match slot.escaped {
+                    Some(mask) => moved_mask(mask, by, Clip::default(), Clip::default()),
+                    None => window.cut_between(
+                        moved_mask(slot.list_mask, by, was, now),
+                        depth,
+                        usize::MAX,
+                    ),
+                };
                 slot.listed
                     && (slot.chunk.is_some_and(|chunk| {
                         chunk.translates
                             && chunk.pass == self.paints.0
                             && since <= chunk.prepass.wrapping_add(1)
-                    }) || slot
-                        .reach
-                        .is_some_and(|reach| !(reach + by).intersects(mask.bounds)))
+                    }) || slot.culled == self.paints.0
+                        && (slot.reach).is_some_and(|reach| !(reach + by).intersects(mask.bounds)))
             })
     }
 
     // Lists again the boxes that a skip of a box kept, and moves them as `relists` checked.
-    fn relist(&mut self, index: u32, (by, was, now): Mv, window: &Window) {
+    fn relist(&mut self, index: u32, visited: Option<u32>, (by, was, now): Mv, window: &Window) {
         let listing = mem::take(&mut self.slots[index as usize].listing);
         let depth = self.depths.last().map_or(0, |&(depth, _)| depth);
         for &at in &listing {
@@ -1106,12 +1272,19 @@ impl Tree {
             if let (Some(order), Some(list)) = (slot.style.z_index, self.stacks.last_mut()) {
                 list.push((order, at, mask));
             }
-            self.calm(at);
+            self.calm(at, visited);
         }
         self.slots[index as usize].listing = listing;
     }
 
-    fn keep_box(&mut self, index: u32, style: &Style, moved: bool, window: &mut Window) {
+    // `kept`: the box and its mask stayed since the last pass, or moved together by a scroll offset.
+    fn keep_box(
+        &mut self,
+        index: u32,
+        style: &Style,
+        [moved, kept]: [bool; 2],
+        window: &mut Window,
+    ) {
         let origin = self.slots[index as usize].origin;
         let [bounds, _] = match moved {
             true => self.place(index, origin, window),
@@ -1151,11 +1324,15 @@ impl Tree {
                     handle.clamp(style, bounds, client, content, scale)
                 });
                 if style.contains != 0 {
+                    // The boxes in the block see this move of the offset, also by the scroll of the block.
+                    let inner = window.offset() + offset.unwrap_or_default();
+                    let was = mem::replace(&mut self.slots[index as usize].inner, inner);
                     (self.blocks).push((
                         style.contains,
                         window.content_mask(),
                         window.depth() as u32,
                         self.scrolled(offset.unwrap_or_default()),
+                        kept.then(|| inner - was),
                     ));
                 }
                 if let Some(offset) = offset {

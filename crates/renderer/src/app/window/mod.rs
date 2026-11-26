@@ -161,13 +161,28 @@ impl HitTransform {
             from_window: Cell::new(turn(self.from_window.get())),
             area,
             view: self.view,
-            id: HitTransform::id(self.key, &to_window, area, self.view),
+            // A scroll keeps the id of a transform without a key.
+            id: match self.key {
+                Some(_) => {
+                    HitTransform::id(self.key, &to_window, area, self.view, Point::default())
+                }
+                None => self.id,
+            },
         });
         moved.push((Rc::as_ptr(self), shifted.clone()));
         shifted
     }
 
-    fn id(key: Option<u64>, to_window: &Plane, area: Rect, view: Rect) -> u64 {
+    // `offset` is the offset of the window where the transform starts. A scroll by `by` adds `by` to it, moves the
+    // area, and turns an affine transform `M` into `T(by)·M·T(-by)`. So these hash as the content of the offset
+    // sees them, on a grid that hides the rounding of the turn, and boxes under a transform stay kept in a scroll.
+    fn id(
+        key: Option<u64>,
+        to_window: &Plane,
+        area: Rect,
+        view: Rect,
+        offset: Point<Pixels>,
+    ) -> u64 {
         use std::hash::{Hash, Hasher};
         static KEYED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if key.is_some() {
@@ -175,17 +190,37 @@ impl HitTransform {
             return KEYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) | 1 << 63;
         }
         let mut hasher = rustc_hash::FxHasher::default();
-        to_window.map(f32::to_bits).hash(&mut hasher);
-        for rect in [area, view] {
-            [
-                rect.origin.x,
-                rect.origin.y,
-                rect.size.width,
-                rect.size.height,
-            ]
-            .map(|value| value.0.to_bits())
-            .hash(&mut hasher);
+        let [x, y] = [offset.x.0, offset.y.0];
+        let near = |value: f32| (value * 16.).round() as i64;
+        let m = to_window;
+        let affine = (m[2], m[5], m[8]) == (0., 0., 1.);
+        match affine {
+            true => {
+                [m[0], m[1], m[3], m[4]].map(f32::to_bits).hash(&mut hasher);
+                [
+                    near(m[6] + (m[0] - 1.) * x + m[3] * y),
+                    near(m[7] + m[1] * x + (m[4] - 1.) * y),
+                ]
+                .hash(&mut hasher);
+            }
+            false => m.map(f32::to_bits).hash(&mut hasher),
         }
+        match affine && area.size.width.0 < OPEN {
+            true => [near(area.origin.x.0 - x), near(area.origin.y.0 - y)].hash(&mut hasher),
+            false => [area.origin.x, area.origin.y]
+                .map(|value| value.0.to_bits())
+                .hash(&mut hasher),
+        }
+        [
+            area.size.width,
+            area.size.height,
+            view.origin.x,
+            view.origin.y,
+            view.size.width,
+            view.size.height,
+        ]
+        .map(|value| value.0.to_bits())
+        .hash(&mut hasher);
         hasher.finish() | 1
     }
 
@@ -1816,6 +1851,7 @@ impl Window {
             };
             Some((local, to_window, invert(&to_window)?))
         });
+        let offset = self.offset();
         let placed = match placed {
             Some((local, to_window, from_window)) => HitTransform {
                 key: None,
@@ -1826,6 +1862,7 @@ impl Window {
                     base.as_ref().map_or(clip, |base| base.area),
                     base.as_ref()
                         .map_or(unbounded_mask().bounds, |base| base.view),
+                    offset,
                 ),
                 area: base.as_ref().map_or(clip, |base| base.area),
                 view: base
@@ -1840,7 +1877,7 @@ impl Window {
             None => HitTransform {
                 key: None,
                 deep: false,
-                id: HitTransform::id(None, &[0.; 9], Rect::default(), Rect::default()),
+                id: HitTransform::id(None, &[0.; 9], Rect::default(), Rect::default(), offset),
                 area: Rect::default(),
                 view: Rect::default(),
                 local: Cell::new(SAME),
@@ -1917,7 +1954,7 @@ impl Window {
             from_window: Cell::new(from_window),
             area,
             view,
-            id: HitTransform::id(key, &to_window, area, view),
+            id: HitTransform::id(key, &to_window, area, view, self.offset()),
         }));
         self.push_content_mask(unbounded_mask());
         let result = f(self);
@@ -1982,7 +2019,7 @@ impl Window {
             from_window: Cell::new(invert(&to_window).unwrap_or_default()),
             area,
             view,
-            id: HitTransform::id(None, &to_window, area, view),
+            id: HitTransform::id(None, &to_window, area, view, self.offset()),
         };
         let outer = self.hit_transform.replace(Rc::new(placed));
         self.push_content_mask(unbounded_mask());

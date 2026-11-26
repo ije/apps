@@ -559,6 +559,48 @@ pub(crate) struct Contained {
 }
 
 impl Contained {
+    // The padding box of the containing block, where the content of its scroll is.
+    fn block(&self, view: &super::ViewState) -> Option<Rect<Pixels>> {
+        let store = view.store.borrow();
+        let dom = store.page_state(view.id)?;
+        match self.container {
+            container @ (0 | usize::MAX) => {
+                let scroll = dom.geometry.scroll.get(&0);
+                let room = scroll.map_or_else(Default::default, |scroll| scroll.room());
+                let [width, height] = self.viewport.map(px);
+                let size = renderer::size(width - room.right, height - room.bottom);
+                let origin = match container {
+                    0 => scroll.map(|scroll| scroll.bounds().origin + scroll.painted())?,
+                    _ => Point::default(),
+                };
+                Some(Rect::new(origin, size))
+            }
+            // The boxes that a scroll container contains move with its scroll.
+            container => dom.layout.blocks.get(&container).map(|block| {
+                let scroll = dom.geometry.scroll.get(&container);
+                *block + scroll.map_or(Point::default(), |s| s.painted())
+            }),
+        }
+    }
+
+    // The move that places `bounds` by the insets in the padding box `block`.
+    fn offset(&self, block: Rect<Pixels>, bounds: Rect<Pixels>) -> Point<Pixels> {
+        let [top, right, bottom, left] = self.inset;
+        let [margin_top, margin_right, margin_bottom, margin_left] = self.margin.map(px);
+        let mut shift = point(px(0.), px(0.));
+        if let Some(right) = right.filter(|_| self.rtl || left.is_none()) {
+            shift.x = block.right() - px(right) - margin_right - bounds.right();
+        } else if let Some(left) = left {
+            shift.x = block.left() + px(left) + margin_left - bounds.left();
+        }
+        if let Some(top) = top {
+            shift.y = block.top() + px(top) + margin_top - bounds.top();
+        } else if let Some(bottom) = bottom {
+            shift.y = block.bottom() - px(bottom) - margin_bottom - bounds.bottom();
+        }
+        shift
+    }
+
     // The move that places `bounds` by the insets in the padding box of the containing block.
     fn shift(
         &self,
@@ -566,30 +608,7 @@ impl Contained {
         bounds: Rect<Pixels>,
         window: &mut Window,
     ) -> Point<Pixels> {
-        let block = {
-            let store = view.store.borrow();
-            store
-                .page_state(view.id)
-                .and_then(|dom| match self.container {
-                    container @ (0 | usize::MAX) => {
-                        let scroll = dom.geometry.scroll.get(&0);
-                        let room = scroll.map_or_else(Default::default, |scroll| scroll.room());
-                        let [width, height] = self.viewport.map(px);
-                        let size = renderer::size(width - room.right, height - room.bottom);
-                        let origin = match container {
-                            0 => scroll.map(|scroll| scroll.bounds().origin + scroll.painted())?,
-                            _ => Point::default(),
-                        };
-                        Some(Rect::new(origin, size))
-                    }
-                    // The boxes that a scroll container contains move with its scroll.
-                    container => dom.layout.blocks.get(&container).map(|block| {
-                        let scroll = dom.geometry.scroll.get(&container);
-                        *block + scroll.map_or(Point::default(), |s| s.painted())
-                    }),
-                })
-        };
-        let Some(block) = block else {
+        let Some(block) = self.block(view) else {
             return Point::default();
         };
         // Redraw only once per mismatch to avoid endless frames when layout repeats the same size.
@@ -612,20 +631,7 @@ impl Contained {
                 window.redraw();
             }
         }
-        let [top, right, bottom, left] = self.inset;
-        let [margin_top, margin_right, margin_bottom, margin_left] = self.margin.map(px);
-        let mut shift = point(px(0.), px(0.));
-        if let Some(right) = right.filter(|_| self.rtl || left.is_none()) {
-            shift.x = block.right() - px(right) - margin_right - bounds.right();
-        } else if let Some(left) = left {
-            shift.x = block.left() + px(left) + margin_left - bounds.left();
-        }
-        if let Some(top) = top {
-            shift.y = block.top() + px(top) + margin_top - bounds.top();
-        } else if let Some(bottom) = bottom {
-            shift.y = block.bottom() - px(bottom) - margin_bottom - bounds.bottom();
-        }
-        shift
+        self.offset(block, bounds)
     }
 }
 
@@ -716,6 +722,8 @@ pub(crate) struct DomBox {
     // The window bounds and cull flags of the last prepaint, which a skip gives to `merge`.
     pub(crate) reached_at: Cell<(Rect<Pixels>, u32)>,
     pub(crate) offset: Cell<Point<Pixels>>,
+    // The part of `offset` from the containing block.
+    pub(crate) based: Cell<Point<Pixels>>,
     pub(crate) frame: bool,
     // Scrolls move or hide the box with its anchor.
     pub(crate) anchored: bool,
@@ -1017,6 +1025,41 @@ impl DomBox {
     }
 }
 
+impl DomBox {
+    fn contained(&self, inset: [Option<f32>; 4]) -> Option<Contained> {
+        Some(Contained {
+            key: self.id,
+            container: self.container?,
+            viewport: self.units.viewport,
+            sized: self.sized,
+            inset,
+            margin: self.margin,
+            rtl: self.rtl,
+        })
+    }
+
+    // The containing block of an out-of-flow box is where the last prepaint found it, seen from the box at `exact`,
+    // and has the size that the build used. A scroll moves both, and a layout that moves or sizes only one of them
+    // does not.
+    fn based(&self, exact: Rect<Pixels>, unscrolled: Point<Pixels>) -> bool {
+        let Some(contained) = self.contained(self.inset) else {
+            return true;
+        };
+        let block = contained.block(&self.view);
+        let mut offset = Point::default();
+        unscroll(&mut offset, self.unplaced, unscrolled);
+        if let Some(block) = block {
+            offset += contained.offset(block, Rect::new(exact.origin + offset, exact.size));
+        }
+        let based = self.based.get();
+        let sized = (self.sized.zip(block)).is_none_or(|([width, height], block)| {
+            (f32::from(block.size.width) - width).abs() <= 0.5
+                && (f32::from(block.size.height) - height).abs() <= 0.5
+        });
+        sized && (offset.x - based.x).0.abs() < 0.01 && (offset.y - based.y).0.abs() < 0.01
+    }
+}
+
 impl Hooks for DomBox {
     // Of the effect layers, only filters draw outside the boxes inside.
     fn bounded(&self) -> bool {
@@ -1105,19 +1148,11 @@ impl Hooks for DomBox {
             }
             bounds.origin += offset;
         }
-        if let Some(container) = self.container {
-            let shift = Contained {
-                key: self.id,
-                container,
-                viewport: self.units.viewport,
-                sized: self.sized,
-                inset,
-                margin: self.margin,
-                rtl: self.rtl,
-            }
-            .shift(&self.view, bounds, window);
+        if let Some(contained) = self.contained(inset) {
+            let shift = contained.shift(&self.view, bounds, window);
             offset += shift;
             bounds.origin += shift;
+            self.based.set(offset);
         }
         if self.fixed {
             let mut viewport = window.viewport_size();
@@ -1433,8 +1468,6 @@ impl Hooks for DomBox {
             || self.sticky.is_some()
             || self.fixed
             || self.anchored
-            || self.container.is_some()
-            || self.sized.is_some()
             || self.perspective.is_some()
             || self.transformed
             || self.frame
@@ -1445,6 +1478,10 @@ impl Hooks for DomBox {
 
     fn skippable(&self) -> bool {
         true
+    }
+
+    fn stays(&self, exact: Rect<Pixels>, unscroll: Point<Pixels>) -> bool {
+        self.based(exact, unscroll)
     }
 
     fn shifts(&self) -> bool {
@@ -1553,6 +1590,11 @@ impl Hooks for DomBox {
     }
 
     fn kept(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        // Its containing block moved or changed its size, so the box has another place.
+        if !self.based(cx.exact, cx.unscroll) {
+            cx.window.unsettle();
+            return self.prepaint(cx, inner);
+        }
         let (placed, mut matrix) = self.placed.get();
         let offset = self.offset.get();
         let bounds = Rect::new(cx.exact.origin + offset, cx.exact.size);

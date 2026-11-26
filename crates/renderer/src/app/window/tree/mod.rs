@@ -79,6 +79,12 @@ struct Slot {
     volatile: bool,
     // A volatile box is in it, so a keep of the box prepaints that box.
     lively: bool,
+    // The paint pass that left the box out, as it was outside its mask.
+    culled: u32,
+    // A scroll container is in the box.
+    nests: bool,
+    // Scroll viewports between its stacking context and its containing block cut the mask of the box.
+    cuts: bool,
     reach: Option<Rect<Pixels>>,
     escaped: Option<Clip<Pixels>>,
     // The size that the measure function gave in the last layout, which can overflow the box.
@@ -126,6 +132,10 @@ struct Slot {
     skipped: u32,
     // The containing blocks of the out-of-flow boxes in it are in it too, so its paint takes no clip from outside.
     contained: bool,
+    // The outermost containing block around the box that an out-of-flow box in it reads, as `escape` counts them.
+    escaping: Option<u32>,
+    // Where the content of a containing block was in the last pass: the offset of the window in it.
+    inner: Point<Pixels>,
     // The count of scroll viewports around the containing block of an out-of-flow box, whose clips it escapes.
     cut: u32,
     // How far the scrolls between an out-of-flow box and its containing block moved it.
@@ -221,6 +231,9 @@ impl Slot {
             below: false,
             volatile: false,
             lively: false,
+            culled: u32::MAX,
+            nests: false,
+            cuts: false,
             reach: None,
             escaped: None,
             measured: taffy::Size::ZERO,
@@ -246,6 +259,8 @@ impl Slot {
             skips: false,
             skipped: 0,
             contained: false,
+            escaping: None,
+            inner: Point::default(),
             cut: 0,
             unscroll: Point::default(),
             shift: Point::default(),
@@ -305,6 +320,7 @@ impl Slot {
         self.below = false;
         self.volatile = false;
         self.lively = false;
+        self.culled = u32::MAX;
         self.escaped = None;
         self.split = None;
         self.chunk = None;
@@ -396,8 +412,7 @@ pub struct Tree {
     // The depth in `blocks` of the outermost containing block of the out-of-flow boxes that paint in their
     // parents, like `escapes`.
     foreign: Option<usize>,
-    // Containing blocks: what they contain, their mask, and the count of scroll viewports around them.
-    blocks: Vec<(u8, Clip<Pixels>, u32, Point<Pixels>)>,
+    blocks: Vec<Block>,
     // The scroll offsets around the current box, each with the ones outside it.
     scrolled: Vec<Point<Pixels>>,
     painting: Vec<u32>,
@@ -420,6 +435,8 @@ pub struct Tree {
     // Whether the boxes that `keep` visits stay where they were, and allow a skip.
     still: bool,
     skips: bool,
+    // A scroll container is among the boxes that the pass went through in the current box.
+    nests: bool,
     // The outermost containing block that an out-of-flow box in the current box reads: its place in `blocks` plus
     // one, or 0 for the viewport. A box can skip only if no such block is outside it.
     escapes: Option<usize>,
@@ -1199,6 +1216,10 @@ fn unsplit(slots: &mut [Slot], index: usize) {
     }
 }
 
+// A containing block: what it contains, its mask, the count of scroll viewports around it, the scroll offsets
+// around its content, and the move of its content in this pass, when the pass kept the block.
+type Block = (u8, Clip<Pixels>, u32, Point<Pixels>, Option<Point<Pixels>>);
+
 fn unfar(slots: &mut [Slot], mut index: usize) {
     while slots[index].far != [None; 2] {
         slots[index].far = [None; 2];
@@ -1395,6 +1416,9 @@ fn cache_input(free: [bool; 2], relative: bool, input: &LayoutInput) -> LayoutIn
 
 // A move by `by` from the mask `was` to `now`.
 type Mv = (Point<Pixels>, Clip<Pixels>, Clip<Pixels>);
+// What a box keeps of the pass around it while the pass goes through it: `skips` and `nests`, `escapes`, the
+// containing block of the box itself, and `foreign`.
+type Outer = ([bool; 2], Option<usize>, Option<usize>, Option<usize>);
 
 // A mask that moved by `by`, as a moved copy moves it: the mask `old` around the copy becomes `now`.
 fn moved_mask(
