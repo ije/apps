@@ -341,7 +341,6 @@ pub(crate) fn interpolate(lerp: Option<&Lerp>, from: &str, to: &str, t: f64) -> 
 
 pub(crate) type Lerps = [rustc_hash::FxHashMap<u64, (String, String, String, Option<Rc<Lerp>>)>; 2];
 
-#[derive(Debug)]
 pub(crate) enum Lerp {
     Same(String),
     Between(String, String, String),
@@ -354,6 +353,13 @@ pub(crate) enum Lerp {
     Matrix(Box<[[f64; 13]; 2]>, bool),
     // The basis and both calculations of `calc-size()`.
     Size(String, String, String),
+}
+
+// The plan comes from the values of the frames, so `Debug` skips it.
+impl std::fmt::Debug for Lerp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("_")
+    }
 }
 
 // The sizes that interpolate with keywords under `interpolate-size: allow-keywords`.
