@@ -7,11 +7,12 @@ pub(crate) mod transform;
 use crate::css;
 use crate::css::properties::Prop;
 use crate::{css::properties::Style, dom::Document};
+use rustc_hash::FxHashMap;
 
 // Find IDs through the tree walk. The arena includes removed nodes and can greatly exceed the live page.
 #[derive(Default)]
 pub(crate) struct Ids {
-    map: std::cell::OnceCell<std::collections::HashMap<String, Vec<usize>>>,
+    map: std::cell::OnceCell<FxHashMap<String, Vec<usize>>>,
     walk: Option<std::rc::Rc<Vec<(u32, u32)>>>,
 }
 
@@ -24,24 +25,20 @@ impl Ids {
     }
 }
 
-pub(crate) fn index<'a>(
-    ids: &'a Ids,
-    doc: &Document,
-) -> &'a std::collections::HashMap<String, Vec<usize>> {
+pub(crate) fn index<'a>(ids: &'a Ids, doc: &Document) -> &'a FxHashMap<String, Vec<usize>> {
     ids.map.get_or_init(|| {
-        let mut map = std::collections::HashMap::<String, Vec<usize>>::new();
-        let mut add = |node: usize| {
-            if let Some(id) = doc.nodes.get(node).and_then(|value| value.attrs.get("id")) {
-                map.entry(id.clone()).or_default().push(node);
-            }
+        let named = |node: usize| Some((node, doc.nodes.get(node)?.attrs.get("id")?));
+        let mut nodes: Vec<_> = match &ids.walk {
+            Some(walk) => walk
+                .iter()
+                .filter_map(|&(node, _)| named(node as usize))
+                .collect(),
+            None => (0..doc.nodes.len()).filter_map(named).collect(),
         };
-        match &ids.walk {
-            Some(walk) => {
-                let mut nodes: Vec<usize> = walk.iter().map(|&(node, _)| node as usize).collect();
-                nodes.sort_unstable();
-                nodes.into_iter().for_each(&mut add);
-            }
-            None => (0..doc.nodes.len()).for_each(&mut add),
+        nodes.sort_unstable_by_key(|&(node, _)| node);
+        let mut map = FxHashMap::<String, Vec<usize>>::default();
+        for (node, id) in nodes {
+            map.entry(id.clone()).or_default().push(node);
         }
         map
     })

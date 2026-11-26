@@ -260,7 +260,8 @@ impl SelectorCache {
         self.dirty
             .chunks(64)
             .enumerate()
-            .filter(|(_, chunk)| chunk.contains(&true))
+            // Warning: `contains` tests each entry in turn. This `or` of the whole chunk vectorizes.
+            .filter(|(_, chunk)| chunk.iter().fold(false, |any, &dirty| any | dirty))
             .flat_map(|(index, chunk)| {
                 let set = chunk.iter().enumerate().filter(|(_, dirty)| **dirty);
                 set.map(move |(bit, _)| index * 64 + bit)

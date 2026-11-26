@@ -841,6 +841,28 @@ fn theme_variables_used_outside_utilities_are_defined() {
 }
 
 #[test]
+fn attribute_variables_are_read_again_by_a_new_theme() {
+    let doc = Document::parse(
+        "<p style='color: var(--color-brand)'>a</p><b style='color: var(--color-brand)'>b</b>",
+    );
+    let order: Vec<(u32, u32)> = (0..doc.nodes.len() as u32).map(|id| (id, 0)).collect();
+    let mut compiler = super::Compiler::default();
+    let defined = |compiler: &mut super::Compiler, theme: &str| {
+        let source = format!("@import 'tailwindcss';{theme}");
+        let mut sheets = vec![Rc::new(super::Stylesheet::parse(&source))];
+        compiler.update(&mut sheets, &doc, &order);
+        compiler
+            .0
+            .last()
+            .unwrap()
+            .vars
+            .contains_key("--color-brand")
+    };
+    assert!(!defined(&mut compiler, ""));
+    assert!(defined(&mut compiler, "@theme{--color-brand:red}"));
+}
+
+#[test]
 fn arbitrary_values_keep_modifiers_and_type_hints() {
     assert_generated(
         "",

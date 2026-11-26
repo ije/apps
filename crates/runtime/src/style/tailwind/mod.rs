@@ -3,7 +3,7 @@ use crate::css::value::color::color;
 use crate::dom::Document;
 use crate::style::tailwind::tables::{BASE, DEFAULTS, KEYFRAMES, ORDER_INDEX, TEXT};
 use crate::style::tailwind::value::{braces, calls, escape, escape_name, removes, split};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     cmp::{Ordering, Reverse},
     collections::{BTreeMap, BTreeSet},
@@ -235,6 +235,8 @@ struct Config {
     nested: std::cell::Cell<u8>,
     classes: FxHashMap<String, bool>,
     scanned: Vec<u64>,
+    // The attribute values with variables that `vars` has read.
+    read: FxHashSet<Box<str>>,
     applied: Vec<(Rc<Stylesheet>, Rc<Stylesheet>)>,
     sorted: Vec<(Sort, u64, Vec<Rule>)>,
     chunks: Vec<(u64, Rc<Stylesheet>)>,
@@ -524,7 +526,11 @@ impl Config {
             let node = &doc.nodes[id];
             for (name, value) in node.attrs.iter() {
                 if name != "class" {
-                    if value.contains("var(--") {
+                    if value.contains("var(--") && !self.read.contains(value.as_str()) {
+                        if self.read.len() > 4096 {
+                            self.read.clear();
+                        }
+                        self.read.insert(value.as_str().into());
                         used.push_str(value);
                     }
                     continue;
