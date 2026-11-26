@@ -430,8 +430,11 @@ pub(super) fn finish(
             let mut rows: Vec<(usize, Vec<usize>)> = Vec::new();
             let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
             for &cell in &node.children {
+                // A hidden row or cell keeps the bounds of its last frame.
                 let Some(row) = doc.nodes[cell].parent.filter(|&row| {
-                    row != id && (style::ROW..=style::FOOTER).contains(&style::role(styles, row))
+                    row != id
+                        && styles.flags[cell] & style::DISPLAY_NONE == 0
+                        && (style::ROW..=style::FOOTER).contains(&style::role(styles, row))
                 }) else {
                     continue;
                 };

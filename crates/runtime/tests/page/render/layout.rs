@@ -739,6 +739,33 @@ fn negative_empty_and_container_margins_collapse_like_chrome() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn hidden_table_rows_and_cells_leave_the_width_of_their_rows() {
+    let text = run_hidden(
+        r#"await load('rows.html');
+        await win.webContents.capturePage();
+        const widths = "[...document.querySelectorAll('tbody, tr')].map(e => e.getBoundingClientRect().width).join()";
+        const now = await run("document.getElementById('w').hidden = true; document.getElementById('c').style.display = 'none';\
+          document.querySelector('tbody').append(document.querySelector('tr').cloneNode(true)); " + widths);
+        await win.webContents.capturePage();
+        console.log('WIDTHS ' + now + ' ' + await run(widths));
+        "#,
+        &[(
+            "rows.html",
+            "<body style='margin:0'><style>table{border-spacing:0}td{padding:0;width:20px;height:10px}</style>\
+             <table><tbody><tr><td></td><td></td></tr><tr id=w><td></td><td style='width:100px'></td></tr>\
+             <tr><td></td><td></td></tr></tbody></table>\
+             <table><tbody><tr><td></td><td id=c style='width:100px'></td></tr><tr><td></td><td></td></tr></tbody></table></body>",
+        )],
+    );
+    let widths = "40,40,0,40,40,40,40,40";
+    assert!(
+        text.contains(&format!("WIDTHS {widths} {widths}")),
+        "like Chrome, rows and groups span only the cells that show: {text}"
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn top_and_bottom_boxes_and_hanging_spaces_align_like_chrome() {
     let (text, rects) = picture_rects(
         "edges.html",
