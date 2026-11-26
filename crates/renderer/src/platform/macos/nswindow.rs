@@ -910,9 +910,9 @@ define_class!(
         #[unsafe(method(otherMouseUp:))]
         fn other_up(&self, event: &NSEvent) { self.pointer(event) }
         #[unsafe(method(mouseMoved:))]
-        fn moved(&self, event: &NSEvent) { self.pointer(event) }
+        fn moved(&self, event: &NSEvent) { self.tracked(event) }
         #[unsafe(method(mouseExited:))]
-        fn exited(&self, event: &NSEvent) { self.pointer(event) }
+        fn exited(&self, event: &NSEvent) { self.tracked(event) }
         #[unsafe(method(mouseDragged:))]
         fn left_drag(&self, event: &NSEvent) { self.pointer(event) }
         #[unsafe(method(rightMouseDragged:))]
@@ -1355,6 +1355,17 @@ impl AppsView {
             return false;
         }
         self.handle_in_context(event)
+    }
+
+    // The tracking area still reports moves while the window ignores the mouse.
+    fn tracked(&self, event: &NSEvent) {
+        if self
+            .window()
+            .is_some_and(|w| w.ignoresMouseEvents() && !w.acceptsMouseMovedEvents())
+        {
+            return;
+        }
+        self.pointer(event)
     }
 
     fn pointer(&self, event: &NSEvent) {

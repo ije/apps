@@ -165,6 +165,40 @@ fn a_moved_interest_area_draws_only_the_exposed_edge() {
 }
 
 #[test]
+fn a_scroll_in_moved_content_draws_only_the_exposed_edge() {
+    let mut scene = Scene::default();
+    let mut frame = |pass: u32, scroll: f32| {
+        scene.begin_paint(pass, &mut Vec::new());
+        let viewport = Clip::from(bounds([0., 0., 400., 300.]));
+        let inner = Clip::from(bounds([20., 50. - scroll, 200., 100.]));
+        scene.begin_scroll(1, viewport, point(0., scroll), false);
+        scene.push(Instance::new(
+            BOX,
+            bounds([10., 20. - scroll, 50., 20.]),
+            viewport,
+        ));
+        scene.begin_scroll(2, inner, point(0., 0.), false);
+        scene.push(Instance::new(
+            BOX,
+            bounds([30., 60. - scroll, 50., 60.]),
+            inner,
+        ));
+        scene.end_scroll();
+        scene.end_scroll();
+        scene.diff(Some(&[]));
+        let damage = (scene.damage.rects.iter())
+            .map(|rect| rect.to_array())
+            .collect::<Vec<_>>();
+        scene.drawn();
+        scene.clear();
+        damage
+    };
+    frame(1, 0.);
+    assert_eq!(frame(2, 10.), [[0., 290., 400., 10.]]);
+    assert_eq!(frame(3, 20.), [[0., 290., 400., 10.]]);
+}
+
+#[test]
 fn nested_escapes_close_their_cuts() {
     // A fixed box in an absolute box: both escape the scroll, one inside the other.
     let viewport = Clip::from(bounds([0., 0., 100., 100.]));

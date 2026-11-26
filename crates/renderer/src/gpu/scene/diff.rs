@@ -530,10 +530,11 @@ impl Scene {
                 u32::MAX => (0, Point::default()),
                 at => (frames[at as usize], self.scrolls[at as usize].shift),
             };
-            let place = |rect: Rect<f32>| bits((rect - shift).to_array());
+            let place = |rect: Rect<f32>| bits((rect + shift).to_array());
             let viewport = &scroll.viewport;
             let mut hasher = rustc_hash::FxHasher::default();
-            (outer, place(viewport.bounds), place(viewport.rounded)).hash(&mut hasher);
+            let rounded = (viewport.radii != Default::default()).then(|| place(viewport.rounded));
+            (outer, place(viewport.bounds), rounded).hash(&mut hasher);
             bits(viewport.radii.to_array()).hash(&mut hasher);
             frames.push(hasher.finish());
         }
