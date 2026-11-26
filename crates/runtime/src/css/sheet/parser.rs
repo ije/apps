@@ -1,7 +1,7 @@
 use crate::css::{
     properties::Prop, sheet::Declaration, sheet::Declarations, sheet::MediaQuery, sheet::Rule,
-    sheet::Stylesheet, value::grammar::computed, value::grammar::supports,
-    value::grammar::syntax_matches, value::tokens::components,
+    sheet::Stylesheet, value::grammar::computed, value::grammar::registrable,
+    value::grammar::supports, value::grammar::syntax_matches, value::tokens::components,
 };
 use crate::css::{selector::Selector, selector::SelectorList, value::units::Lengths};
 use cssparser::{
@@ -742,12 +742,13 @@ impl<'i> AtRuleParser<'i> for Rules {
                     return Err(ParseError::unexpected_token());
                 };
                 // The initial value must not depend on an element, so `2em` drops the rule.
-                if syntax.trim() != "*"
-                    && !initial.as_deref().is_some_and(|value| {
-                        !value.contains("var(")
-                            && syntax_matches(&syntax, value)
-                            && computed(&syntax, value, None).1
-                    })
+                if !registrable(&syntax)
+                    || (syntax.trim() != "*"
+                        && !initial.as_deref().is_some_and(|value| {
+                            !value.contains("var(")
+                                && syntax_matches(&syntax, value)
+                                && computed(&syntax, value, None).1
+                        }))
                 {
                     return Err(ParseError::unexpected_token());
                 }

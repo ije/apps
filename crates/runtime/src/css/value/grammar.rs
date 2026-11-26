@@ -1081,6 +1081,35 @@ pub(crate) fn syntax_matches(syntax: &str, value: &str) -> bool {
     })
 }
 
+// Whether `@property` and `CSS.registerProperty()` take a syntax. The other names of `syntax_matches` are internal.
+pub(crate) fn registrable(syntax: &str) -> bool {
+    syntax.trim() == "*"
+        || syntax.split('|').all(|part| {
+            let part = part.trim();
+            let name = part.strip_suffix(['+', '#']).unwrap_or(part);
+            let word = |c: char| c.is_alphanumeric() || matches!(c, '-' | '_');
+            match name
+                .strip_prefix('<')
+                .and_then(|name| name.strip_suffix('>'))
+            {
+                Some("transform-list") => name == part,
+                Some(name) => "length number percentage length-percentage color image url integer \
+                     angle time resolution transform-function custom-ident string"
+                    .split(' ')
+                    .any(|kind| kind == name),
+                None => {
+                    let rest = name.strip_prefix('-').unwrap_or(name);
+                    name == part
+                        && rest.starts_with(|c: char| word(c) && !c.is_ascii_digit())
+                        && name.chars().all(word)
+                        && !"initial inherit unset revert revert-layer default"
+                            .split(' ')
+                            .any(|keyword| name.eq_ignore_ascii_case(keyword))
+                }
+            }
+        })
+}
+
 // The type of a registered syntax that takes the value: the first that matches.
 pub(crate) fn matched<'a>(syntax: &'a str, value: &str) -> &'a str {
     match syntax.contains('|') {

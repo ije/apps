@@ -617,6 +617,24 @@ fn css_global_supports_escape_and_register_property() {
 }
 
 #[test]
+fn registered_properties_take_only_the_syntax_names_of_chrome() {
+    let (_, engine) = css_page(
+        "<html><head><style>@property --place{syntax:'<place>';inherits:false;initial-value:center}\
+         @property --len{syntax:'<length>+';inherits:false;initial-value:1px 2px}</style></head><body><p id=p></p></body></html>",
+    );
+    engine.eval(r#"
+        const reg = (syntax, initialValue) => { try { CSS.registerProperty({ name: '--r' + Math.random().toString(36).slice(2), syntax, inherits: false, initialValue }); return 'ok'; } catch (e) { return e.name; } };
+        for (const [syntax, value] of [['<place>', 'center'], ['<size>', 'max-content'], ['<non-negative-length>', '1px'], ['<easing-function>', 'ease'], ['[a|b]', 'a'], ['<length>{1,2}', '1px'],
+          ['<transform-list>+', 'scale(2)'], ['<length> +', '1px'], ['inherit', 'inherit'], ['default', 'default'], ['<length>|*', '1px'], ['foo bar', 'foo bar'], ['1a', '1a']])
+          if (reg(syntax, value) !== 'SyntaxError') throw Error('took ' + syntax);
+        for (const [syntax, value] of [['<length>', '1px'], ['<string>', '"x"'], ['foo | bar', 'bar'], ['<length>#', '1px'], ['<color> | <length>+', 'red'], ['<transform-list>', 'scale(2)'], ['*', undefined]])
+          if (reg(syntax, value) !== 'ok') throw Error('dropped ' + syntax);
+        const style = getComputedStyle(document.getElementById('p'));
+        if (style.getPropertyValue('--place') !== '' || style.getPropertyValue('--len') !== '1px 2px') throw Error('@property ' + style.getPropertyValue('--place'));
+    "#, "test").unwrap();
+}
+
+#[test]
 fn computed_styles_resolve_lengths_colors_initial_values_and_pseudo_elements() {
     let (host, engine) = css_page(
         "<html><head><style>:root{font-size:16px} #a{padding:calc(0.25rem * 2) 1em;margin:5%;color:#ff000080;border:2px solid;animation:fade 2s ease-in 1s infinite;line-height:1.5;opacity:50%;box-sizing:border-box;width:100px;height:40px} #a::before{content:'x';font-weight:700} #h{display:none}</style></head><body><div id=a>a</div><span id=s>s</span><div id=h></div></body></html>",
