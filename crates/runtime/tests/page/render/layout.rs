@@ -2085,3 +2085,38 @@ fn zoom_scales_layout_and_reads_like_chrome() {
         assert!(text.contains(&format!("ZOOM {line}\n")), "{line}: {text}");
     }
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn animations_follow_first_frames_seeks_shorthands_and_shadow_trees() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const transition = await run(`[Math.round(document.getElementById('t').getBoundingClientRect().width), document.getElementById('t').getAnimations().length].join()`);
+        if (transition !== '70,1') fail('a change in the first animation frame starts a transition: ' + transition);
+        const seek = await run(`(() => { const a = document.getElementById('a'), animation = a.getAnimations()[0], width = () => a.getBoundingClientRect().width;
+          animation.pause(); animation.currentTime = 5000; const half = width(); animation.currentTime = 2000;
+          return [half, width(), getComputedStyle(a).width].join(); })()`);
+        if (seek !== '60,30,30px') fail('a seek lays out at the next read: ' + seek);
+        const lists = await run(`(() => { const root = document.getElementById('h').shadowRoot;
+          return [document.getAnimations().length, root.getAnimations().length, document.getElementById('h').getAnimations({ subtree: true }).length].join(); })()`);
+        if (lists !== '2,1,0') fail('each tree lists its own animations: ' + lists);
+        const longhands = await run(`(() => { const s = document.createElement('div').style; s.animation = 'k 2s ease-in 1s 3 alternate both paused';
+          const one = [s.animationName, s.animationDuration, s.animationDelay, s.animationIterationCount, s.animationTimeline];
+          s.animationDuration = '5s'; s.animation = 'z 7s'; s.transition = 'width 3s linear';
+          return [...one, s.animationDuration, s.animationName, s.transitionProperty, s.transitionDuration, s.transitionDelay].join(); })()`);
+        if (longhands !== 'k,2s,1s,3,auto,7s,z,width,3s,0s') fail('shorthands give their longhands: ' + longhands);
+        for (const top of [40, 80, 20, 0]) { await run(`document.getElementById('s').scrollTop = ${top}`); await win.webContents.capturePage(); }
+        "#,
+        &[(
+            "page.html",
+            "<head><style>body{margin:0} #t{width:20px;height:10px;transition:width 100s linear -50s}\
+             #a{height:10px;animation:k 10s linear} @keyframes k{from{width:10px}to{width:110px}}\
+             #s{width:100px;height:60px;overflow:auto}</style></head><body><div id=t></div><div id=a></div>\
+             <div id=s><div style='height:40px'></div><div id=h></div><div style='height:200px'></div></div>\
+             <script>const t = document.getElementById('t'); requestAnimationFrame(() => { t.style.width = '120px'; });\
+             document.getElementById('h').attachShadow({ mode: 'open' }).innerHTML = '<style>@keyframes k{from{opacity:.2}to{opacity:1}}\
+             i{display:block;height:20px;background:blue;animation:k 1s linear infinite}</style><i></i>';</script></body>",
+        )],
+    );
+}

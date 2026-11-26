@@ -320,6 +320,20 @@ impl Motion {
         }
     }
 
+    // As in Chrome, the page has styles before its first frame, so a change in the first animation frame
+    // callbacks starts transitions.
+    pub fn seed(&mut self, styles: &ComputedStyles) {
+        if self.seen.len() != 0 {
+            return;
+        }
+        for id in 0..styles.values.len() {
+            let style = styles.unanchored(id);
+            if TRANSITIONS.iter().any(|&prop| style.contains(prop)) {
+                self.read(id, style);
+            }
+        }
+    }
+
     pub fn forget(&mut self, id: usize) {
         if let Some(previous) = self.previous.get_mut(id) {
             *previous = super::empty().0;

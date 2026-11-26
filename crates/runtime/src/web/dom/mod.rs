@@ -63,9 +63,11 @@ pub fn call(
             Ok(Value::Null)
         }
         "dom.declare" => css::declare(args),
+        "dom.longhand" => css::longhand(args),
         "dom.constructed" | "dom.adopt" | "dom.supports" | "dom.registerProperty" => {
             css::constructed(op, args, state)
         }
+        "dom.beforeFrame" => css::before_frame(doc, state, viewport),
         "dom.cssAnimations" => css::css_animations(id()?, args, doc, state, viewport),
         "dom.animated" => css::animated(id()?, args, doc, state, viewport),
         "dom.computed" => css::computed(id()?, args, doc, state, viewport),

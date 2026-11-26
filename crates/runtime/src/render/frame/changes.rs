@@ -419,6 +419,8 @@ pub(super) fn animate(
         info[id].flags |= cull::COMPOSITED_PSEUDO;
         fresh.iter_mut().for_each(|fresh| fresh.push(id));
     }
+    // Walk parents go from a shadow tree to its host, and from a slotted node to its slot.
+    let parents = &dom.layout.cull.parents;
     let mut animate = |info: &mut [cull::Info], id: usize| {
         let mut node = Some(id);
         while let Some(id) = node.filter(|&id| id < info.len()) {
@@ -427,7 +429,10 @@ pub(super) fn animate(
             }
             info[id].flags |= cull::ANIMATED;
             fresh.iter_mut().for_each(|fresh| fresh.push(id));
-            node = cx.doc.nodes[id].parent;
+            node = match parents.get(id) {
+                Some(&parent) if parent != u32::MAX => Some(parent as usize),
+                _ => cx.doc.nodes[id].parent,
+            };
         }
     };
     for &(id, _) in cx.composited {

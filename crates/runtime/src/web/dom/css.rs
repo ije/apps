@@ -47,12 +47,17 @@ pub(super) fn css_control(
     }
     let styles = state.restyle(doc, viewport);
     state.dirty = true;
-    Ok(json!(state.styles.motion.css_control(
+    let done = state.styles.motion.css_control(
         args[0].as_u64().unwrap_or(0) as u32,
         args[1].as_str().unwrap_or_default(),
         time,
         &styles,
-    )))
+    );
+    // As in Chrome, the next geometry read lays out the page with the new animated values.
+    if done {
+        state.geometry.mirror.set_moved();
+    }
+    Ok(json!(done))
 }
 
 pub(super) fn easing(args: &Value) -> Result<Value> {
@@ -202,6 +207,32 @@ pub(super) fn specified(args: &Value) -> Result<Value> {
     )))
 }
 
+// A longhand of an inline `animation` or `transition` declaration, as Chrome gives it.
+pub(super) fn longhand(args: &Value) -> Result<Value> {
+    let (value, name) = (
+        args[0].as_str().unwrap_or_default(),
+        args[1].as_str().unwrap_or_default(),
+    );
+    let initial = css::value::grammar::initial(name);
+    let Some((_, key)) = name.split_once('-') else {
+        return Ok(json!(""));
+    };
+    Ok(json!(match value {
+        _ if value.contains("var(") => String::new(),
+        "inherit" | "initial" | "unset" | "revert" | "revert-layer" => value.to_owned(),
+        "none" if name == "transition-property" => value.to_owned(),
+        _ if key.contains("timeline") || key.starts_with("range") => {
+            initial.unwrap_or_default().to_owned()
+        }
+        _ => css::value::resolved::longhand(
+            value,
+            key,
+            &css::value::units::Lengths::new(16., 0., 0.),
+            initial
+        ),
+    }))
+}
+
 pub(super) fn declare(args: &Value) -> Result<Value> {
     Ok(json!(
         css::sheet::declare(args[0].as_str().unwrap_or_default()).concat()
@@ -323,6 +354,16 @@ pub(super) fn css_animations(
         args[2].as_bool() == Some(true),
         &styles
     )))
+}
+
+pub(super) fn before_frame(
+    doc: &mut Document,
+    state: &mut PageState,
+    viewport: [f32; 2],
+) -> Result<Value> {
+    let styles = state.restyle(doc, viewport);
+    state.styles.motion.seed(&styles);
+    Ok(Value::Null)
 }
 
 pub(super) fn animated(

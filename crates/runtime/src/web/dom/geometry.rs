@@ -112,7 +112,17 @@ pub(super) fn scroll(
         {
             return Ok(json!([0., 0.]));
         }
+        if crate::render::layout::size::turned(doc, &computed, id).is_some() {
+            state.geometry.turned.insert(id);
+        }
     }
+    // A box that lays out turned clockwise scrolls left on the axis of its top.
+    let turned = !page && state.geometry.turned.contains(&id);
+    let [left, top] = [1, 2].map(|axis| args[axis].as_f64());
+    let [left, top] = match turned {
+        true => [top, left.map(|left| -left)],
+        false => [left, top],
+    };
     let handle = state
         .geometry
         .scroll
@@ -121,18 +131,14 @@ pub(super) fn scroll(
         .clone();
     let previous = handle.offset();
     let ratio = state.pixel_ratio.max(1.);
-    let axis = |value: &Value, current: renderer::Pixels| {
-        renderer::px(
-            value
-                .as_f64()
-                .map_or(f32::from(current), |v| -(v as f32 * ratio).round() / ratio),
-        )
+    let axis = |value: Option<f64>, current: renderer::Pixels| {
+        renderer::px(value.map_or(f32::from(current), |v| -(v as f32 * ratio).round() / ratio))
     };
-    let target = renderer::point(axis(&args[1], previous.x), axis(&args[2], previous.y));
+    let target = renderer::point(axis(left, previous.x), axis(top, previous.y));
     let snap = match args[4].as_str() {
         Some("by") => renderer::Snap::From(previous),
         Some(_) => renderer::Snap::To([true; 2]),
-        None => renderer::Snap::To([1, 2].map(|axis| !args[axis].is_null())),
+        None => renderer::Snap::To([left.is_some(), top.is_some()]),
     };
     // A script can turn snapping off and scroll before the next layout.
     let snaps = handle.snaps()
@@ -161,7 +167,8 @@ pub(super) fn scroll(
     }
     state.dirty |= target != previous;
     state.geometry.sync_scroll();
-    Ok(json!([-f32::from(target.x), -f32::from(target.y)]))
+    let [left, top] = [-target.x, -target.y].map(f32::from);
+    Ok(json!(if turned { [-top, left] } else { [left, top] }))
 }
 
 pub(super) fn fragments(id: usize, state: &mut PageState) -> Result<Value> {

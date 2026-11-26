@@ -819,3 +819,28 @@ fn scroll_timelines_follow_the_offset_in_the_same_frame() {
         )],
     );
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn vertical_scroll_boxes_scroll_on_their_block_axis_like_chrome() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const read = id => run(`(e => { const out = [e.scrollWidth, e.scrollHeight]; for (const left of [-30, 30, -1000, 1000]) { e.scrollLeft = left; out.push(e.scrollLeft); } return out.join(); })(document.getElementById('${id}'))`);
+        const rl = await read('rl'), lr = await read('lr');
+        if (rl !== '160,100,-30,0,-60,0') fail('vertical-rl scrolls to its left with negative offsets: ' + rl);
+        if (lr !== '160,100,0,30,0,60') fail('vertical-lr scrolls to its right: ' + lr);
+        await run(`document.getElementById('rl').scrollLeft = -40`);
+        await win.webContents.capturePage();
+        const last = await run(`Math.round(document.getElementById('end').getBoundingClientRect().left)`);
+        if (last !== -20) fail('the last line moves with the offset: ' + last);
+        "#,
+        &[(
+            "page.html",
+            "<head><style>body{margin:0;font:16px/20px Helvetica} p{margin:0}\
+             div{width:100px;height:100px;overflow:auto;scrollbar-width:none}</style></head><body>\
+             <div id=rl style='writing-mode:vertical-rl'><p>1</p><p>2</p><p>3</p><p>4</p><p>5</p><p>6</p><p>7</p><p id=end>8</p></div>\
+             <div id=lr style='writing-mode:vertical-lr'><p>1</p><p>2</p><p>3</p><p>4</p><p>5</p><p>6</p><p>7</p><p>8</p></div></body>",
+        )],
+    );
+}

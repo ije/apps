@@ -177,8 +177,12 @@ impl<'a> Timelines<'a> {
             3 => false,
             axis => (axis == 1) != vertical.is_some_and(|mode| !mode.starts_with("horizontal")),
         };
-        let pick =
-            |point: renderer::Point<renderer::Pixels>| f64::from(if x { point.x } else { point.y });
+        // The handle of a box that lays out turned has the axes of its turned frame.
+        let turned = geometry.turned.contains(&scroller);
+        let inner = x != turned;
+        let pick = |point: renderer::Point<renderer::Pixels>| {
+            f64::from(if inner { point.x } else { point.y })
+        };
         let [low, high] = handle.range().map(pick);
         let max = high - low;
         // Offsets count from 0 at the start of the scroll, down for boxes that scroll from their start.
@@ -192,16 +196,22 @@ impl<'a> Timelines<'a> {
             None => [[0., max]; 3],
             Some((subject, inset)) => {
                 let bounds = handle.bounds();
-                let port = [
-                    bounds.origin.x,
-                    bounds.origin.y,
-                    bounds.size.width,
-                    bounds.size.height,
-                ]
-                .map(f32::from);
+                let port = match turned {
+                    true => *geometry.mirror.get(&scroller)?,
+                    false => [
+                        bounds.origin.x,
+                        bounds.origin.y,
+                        bounds.size.width,
+                        bounds.size.height,
+                    ]
+                    .map(f32::from),
+                };
                 let rect = *geometry.mirror.get(&subject)?;
                 let start = |rect: [f32; 4]| f64::from(rect[usize::from(!x)]);
-                let reverse = high > 0.;
+                let reverse = match turned {
+                    true => x && vertical == Some("vertical-rl"),
+                    false => high > 0.,
+                };
                 let room = size(port);
                 // Where the subject starts in the scrolled content.
                 let from = match reverse {

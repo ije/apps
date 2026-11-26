@@ -28,6 +28,8 @@ pub struct Geometry {
     pub(crate) scroll_offsets: rustc_hash::FxHashMap<usize, renderer::Point<renderer::Pixels>>,
     // The zoom of each scroll box as of the last style pass.
     pub(crate) scroll_zooms: rustc_hash::FxHashMap<usize, f32>,
+    // Scroll boxes that lay out turned clockwise, so their offsets go to pages on the other axes.
+    pub(crate) turned: rustc_hash::FxHashSet<usize>,
     // The scroll offsets that the mirror shows, as of the last prepaint, the moves of the mirror for user scrolls
     // since then, and whether the boxes in each scroll move as a whole, by style epoch and walk.
     pub(crate) mirror_offsets: rustc_hash::FxHashMap<usize, renderer::Point<renderer::Pixels>>,
@@ -223,14 +225,13 @@ impl Geometry {
     pub(crate) fn sync_scroll(&mut self) {
         for (&id, handle) in &self.scroll {
             let (offset, max) = (scroll_offset(handle, handle.offset()), handle.overflow());
+            let [left, top, x, y] = [-offset.x, -offset.y, max.x, max.y].map(f32::from);
             self.mirror.scroll(
                 id,
-                [
-                    -f32::from(offset.x),
-                    -f32::from(offset.y),
-                    f32::from(max.x),
-                    f32::from(max.y),
-                ],
+                match self.turned.contains(&id) {
+                    true => [-top, left, y, x],
+                    false => [left, top, x, y],
+                },
             );
         }
     }

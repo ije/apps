@@ -468,84 +468,8 @@ pub(crate) fn resolved(
             .and_then(|value| super::timeline::specified(name, value))
             .unwrap_or_else(|| initial.unwrap_or_default().into());
     }
-    let shorthand = |shorthand: Prop, key: &str| {
-        let list = components(style.get(shorthand)?, ',');
-        let parts: Vec<_> = list
-            .iter()
-            .map(|item| {
-                let mut times = 0;
-                let parts = components(item, ' ');
-                let found = parts.into_iter().find(|part| {
-                    let time = part.ends_with('s')
-                        && part.trim_end_matches(['m', 's']).parse::<f32>().is_ok()
-                        || part.ends_with(')')
-                            && units
-                                .math(part, f32::NAN, &[])
-                                .is_some_and(|(_, kind)| kind == Kind::Time);
-                    let time = time || *part == "auto" && times == 0;
-                    times += usize::from(time);
-                    match key {
-                        "duration" => time && times == 1,
-                        "delay" => time && times == 2,
-                        "iteration-count" => *part == "infinite" || part.parse::<f32>().is_ok(),
-                        "direction" => matches!(
-                            *part,
-                            "normal" | "reverse" | "alternate" | "alternate-reverse"
-                        ),
-                        "fill-mode" => matches!(*part, "forwards" | "backwards" | "both"),
-                        "play-state" => matches!(*part, "paused" | "running"),
-                        "behavior" => matches!(*part, "allow-discrete"),
-                        "timing-function" => {
-                            matches!(
-                                *part,
-                                "linear"
-                                    | "ease"
-                                    | "ease-in"
-                                    | "ease-out"
-                                    | "ease-in-out"
-                                    | "step-start"
-                                    | "step-end"
-                            ) || part.starts_with("cubic-bezier(")
-                                || part.starts_with("steps(")
-                                || part.starts_with("linear(")
-                        }
-                        _ => {
-                            !time
-                                && part.parse::<f32>().is_err()
-                                && !matches!(
-                                    *part,
-                                    "infinite"
-                                        | "normal"
-                                        | "reverse"
-                                        | "alternate"
-                                        | "alternate-reverse"
-                                        | "forwards"
-                                        | "backwards"
-                                        | "both"
-                                        | "none"
-                                        | "paused"
-                                        | "running"
-                                        | "linear"
-                                        | "ease"
-                                        | "ease-in"
-                                        | "ease-out"
-                                        | "ease-in-out"
-                                        | "step-start"
-                                        | "step-end"
-                                        | "allow-discrete"
-                                )
-                                && !part.contains('(')
-                        }
-                    }
-                });
-                found.map_or_else(
-                    || initial.unwrap_or_default().to_owned(),
-                    |part| part.to_owned(),
-                )
-            })
-            .collect();
-        Some(parts.join(", "))
-    };
+    let shorthand =
+        |shorthand: Prop, key: &str| Some(longhand(style.get(shorthand)?, key, units, initial));
     let value = match style.get(prop) {
         Some(value) => value.to_owned(),
         None => match name.split_once('-') {
@@ -1291,6 +1215,86 @@ pub(crate) fn resolved(
 }
 
 // A sum of percentages and lengths, like `calc(10% + 1em)`, as its percentage and its pixels.
+// One longhand of an `animation` or `transition` value, like `duration`.
+pub(crate) fn longhand(value: &str, key: &str, units: &Lengths, initial: Option<&str>) -> String {
+    let list = components(value, ',');
+    let parts: Vec<_> = list
+        .iter()
+        .map(|item| {
+            let mut times = 0;
+            let parts = components(item, ' ');
+            let found = parts.into_iter().find(|part| {
+                let time = part.ends_with('s')
+                    && part.trim_end_matches(['m', 's']).parse::<f32>().is_ok()
+                    || part.ends_with(')')
+                        && units
+                            .math(part, f32::NAN, &[])
+                            .is_some_and(|(_, kind)| kind == Kind::Time);
+                let time = time || *part == "auto" && times == 0;
+                times += usize::from(time);
+                match key {
+                    "duration" => time && times == 1,
+                    "delay" => time && times == 2,
+                    "iteration-count" => *part == "infinite" || part.parse::<f32>().is_ok(),
+                    "direction" => matches!(
+                        *part,
+                        "normal" | "reverse" | "alternate" | "alternate-reverse"
+                    ),
+                    "fill-mode" => matches!(*part, "forwards" | "backwards" | "both"),
+                    "play-state" => matches!(*part, "paused" | "running"),
+                    "behavior" => matches!(*part, "allow-discrete"),
+                    "timing-function" => {
+                        matches!(
+                            *part,
+                            "linear"
+                                | "ease"
+                                | "ease-in"
+                                | "ease-out"
+                                | "ease-in-out"
+                                | "step-start"
+                                | "step-end"
+                        ) || part.starts_with("cubic-bezier(")
+                            || part.starts_with("steps(")
+                            || part.starts_with("linear(")
+                    }
+                    _ => {
+                        !time
+                            && part.parse::<f32>().is_err()
+                            && !matches!(
+                                *part,
+                                "infinite"
+                                    | "normal"
+                                    | "reverse"
+                                    | "alternate"
+                                    | "alternate-reverse"
+                                    | "forwards"
+                                    | "backwards"
+                                    | "both"
+                                    | "none"
+                                    | "paused"
+                                    | "running"
+                                    | "linear"
+                                    | "ease"
+                                    | "ease-in"
+                                    | "ease-out"
+                                    | "ease-in-out"
+                                    | "step-start"
+                                    | "step-end"
+                                    | "allow-discrete"
+                            )
+                            && !part.contains('(')
+                    }
+                }
+            });
+            found.map_or_else(
+                || initial.unwrap_or_default().to_owned(),
+                |part| part.to_owned(),
+            )
+        })
+        .collect();
+    parts.join(", ")
+}
+
 pub(crate) fn percent_sum(value: &str, units: &Lengths) -> Option<(f32, f32)> {
     // Such a sum is linear in its base, so it is its value at base 0 and the change of one base of 100.
     // Like Chrome, other functions with percentages in it, like `min(10%, 5px)`, keep their text.

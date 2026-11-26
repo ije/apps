@@ -1065,6 +1065,7 @@
   const specified = (name, value) => { if (name.startsWith('--') || /^[a-z-]*$/.test(value) && !/position|origin|family|counter|offset|overflow-clip/.test(name)) return value; const key = name + ':' + value; let text = specifiedText.get(key); if (text === undefined) { if (specifiedText.size > 1023) specifiedText.clear(); specifiedText.set(key, text = host('dom.specified', name, value)); } return text; };
   const specifiedList = list => list.map(([name, value, priority]) => [name, specified(name, value), priority]);
   let shorthands = null, shorthandsOf = null;
+  const resetLonghand = /^(animation)-(?:duration|timing-function|delay|iteration-count|direction|fill-mode|play-state|name|timeline|range-start|range-end)$|^(transition)-(?:property|duration|timing-function|delay|behavior)$/;
   const timelineShorthand = /^(animation-range|scroll-timeline|view-timeline)$/;
   // Like Chrome, `animation` writes its longhands when a timeline or range longhand comes after it.
   const animationLonghands = list => {
@@ -1170,6 +1171,9 @@
       const list = this._list, found = list.findLast(entry => entry[0] === name);
       // Like Chrome, `animation` has no value when a timeline or range longhand follows it.
       if (found && name === 'animation' && animationLonghands(list) !== list) return '';
+      // `animation` and `transition` stay whole in the list, so their longhands come from the later declaration.
+      const match = resetLonghand.exec(name), reset = match && (match[1] ?? match[2]), whole = reset && list.findLastIndex(entry => entry[0] === reset);
+      if (reset && whole >= 0 && whole > list.lastIndexOf(found)) return specified(name, host('dom.longhand', list[whole][1], name));
       if (found) return specified(name, found[1]);
       const parts = (shorthands ?? loadShorthands()).get(name), entries = parts?.map(part => list.findLast(entry => entry[0] === part));
       return entries && entries.every(entry => entry && entry[2] === entries[0][2]) ? shorthandValue(name, entries.map(entry => specified(entry[0], entry[1])), parts) : '';
@@ -1191,7 +1195,8 @@
       if (!added.length) return;
       // As in Chrome, a set name keeps its place, unless a later name of its logical group maps the other way.
       const whole = added.find(entry => entry[0] === 'mask' || entry[0] === 'offset')?.[0];
-      const next = owner.read().filter(entry => !whole || !entry[0].startsWith(whole + '-') || entry[0] === 'mask-type'), end = [];
+      const resets = added.find(entry => entry[0] === 'animation' || entry[0] === 'transition');
+      const next = owner.read().filter(entry => (!whole || !entry[0].startsWith(whole + '-') || entry[0] === 'mask-type') && !(resets && resetLonghand.exec(entry[0])?.slice(1).includes(resets[0]) && (resets[2] || !entry[2]))), end = [];
       for (const entry of added) {
         const i = next.findLastIndex(old => old[0] === entry[0]), group = i < 0 || entry[0].startsWith('--') ? null : logicalGroup(entry[0]);
         let moved = false;
@@ -4002,10 +4007,11 @@
   Object.defineProperty(Element.prototype, 'attributeStyleMap', { get() { return cached(styleMaps, this, () => typed().map(this)); }, enumerable: true, configurable: true });
   Object.defineProperty(CSSStyleRule.prototype, 'styleMap', { get() { return cached(styleMaps, this, () => typed().map(this)); }, enumerable: true, configurable: true });
   Element.prototype.computedStyleMap = function computedStyleMap() { return cached(computedMaps, this, () => typed().computed(this)); };
-  const animationFrames = new Map(); let animationFrameId = 0, animationTimer, frameRequested = false;
+  const animationFrames = new Map(); let animationFrameId = 0, animationTimer, frameRequested = false, framed = false;
   globalThis.__appsAnimationFrame = () => {
     animationTimer = undefined; frameRequested = false;
     const now = performance.now(), callbacks = [...animationFrames];
+    if (!framed) { framed = true; if (callbacks.length) host('dom.beforeFrame'); }
     timelineTime = now;
     if (pendingAnimations.size) { const ready = [...pendingAnimations]; pendingAnimations.clear(); for (const animation of ready) readyAnimation(animation); }
     for (const [id, callback] of callbacks) {
@@ -4544,11 +4550,15 @@
   const animationsOf = test => [...liveAnimations].filter(animation => (animation.playState !== 'finished' || filling(animation)) && animation.effect && test(effects.get(animation.effect))).sort((a, b) => animationOrder(a) - animationOrder(b));
   Object.defineProperties(Element.prototype, {
     animate: { value(keyframes, options) { const animation = new Animation(new KeyframeEffect(this, keyframes, options), options?.timeline === undefined ? documentTimeline : options.timeline); if (options?.id !== undefined) animation.id = String(options.id); if (options?.rangeStart !== undefined) animation.rangeStart = options.rangeStart; if (options?.rangeEnd !== undefined) animation.rangeEnd = options.rangeEnd; animation.play(); return animation; }, writable: true, configurable: true },
-    getAnimations: { value(options) { const subtree = !!options?.subtree; return [...cssOf(this, subtree), ...animationsOf(({ target, pseudo }) => target === this && (!pseudo || subtree) || subtree && !!target && this.contains(target))]; }, writable: true, configurable: true },
+    getAnimations: { value(options) { const subtree = !!options?.subtree; const css = cssOf(this, subtree); return [...subtree ? cssIn(css, this.getRootNode()) : css, ...animationsOf(({ target, pseudo }) => target === this && (!pseudo || subtree) || subtree && !!target && this.contains(target))]; }, writable: true, configurable: true },
   });
+  // The native walk goes into shadow trees, so the cache keeps their animations. getAnimations() lists one tree only.
+  const cssIn = (list, root) => list.filter(animation => { const { node } = cssData.get(animation); return (transitionNodes.has(node) ? document : wrap(node).getRootNode()) === root; });
+  const treeAnimations = root => [...cssIn(cssOf(root, true), root), ...animationsOf(({ target }) => !!target?.isConnected && target.getRootNode() === root)];
+  Object.defineProperty(ShadowRoot.prototype, 'getAnimations', { value() { return treeAnimations(this); }, writable: true, configurable: true });
   Object.defineProperties(Document.prototype, {
     timeline: { get() { return documentTimeline; }, configurable: true },
-    getAnimations: { value() { return [...cssOf(this, true), ...animationsOf(({ target }) => !!target?.isConnected)]; }, writable: true, configurable: true },
+    getAnimations: { value() { return treeAnimations(this); }, writable: true, configurable: true },
   });
   Object.assign(globalThis, { Animation, AnimationEffect, KeyframeEffect, AnimationTimeline, DocumentTimeline, ScrollTimeline, ViewTimeline, AnimationPlaybackEvent, CSSAnimation, CSSTransition });
   // View transitions. The pseudo-elements are nodes under the root that dom.js doesn't link, so only styles, frames

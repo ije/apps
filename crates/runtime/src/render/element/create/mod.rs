@@ -888,6 +888,18 @@ pub(super) fn create(
         }
     }
     let scrolls = overflow.map(|axis| axis == renderer::Overflow::Scroll);
+    if overflow
+        .iter()
+        .any(|&axis| axis != renderer::Overflow::Visible)
+    {
+        let mut store = view.store.borrow_mut();
+        let turned = &mut store.state(view.id).geometry.turned;
+        if id != 0 && crate::render::layout::size::turned(doc, styles, id).is_some() {
+            turned.insert(id);
+        } else {
+            turned.remove(&id);
+        }
+    }
     let gutter = overflow[1] == renderer::Overflow::Hidden
         && (style.get(Prop::SCROLLBAR_GUTTER)).is_some_and(|value| value.starts_with("stable"));
     let look = if scrolls.contains(&true) || gutter {

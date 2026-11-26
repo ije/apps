@@ -519,6 +519,7 @@ pub(super) fn forget(
         // Pages read offsets from the layout mirror, which only handles write.
         for id in unscrolled {
             dom.geometry.scroll.remove(&id);
+            dom.geometry.turned.remove(&id);
             dom.geometry.mirror.unscroll(id);
         }
     }
