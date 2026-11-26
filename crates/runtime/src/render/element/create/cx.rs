@@ -47,6 +47,7 @@ pub(super) struct Cx<'a> {
     pub(super) mark: usize,
     pub(super) order: Option<i32>,
     pub(super) positioned: bool,
+    pub(super) joins: bool,
     pub(super) parent_box: Option<usize>,
     pub(super) positioner: Option<usize>,
     /// The key of the boxes that can share the style of this one.
@@ -97,6 +98,13 @@ pub(super) fn percentage(value: &str) -> Option<f32> {
         .filter(|v| v.is_finite())
 }
 
+/// A box that lays out in a frame turned by 90 degrees: the size of the frame along and across its lines.
+pub(super) struct Turn {
+    pub(super) clockwise: bool,
+    pub(super) inline: f32,
+    pub(super) block: f32,
+}
+
 /// The edges and sizes of the box, for the stages after its padding, borders and margins are known.
 pub(super) struct Frame {
     pub(super) padding: [f32; 4],
@@ -104,6 +112,7 @@ pub(super) struct Frame {
     pub(super) margin: [f32; 4],
     pub(super) extra: [f32; 2],
     pub(super) intrinsic_width: Option<f32>,
+    pub(super) turn: Option<Turn>,
     pub(super) inset_x: [Option<f32>; 2],
     pub(super) natural_ratio: Option<f32>,
 }
@@ -162,6 +171,12 @@ impl Frame {
             depth,
             ..
         } = *cx;
+        if let Some(turn) = &self.turn {
+            return [
+                turn.inline - padding[1] - padding[3] - borders[1] - borders[3],
+                turn.block - padding[0] - padding[2] - borders[0] - borders[2],
+            ];
+        }
         let mut content = containing;
         for (axis, (prop, min, max)) in [
             (Prop::WIDTH, Prop::MIN_WIDTH, Prop::MAX_WIDTH),
@@ -684,7 +699,23 @@ impl Cx<'_> {
         wrapper
     }
 
+    /// Whether an `auto` width fills the containing block.
+    pub(super) fn fills(&self) -> bool {
+        !self.reader.flex_parent
+            && !matches!(self.position, "absolute" | "fixed")
+            && !self.display.starts_with("inline")
+            && (self.style.get(Prop::FLOAT)).is_none_or(|value| value == "none")
+    }
+
     pub(super) fn stretched(&self, axis: usize) -> bool {
+        (self.style)
+            .get([Prop::WIDTH, Prop::HEIGHT][axis])
+            .is_none_or(|value| value == "auto")
+            && self.stretches(axis)
+    }
+
+    /// Whether the container stretches this flex item when its size in the axis is `auto`.
+    pub(super) fn stretches(&self, axis: usize) -> bool {
         let Self {
             reader,
             id,
@@ -693,9 +724,9 @@ impl Cx<'_> {
             ..
         } = *self;
         let flex_parent = reader.flex_parent;
-        let [size, start, end] = [
-            [Prop::WIDTH, Prop::MARGIN_LEFT, Prop::MARGIN_RIGHT],
-            [Prop::HEIGHT, Prop::MARGIN_TOP, Prop::MARGIN_BOTTOM],
+        let [start, end] = [
+            [Prop::MARGIN_LEFT, Prop::MARGIN_RIGHT],
+            [Prop::MARGIN_TOP, Prop::MARGIN_BOTTOM],
         ][axis];
         flex_parent
             && reader
@@ -703,7 +734,6 @@ impl Cx<'_> {
                 .is_some_and(|value| value.starts_with("column"))
                 == (axis == 0)
             && !matches!(position, "absolute" | "fixed")
-            && style.get(size).is_none_or(|value| value == "auto")
             && [start, end]
                 .iter()
                 .all(|&prop| style.get(prop) != Some("auto"))

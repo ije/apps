@@ -3,13 +3,14 @@ use super::super::kept::{Query, Read, Shared, hashed};
 use super::super::margin::{clear_bits, float_side};
 use super::super::query::{boxless, collapses, insets, padding_start, scroller};
 use super::cx::{Cx, Frame};
+use crate::css;
 use crate::css::properties::Prop;
 use crate::render::{
     layout::cull,
     paint::{DomBox, Turned, scrollbar},
 };
 use crate::style::{self};
-use renderer::px;
+use renderer::{px, size};
 use std::rc::Rc;
 
 /// Finishes the box: window drags, the anchor and sticky offsets of positioned boxes, its hooks and the stacking
@@ -46,6 +47,7 @@ pub(super) fn finish(
         stacking,
         effect_layer,
         composited,
+        joins,
         drawable,
         layered,
         mark,
@@ -62,7 +64,6 @@ pub(super) fn finish(
         text,
         pixel_ratio,
         view,
-        measured,
         ids,
         info,
         reads,
@@ -76,7 +77,6 @@ pub(super) fn finish(
         padding,
         borders,
         margin,
-        extra,
         ..
     } = *fr;
     let made = parsed.made;
@@ -266,6 +266,18 @@ pub(super) fn finish(
                 }
                 _ => None,
             };
+            // A content height doesn't stretch.
+            let start = match start {
+                None | Some(renderer::AlignItems::Stretch)
+                    if !inline
+                        && style
+                            .get(Prop::HEIGHT)
+                            .is_some_and(css::value::content_size) =>
+                {
+                    Some(renderer::AlignItems::FlexStart)
+                }
+                start => start,
+            };
             if inline {
                 el.style().justify_self = start;
             } else {
@@ -273,53 +285,46 @@ pub(super) fn finish(
             }
         }
     }
-    let vertical = style
-        .get(Prop::WRITING_MODE)
-        .filter(|mode| mode.starts_with("vertical") || mode.starts_with("sideways"))
-        .filter(|_| id != 0 && !node.tag.starts_with('#') && slot.is_none());
-    let mut el = match vertical {
-        Some(mode) => {
-            let [_, widest, ..] = crate::render::layout::grid::intrinsic::intrinsic(
-                doc,
-                id,
-                styles,
-                None,
-                None,
-                text,
-                &mut measured.borrow_mut(),
-            );
-            let inline = style
-                .get(Prop::HEIGHT)
-                .and_then(|value| units.resolve(value, containing[1]))
-                .map(|height| height + extra[1])
-                .unwrap_or_else(|| widest.min(units.viewport[1]))
-                .max(1.);
-            let block = crate::render::layout::grid::intrinsic::intrinsic(
-                doc,
-                id,
-                styles,
-                Some(inline),
-                None,
-                text,
-                &mut measured.borrow_mut(),
-            )[3];
-            renderer::node()
+    let mut el = match &fr.turn {
+        Some(turn) => {
+            let mut outer = renderer::node()
                 .id(("vertical", id))
                 .relative()
                 .flex_shrink_0()
-                .w(px(block))
-                .h(px(inline))
-                .child(Turned::node(
-                    el.absolute().top_0().left_0().w(px(inline)).into(),
-                    mode != "sideways-lr",
-                    block,
-                    inline,
-                ))
+                .w(px(turn.block))
+                .h(px(turn.inline));
+            let (own, inner) = (outer.style(), el.style());
+            own.position = inner.position;
+            own.inset = std::mem::replace(
+                &mut inner.inset,
+                renderer::Edges::all(renderer::Length::Auto),
+            );
+            own.margin = std::mem::replace(&mut inner.margin, renderer::Edges::all(px(0.).into()));
+            (own.align_self, own.justify_self) = (inner.align_self, inner.justify_self);
+            (own.escape, own.placed) = (inner.escape, inner.placed);
+            (inner.escape, inner.placed) = (0, 0);
+            own.flow = inner.flow
+                & (renderer::Flow::FLOAT
+                    | renderer::Flow::CLEAR_LEFT
+                    | renderer::Flow::CLEAR_RIGHT
+                    | renderer::Flow::RTL);
+            inner.flow = 0;
+            outer.child(Turned::node(
+                el.absolute().top_0().left_0().into(),
+                turn.clockwise,
+                turn.block,
+                turn.inline,
+            ))
         }
         None => el,
     };
     if follow.is_some() {
         el.style().follow = follow;
+    }
+    // A box with other places has another style too, so it builds again.
+    let anchored = styles.used(id).filter(|used| used.anchored);
+    if let Some(used) = anchored {
+        el.style().anchored = Some(Box::new(used.place));
     }
     let hooks = DomBox {
         text_clip,
@@ -331,6 +336,8 @@ pub(super) fn finish(
         local: Default::default(),
         offset: Default::default(),
         frame: node.tag == "iframe",
+        anchored: anchored.is_some_and(|used| used.scrolls),
+        hidden: Default::default(),
         unplaced,
         block: made.absolute.then_some(borders),
         container: positioner.filter(|&block| position == "fixed" || Some(block) != parent_box),
@@ -341,14 +348,29 @@ pub(super) fn finish(
         style: style.clone(),
         effects: effect_layer,
         composited,
+        space: renderer::Space {
+            joins,
+            preserves: made.preserves,
+            hidden: false,
+        },
         transformed: info[id].flags & cull::TRANSFORMED != 0,
-        perspective: parent_perspective.clone().zip(parent).map(Box::new),
+        perspective: (parent_perspective.clone().zip(parent)).map(|(perspective, parent)| {
+            let borders = styles.lengths[parent].borders(&styles.values[parent], 0.);
+            Box::new((perspective, parent, borders))
+        }),
         units,
         revision: info[id].revision,
-        sides: [
-            padding[1] + padding[3] + borders[1] + borders[3],
-            padding[0] + padding[2] + borders[0] + borders[2],
-        ],
+        sides: {
+            let mut sides = [
+                padding[1] + padding[3] + borders[1] + borders[3],
+                padding[0] + padding[2] + borders[0] + borders[2],
+            ];
+            // The page measures the box, not its turned frame.
+            if fr.turn.is_some() {
+                sides.reverse();
+            }
+            sides
+        },
         margin,
         cell: slot.as_ref().and(parent),
         grid: slot
@@ -477,6 +499,7 @@ pub(super) fn finish(
                 hooks.sides,
                 hooks.margin,
                 hooks.drawn,
+                hooks.space,
             ),
             (
                 hooks.cell,
@@ -508,6 +531,9 @@ pub(super) fn finish(
                 } else {
                     renderer::Flow::LEFT
                 };
+                if let Some(value) = style.get(Prop::SHAPE_OUTSIDE) {
+                    el.style().outside = shape_outside(cx, fr, value);
+                }
             }
             // A block that makes no formatting context of its own: floats around it reach into it.
             None if placed
@@ -643,4 +669,77 @@ pub(super) fn finish(
         _ => {}
     }
     element.into()
+}
+
+/// The shape that lines run around, instead of the margin box of the float.
+fn shape_outside(cx: &Cx<'_>, fr: &Frame, value: &str) -> Option<Rc<renderer::Outside>> {
+    let frame = css::value::shape_outside(value)?
+        .reference
+        .unwrap_or("margin-box");
+    let (style, units) = (cx.style, cx.units);
+    let margin = style
+        .get(Prop::SHAPE_MARGIN)
+        .and_then(|value| units.resolve(value, cx.containing[0]))
+        .unwrap_or(0.)
+        .max(0.);
+    let boxes = [fr.margin, fr.borders, fr.padding];
+    let depth = match frame {
+        "border-box" => 1,
+        "padding-box" => 2,
+        "content-box" => 3,
+        _ => 0,
+    };
+    // How far the reference box is inside the margin box, and its corners inside the border box.
+    let inset: [f32; 4] =
+        std::array::from_fn(|side| boxes[..depth].iter().map(|edges| edges[side]).sum());
+    let grow: [f32; 4] = std::array::from_fn(|side| inset[side] - fr.margin[side]);
+    let (value, margins) = (value.to_owned(), fr.margin);
+    let radii = crate::render::effects::clip::radii(style, &units, || cx.containing);
+    let key = hashed((
+        &value,
+        inset.map(f32::to_bits),
+        format!("{radii:?}"),
+        margin.to_bits(),
+        [units.font.em, units.viewport[0], units.viewport[1]].map(f32::to_bits),
+    ));
+    Some(Rc::new(renderer::Outside {
+        key,
+        rows: Default::default(),
+        points: Box::new(move |[width, height]| {
+            let inner = [
+                (width - inset[1] - inset[3]).max(0.),
+                (height - inset[0] - inset[2]).max(0.),
+            ];
+            let outer = size(
+                px(width - margins[1] - margins[3]),
+                px(height - margins[0] - margins[2]),
+            );
+            let radii = radii.resolve(outer);
+            let (rx, ry) = (radii.x.to_array(), radii.y.to_array());
+            let corners: [[f32; 2]; 4] = std::array::from_fn(|at| {
+                let side = if matches!(at, 0 | 3) {
+                    grow[3]
+                } else {
+                    grow[1]
+                };
+                let edge = if at < 2 { grow[0] } else { grow[2] };
+                let [rx, ry] = [f32::from(rx[at]), f32::from(ry[at])];
+                match rx > 0. && ry > 0. {
+                    true => [(rx - side).max(0.), (ry - edge).max(0.)],
+                    false => [0.; 2],
+                }
+            });
+            let shape = css::value::shape_outside(&value).and_then(|shaped| shaped.shape);
+            let ops = match shape {
+                Some(shape) => shape.outline(&units, inner, None).unwrap_or_default(),
+                None => css::value::shape::rounded([0., 0., inner[0], inner[1]], corners),
+            };
+            let mut points = css::value::shape::Track::new(&ops).points();
+            for [x, y] in &mut points {
+                (*x, *y) = (*x + inset[3], *y + inset[0]);
+            }
+            points
+        }),
+        margin,
+    }))
 }

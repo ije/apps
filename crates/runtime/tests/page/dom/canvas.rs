@@ -34,7 +34,7 @@ fn visibility_observers_option_lists_and_canvas_current_color_follow_chrome() {
         document.body.append(document.createElement('i'));
         check(first === s.options, true, 'same options');
         s.append(new Option('C'));
-        check([first === s.options, first.length, s.options.length, s.options === s.options], [false, 2, 3, true], 'options after a change');
+        check([first === s.options, first.length, first[2].text], [true, 3, 'C'], 'options after a change');
     "#, "test").unwrap();
 }
 

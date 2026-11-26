@@ -9,7 +9,7 @@ use crate::style::cascade::TreeWalk;
 use crate::style::cascade::container::{ContainerQuery, style_query};
 use crate::style::cascade::memo::{CachedNode, CachedStyle, Share};
 use crate::style::cascade::rank::{AGENT, AUTHOR, DELETED, Layer, UNLAYERED, USER};
-use crate::style::cascade::shadow::{PART, SLOTTED};
+use crate::style::cascade::shadow::{HIGHLIGHT, PART, SLOTTED};
 #[cfg(target_os = "macos")]
 use crate::style::ua::GLASS_SHEET;
 use crate::style::ua::{FULLSCREEN_SHEET, UA_SHEET};
@@ -38,7 +38,7 @@ pub(crate) struct StyleScope {
     pub(crate) medias: Vec<Option<MediaStack>>,
     pub(crate) keyframes: HashMap<String, Vec<(f32, Declarations)>>,
     pub(crate) properties: Registry,
-    pub(crate) states: u16,
+    pub(crate) states: u32,
     pub(crate) nodes: Vec<Option<MatchedRules>>,
     pub(crate) lists: RuleLists,
     pub(crate) keys: Vec<u128>,
@@ -99,6 +99,11 @@ impl StyleScope {
                             lists.push(compound.clone());
                             self.arguments
                                 .insert(self.pseudos.len(), (argument.into(), compound, target));
+                        }
+                        if kind == HIGHLIGHT {
+                            let name = selector.pseudo_argument().unwrap_or_default().into();
+                            self.arguments
+                                .insert(self.pseudos.len(), (name, Rc::default(), kind));
                         }
                         let key: Key = pseudo
                             .keys()
@@ -375,13 +380,17 @@ impl<'a> Collect<'a> {
                 }
             }
             Rule::Variant(..) | Rule::Utility(..) | Rule::FontFace(_) | Rule::Tailwind(_) => {}
-            Rule::Property(name, ..) | Rule::Keyframes(name, _) => {
+            Rule::Property(name, ..) | Rule::Keyframes(name, _) | Rule::PositionTry(name, _) => {
                 let path = |index: Option<usize>| {
                     index
                         .map_or(&[][..], |index| &self.layers[index].1[..])
                         .iter()
                         .copied()
                         .chain([u32::MAX])
+                };
+                let name = match item {
+                    Rule::PositionTry(..) => format!("\0{name}"),
+                    _ => name.clone(),
                 };
                 let key = (matches!(item, Rule::Property(..)), name.clone());
                 if self
@@ -393,18 +402,17 @@ impl<'a> Collect<'a> {
                 }
                 self.layered.insert(key, layer);
                 match item {
-                    Rule::Property(name, syntax, inherits, initial) => {
-                        self.properties.insert(
-                            Prop::new(name),
-                            (
-                                syntax.as_str().into(),
-                                *inherits,
-                                initial.as_deref().map(Rc::from),
-                            ),
-                        );
+                    Rule::Property(name, ..) => {
+                        if let Some(property) = item.property() {
+                            self.properties.insert(Prop::new(name), property);
+                        }
                     }
-                    Rule::Keyframes(name, frames) => {
-                        self.keyframes.insert(name.clone(), frames.clone());
+                    Rule::Keyframes(_, frames) => {
+                        self.keyframes.insert(name, frames.clone());
+                    }
+                    // They take their place among the keyframes, under names that no keyframes have.
+                    Rule::PositionTry(_, values) => {
+                        self.keyframes.insert(name, vec![(0., values.clone())]);
                     }
                     _ => {}
                 }
@@ -804,12 +812,14 @@ impl StyleCache {
                     let mut keys = Vec::new();
                     let mut inserted = Vec::new();
                     let mut pending = Vec::new();
+                    let block = cached.block;
+                    let generated = |key: u128| {
+                        block.is_some_and(|block| (key >> 64) as u64 == block && key as u64 != 0)
+                    };
+                    // Another Tailwind configuration makes all its utilities again, with keys of their own.
+                    room &= !(cached.keys.iter().zip(&deleted))
+                        .any(|(key, deleted)| *deleted && generated(*key));
                     if same {
-                        let generated = |key: u128| {
-                            cached
-                                .block
-                                .is_some_and(|block| (key >> 64) as u64 == block && key as u64 != 0)
-                        };
                         let mut olds = author.iter().copied();
                         let mut previous = cached
                             .keys
@@ -924,6 +934,7 @@ impl StyleCache {
                             }
                         }
                         if cached.keyframes != keyframes {
+                            self.rules += 1;
                             let animated = |value: &CachedStyle| {
                                 value.style.contains(Prop::ANIMATION)
                                     || value.style.contains(Prop::ANIMATION_NAME)
@@ -1013,6 +1024,7 @@ impl StyleCache {
                     ..
                 } = collected;
                 self.next += 1;
+                self.rules += 1;
                 let mut scope = StyleScope {
                     id: self.next,
                     fullscreen,
@@ -1044,7 +1056,7 @@ impl StyleCache {
 }
 
 impl StyleCache {
-    pub(crate) fn font_faces(&self) -> Vec<(String, String, Option<String>)> {
+    pub(crate) fn font_faces(&self) -> Vec<crate::css::sheet::FontFace> {
         let mut seen = std::collections::HashSet::new();
         self.scopes
             .iter()
@@ -1248,8 +1260,11 @@ impl StyleScope {
             });
             matched_pseudos.sort_unstable();
             matched_pseudos.dedup();
-            // Cells take `cellpadding` from their table.
-            if matches!(node.tag.as_str(), "td" | "th") {
+            // Table parts take `cellpadding`, `border` and `rules` from their table.
+            if matches!(
+                node.tag.as_str(),
+                "td" | "th" | "thead" | "tbody" | "tfoot" | "colgroup"
+            ) {
                 let mut at = node.parent;
                 for _ in 0..3 {
                     let Some(parent) = at else { break };

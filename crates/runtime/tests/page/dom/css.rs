@@ -272,17 +272,17 @@ fn form_pseudo_classes_follow_script_state() {
     engine.eval(r#"
         const q=s=>[...document.querySelectorAll(s)].map(e=>e.id).join(),$=id=>document.getElementById(id);
         const expect=(s,v,step)=>{if(q(s)!==v)throw Error(step+': '+s+' = '+q(s));};
-        expect(':invalid','em,req,num,sel,r1,r2,ta','load');
+        expect('form :invalid:not(fieldset)','em,req,num,sel,r1,r2,ta','load');
         $('em').value='a@b.co';$('req').value='x';$('num').setAttribute('min','1');$('ta').value='t';
-        expect(':invalid','sel,r1,r2','values');
+        expect('form :invalid:not(fieldset)','sel,r1,r2','values');
         $('req').value='';$('plain').setCustomValidity('bad');
-        expect(':invalid','req,plain,sel,r1,r2','custom');
+        expect('form :invalid:not(fieldset)','req,plain,sel,r1,r2','custom');
         $('plain').setCustomValidity('');$('sel').value='a';$('r2').checked=true;$('fs').disabled=false;
-        expect(':invalid','req,in1','groups');
+        expect('form :invalid:not(fieldset)','req,in1','groups');
         const made=document.createElement('input');made.id='made';made.required=true;$('fs').append(made);
         expect('fieldset :invalid','in1,made','created');
         $('fs').disabled=true;
-        expect(':invalid','req','disabled');
+        expect('form :invalid:not(fieldset)','req','disabled');
         $('cb').indeterminate=true;
         expect(':indeterminate','cb','indeterminate');
         $('cb').click();
@@ -601,7 +601,7 @@ fn css_global_supports_escape_and_register_property() {
         "<html><head><style>.x{width:var(--w)}</style></head><body><div class=x id=x><p id=c></p></div></body></html>",
     );
     engine.eval(r#"
-        if (!CSS.supports('display', 'grid') || CSS.supports('width', 'bogus') || !CSS.supports('(filter: blur(1px)) and (not (display: nonsense))') || !CSS.supports('display: flex') || CSS.supports('hyphens', 'auto') || !CSS.supports('word-break', 'break-all')) throw Error('supports');
+        if (!CSS.supports('display', 'grid') || CSS.supports('width', 'bogus') || !CSS.supports('(filter: blur(1px)) and (not (display: nonsense))') || !CSS.supports('display: flex') || CSS.supports('text-emphasis', 'dot') || !CSS.supports('word-break', 'break-all')) throw Error('supports');
         if (!CSS.supports('selector(:has(a))') || CSS.supports('selector(::nonsense(')) throw Error('selector()');
         if (CSS.escape('1a b') !== '\\31 a\\ b' || CSS.escape('-') !== '\\-' || CSS.escape('a#b') !== 'a\\#b') throw Error('escape ' + CSS.escape('1a b'));
         CSS.registerProperty({ name: '--w', syntax: '<length>', inherits: false, initialValue: '12px' });
@@ -989,6 +989,7 @@ fn css_values_and_cascade_like_chrome() {
         check('important declarations go last', () => { d.style.cssText = 'color:red !important;width:1px'; return d.style.cssText === 'width: 1px; color: red !important;'; });
         check('internal pseudo-classes are not for pages', () => !CSS.supports('selector(:-internal-scope)') && attempt(() => document.querySelector('div:-internal-scope')) === 'SyntaxError');
         check('rotation axes', () => set('rotate: z 45deg').rotate === '45deg' && set('rotate: 0 0 -1 45deg').rotate === '-45deg');
+        check('legacy mask composite', () => { d.style.cssText = '-webkit-mask: linear-gradient(red, blue), none'; d.style.webkitMaskComposite = 'xor'; d.style.color = 'red'; const kept = d.style.maskComposite === 'xor' && getComputedStyle(d).maskComposite === 'xor, xor'; d.style.maskComposite = 'source-in'; const same = d.style.maskComposite === 'xor'; d.style.cssText = ''; return kept && same && !CSS.supports('mask-composite', 'xor'); });
         check('translate and inset sides', () => { d.style.cssText = 'translate: 0 251px'; const one = d.style.translate; d.style.translate = '0px 0px'; return one === '0px 251px' && d.style.translate === '0px' && set('clip-path: inset(0 calc(100% - 30%) 0 0)').clipPath === 'inset(0px 70% 0px 0px)' && set('clip-path: inset(0 calc(100% - 60px) 0 0)').clipPath === 'inset(0px calc(100% - 60px) 0px 0px)' && set('clip-path: inset(0 round 10% 2em)').clipPath === 'inset(0px round 10% 32px)' && set('clip-path: inset(1px 2px round 1em / 5px)').clipPath === 'inset(1px 2px round 16px / 5px)'; });
         check('a repeated declaration moves to its last place', () => { d.style.cssText = 'color:red;width:1px;color:blue'; return d.style.cssText === 'width: 1px; color: blue;'; });
         check('declarations iterate', () => { d.style.cssText = 'color: red; width: 1px'; return [...d.style].join() === 'color,width' && [...getComputedStyle(d)].includes('color'); });

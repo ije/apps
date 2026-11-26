@@ -3,6 +3,7 @@ pub(crate) mod grid;
 pub(crate) mod line;
 pub(crate) mod measure;
 pub(crate) mod size;
+pub(crate) mod temporal;
 
 use crate::css;
 use std::rc::Rc;
@@ -78,6 +79,7 @@ pub struct Layout {
     // box from the border box of the element in layout, its size, then the padding plus border of each side.
     pub pseudo_boxes: rustc_hash::FxHashMap<usize, [f32; 8]>,
     pub(in crate::render) container_pass: bool,
+    pub(crate) anchors: crate::render::frame::anchor::Anchors,
     pub(in crate::render) blocks: rustc_hash::FxHashMap<usize, renderer::Rect<renderer::Pixels>>,
     pub(crate) cull: cull::Cull,
     // The `content-visibility: auto` boxes, each with the boxes on its path, the boxes that clip it, and the view
@@ -132,9 +134,13 @@ impl Layout {
         std::mem::take(&mut self.skip_events)
     }
 
-    // Whether the last frame culled `id` as hidden, and whether `id` is a `content-visibility: auto` box.
+    // Whether the last frame culled `id` as hidden or showed it, and whether `id` is a `content-visibility: auto` box.
     pub(crate) fn culled(&self, id: usize) -> bool {
         self.cull.visible.get(id) == Some(&false)
+    }
+
+    pub(crate) fn shown(&self, id: usize) -> bool {
+        self.cull.visible.get(id) == Some(&true)
     }
 
     pub(crate) fn auto_box(&self, id: usize) -> bool {
@@ -205,6 +211,9 @@ impl Layout {
         self.measurements.naturals.remove(&id);
         self.blocks.remove(&id);
         self.containers.remove(&id);
+        self.anchors
+            .sources
+            .retain(|popover, source| ![*popover, *source].contains(&id));
         self.flexed_grids.remove(&id);
         self.grid_widest.remove(&id);
         for pseudo in 0..3 {

@@ -1,4 +1,4 @@
-use super::{Features, Font, FontWeight};
+use super::{Embedding, Features, Font, FontWeight, Hyphenation, Indent};
 use crate::{Color, Pixels, px};
 use std::rc::Rc;
 
@@ -17,10 +17,19 @@ macro_rules! keywords {
 keywords! {
     FontStyle { Normal, Italic, Oblique }
     DecorationStyle { Solid, Double, Dotted, Dashed, Wavy }
+    Caps { Normal, Small, AllSmall, Petite, AllPetite, Unicase, Titling }
+    AdjustMetric { XHeight, CapHeight, Advance }
     TextAlign { Left, Center, Right }
     WhiteSpace { Normal, Nowrap }
     WordBreak { Normal, BreakWord, Anywhere, BreakAll, KeepAll }
     TextWrap { Wrap, Balance, Pretty }
+}
+
+/// `font-size-adjust`: the size that makes `metric` this many times as large.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SizeAdjust {
+    pub metric: AdjustMetric,
+    pub value: f32,
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -37,10 +46,33 @@ pub struct TextRun {
     pub font_size: Option<Pixels>,
     pub inset: [Pixels; 2],
     pub nowrap: bool,
+    /// Spaces at the end of a row stay.
+    pub preserve: bool,
+    /// `None` breaks at soft hyphens.
+    pub hyphenation: Option<Rc<Hyphenation>>,
+    /// The text is in a right-to-left paragraph.
+    pub rtl: bool,
+    /// `unicode-bidi: plaintext`: each line has the direction of its first letter.
+    pub plaintext: bool,
+    pub embedding: Option<Rc<Embedding>>,
+    /// The `Flow` sides of the floats that a line break clears.
+    pub clear: u8,
     /// Spaces per tab stop, or pixels when negative.
     pub tab_size: f32,
     /// `-webkit-text-stroke`: the width and color of a line centered on the glyph outlines.
     pub stroke: Option<(Pixels, Color)>,
+}
+
+impl TextRun {
+    // A clone is large code.
+    #[inline(never)]
+    pub(super) fn part(&self, len: usize, inset: [Pixels; 2]) -> Self {
+        Self {
+            len,
+            inset,
+            ..self.clone()
+        }
+    }
 }
 
 /// Strikethroughs have no offset.
@@ -52,6 +84,10 @@ pub struct Decoration {
     pub style: DecorationStyle,
     /// From the baseline, instead of the default place under it.
     pub offset: Option<Pixels>,
+    /// Below the descenders, for `text-underline-position: under`.
+    pub under: bool,
+    /// The line leaves gaps around the ink that it would cross.
+    pub skip_ink: bool,
 }
 
 /// Declares `TextStyle` and its overrides from one list, so the two cannot drift.
@@ -104,7 +140,8 @@ text_style! {
     line_height set_line_height: Pixels = px(20.),
     font_weight set_font_weight: FontWeight = 400.,
     font_style set_font_style: FontStyle = FontStyle::Normal,
-    font_synthesis set_font_synthesis: [bool; 2] = [true; 2],
+    font_synthesis set_font_synthesis: [bool; 3] = [true; 3],
+    font_size_adjust set_font_size_adjust: Option<SizeAdjust> = None,
     background_color set_background_color: Option<Color> = None,
     underline set_underline: Option<Decoration> = None,
     strikethrough set_strikethrough: Option<Decoration> = None,
@@ -117,6 +154,8 @@ text_style! {
     text_indent set_text_indent: Pixels = Pixels::ZERO,
     // The part of `text-indent` that is a fraction of the width of the paragraph, from a percentage.
     text_indent_percent set_text_indent_percent: f32 = 0.,
+    // `hanging` and `each-line`.
+    text_indent_rows set_text_indent_rows: [bool; 2] = [false; 2],
     float set_float: Pixels = Pixels::ZERO,
     text_wrap set_text_wrap: TextWrap = TextWrap::Wrap,
     word_break set_word_break: WordBreak = WordBreak::Normal,
@@ -126,6 +165,17 @@ text_style! {
 }
 
 impl TextStyle {
+    /// The indent in a paragraph of this width.
+    pub fn indent(&self, width: Pixels) -> Indent {
+        let indent = self.text_indent + width * self.text_indent_percent;
+        let [hanging, each] = self.text_indent_rows;
+        let [first, rest] = match hanging {
+            true => [Pixels::ZERO, indent],
+            false => [indent, Pixels::ZERO],
+        };
+        Indent { first, rest, each }
+    }
+
     pub fn font(&self) -> Font {
         let (family, features) = (self.font_family.clone(), self.font_features.clone());
         let (weight, style) = (self.font_weight, self.font_style);
@@ -135,6 +185,7 @@ impl TextStyle {
             weight,
             style,
             synthesis: self.font_synthesis,
+            size_adjust: self.font_size_adjust,
             ..Font::default()
         }
     }
@@ -162,6 +213,12 @@ impl TextStyle {
             font_size: None,
             inset: [Pixels::ZERO; 2],
             nowrap: false,
+            preserve: false,
+            hyphenation: None,
+            rtl: false,
+            plaintext: false,
+            embedding: None,
+            clear: 0,
             tab_size: 8.,
             stroke: None,
         }

@@ -50,6 +50,16 @@ pub fn call(
         "dom.aliases" => css::aliases(),
         "dom.path" => css::css_path(args),
         "dom.specified" => css::specified(args),
+        "dom.popoverSource" => {
+            let id = id()?;
+            state.layout.anchors.opened += 1;
+            let sources = &mut state.layout.anchors.sources;
+            match args[1].as_u64().filter(|&source| source != 0) {
+                Some(source) => sources.insert(id, source as usize),
+                None => sources.remove(&id),
+            };
+            Ok(Value::Null)
+        }
         "dom.declare" => css::declare(args),
         "dom.constructed" | "dom.adopt" | "dom.supports" | "dom.registerProperty" => {
             css::constructed(op, args, state)
@@ -120,6 +130,7 @@ pub fn call(
         "dom.html" => nodes::html(id()?, args, doc, state),
         "dom.rangeNodes" => text::range_nodes(args, doc),
         "dom.selection" => text::selection(id()?, args, doc, state),
+        "dom.highlights" => text::highlights(args, doc, state),
         "dom.userSelect" | "dom.selectionText" => {
             text::user_select(op, id()?, args, doc, state, viewport)
         }

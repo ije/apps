@@ -201,7 +201,7 @@ pub(super) fn replaced(
         el = if let Some(alt) = alt {
             let mut text = renderer::text(
                 alt.clone(),
-                Some(vec![style::text_run(style, &units, alt.len())]),
+                Some(Rc::new([style::text_run(style, &units, alt.len())])),
             );
             text.text_style().set_float(px(16.));
             el.child(

@@ -664,6 +664,53 @@ fn language_direction_link_and_form_pseudo_classes() {
 }
 
 #[test]
+fn form_pseudo_classes_follow_owners_groups_and_states() {
+    let mut doc = Document::parse(
+        "<form id=f><fieldset id=s><input id=a></fieldset><input id=o form=g><button id=b></button></form><form id=g><input id=i></form><button id=x form=f></button><button id=y form=f type=button></button><input id=z form=none><form id=r><input type=radio name=n id=r1><input type=radio name=n id=r2><input type=radio name=m id=r3></form><input type=radio name=n id=r4 form=r><input type=radio id=r5><x-a id=w></x-a><progress id=p></progress>",
+    );
+    let find = |doc: &Document, id: &str| {
+        (0..doc.nodes.len())
+            .find(|&node| doc.nodes[node].attrs.get("id").is_some_and(|v| v == id))
+            .unwrap()
+    };
+    let check = |doc: &Document, cases: &[(&str, &str)]| {
+        for (selector, expected) in cases {
+            assert_eq!(matched(doc, selector), *expected, "{selector}");
+        }
+    };
+    check(
+        &doc,
+        &[
+            (":is(form, fieldset):valid", "f,s,g,r"),
+            (":default", "b"),
+            (":indeterminate", "r1,r2,r3,r4,r5,p"),
+            (":user-valid, :state(on)", ""),
+        ],
+    );
+    let [a, o, b, r4, w] = ["a", "o", "b", "r4", "w"].map(|id| find(&doc, id));
+    doc.nodes[a].state = super::super::INVALID | super::super::USER;
+    doc.nodes[o].state = super::super::INVALID;
+    doc.nodes[r4].state = super::super::DIRTY | super::super::CHECKED;
+    doc.nodes[w].state = super::super::FORM_ASSOCIATED | super::super::INVALID;
+    doc.nodes[w].value = Some("on\0off".into());
+    doc.nodes[b].attrs.set("type", "reset");
+    check(
+        &doc,
+        &[
+            (":is(form, fieldset):invalid", "f,s,g"),
+            (":default", "x"),
+            (":indeterminate", "r3,r5,p"),
+            (":user-invalid", "a"),
+            (":state(off)", "w"),
+            ("x-a:invalid:enabled", "w"),
+        ],
+    );
+    let g = find(&doc, "g");
+    doc.nodes[g].attrs.remove("id");
+    check(&doc, &[("form:invalid", "f")]);
+}
+
+#[test]
 fn form_states_follow_fieldsets_and_pushed_bits() {
     let mut doc = Document::parse(
         "<style>:disabled{color:red}:invalid{color:blue}:not(:defined){color:green}:indeterminate,:default{color:gray}</style><form><fieldset id=fs disabled><legend id=lg><input id=a></legend><input id=b><legend id=lg2><input id=c></legend></fieldset><select><optgroup id=og disabled><option id=o1>x</option></optgroup><option id=o2 selected>y</option></select><input id=cb type=CheckBox checked><input id=sub type=submit><button id=btn></button><x-el id=x></x-el><input id=t readonly></form><button id=out></button><p dir=RTL id=p></p><svg><feColorMatrix id=m type=Saturate></feColorMatrix></svg>",
@@ -679,7 +726,7 @@ fn form_states_follow_fieldsets_and_pushed_bits() {
         ("input:enabled", "a,cb,sub,t"),
         ("input:read-write", "a"),
         (":default", "o2,cb,sub"),
-        (":valid", "a,cb,sub,btn,out"),
+        (":valid", "fs,a,cb,sub,btn,out"),
         (":invalid, :indeterminate", ""),
         (":not(:defined)", "x"),
         ("[type=checkbox], [dir=rtl], [type=saturate]", "cb,p"),
@@ -694,7 +741,7 @@ fn form_states_follow_fieldsets_and_pushed_bits() {
     for (selector, expected) in [
         (":not(:defined)", ""),
         (":indeterminate", "cb"),
-        (":invalid", "a"),
+        (":invalid", "fs,a"),
         (":has(> legend > :invalid)", "fs"),
     ] {
         assert_eq!(matched(&doc, selector), expected, "{selector}");

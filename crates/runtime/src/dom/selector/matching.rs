@@ -1,3 +1,4 @@
+use super::controls::radio;
 use super::*;
 use crate::css::selector::ACTIVE;
 use crate::css::selector::FOCUS;
@@ -99,6 +100,113 @@ pub(super) fn submits(node: &crate::dom::Node) -> bool {
     }
 }
 
+// Elements that can be invalid: form controls and form-associated custom elements.
+fn submittable(node: &crate::dom::Node) -> bool {
+    matches!(
+        node.tag.as_str(),
+        "input" | "button" | "select" | "textarea"
+    ) || node.state & crate::dom::FORM_ASSOCIATED != 0
+}
+
+// Match `candidate` in dom.js, which also sets the validity bit.
+fn validated(doc: &Document, id: usize, memo: &mut SelectorCache) -> bool {
+    memo.depend(id, 0);
+    memo.depend(id, 1);
+    memo.depend(id, 5);
+    let node = &doc.nodes[id];
+    let candidate = match node.tag.as_str() {
+        "input" => !["hidden", "reset", "button", "image"]
+            .iter()
+            .any(|kind| node.input_type().eq_ignore_ascii_case(kind)),
+        "button" => submits(node),
+        _ => submittable(node),
+    };
+    candidate
+        && !node.attrs.contains_key("readonly")
+        && node.parent.is_none_or(|parent| {
+            memo.depend(parent, 4);
+            !doc.nodes[parent].tag.starts_with("datalist")
+        })
+        && !disabled(doc, id, memo)
+}
+
+// Match `formOf` in dom.js.
+fn form_of(doc: &Document, id: usize, memo: &mut SelectorCache) -> Option<usize> {
+    memo.depend(id, 0);
+    if doc.nodes[id].attrs.contains_key("form") {
+        memo.depend(id, 2);
+        return memo.index(doc, id).owner(id);
+    }
+    let mut at = id;
+    loop {
+        memo.depend(at, 1);
+        at = doc.nodes[at].parent?;
+        memo.depend(at, 4);
+        if doc.nodes[at].tag == "form" {
+            return Some(at);
+        }
+    }
+}
+
+// The first control in the form or the fieldset `id` that passes `test`. The form's controls outside of it count
+// by tree order only when `ordered`.
+fn first_control(
+    doc: &Document,
+    id: usize,
+    memo: &mut SelectorCache,
+    ordered: bool,
+    test: impl Fn(usize, &mut SelectorCache) -> bool,
+) -> Option<usize> {
+    let form = doc.nodes[id].tag == "form";
+    let mut first = None;
+    if form {
+        memo.depend(id, 2);
+        let outside = memo.index(doc, id).outside(id).to_vec();
+        for at in outside {
+            memo.depend(at, 0);
+            if submittable(&doc.nodes[at])
+                && test(at, memo)
+                && first.is_none_or(|first| precedes(doc, at, first, memo))
+            {
+                first = Some(at);
+                if !ordered {
+                    return first;
+                }
+            }
+        }
+    }
+    let mut pending = vec![id];
+    while let Some(at) = pending.pop() {
+        let node = &doc.nodes[at];
+        if node.tag.starts_with('#') {
+            continue;
+        }
+        if at != id && submittable(node) {
+            memo.depend(at, 0);
+            if !(form && node.attrs.contains_key("form")) && test(at, memo) {
+                return match first {
+                    Some(first) if precedes(doc, first, at, memo) => Some(first),
+                    _ => Some(at),
+                };
+            }
+        }
+        memo.depend(at, 2);
+        if node.tag.contains('-') {
+            memo.depend(at, 5);
+        }
+        if node.tag != "template" && (at == id || !form || node.tag != "form") {
+            pending.extend(node.children.iter().rev());
+        }
+    }
+    first
+}
+
+fn precedes(doc: &Document, a: usize, b: usize, memo: &mut SelectorCache) -> bool {
+    controls::precedes(doc, a, b, |id, children| {
+        memo.depend(id, if children { 2 } else { 1 })
+    })
+}
+
 impl SelectorCache {
     pub(crate) fn matches(
         &mut self,
@@ -113,6 +221,14 @@ impl SelectorCache {
     // Matches without the kept results, which an update has not checked yet.
     pub(crate) fn matches_fresh(&mut self, selector: &Selector, doc: &Document, id: usize) -> bool {
         matches_with(selector, doc, id, None, self, false, true)
+    }
+
+    // The controls of the page, or those in the tree of `id` for a match outside of a style pass.
+    fn index(&mut self, doc: &Document, id: usize) -> &Controls {
+        if self.nodes.is_empty() && !self.controls.whole {
+            self.controls = Controls::of(doc, id);
+        }
+        &self.controls
     }
 
     // Records the classes and attributes that the selector reads.
@@ -184,6 +300,36 @@ pub(super) fn reads(selector: &Selector) -> u16 {
     })
 }
 
+/// Whether `dir=auto` of an element is right-to-left, from the first letter of its text.
+fn auto_rtl(doc: &Document, id: usize, memo: &mut SelectorCache) -> bool {
+    memo.depend(id, 0);
+    memo.depend(id, 2);
+    memo.depend(id, 3);
+    let node = &doc.nodes[id];
+    if let Some(value) = node.current_value() {
+        return renderer::right_to_left(value) == Some(true);
+    }
+    let mut pending: Vec<usize> = node.children.iter().rev().copied().collect();
+    while let Some(child) = pending.pop() {
+        memo.depend(child, 3);
+        let node = &doc.nodes[child];
+        if node.tag == "#text" {
+            if let Some(rtl) = renderer::right_to_left(&node.text) {
+                return rtl;
+            }
+            continue;
+        }
+        memo.depend(child, 0);
+        memo.depend(child, 2);
+        if !matches!(node.tag.as_str(), "bdi" | "script" | "style" | "textarea")
+            && !node.attrs.contains_key("dir")
+        {
+            pending.extend(node.children.iter().rev());
+        }
+    }
+    false
+}
+
 // Whether a match of this `:has()` argument reads only nodes below the anchor, or below its parent when
 // the argument starts at a sibling, and no kind that `update` leaves out.
 fn local(selector: &Selector, anchor: &crate::dom::Node) -> bool {
@@ -202,6 +348,9 @@ fn local(selector: &Selector, anchor: &crate::dom::Node) -> bool {
                     | "enabled"
                     | "valid"
                     | "invalid"
+                    | "user-valid"
+                    | "user-invalid"
+                    | "indeterminate"
                     | "in-range"
                     | "out-of-range"
                     | "default"
@@ -511,6 +660,11 @@ fn matches_with(
                     || node.tag == "input"
                         && node.state & crate::dom::INDETERMINATE != 0
                         && node.input_type().eq_ignore_ascii_case("checkbox")
+                    || radio(node) && {
+                        memo.depend(id, 0);
+                        memo.depend(id, 2);
+                        !node.checked() && !memo.index(doc, id).checked(id)
+                    }
             }
             "default" => {
                 let checkable = node.tag == "input"
@@ -520,30 +674,30 @@ fn matches_with(
                 if checkable || node.tag == "option" {
                     node.attrs
                         .contains_key(if checkable { "checked" } else { "selected" })
-                } else if submits(node) {
-                    let mut form = Some(id);
-                    while let Some(at) = form.filter(|&at| doc.nodes[at].tag != "form") {
-                        memo.depend(at, 1);
-                        form = doc.nodes[at].parent;
-                        form.inspect(|&form| memo.depend(form, 4));
-                    }
-                    let mut pending = Vec::from_iter(form);
-                    let mut first = None;
-                    while let Some(at) = pending.pop() {
-                        if doc.nodes[at].tag.starts_with('#') {
-                            continue;
-                        }
-                        memo.depend(at, 0);
-                        if Some(at) != form && submits(&doc.nodes[at]) {
-                            first = Some(at);
-                            break;
-                        }
-                        memo.depend(at, 2);
-                        pending.extend(doc.nodes[at].children.iter().rev());
-                    }
-                    first == Some(id)
                 } else {
-                    false
+                    submits(node)
+                        && form_of(doc, id, memo).is_some_and(|form| {
+                            memo.depend(form, 2);
+                            // Kept like the positions of `:nth-child(An+B of S)`.
+                            let key = (0, form, None);
+                            let first = match memo.nth.get(&key) {
+                                Some(first) => first.clone(),
+                                None => {
+                                    let start = memo.dependencies.len();
+                                    let first = first_control(doc, form, memo, true, |at, _| {
+                                        submits(&doc.nodes[at])
+                                    });
+                                    let mut dependencies = memo.dependencies.split_off(start);
+                                    dependencies.sort_unstable();
+                                    dependencies.dedup();
+                                    let first = first.map(|at| (at, 0)).into_iter().collect();
+                                    let first = Rc::new((first, dependencies));
+                                    memo.nth.insert(key, first.clone());
+                                    first
+                                }
+                            };
+                            first.0.contains_key(&id)
+                        })
                 }
             }
             "checked" => {
@@ -596,6 +750,14 @@ fn matches_with(
                     _ => false,
                 }
             }
+            "state" => {
+                memo.depend(id, 3);
+                node.tag.contains('-')
+                    && node
+                        .value
+                        .as_ref()
+                        .is_some_and(|states| states.split('\0').any(|state| state == argument))
+            }
             "modal" | "popover-open" | "fullscreen" | "-webkit-full-screen" => {
                 memo.depend(id, 5);
                 node.state
@@ -612,31 +774,33 @@ fn matches_with(
                     && node.state & (crate::dom::MODAL | crate::dom::MODAL << 5) != 0
             }
             "disabled" | "enabled" => {
-                matches!(
+                (matches!(
                     node.tag.as_str(),
                     "button" | "input" | "select" | "textarea" | "optgroup" | "option" | "fieldset"
-                ) && disabled(doc, id, memo) == (name == "disabled")
+                ) || node.tag.contains('-') && {
+                    memo.depend(id, 5);
+                    node.state & crate::dom::FORM_ASSOCIATED != 0
+                }) && disabled(doc, id, memo) == (name == "disabled")
             }
-            "valid" | "invalid" => {
-                // Match `candidate` in dom.js, which also sets the validity bit.
-                memo.depend(id, 1);
+            "valid" | "invalid" if matches!(node.tag.as_str(), "form" | "fieldset") => {
+                let invalid = first_control(doc, id, memo, false, |at, memo| {
+                    doc.nodes[at].state & crate::dom::INVALID != 0 && validated(doc, at, memo) || {
+                        memo.depend(at, 5);
+                        false
+                    }
+                });
+                invalid.is_some() == (name == "invalid")
+            }
+            "valid" | "invalid" | "user-valid" | "user-invalid" => {
                 memo.depend(id, 5);
-                let candidate = match node.tag.as_str() {
-                    "input" => !["hidden", "reset", "button"]
-                        .iter()
-                        .any(|kind| node.input_type().eq_ignore_ascii_case(kind)),
-                    "button" => submits(node),
-                    "select" | "textarea" => true,
-                    _ => false,
-                };
-                candidate
-                    && !node.attrs.contains_key("readonly")
-                    && node.parent.is_none_or(|parent| {
-                        memo.depend(parent, 4);
-                        !doc.nodes[parent].tag.starts_with("datalist")
-                    })
-                    && !disabled(doc, id, memo)
-                    && (node.state & crate::dom::INVALID != 0) == (name == "invalid")
+                let invalid = node.state & crate::dom::INVALID != 0;
+                (!name.starts_with("user") || node.state & crate::dom::USER != 0)
+                    && if node.state & crate::dom::FORM_ASSOCIATED != 0 {
+                        // As in Chrome, a custom element that is not validated is valid.
+                        (invalid && validated(doc, id, memo)) == (name == "invalid")
+                    } else {
+                        invalid == name.ends_with("invalid") && validated(doc, id, memo)
+                    }
             }
             "placeholder-shown" | "required" | "optional" => {
                 memo.depend(id, 2);
@@ -687,6 +851,7 @@ fn matches_with(
                     _ => "contenteditable",
                 };
                 let mut value = None;
+                let mut found = None;
                 let mut current = Some(id);
                 while value.is_none()
                     && let Some(ancestor) = current
@@ -704,6 +869,11 @@ fn matches_with(
                                     .any(|v| value.eq_ignore_ascii_case(v)),
                                 _ => crate::dom::editable_value(value).is_some(),
                             });
+                    found = Some(ancestor);
+                    // Without a direction, a `<bdi>` is `dir=auto`.
+                    if attribute == "dir" && value.is_none() && doc.nodes[ancestor].tag == "bdi" {
+                        break;
+                    }
                     current = doc.nodes[ancestor].parent;
                 }
                 match name.as_str() {
@@ -721,7 +891,15 @@ fn matches_with(
                             })
                     }),
                     "dir" => {
-                        let rtl = value.is_some_and(|value| value.eq_ignore_ascii_case("rtl"));
+                        let rtl = match value {
+                            Some(value) if !value.eq_ignore_ascii_case("auto") => {
+                                value.eq_ignore_ascii_case("rtl")
+                            }
+                            value => found.is_some_and(|found| {
+                                (value.is_some() || doc.nodes[found].tag == "bdi")
+                                    && auto_rtl(doc, found, memo)
+                            }),
+                        };
                         let wanted = argument.trim();
                         wanted.eq_ignore_ascii_case("rtl") && rtl
                             || wanted.eq_ignore_ascii_case("ltr") && !rtl

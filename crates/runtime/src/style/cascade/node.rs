@@ -1,7 +1,7 @@
 // One style pass over the nodes of a walk: matching, cascade, used values, pseudo-elements and the store.
 use crate::css::properties::{Prop, Registry, Style, Vars};
-use crate::css::value::color::color;
 use crate::css::value::units::{FontUnits, Lengths};
+use crate::css::value::{anchor, color::color};
 use crate::dom::Document;
 use crate::style::cascade::computed::{
     AGENT_DISPLAY, CAPTION, CELL, COUNTED, ComputedStyles, DISPLAY_CONTENTS, DISPLAY_NONE, Extras,
@@ -15,7 +15,7 @@ use crate::style::cascade::moves::mark_moves;
 use crate::style::cascade::rank::{AGENT, CascadeRank, physical, put};
 use crate::style::cascade::scope::{MatchedRules, PSEUDO, SELECTOR, intern};
 use crate::style::cascade::shadow::{
-    ELEMENT, PART, SLOTTED, STARTING, ShadowRule, Shadowed, exported_parts,
+    ELEMENT, HIGHLIGHT, PART, SLOTTED, STARTING, ShadowRule, Shadowed, exported_parts,
 };
 use crate::style::cascade::used_values::Element;
 use crate::style::cascade::{Container, Passed, TreeWalk};
@@ -439,7 +439,7 @@ impl NodePass<'_> {
                         .filter(|&index| {
                             let (kind, selector, _, key) = &inner.pseudos[index];
                             key.is_empty()
-                                && *kind != 12
+                                && !matches!(*kind, SLOTTED | HIGHLIGHT)
                                 && matches.matches(selector, doc, root, None)
                         })
                         .collect();
@@ -871,102 +871,7 @@ impl NodePass<'_> {
                             format!("auto {width} / {height}").into(),
                         ));
                     }
-                    // HTML table attributes, as presentation hints.
-                    let tag = node.tag.as_str();
-                    if matches!(
-                        tag,
-                        "table" | "td" | "th" | "tr" | "thead" | "tbody" | "tfoot" | "col" | "colgroup"
-                    ) {
-                        let length = |value: &str| -> Option<Rc<str>> {
-                            let value = value.trim();
-                            let (number, percent) = match value.strip_suffix('%') {
-                                Some(number) => (number, true),
-                                None => (value.strip_suffix("px").unwrap_or(value), false),
-                            };
-                            let number = number.trim().parse::<f32>().ok().filter(|v| *v >= 0.)?;
-                            Some(format!("{number}{}", if percent { "%" } else { "px" }).into())
-                        };
-                        let cell = matches!(tag, "td" | "th");
-                        let table = if cell {
-                            std::iter::successors(node.parent, |&at| doc.nodes[at].parent)
-                                .take(3)
-                                .find(|&at| doc.nodes[at].tag == "table")
-                        } else {
-                            None
-                        };
-                        let padding = table
-                            .and_then(|table| length(doc.nodes[table].attrs.get("cellpadding")?))
-                            .filter(|value| !value.ends_with('%'));
-                        let attrs = node
-                            .attrs
-                            .iter()
-                            .map(|(name, value)| (name.as_str(), value.trim()));
-                        for (name, value) in
-                            attrs.chain(padding.as_deref().map(|value| ("cellpadding", value)))
-                        {
-                            let sides = |props: [Prop; 4], value: Rc<str>| {
-                                props.map(|prop| (prop, value.clone()))
-                            };
-                            let found: Vec<(Prop, Rc<str>)> = match (name, tag) {
-                                ("width", "table" | "td" | "th" | "col" | "colgroup") => length(value)
-                                    .map(|value| (Prop::WIDTH, value))
-                                    .into_iter()
-                                    .collect(),
-                                ("height", "table" | "td" | "th" | "tr") => length(value)
-                                    .map(|value| (Prop::HEIGHT, value))
-                                    .into_iter()
-                                    .collect(),
-                                ("bgcolor", _) => vec![(Prop::BACKGROUND_COLOR, value.into())],
-                                ("nowrap", "td" | "th") => vec![(Prop::WHITE_SPACE, "nowrap".into())],
-                                ("align", "table") if value.eq_ignore_ascii_case("center") => vec![
-                                    (Prop::MARGIN_LEFT, "auto".into()),
-                                    (Prop::MARGIN_RIGHT, "auto".into()),
-                                ],
-                                ("align", "table") => Vec::new(),
-                                ("align", _) => ["left", "right", "center", "justify"]
-                                    .into_iter()
-                                    .find(|side| value.eq_ignore_ascii_case(side))
-                                    .map(|side| (Prop::TEXT_ALIGN, side.into()))
-                                    .into_iter()
-                                    .collect(),
-                                ("valign", _) => ["top", "middle", "bottom", "baseline"]
-                                    .into_iter()
-                                    .find(|side| value.eq_ignore_ascii_case(side))
-                                    .map(|side| (Prop::VERTICAL_ALIGN, side.into()))
-                                    .into_iter()
-                                    .collect(),
-                                ("cellspacing", "table") => length(value)
-                                    .filter(|value| !value.ends_with('%'))
-                                    .map(|value| (Prop::BORDER_SPACING, value))
-                                    .into_iter()
-                                    .collect(),
-                                ("border", "table") => sides(
-                                    [
-                                        Prop::BORDER_TOP_WIDTH,
-                                        Prop::BORDER_RIGHT_WIDTH,
-                                        Prop::BORDER_BOTTOM_WIDTH,
-                                        Prop::BORDER_LEFT_WIDTH,
-                                    ],
-                                    length(value)
-                                        .filter(|value| !value.ends_with('%'))
-                                        .unwrap_or("1px".into()),
-                                )
-                                .into(),
-                                ("cellpadding", _) if cell => sides(
-                                    [
-                                        Prop::PADDING_TOP,
-                                        Prop::PADDING_RIGHT,
-                                        Prop::PADDING_BOTTOM,
-                                        Prop::PADDING_LEFT,
-                                    ],
-                                    value.into(),
-                                )
-                                .into(),
-                                _ => Vec::new(),
-                            };
-                            hints.extend(found);
-                        }
-                    }
+                    super::hints::html(doc, id, &mut hints);
                     if node.state & (crate::dom::TOP_LAYER | crate::dom::LEAVING) != 0
                         && node.tag != "html"
                     {
@@ -1073,6 +978,7 @@ impl NodePass<'_> {
                 });
             if let Some((cached, vars)) = cached {
                 cached.used.set(style_cache.pass);
+                style_cache.anchoring |= cached.positions;
                 if let Some(node) = scoped.nodes[id].as_mut() {
                     if let Some(key) = &key {
                         node.cached = Some(CachedNode::new(
@@ -1173,6 +1079,8 @@ impl NodePass<'_> {
             let agent_display = cascade
                 .get(&Prop::DISPLAY)
                 .is_some_and(|(rank, _)| rank.level == AGENT);
+            // Like Chrome, a header cell in text that starts at its start is centered.
+            let centered = node.tag == "th" && !cascade.contains_key(&Prop::TEXT_ALIGN);
             let mut declared = Vec::new();
             let mut strong = Vec::new();
             style.extend(cascade.into_iter().filter_map(|(prop, (rank, value))| {
@@ -1207,13 +1115,20 @@ impl NodePass<'_> {
             {
                 style.insert_current(Prop::TEXT_DECORATION_COLOR, ink);
             }
-            if style.get(Prop::TEXT_ALIGN) == Some("-internal-center") {
+            if centered {
                 let inherited = parent_style
                     .and_then(|parent| parent.get(Prop::TEXT_ALIGN))
-                    .filter(|value| !matches!(*value, "start" | "-internal-center"))
+                    .filter(|value| *value != "start")
                     .unwrap_or("center")
                     .to_owned();
                 style.insert(Prop::TEXT_ALIGN, inherited);
+            }
+            if node.tag == "table"
+                && style
+                    .get(Prop::TEXT_ALIGN)
+                    .is_some_and(|value| value.starts_with("-webkit-"))
+            {
+                style.insert(Prop::TEXT_ALIGN, "start");
             }
             if style
                 .get(Prop::DISPLAY)
@@ -1246,6 +1161,8 @@ impl NodePass<'_> {
                     style.remove(prop);
                 }
             }
+            let positions = anchor::positions(&style);
+            style_cache.anchoring |= positions;
             let (role, units, queried, viewport) = self.used_values(
                 &mut style,
                 Element {
@@ -1323,6 +1240,9 @@ impl NodePass<'_> {
             for &index in again.as_deref().unwrap_or(&key.pseudos) {
                 let (pseudo, selector, order, _) = &scoped.pseudos[index];
                 let (_, declarations, layer) = &scoped.rules[*order];
+                if *pseudo == HIGHLIGHT {
+                    continue;
+                }
                 if matches!(*pseudo, SLOTTED | PART) {
                     if let Some((name, compound, target)) = scoped.arguments.get(&index) {
                         groups[usize::from(*pseudo == PART)].push(Passed {
@@ -1786,6 +1706,7 @@ impl NodePass<'_> {
                 extras: rare(&extra).then(|| Rc::new(extra)),
                 viewport,
                 keyword,
+                positions,
             });
             if let Some(values) = &cached.extras {
                 extras.put(id, values.clone());

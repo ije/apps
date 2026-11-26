@@ -30,6 +30,8 @@ impl Tree {
             ceiling: f32::NEG_INFINITY,
             reach: f32::NEG_INFINITY,
             origin: [0.; 2],
+            natural: false,
+            naturals: Vec::new(),
             active: false,
             joined: false,
             hung: Vec::new(),
@@ -75,8 +77,10 @@ impl Tree {
             }
             true
         });
+        tree.forget();
         if again {
             taffy::compute_root_layout(&mut tree, root, space);
+            tree.forget();
         }
         #[cfg(debug_assertions)]
         {
@@ -87,6 +91,7 @@ impl Tree {
                 .collect();
             tree.exact = true;
             taffy::compute_root_layout(&mut tree, root, space);
+            tree.forget();
             let mut pending = vec![index_of(root)];
             while let Some(index) = pending.pop() {
                 let slot = &tree.slots[index as usize];
@@ -125,7 +130,8 @@ impl Tree {
             slots.get(index as usize).is_some_and(|slot| {
                 slot.live
                     && (slot.style.escape & Escape::PLACED != 0 && slot.style.placed != 0
-                        || slot.style.follow.is_some())
+                        || slot.style.follow.is_some()
+                        || slot.style.anchored.is_some())
             })
         });
         self.marks.retain(|&mark, &mut index| {
@@ -165,7 +171,7 @@ impl Tree {
                 // A block is at the start of its line, which only a text knows.
                 let across = !follow.below || marked.style.mark.is_some_and(|mark| mark.inline);
                 if at == parent && follow.axes & 1 != 0 && across {
-                    location.x = match follow.rtl {
+                    location.x = match marked.turned.unwrap_or(follow.rtl) {
                         true => place.x - layout.margin.right - layout.size.width,
                         false => place.x + layout.margin.left,
                     };
@@ -180,10 +186,12 @@ impl Tree {
                 }
             }
             let slot = &slots[index as usize];
+            let anchored = slot.style.anchored.as_deref();
             let escape = slot.style.escape & Escape::PLACED;
             if escape == 0
-                || slot.style.placed == 0
-                || slots[parent as usize].style.contains & escape != 0
+                || anchored.is_none()
+                    && (slot.style.placed == 0
+                        || slots[parent as usize].style.contains & escape != 0)
             {
                 continue;
             }
@@ -236,6 +244,11 @@ impl Tree {
                     0 => [layout.margin.left, layout.margin.right, layout.size.width],
                     _ => [layout.margin.top, layout.margin.bottom, layout.size.height],
                 };
+                if let Some(aligned) = anchored.and_then(|axes| axes[axis]) {
+                    let extent = (extent + margin_start + margin_end) / scale;
+                    let at = aligned.place(extent, size[axis] / scale) * scale;
+                    return Some(origin[axis] + at + margin_start);
+                }
                 match (start, end) {
                     (Some(start), end) if !end_wins || end.is_none() => {
                         Some(origin[axis] + start + margin_start)

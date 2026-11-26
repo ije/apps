@@ -31,14 +31,18 @@ impl Tree {
         window.take_marks();
         self.prepaint_node(index_of(root), Point::default(), false, window);
         self.unshift = false;
-        for (mark, at) in window.take_marks() {
+        for (mark, at, rtl) in window.take_marks() {
             if let Some(&index) = self.marks.get(&mark)
                 && (self.slots[index as usize].style.mark).is_some_and(|mark| mark.inline)
             {
-                let shift = &mut self.slots[index as usize].shift;
+                let slot = &mut self.slots[index as usize];
+                let shift = slot.shift;
                 let at = point(at.x.0, at.y.0) * window.scale_factor();
-                if (shift.x - at.x).abs() > 0.05 || (shift.y - at.y).abs() > 0.05 {
-                    *shift = at;
+                if (shift.x - at.x).abs() > 0.05
+                    || (shift.y - at.y).abs() > 0.05
+                    || slot.turned != rtl
+                {
+                    (slot.shift, slot.turned) = (at, rtl);
                     window.rebar();
                 }
             }
@@ -497,7 +501,8 @@ impl Tree {
             far = far.max(point(part.right(), part.bottom()));
             near = near.min(point(part.left(), part.top()));
         }
-        if !visible.x && !visible.y {
+        let outset = slot.style.clips_past_padding().cloned();
+        if !visible.x && !visible.y && outset.is_none() {
             let corners = self.painted(index, nested, scale, [near, far]);
             self.slots[index as usize].far[nested as usize] = Some(corners);
             return placed(corners);
@@ -534,13 +539,39 @@ impl Tree {
                 }
             }
         }
+        let room = outset.map_or_else(Default::default, |crate::ClipMargin { sides, reach }| {
+            let border = &self.slots[index as usize].style.border_widths;
+            [
+                sides.left - border.left,
+                sides.top - border.top,
+                sides.right - border.right,
+                sides.bottom - border.bottom,
+            ]
+            .map(|side| ((side + reach).0 * scale).max(0.))
+        });
         let near = point(
-            if visible.x { near.x } else { 0. },
-            if visible.y { near.y } else { 0. },
+            if visible.x {
+                near.x
+            } else {
+                near.x.max(-room[0])
+            },
+            if visible.y {
+                near.y
+            } else {
+                near.y.max(-room[1])
+            },
         );
         let far = point(
-            if visible.x { far.x } else { size.width },
-            if visible.y { far.y } else { size.height },
+            if visible.x {
+                far.x
+            } else {
+                far.x.min(size.width + room[2])
+            },
+            if visible.y {
+                far.y
+            } else {
+                far.y.min(size.height + room[3])
+            },
         );
         let corners = self.painted(index, nested, scale, [near, far]);
         self.slots[index as usize].far[nested as usize] = Some(corners);

@@ -167,7 +167,16 @@ fn registered_fallbacks_and_contents_items_follow_their_ancestors() {
             &mut cache,
             Some(&context),
         );
-        assert_eq!(cached.values[t].get(Prop::COLOR), Some(ink), "step {step}");
+        let color = if ink == "blue" {
+            "rgb(0, 0, 255)"
+        } else {
+            "rgb(0, 128, 0)"
+        };
+        assert_eq!(
+            cached.values[t].get(Prop::COLOR),
+            Some(color),
+            "step {step}"
+        );
         let item = if display == "grid" { "block" } else { "inline" };
         assert_eq!(
             cached.values[s].get(Prop::DISPLAY).unwrap_or("inline"),
@@ -1071,5 +1080,63 @@ fn siblings_share_styles_only_after_like_siblings() {
                 "{id}"
             );
         }
+    }
+}
+
+#[test]
+fn auto_directions_follow_their_text() {
+    let mut doc = Document::parse(
+        "<style>:dir(rtl){color:red}:dir(-internal-auto-rtl){width:5px}</style><p dir=auto>12 <b>x<i></i></b></p><bdi>שלום</bdi><input dir=auto value='שלום'><textarea dir=auto>abc</textarea>",
+    );
+    let [p, b, bdi, input, area] =
+        ["p", "b", "bdi", "input", "textarea"].map(|tag| element(&doc, tag));
+    let text = doc.nodes[b].children[0];
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    for (step, expected) in [
+        ["ltr", "rtl", "rtl", "ltr"],
+        ["rtl", "rtl", "rtl", "ltr"],
+        ["rtl", "rtl", "ltr", "rtl"],
+        ["ltr", "rtl", "ltr", "rtl"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        match step {
+            1 => doc.nodes[text].text = "י".into(),
+            2 => {
+                doc.nodes[input].value = Some("1 abc".into());
+                doc.nodes[area].value = Some("(שלום".into());
+            }
+            3 => {
+                doc.nodes[b].attrs.insert("dir".into(), "rtl".into());
+            }
+            _ => {}
+        }
+        let cached = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+        let fresh = compute_styles(
+            &doc,
+            800.,
+            600.,
+            None,
+            &mut sheets,
+            &mut StyleCache::default(),
+            None,
+        );
+        assert_eq!(cached.values, fresh.values, "{step}");
+        let direction = |id: usize| {
+            cached.values[id]
+                .get(Prop::DIRECTION)
+                .unwrap_or("ltr")
+                .to_owned()
+        };
+        assert_eq!([p, bdi, input, area].map(direction), expected, "{step}");
+        assert_eq!(
+            cached.values[p].get(Prop::COLOR) == Some("red"),
+            expected[0] == "rtl",
+            "{step}"
+        );
+        assert_eq!(cached.values[bdi].get(Prop::COLOR), Some("red"));
+        assert_eq!(cached.values[bdi].get(Prop::WIDTH), None);
     }
 }

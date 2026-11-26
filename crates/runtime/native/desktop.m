@@ -996,4 +996,19 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
     return strdup(AppsJSON(@{ @"value": result }).UTF8String);
 }
 
+char *apps_date_patterns(void) {
+    @autoreleasepool {
+        NSLocale *locale = NSLocale.currentLocale;
+        NSDateFormatter *formatter = [NSDateFormatter new];
+        formatter.locale = locale;
+        NSMutableArray *lines = [NSMutableArray array];
+        for (NSString *template in @[ @"yyyyMMdd", @"jjmm", @"MMMMyyyy" ])
+            [lines addObject:[NSDateFormatter dateFormatFromTemplate:template options:0 locale:locale] ?: template];
+        [lines addObject:formatter.AMSymbol ?: @"AM"];
+        [lines addObject:formatter.PMSymbol ?: @"PM"];
+        [lines addObjectsFromArray:formatter.standaloneMonthSymbols ?: @[]];
+        return strdup([lines componentsJoinedByString:@"\n"].UTF8String);
+    }
+}
+
 void apps_native_free(char *text) { free(text); }

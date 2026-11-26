@@ -136,7 +136,7 @@ impl MediaQuery {
                         "standalone",
                         "window-controls-overlay",
                     ],
-                    "standalone",
+                    "browser",
                 );
             }
             "update" => return keyword(&["none", "slow", "fast"], "fast"),

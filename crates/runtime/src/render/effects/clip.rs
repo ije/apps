@@ -2,141 +2,75 @@ use super::{Ids, index};
 use crate::css;
 use crate::css::properties::Prop;
 use crate::{
-    css::{properties::Style, value::tokens::components, value::units::Lengths},
+    css::{
+        properties::MARGIN, properties::PADDING, properties::Style, value::shape,
+        value::shape::Shape, value::shape::Shaped, value::units::Lengths,
+    },
     dom::Document,
 };
 use renderer::{Corners, Length, Pixels, Radii, px};
 
 pub(crate) enum Clip {
     Rounded([f32; 4], [f32; 4]),
-    Shape(String),
+    // An SVG shape, and its left, top, right and bottom when they are known.
+    Shape(String, Option<[f32; 4]>),
 }
 
+// `size` is the size of the border box of a style.
 pub(crate) fn clip(
     value: &str,
+    style: &Style,
     units: &Lengths,
     size: [f32; 2],
     doc: &Document,
     ids: &Ids,
 ) -> Option<Clip> {
+    if let Some(Shaped { shape, reference }) = Shaped::parse(value) {
+        let [top, right, bottom, left] = insets(reference, style, units, size);
+        let inner = [
+            (size[0] - left - right).max(0.),
+            (size[1] - top - bottom).max(0.),
+        ];
+        let even = shape.as_ref().is_some_and(Shape::even);
+        let outline = match &shape {
+            Some(shape) => match shape.rounded(units, inner, None) {
+                Some(([x, y, w, h], radii)) if radii.iter().all(|r| (r[0] - r[1]).abs() < 1e-3) => {
+                    return Some(Clip::Rounded(
+                        [x + left, y + top, w.max(0.), h.max(0.)],
+                        radii.map(|r| r[0]),
+                    ));
+                }
+                _ => shape.outline(units, inner, None)?,
+            },
+            None => {
+                let radii = edge_radii(reference, style, units, size);
+                if radii.iter().all(|r| r[0] == r[1]) {
+                    return Some(Clip::Rounded(
+                        [left, top, inner[0], inner[1]],
+                        radii.map(|r| r[0]),
+                    ));
+                }
+                shape::rounded([0., 0., inner[0], inner[1]], radii)
+            }
+        };
+        let rule = if even { "evenodd" } else { "nonzero" };
+        let reach = shape::reach(&outline)?;
+        return Some(Clip::Shape(
+            format!(
+                "<path transform=\"translate({left} {top})\" fill-rule=\"{rule}\" d=\"{}\"/>",
+                shape::svg(&outline)
+            ),
+            Some([
+                reach[0] + left,
+                reach[1] + top,
+                reach[2] + left,
+                reach[3] + top,
+            ]),
+        ));
+    }
     let [width, height] = size;
-    let (name, args) = components(value, ' ')
-        .into_iter()
-        .find_map(|part| part.strip_suffix(')')?.split_once('('))?;
-    let svg = Clip::Shape;
+    let (name, args) = value.strip_suffix(')')?.split_once('(')?;
     match name.to_ascii_lowercase().as_str() {
-        "inset" | "rect" | "xywh" => {
-            let (rect, radii) = css::value::clip_path(value, units, size)?;
-            let round = args.split_once(" round ").map(|(_, round)| round.trim());
-            let Some(round) = round.filter(|round| round.contains(['%', '/'])) else {
-                return Some(Clip::Rounded(rect, radii));
-            };
-            // Percent and `/` radii can be elliptical. As for border-radius, percentages take the
-            // reference box, and radii that don't fit scale down together.
-            let (horizontal, vertical) = round.split_once('/').unwrap_or((round, round));
-            let corners = |list: &str, base: f32| -> Option<[f32; 4]> {
-                let values = components(list.trim(), ' ');
-                let values = match values[..] {
-                    [a] => [a; 4],
-                    [a, b] => [a, b, a, b],
-                    [a, b, c] => [a, b, c, b],
-                    [a, b, c, d] => [a, b, c, d],
-                    _ => return None,
-                };
-                let mut out = [0.; 4];
-                for (corner, value) in values.into_iter().enumerate() {
-                    out[corner] = units.resolve(value, base)?.max(0.);
-                }
-                Some(out)
-            };
-            let [w, h] = [rect[2], rect[3]];
-            let (mut rx, mut ry) = (corners(horizontal, width)?, corners(vertical, height)?);
-            let fit = [
-                w / (rx[0] + rx[1]),
-                h / (ry[1] + ry[2]),
-                w / (rx[2] + rx[3]),
-                h / (ry[3] + ry[0]),
-            ]
-            .into_iter()
-            .fold(1f32, f32::min);
-            rx = rx.map(|value| value * fit);
-            ry = ry.map(|value| value * fit);
-            if rx == ry {
-                return Some(Clip::Rounded(rect, rx));
-            }
-            let [x, y] = [rect[0], rect[1]];
-            Some(svg(format!(
-                "<path d=\"M{} {y}H{}A{} {} 0 0 1 {} {}V{}A{} {} 0 0 1 {} {}H{}A{} {} 0 0 1 {x} {}V{}A{} {} 0 0 1 {} {y}Z\"/>",
-                x + rx[0],
-                x + w - rx[1],
-                rx[1],
-                ry[1],
-                x + w,
-                y + ry[1],
-                y + h - ry[2],
-                rx[2],
-                ry[2],
-                x + w - rx[2],
-                y + h,
-                x + rx[3],
-                rx[3],
-                ry[3],
-                y + h - ry[3],
-                y + ry[0],
-                rx[0],
-                ry[0],
-                x + rx[0],
-            )))
-        }
-        "circle" | "ellipse" => {
-            let (rect, radii) = css::value::clip_path(value, units, size)?;
-            if (rect[2] - rect[3]).abs() <= rect[2].max(rect[3]) * 1e-4 {
-                return Some(Clip::Rounded(rect, radii));
-            }
-            Some(svg(format!(
-                "<ellipse cx=\"{}\" cy=\"{}\" rx=\"{}\" ry=\"{}\"/>",
-                rect[0] + rect[2] / 2.,
-                rect[1] + rect[3] / 2.,
-                rect[2] / 2.,
-                rect[3] / 2.
-            )))
-        }
-        "polygon" => {
-            let mut parts = components(args, ',');
-            let rule = match parts.first().map(|part| part.trim()) {
-                Some(rule @ ("evenodd" | "nonzero")) => {
-                    parts.remove(0);
-                    rule
-                }
-                _ => "nonzero",
-            };
-            let mut points = String::new();
-            for part in parts {
-                let pair = components(part.trim(), ' ');
-                let [x, y] = <[&str; 2]>::try_from(pair).ok()?;
-                points.push_str(&format!(
-                    "{},{} ",
-                    units.resolve(x, width)?,
-                    units.resolve(y, height)?
-                ));
-            }
-            Some(svg(format!(
-                "<polygon fill-rule=\"{rule}\" points=\"{points}\"/>"
-            )))
-        }
-        "path" => {
-            let mut parts = components(args, ',');
-            let rule = if parts.len() > 1 {
-                parts.remove(0).trim()
-            } else {
-                "nonzero"
-            };
-            let data = parts.first()?.trim().trim_matches(['"', '\'']);
-            Some(svg(format!(
-                "<path fill-rule=\"{rule}\" d=\"{}\"/>",
-                crate::dom::escape(data)
-            )))
-        }
         "url" => {
             let id = args.trim().trim_matches(['"', '\'']).strip_prefix('#')?;
             let clip = index(ids, doc)
@@ -161,15 +95,98 @@ pub(crate) fn clip(
                     })
                 })
                 .collect();
-            Some(svg(if object {
-                format!("<g transform=\"scale({width} {height})\">{shapes}</g>")
-            } else {
-                shapes
-            }))
+            Some(Clip::Shape(
+                if object {
+                    format!("<g transform=\"scale({width} {height})\">{shapes}</g>")
+                } else {
+                    shapes
+                },
+                None,
+            ))
         }
         _ => None,
     }
 }
+
+// The distances from the border box to another box of a style.
+pub(crate) fn insets(
+    reference: Option<&str>,
+    style: &Style,
+    units: &Lengths,
+    size: [f32; 2],
+) -> [f32; 4] {
+    let edges = |props| units.edges(style, props, size[0]);
+    match reference {
+        Some("padding-box") => units.borders(style, size[0]),
+        Some("content-box" | "fill-box") => {
+            let (borders, padding) = (units.borders(style, size[0]), edges(PADDING));
+            std::array::from_fn(|side| borders[side] + padding[side].max(0.))
+        }
+        Some("margin-box") => edges(MARGIN).map(|margin| -margin),
+        _ => [0.; 4],
+    }
+}
+
+// How far an `overflow-clip-margin` reaches past the padding box.
+pub(crate) fn margin(
+    value: &str,
+    style: &Style,
+    units: &Lengths,
+    base: f32,
+) -> Option<renderer::ClipMargin> {
+    let (mut reach, mut sides) = (0., [0.; 4]);
+    for part in value.split(' ') {
+        match part {
+            "padding-box" => {}
+            "border-box" => sides = units.borders(style, base),
+            "content-box" => {
+                sides = units.edges(style, PADDING, base).map(|side| -side.max(0.));
+            }
+            length => reach = units.resolve(length, 0.)?,
+        }
+    }
+    let [top, right, bottom, left] = sides.map(px);
+    Some(renderer::ClipMargin {
+        sides: renderer::Edges {
+            top,
+            right,
+            bottom,
+            left,
+        },
+        reach: px(reach),
+    })
+}
+
+// The radii of a box of a style, as its `border-radius` gives them.
+pub(crate) fn edge_radii(
+    reference: Option<&str>,
+    style: &Style,
+    units: &Lengths,
+    size: [f32; 2],
+) -> [[f32; 2]; 4] {
+    let [top, right, bottom, left] = insets(reference, style, units, size);
+    let radii = radii(style, units, || size).resolve(renderer::size(px(size[0]), px(size[1])));
+    let corner = |x: Pixels, y: Pixels, h: f32, v: f32| {
+        let (x, y) = (f32::from(x), f32::from(y));
+        match x > 0. && y > 0. {
+            true => [(x - h).max(0.), (y - v).max(0.)],
+            false => [0.; 2],
+        }
+    };
+    [
+        corner(radii.x.top_left, radii.y.top_left, left, top),
+        corner(radii.x.top_right, radii.y.top_right, right, top),
+        corner(radii.x.bottom_right, radii.y.bottom_right, right, bottom),
+        corner(radii.x.bottom_left, radii.y.bottom_left, left, bottom),
+    ]
+}
+
+pub(crate) const RADII: [Prop; 4] = [
+    Prop::BORDER_TOP_LEFT_RADIUS,
+    Prop::BORDER_TOP_RIGHT_RADIUS,
+    Prop::BORDER_BOTTOM_RIGHT_RADIUS,
+    Prop::BORDER_BOTTOM_LEFT_RADIUS,
+];
 
 pub(crate) fn radii(style: &Style, units: &Lengths, basis: impl Fn() -> [f32; 2]) -> Radii<Length> {
     let mut radii = Radii::default();
@@ -266,46 +283,61 @@ mod tests {
         let doc = Document::parse(
             "<svg><clipPath id=c><rect width=5 height=5></rect></clipPath></svg><p id=c></p>",
         );
-        let ids = &Ids::default();
-        assert!(matches!(
-            clip("inset(10px round 4px)", &units, [100., 60.], &doc, ids),
-            Some(Clip::Rounded([10., 10., 80., 40.], [4., 4., 4., 4.]))
-        ));
-        let Some(Clip::Shape(polygon)) = clip(
-            "polygon(50% 0, 100% 100%, 0 100%)",
-            &units,
-            [100., 60.],
-            &doc,
-            ids,
-        ) else {
-            panic!("polygon");
+        let box_ = super::super::tests::style(&[
+            ("padding-left", "10px"),
+            ("border-top-width", "5px"),
+            ("border-top-style", "solid"),
+            ("margin-right", "20px"),
+            ("border-top-left-radius", "30px"),
+        ]);
+        let clip = |value: &str| clip(value, &box_, &units, [100., 60.], &doc, &Ids::default());
+        let rounded = |value: &str| match clip(value) {
+            Some(Clip::Rounded(rect, radii)) => (rect, radii),
+            _ => panic!("{value}"),
         };
-        assert!(polygon.contains("points=\"50,0 100,60 0,60 \""));
-        let Some(Clip::Shape(pill)) = clip("inset(0 round 50%)", &units, [100., 60.], &doc, ids)
-        else {
-            panic!("elliptical inset");
+        let shape = |value: &str| match clip(value) {
+            Some(Clip::Shape(svg, reach)) => (svg, reach),
+            _ => panic!("{value}"),
         };
-        assert!(pill.contains("M50 0H50A50 30 0 0 1 100 30"), "{pill}");
-        assert!(matches!(
-            clip("inset(0 round 80px)", &units, [100., 60.], &doc, ids),
-            Some(Clip::Rounded(_, [80., 80., 80., 80.]))
-        ));
-        let Some(Clip::Rounded(rect, radii)) = clip("circle(40%)", &units, [100., 60.], &doc, ids)
-        else {
-            panic!("circle");
-        };
+        assert_eq!(
+            rounded("inset(10px round 4px)"),
+            ([10., 10., 80., 40.], [4.; 4])
+        );
+        // Radii that don't fit scale down together.
+        assert_eq!(rounded("inset(0 round 80px)").1, [30.; 4]);
+        assert_eq!(rounded("rect(auto 80px 50% 10px)").0, [10., 0., 70., 30.]);
+        assert_eq!(
+            rounded("xywh(5px 6px 50% 10px round 3px) border-box"),
+            ([5., 6., 50., 10.], [3.; 4])
+        );
+        assert_eq!(rounded("content-box inset(0)").0, [10., 5., 90., 55.]);
+        assert_eq!(rounded("margin-box").0, [0., 0., 120., 60.]);
+        assert_eq!(rounded("border-box").1, [30., 0., 0., 0.]);
+        assert_eq!(
+            rounded("circle(10px at left top)"),
+            ([-10., -10., 20., 20.], [10.; 4])
+        );
+        let (rect, radii) = rounded("circle(40%)");
         assert!((rect[2] - rect[3]).abs() < 1e-3 && (radii[0] * 2. - rect[2]).abs() < 1e-3);
-        assert!(matches!(
-            clip("ellipse(40% 20%)", &units, [100., 60.], &doc, ids),
-            Some(Clip::Shape(_))
-        ));
-        assert!(matches!(
-            clip("path('M0 0 L10 0 L5 5 Z')", &units, [100., 60.], &doc, ids),
-            Some(Clip::Shape(_))
-        ));
-        let Some(Clip::Shape(shapes)) = clip("url(#c)", &units, [100., 60.], &doc, ids) else {
-            panic!("url");
-        };
-        assert!(shapes.contains("<rect"));
+        shape("inset(0 round 50%)");
+        shape("ellipse(40% 20%)");
+        assert_eq!(
+            shape("polygon(50% 0, 100% 100%, -10px 100%)"),
+            (
+                "<path transform=\"translate(0 0)\" fill-rule=\"nonzero\" d=\"M50 0L100 60L-10 60Z\"/>".into(),
+                Some([-10., 0., 100., 60.])
+            )
+        );
+        assert!(
+            shape("path(evenodd, 'M0 0 L10 0 5 5z')")
+                .0
+                .contains("\"evenodd\" d=\"M0 0L10 0L5 5Z\"")
+        );
+        assert!(
+            shape("shape(from 0 0, hline to 100%, line by -50% 10px, curve by 5px 5px with 1px 1px, close)")
+                .0
+                .contains("d=\"M0 0L100 0L50 10Q51 11 55 15Z\"")
+        );
+        assert!(shape("url(#c)").0.contains("<rect"));
     }
 }

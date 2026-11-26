@@ -149,7 +149,9 @@ pub(super) fn media_matches(
 }
 
 pub(super) fn properties() -> Result<Value> {
-    Ok(json!(css::properties::Prop::names()))
+    let mut names = css::properties::Prop::names().to_vec();
+    names.retain(|name| !name.starts_with("-internal-"));
+    Ok(json!(names))
 }
 
 pub(super) fn aliases() -> Result<Value> {
@@ -329,8 +331,8 @@ pub(super) fn computed(
 ) -> Result<Value> {
     let styles = state.restyle(doc, viewport);
     let pseudo = args[2].as_str().unwrap_or_default().trim_start_matches(':');
-    if let Some(style) = styles.values.get(id) {
-        state.styles.motion.read(id, style);
+    if id < styles.values.len() {
+        state.styles.motion.read(id, styles.unanchored(id));
     }
     let slot = match pseudo {
         "" => Some(0),
@@ -362,6 +364,7 @@ pub(super) fn computed(
                 .backdrop(id, styles.extras(id).backdrop.as_ref()?)
         })
         .flatten();
+    let highlight;
     let style = match pseudo {
         "" => Some(current.as_ref().unwrap_or_else(|| {
             &**state
@@ -381,6 +384,17 @@ pub(super) fn computed(
             .as_ref()
             .or_else(|| styles.extras(id).backdrop.as_deref()),
         "selection" => styles.extras(id).selection.as_deref(),
+        _ if let Some(name) = pseudo
+            .strip_prefix("highlight(")
+            .and_then(|name| name.strip_suffix(')')) =>
+        {
+            let kept = &mut state.styles.highlights.borrow_mut();
+            highlight = state
+                .styles
+                .cache
+                .highlight(&styles, kept, id, &name.trim().into());
+            highlight.as_deref()
+        }
         // The button of a file input shares the slot of the scrollbar track.
         "file-selector-button" | "-webkit-file-upload-button"
             if doc.nodes[id].tag == "input"
@@ -412,6 +426,21 @@ pub(super) fn computed(
             Some(&*sampled.insert(style))
         }
         (style, _) => style,
+    };
+    let mut anchored = None;
+    let style = match style {
+        Some(style)
+            if pseudo.is_empty()
+                && let Some(used) = (state.layout.anchors.boxes.contains_key(&id))
+                    .then(|| styles.used(id).cloned())
+                    .flatten()
+                    .or_else(|| crate::render::unplaced(&styles, id).map(Rc::new)) =>
+        {
+            let mut style = style.clone();
+            used.apply(&mut style, true);
+            Some(&*anchored.insert(style))
+        }
+        style => style,
     };
     let mut full = None;
     let style = match style {
@@ -604,6 +633,9 @@ pub(super) fn computed(
                 .is_none_or(|display| !display.ends_with("flex") && !display.ends_with("grid"))
         });
     let value = |name: &str| -> String {
+        if name.starts_with("-internal-") {
+            return String::new();
+        }
         let name = css::value::resolved::physical_name(style, name);
         let get =
             |name| css::value::resolved::resolved(style, &units, name, size, &container, &registry);
@@ -825,7 +857,7 @@ pub(super) fn computed(
                 };
                 let count = css::value::tokens::components(&get(image), ',').len();
                 let layers = css::value::tokens::components(&value, ',');
-                if layers.len() == count {
+                if layers.is_empty() || layers.len() == count {
                     return value;
                 }
                 (0..count)
@@ -987,7 +1019,11 @@ pub(super) fn font(args: &Value, state: &mut PageState) -> Result<Value> {
     let family = args[1].as_str().context("Expected font family")?;
     Ok(match args[2].as_str() {
         Some(name) => json!(state.local_font(family, name)),
-        None => json!(state.add_font(family, crate::web::bytes(&args[2])?)?),
+        None => {
+            let text = |at: usize| args[3][at].as_str();
+            let rules = crate::render::fonts::rules(text(0), [1, 2, 3].map(text));
+            json!(state.add_font(family, crate::web::bytes(&args[2])?, rules, usize::MAX)?)
+        }
     })
 }
 

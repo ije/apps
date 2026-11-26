@@ -1,6 +1,6 @@
 use super::PageState;
 use crate::dom::Document;
-use crate::render::fonts::{Face, sources};
+use crate::render::fonts::{Face, ranges, rules, sources};
 use crate::style;
 use anyhow::{Context, Result, ensure};
 use std::{collections::HashMap, path::PathBuf};
@@ -21,26 +21,22 @@ impl PageState {
             .cache
             .font_faces()
             .into_iter()
-            .map(|(family, src, range)| {
-                // Declarations keep `U+0400-04FF` as tokens joined by `/**/`.
-                let range = range.map(|range| range.replace("/**/", ""));
-                (family, sources(&src), src, range)
-            })
+            .map(|face| (sources(&face.src), face))
             .collect();
-        let ranges: Vec<_> = faces
+        let pending: Vec<_> = faces
             .iter()
-            .map(|(_, sources, _, range)| {
+            .map(|(sources, face)| {
                 let pending = sources
                     .iter()
                     .filter(|(kind, _)| *kind == "url")
                     .map(|(_, url)| self.fonts.files.get(url))
                     .find(|tried| tried.is_none_or(Option::is_some));
-                range.as_ref().filter(|_| pending == Some(None))
+                face.range.as_deref().filter(|_| pending == Some(None))
             })
             .collect();
         let revision = doc.nodes.latest();
-        let scanned = ranges.iter().any(Option::is_some) && self.fonts.text.0 != revision;
-        if ranges.iter().all(Option::is_none) {
+        let scanned = pending.iter().any(Option::is_some) && self.fonts.text.0 != revision;
+        if pending.iter().all(Option::is_none) {
             self.fonts.text = Default::default();
         } else if scanned {
             let (last, chars) = &mut self.fonts.text;
@@ -58,7 +54,7 @@ impl PageState {
             *last = revision;
         }
         let chars = &self.fonts.text.1;
-        let mut order: Vec<_> = ranges
+        let mut order: Vec<_> = pending
             .into_iter()
             .enumerate()
             .map(|(index, range)| {
@@ -68,22 +64,10 @@ impl PageState {
                 if !scanned {
                     return (0, index);
                 }
-                let used = range
-                    .split(',')
-                    .filter_map(|range| {
-                        let range = range.trim().strip_prefix(['U', 'u'])?.strip_prefix('+')?;
-                        let hex = |text: &str| usize::from_str_radix(text, 16).ok();
-                        let (low, high) = match range.split_once('-') {
-                            Some((low, high)) => (hex(low)?, hex(high)?),
-                            None => (
-                                hex(&range.replace('?', "0"))?,
-                                hex(&range.replace('?', "f"))?,
-                            ),
-                        };
-                        Some((low, high.min(0x10ffff)))
-                    })
-                    .filter(|(low, high)| low <= high)
-                    .flat_map(|(low, high)| {
+                let used = ranges(range)
+                    .into_iter()
+                    .map(|range| range.map(|code| code as usize))
+                    .flat_map(|[low, high]| {
                         (low / 64..=high / 64).map(move |word| (word, low, high))
                     })
                     .map(|(word, low, high)| {
@@ -103,7 +87,12 @@ impl PageState {
         order.sort_by_key(|&(used, _)| std::cmp::Reverse(used));
         let mut statuses = vec!["unloaded"; faces.len()];
         for (_, index) in order.into_iter().filter(|&(used, _)| used > 0) {
-            let (family, sources, ..) = &faces[index];
+            let (sources, face) = &faces[index];
+            let family = &face.family;
+            let rules = rules(
+                face.range.as_deref(),
+                [&face.weight, &face.style, &face.stretch].map(|value| value.as_deref()),
+            );
             statuses[index] = 'status: {
                 for (kind, value) in sources {
                     if *kind == "local" {
@@ -115,7 +104,14 @@ impl PageState {
                     let name = match self.fonts.files.get(value).cloned() {
                         Some(name) => {
                             if let Some(name) = &name {
-                                self.use_font(family, name, false);
+                                let placed = self.fonts.placed.get(index);
+                                if placed.is_none_or(|placed| placed.as_ref() != Some(face)) {
+                                    self.add_face(family, name, rules.clone(), index);
+                                    if self.fonts.placed.len() <= index {
+                                        self.fonts.placed.resize(index + 1, None);
+                                    }
+                                    self.fonts.placed[index] = Some(face.clone());
+                                }
                             }
                             name
                         }
@@ -141,7 +137,7 @@ impl PageState {
                                         .and_then(|path| Ok(std::fs::read(path)?))
                                 }
                             }
-                            .and_then(|bytes| self.add_font(family, bytes));
+                            .and_then(|bytes| self.add_font(family, bytes, rules.clone(), index));
                             if let Err(error) = &result {
                                 eprintln!("apps: @font-face {family}: {error}");
                             }
@@ -160,12 +156,21 @@ impl PageState {
         let faces = faces
             .into_iter()
             .zip(statuses)
-            .map(|((family, _, src, range), status)| (family, src, range, status))
+            .map(|((_, face), status)| {
+                let descriptors = [face.weight, face.style, face.stretch];
+                (face.family, face.src, face.range, status, descriptors)
+            })
             .collect();
         (self.fonts.loads != loads, faces)
     }
 
-    pub(crate) fn add_font(&mut self, family: &str, bytes: Vec<u8>) -> Result<String> {
+    pub(crate) fn add_font(
+        &mut self,
+        family: &str,
+        bytes: Vec<u8>,
+        rules: renderer::FaceRules,
+        order: usize,
+    ) -> Result<String> {
         const LIMIT: usize = 32 * 1024 * 1024;
         let system = self
             .fonts
@@ -223,15 +228,44 @@ impl PageState {
             .and_then(|id| database.face(*id))
             .context("Unsupported or invalid font data")?
             .clone();
-        let name = system.add_font(bytes, family)?;
+        let name = system.add_font(bytes, family, rules.clone(), order)?;
         // Faces are found by the family of their `@font-face`, as in CSS.
         for &id in &ids {
             database.remove_face(id);
         }
-        info.families = vec![(name.clone(), usvg::fontdb::Language::English_UnitedStates)];
+        info.families = vec![(
+            family.to_owned(),
+            usvg::fontdb::Language::English_UnitedStates,
+        )];
+        if let Some([weight, _]) = rules.weight {
+            info.weight = usvg::fontdb::Weight(weight as u16);
+        }
+        info.style = match rules.style {
+            Some(renderer::FontStyle::Normal) => usvg::fontdb::Style::Normal,
+            Some(renderer::FontStyle::Italic) => usvg::fontdb::Style::Italic,
+            Some(renderer::FontStyle::Oblique) => usvg::fontdb::Style::Oblique,
+            None => info.style,
+        };
         database.push_face_info(info);
-        self.use_font(family, &name, true);
+        self.fonts_changed();
         Ok(name)
+    }
+
+    // A file that another face uses too.
+    fn add_face(&mut self, family: &str, name: &str, rules: renderer::FaceRules, order: usize) {
+        let system = self.fonts.system.as_ref();
+        if system.is_some_and(|system| system.add_face(family, name, rules, order)) {
+            self.fonts_changed();
+        }
+    }
+
+    fn fonts_changed(&mut self) {
+        self.fonts.loads += 1;
+        style::FONT_NAMES.with(|names| *names.borrow_mut() = Default::default());
+        // Invalidate only font-dependent values. A new style cache loses constructed and CSSOM-edited sheets.
+        self.styles.cache.environment.metrics = None;
+        self.styles.invalidate();
+        self.dirty = true;
     }
 
     pub(crate) fn local_font(&mut self, family: &str, name: &str) -> bool {
@@ -244,26 +278,12 @@ impl PageState {
         else {
             return false;
         };
-        self.use_font(family, &found, false);
+        let same = found.eq_ignore_ascii_case(family);
+        if !same && !self.fonts.aliases.contains_key(family) {
+            self.fonts.aliases.insert(family.to_owned(), found);
+            self.fonts_changed();
+        }
         true
-    }
-
-    pub(crate) fn use_font(&mut self, family: &str, name: &str, added: bool) {
-        let same = name.eq_ignore_ascii_case(family);
-        if !added && (same || self.fonts.aliases.contains_key(family)) {
-            return;
-        }
-        self.fonts.loads += 1;
-        style::FONT_NAMES.with(|names| *names.borrow_mut() = Default::default());
-        // Invalidate only font-dependent values. A new style cache loses constructed and CSSOM-edited sheets.
-        self.styles.cache.environment.metrics = None;
-        self.styles.invalidate();
-        if !same {
-            self.fonts
-                .aliases
-                .insert(family.to_owned(), name.to_owned());
-        }
-        self.dirty = true;
     }
 }
 
@@ -310,7 +330,7 @@ mod tests {
         assert_eq!(
             faces
                 .iter()
-                .map(|(family, _, _, status)| format!("{family} {status}"))
+                .map(|(family, _, _, status, _)| format!("{family} {status}"))
                 .collect::<Vec<_>>(),
             [
                 "Fallback loaded",
@@ -323,8 +343,7 @@ mod tests {
         );
         assert_eq!(state.fonts.files["missing.woff2"], None);
         assert!(!state.fonts.files.contains_key("cyrillic.woff2"));
-        // Added faces go under their CSS family, so no alias is needed, except on Windows.
-        assert!(cfg!(windows) || !state.fonts.aliases.contains_key("Ranked"));
+        assert!(!state.fonts.aliases.contains_key("Ranked"));
         let width = |state: &PageState, font: &str, text: &str| {
             crate::render::raster::canvas::text::line(
                 &system,
@@ -348,13 +367,7 @@ mod tests {
             "Missing, Brand, sans-serif".into(),
         )]));
         // The later installed families stay for the glyphs that the first lacks.
-        // Windows finds an added face only by the family name in its file.
-        let first = if cfg!(windows) {
-            "H2O Test\n"
-        } else {
-            "Brand\n"
-        };
-        assert!(font.family.starts_with(first), "{}", font.family);
+        assert!(font.family.starts_with("Brand\n"), "{}", font.family);
         assert!(!load(&mut doc, &mut state).0);
         assert_eq!(state.fonts.text.1.len(), 0x110000 / 64);
         let text = doc
@@ -377,15 +390,15 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn faces_of_one_family_match_by_their_weight_class() {
+    fn faces_of_one_family_match_by_their_declared_weight() {
         let system = std::rc::Rc::new(renderer::TextSystem::new());
         let assets = HashMap::from(["test.woff2", "test-medium.woff2"].map(|name| {
             let fonts = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fonts");
             (name.to_owned(), PathBuf::from(fonts).join(name))
         }));
         let mut doc = Document::parse(
-            "<style>@font-face { font-family: Brand; src: url(test.woff2) }
-            @font-face { font-family: Brand; src: url(test-medium.woff2) }</style><p>AB</p>",
+            "<style>@font-face { font-family: Brand; src: url(test.woff2); font-weight: 700 }
+            @font-face { font-family: Brand; src: url(test-medium.woff2); font-weight: 100 500 }</style><p>AB</p>",
         );
         let mut state = PageState::default();
         state.fonts.system = Some(system.clone());
@@ -393,7 +406,7 @@ mod tests {
         state.base = url::Url::parse("apps:///index.html").ok();
         state.restyle(&mut doc, [800., 600.]);
         state.load_fonts(&doc, &assets);
-        for (weight, width) in [(400, 15.), (500, 7.5), (600, 7.5)] {
+        for (weight, width) in [(100, 7.5), (500, 7.5), (600, 15.), (700, 15.)] {
             let font = format!("{weight} 10px Brand");
             assert_eq!(
                 crate::render::raster::canvas::text::line(

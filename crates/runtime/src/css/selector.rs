@@ -3,12 +3,12 @@ use std::{borrow::Cow, hash::BuildHasher, rc::Rc};
 
 pub(crate) type SelectorList = Rc<Vec<Selector>>;
 
-pub(crate) const FOCUS: u16 = 1;
-pub(crate) const FOCUS_WITHIN: u16 = 2;
-pub(crate) const HOVER: u16 = 4;
-pub(crate) const ACTIVE: u16 = 8;
-pub(crate) const FOCUS_VISIBLE: u16 = 128;
-pub(crate) const HAS: u16 = 16;
+pub(crate) const FOCUS: u32 = 1;
+pub(crate) const FOCUS_WITHIN: u32 = 2;
+pub(crate) const HOVER: u32 = 4;
+pub(crate) const ACTIVE: u32 = 8;
+pub(crate) const FOCUS_VISIBLE: u32 = 128;
+pub(crate) const HAS: u32 = 16;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Selector {
@@ -296,7 +296,7 @@ impl Selector {
         Ok(())
     }
 
-    pub(crate) fn states(&self, parents: &mut Vec<SelectorList>) -> u16 {
+    pub(crate) fn states(&self, parents: &mut Vec<SelectorList>) -> u32 {
         let mut states = self
             .previous
             .as_ref()
@@ -353,6 +353,7 @@ impl Selector {
                     "-webkit-progress-value",
                     "file-selector-button",
                     "-webkit-file-upload-button",
+                    "highlight",
                 ]
                 .iter()
                 .position(|n| n == name)
@@ -416,7 +417,7 @@ impl Selector {
         };
         let classes = compound(&rest[..split]);
         let allowed = if part {
-            !matches!(kind, 12 | 13) && classes.stateful()
+            !matches!(kind, 12 | 13 | 22) && classes.stateful()
         } else {
             matches!(kind, 0 | 1 | 3 | 6 | 14..=16 | usize::MAX) && classes.simple.is_empty()
         };
@@ -867,6 +868,16 @@ impl Selector {
                             && name != "-internal-dialog-in-top-layer"
                         {
                             return None;
+                        }
+                        let ident;
+                        if functional && (name == "state" || element && name == "highlight") {
+                            let length;
+                            argument = argument.trim();
+                            (ident, length) = identifier(argument)?;
+                            if length != argument.len() {
+                                return None;
+                            }
+                            argument = &ident;
                         }
                         if element {
                             specificity[2] = specificity[2].saturating_add(1);

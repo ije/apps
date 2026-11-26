@@ -1,9 +1,11 @@
 use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType};
 use objc2_core_text::{
-    CTFont, CTFontDescriptor, CTFontTableOptions, kCTFontFeatureSettingsAttribute,
-    kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue, kCTFontVariationAttribute,
-    kCTFontVariationAxisDefaultValueKey, kCTFontVariationAxisIdentifierKey,
-    kCTFontVariationAxisMaximumValueKey, kCTFontVariationAxisMinimumValueKey,
+    CTFont, CTFontDescriptor, CTFontTableOptions, kCTFontFeatureSelectorIdentifierKey,
+    kCTFontFeatureSettingsAttribute, kCTFontFeatureTypeIdentifierKey,
+    kCTFontFeatureTypeSelectorsKey, kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue,
+    kCTFontVariationAttribute, kCTFontVariationAxisDefaultValueKey,
+    kCTFontVariationAxisIdentifierKey, kCTFontVariationAxisMaximumValueKey,
+    kCTFontVariationAxisMinimumValueKey,
 };
 use std::ptr;
 
@@ -26,6 +28,18 @@ pub(super) fn with_features(font: &CTFont, features: &[(String, u32)]) -> CFReta
             let keys = unsafe { [kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue] };
             CFDictionary::<CFString, CFType>::from_slices(&keys, &[&tag, &value])
         })
+        // CoreText doesn't map the tag to the small capitals of the oldest fonts.
+        .chain(features.iter().filter(|(tag, _)| tag == "smcp").map(|_| {
+            let three = CFNumber::new_i32(3);
+            // SAFETY: the keys are CoreText constants.
+            let keys = unsafe {
+                [
+                    kCTFontFeatureTypeIdentifierKey,
+                    kCTFontFeatureSelectorIdentifierKey,
+                ]
+            };
+            CFDictionary::<CFString, CFType>::from_slices(&keys, &[&three, &three])
+        }))
         .collect();
     let settings = CFArray::from_retained_objects(&settings);
     // SAFETY: a size of 0 keeps the font's size, and the descriptor only adds feature settings.
@@ -117,6 +131,45 @@ pub(super) fn default_weight(font: &CTFont) -> Option<f32> {
                 .then(|| number(&axis, default)?.as_f32())?
         })
         .filter(|weight| *weight >= 100.)
+}
+
+/// The tags of the AAT small capitals of a font.
+pub(super) fn small_caps(font: &CTFont) -> Vec<[u8; 4]> {
+    // SAFETY: CoreText returns an array of dictionaries for features, with an array of dictionaries of selectors.
+    let Some(features) = (unsafe { font.features() }) else {
+        return Vec::new();
+    };
+    let features = unsafe { features.cast_unchecked::<CFDictionary<CFString, CFType>>() };
+    // SAFETY: the keys are CoreText constants.
+    let keys = unsafe {
+        [
+            kCTFontFeatureTypeIdentifierKey,
+            kCTFontFeatureSelectorIdentifierKey,
+        ]
+    };
+    let mut tags = Vec::new();
+    for feature in features.iter() {
+        let number = |from: &CFDictionary<CFString, CFType>, key: &CFString| {
+            from.get(key)?.downcast::<CFNumber>().ok()?.as_i32()
+        };
+        let Some(selectors) = (unsafe { feature.get(kCTFontFeatureTypeSelectorsKey) })
+            .and_then(|list| list.downcast::<CFArray>().ok())
+        else {
+            continue;
+        };
+        let selectors = unsafe { selectors.cast_unchecked::<CFDictionary<CFString, CFType>>() };
+        for selector in selectors.iter() {
+            let pair = [number(&feature, keys[0]), number(&selector, keys[1])];
+            tags.extend(match pair.map(|value| value.unwrap_or(-1)) {
+                [3, 3] | [37, 1] => Some(*b"smcp"),
+                [38, 1] => Some(*b"c2sc"),
+                [37, 2] => Some(*b"pcap"),
+                [38, 2] => Some(*b"c2pc"),
+                _ => None,
+            });
+        }
+    }
+    tags
 }
 
 fn os2(font: &CTFont, len: usize) -> Option<CFRetained<objc2_core_foundation::CFData>> {

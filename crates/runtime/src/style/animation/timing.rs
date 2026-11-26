@@ -5,7 +5,7 @@ use crate::css::{
 use crate::dom::Document;
 use crate::style::cascade::computed::ComputedStyles;
 use crate::style::keyframes::interpolate::{
-    Lerp, PAINT, animatable, computed, interpolate, keeps_box_in_place, lerp, transitions,
+    Lerp, PAINT, animatable, computed, interpolate, keeps_box_in_place, lerp_of, sized, transitions,
 };
 use crate::style::keyframes::{Animation, COMPOSITES, DIRECTIONS, FILLS, keyword, tracks};
 use std::borrow::Cow;
@@ -146,7 +146,7 @@ pub(crate) fn retarget(
                 }
                 longhands
                     .into_iter()
-                    .map(|(name, _)| Prop::new(&name))
+                    .map(|(name, _)| crate::css::properties::physical(Prop::new(&name), new))
                     .collect()
             }
         };
@@ -192,7 +192,12 @@ pub(crate) fn retarget(
         if from == after {
             continue;
         }
-        let lerp = lerp(property.name(), &from, after);
+        let lerp = lerp_of(
+            property,
+            registry,
+            &sized(new, property, &from),
+            &sized(new, property, after),
+        );
         if !discrete && (matches!(property, Prop::DISPLAY | Prop::OVERLAY) || lerp.is_none()) {
             continue;
         }

@@ -442,6 +442,39 @@ fn clip_paths_clip_out_of_flow_descendants_like_chrome() {
     );
 }
 
+// The colors are those of Chrome.
+#[test]
+#[ignore = "requires the macOS window server"]
+fn shapes_mask_boxes_offset_paths_and_clip_margins_draw_like_chrome() {
+    let page = "<body style='margin:0;width:400px;background:white'><style>div{width:100px;height:100px;box-sizing:border-box;\
+        background:red;float:left}</style>\
+        <div style='clip-path:shape(from 0 0,hline to 100%,vline by 50%,hline to 0,close)'></div>\
+        <div style='clip-path:content-box;padding:20px'></div>\
+        <div style='clip-path:xywh(0 0 50% 100%);filter:drop-shadow(40px 0 red)'></div>\
+        <div id=m style='padding:20px;mask:linear-gradient(#000 0 0) content-box exclude,linear-gradient(#000 0 0)'></div>\
+        <div style='background:none'><i style='display:block;width:20px;height:20px;background:red;\
+        offset-path:ray(90deg);offset-distance:30px'></i></div>\
+        <div style='background:none;overflow:clip;overflow-clip-margin:10px;width:50px;margin:0 50px 0 20px'>\
+        <b style='display:block;width:200px;height:50px;background:red'></b></div></body>";
+    let text = run_hidden(
+        &format!(
+            r#"{STEPS}
+            await load('page.html');
+            const row = async points => {{ const out = []; for (const [x, y] of points) out.push(await pixel(x, y) === '255,255,255' ? 'w' : 'r'); return out.join(''); }};
+            console.log('PIXELS ' + await row([[50, 25], [50, 75], [150, 10], [150, 50], [240, 50], [260, 50], [350, 5], [350, 50], [80, 150], [50, 150], [115, 110], [125, 110], [175, 110], [185, 110]]));
+            await step('padding', () => run("document.getElementById('m').style.padding = '2px'"));
+            console.log('PIXELS ' + await row([[350, 5], [350, 1]]));
+            "#
+        ),
+        &[("page.html", page)],
+    );
+    let pixels: Vec<_> = text
+        .lines()
+        .filter(|line| line.starts_with("PIXELS"))
+        .collect();
+    assert_eq!(pixels, ["PIXELS rwwrrwrwrwwrrw", "PIXELS wr"], "{text}");
+}
+
 #[test]
 #[ignore = "requires the macOS window server"]
 fn faded_inline_text_stays_in_its_lines() {
@@ -1642,4 +1675,147 @@ fn page_bars_follow_chrome() {
             "{line}: {text}"
         );
     }
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn boxes_in_3d_rendering_contexts_draw_and_hit_by_depth_like_chrome() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        // BGRA to RGB.
+        const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap()].slice(0, 3).reverse().join();
+        const look = async (name, x, y, color, id) => {
+            const seen = await pixel(x, y), hit = await run(`document.elementFromPoint(${x}, ${y}).id`);
+            if (seen !== color || id && hit !== id) fail(name + ': ' + seen + ' on ' + hit);
+        };
+        const [red, green] = ['255,0,0', '0,128,0'];
+        await look('front', 50, 50, red, 'front');
+        await run("card.className = 'turned'");
+        await look('back', 50, 50, green, 'back');
+        // The first box in the tree is nearest to the viewer.
+        await look('near', 170, 50, red, 'near');
+        await run("near.style.transform = 'translateZ(-30px)'");
+        await look('far', 170, 50, green, 'far');
+        // Two planes that go through each other.
+        await look('left', 270, 50, red);
+        await look('right', 330, 50, green);
+        // `opacity` flattens the children, which then paint in tree order.
+        await run("near.style.transform = 'translateZ(30px)', near.parentNode.style.opacity = 0.99");
+        for (let n = 0; n < 2; n++) await win.webContents.capturePage();
+        const hit = await run('document.elementFromPoint(170, 50).id');
+        if (hit !== 'far') fail('flat: ' + hit);
+        const rect = JSON.parse(await run("card.className = 'edge', JSON.stringify(back.getBoundingClientRect())"));
+        if (Math.abs(rect.x - 50) > 0.1 || rect.width > 0.1) fail('edge: ' + JSON.stringify(rect));
+        "#,
+        &[(
+            "page.html",
+            "<style>body{margin:0;background:#fff}.s{position:absolute;top:0;width:100px;height:100px;transform-style:preserve-3d}\
+             .s>div{position:absolute;inset:0}.turned{transform:rotateY(180deg)}.edge{transform:rotateY(90deg)}</style>\
+             <div class=s style='left:0'><div id=card style='transform-style:preserve-3d'><div id=front style='position:absolute;inset:0;background:#f00;backface-visibility:hidden'></div>\
+             <div id=back style='position:absolute;inset:0;background:#008000;backface-visibility:hidden;transform:rotateY(180deg)'></div></div></div>\
+             <div class=s style='left:120px'><div id=near style='background:#f00;transform:translateZ(30px)'></div><div id=far style='background:#008000'></div></div>\
+             <div class=s style='left:250px'><div id=one style='background:#f00;transform:rotateY(45deg)'></div><div id=two style='background:#008000;transform:rotateY(-45deg)'></div></div>\
+             <script>const card = document.getElementById('card'), near = document.getElementById('near'), back = document.getElementById('back')</script></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn boxes_take_the_pointer_where_3d_transforms_put_them_like_chrome() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const hit = async (name, x, y, id) => {
+            const found = await run(`(node => node && (node.id || node.localName))(document.elementFromPoint(${x}, ${y}))`);
+            if (found !== id) fail(name + ': ' + found + ' instead of ' + id);
+        };
+        // A plane behind the viewer takes no pointer, and one that crosses the viewer only the part before it.
+        await hit('behind', 50, 50, 'a');
+        await hit('behind flat', 150, 50, 'b');
+        await hit('crossing', 270, 95, 'near');
+        await hit('crossing', 270, 120, 'near');
+        await hit('crossing', 270, 30, 'html');
+        // A transform without an inverse draws nothing and takes no pointer.
+        const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap()].slice(0, 3).join();
+        for (const x of [320, 350, 380]) {
+            await hit('singular', x, 30, 'html');
+            if (await pixel(x, 30) !== '255,255,255') fail('singular at ' + x);
+        }
+        // A box that becomes inline, and a new node with the number of a removed box, lose the place in 3D.
+        await run("turned.parentNode.id = 'line'");
+        await hit('turned', 60, 220, 'line');
+        await run("turned.style.cssText = ''");
+        for (let n = 0; n < 2; n++) await win.webContents.capturePage();
+        const [x, y] = JSON.parse(await run("(r => JSON.stringify([r.x + r.width / 2, r.y + r.height / 2]))(turned.getBoundingClientRect())"));
+        await hit('inline', x, y, 'turned');
+        await run("document.querySelectorAll('.s, #boxes').forEach(node => node.remove())");
+        for (let n = 0; n < 10; n++) await win.webContents.capturePage();
+        await run("words.innerHTML = Array.from({ length: 60 }, (_, at) => '<span id=w' + at + '>word</span> ').join('')");
+        for (let n = 0; n < 2; n++) await win.webContents.capturePage();
+        const missed = await run("[...words.children].filter(word => { const r = word.getBoundingClientRect(); return document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2) !== word }).length");
+        if (missed) fail('new words missed: ' + missed);
+        "#,
+        &[(
+            "page.html",
+            "<style>body{margin:0;background:#fff}.s{position:absolute;top:0;width:100px;height:100px;perspective:100px;pointer-events:none}\
+             .s *{position:absolute;inset:0;pointer-events:auto}.k{background:#f00}#boxes i{position:absolute;display:block;width:30px;height:20px;transform:rotateX(40deg);left:0;top:300px}</style>\
+             <div id=a style='position:absolute;inset:0 auto auto 0;width:100px;height:100px'></div><div id=b style='position:absolute;left:100px;top:0;width:100px;height:100px'></div>\
+             <div class=s style='left:0'><div id=p style='transform-style:preserve-3d;pointer-events:none'><div id=c style='transform:translateZ(200px)'></div></div></div>\
+             <div class=s style='left:100px'><div id=d style='transform:translateZ(200px)'></div></div>\
+             <div class=s style='left:220px;height:200px;overflow:hidden'><div id=near class=k style='transform:rotateX(80deg) scaleY(4)'></div></div>\
+             <div class=s style='width:30px;left:310px'><div class=k style='transform:scale3d(1,1,0)'></div></div>\
+             <div class=s style='width:30px;left:340px;perspective:none;transform-style:preserve-3d'><div class=k style='transform:scaleZ(0)'></div></div>\
+             <div class=s style='width:30px;left:370px;perspective:none'><div class=k style='transform:scaleZ(0)'></div></div>\
+             <p style='position:absolute;top:200px;margin:0'><a id=turned style='display:inline-block;padding:20px 60px;pointer-events:auto;transform:rotateY(180deg);backface-visibility:hidden'>turned</a></p>\
+             <div id=boxes style='transform-style:preserve-3d;pointer-events:none'><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>\
+             <div id=words style='position:absolute;top:0;width:400px'></div>\
+             <script>const turned = document.getElementById('turned'), words = document.getElementById('words')</script></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn positioned_boxes_paint_in_their_new_order() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        for (let n = 0; n < 3; n++) await win.webContents.capturePage();
+        await run("const box = document.getElementById('box'); box.append(box.firstChild)");
+        await win.webContents.capturePage();
+        const seen = [...(await win.webContents.capturePage({ x: 10, y: 10, width: 1, height: 1 })).toBitmap()].slice(0, 3).reverse().join();
+        if (seen !== '255,0,0') fail(seen);
+        "#,
+        &[(
+            "page.html",
+            "<style>body{margin:0}#box{position:relative;height:90px}#box>div{position:absolute;inset:0;background:#f00}#box>.b{background:#00f}</style>\
+             <div id=box><div>a</div><div class=b>b</div></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn turning_3d_contexts_draw_their_last_frame() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        // BGRA to RGB.
+        const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap()].slice(0, 3).reverse().join();
+        await run("document.body.className = 'on'");
+        for (let n = 0; n < 30; n++) await win.webContents.capturePage();
+        await new Promise(resolve => setTimeout(resolve, 300));
+        const seen = await pixel(50, 50);
+        if (seen !== '0,128,0') fail(seen);
+        "#,
+        &[(
+            "page.html",
+            "<style>body{margin:0;background:#fff}#s{perspective:400px;width:100px}#card{height:100px;transform-style:preserve-3d;transition:transform .2s}\
+             .on #card{transform:rotateY(180deg)}#card>div{position:absolute;inset:0;background:#f00;backface-visibility:hidden}\
+             #card>.b{background:#008000;transform:rotateY(180deg)}i{display:block;width:9px;height:9px;animation:m .2s infinite}@keyframes m{to{translate:9px}}</style>\
+             <div id=s><div id=card><div><i></i></div><div class=b></div></div></div></body>",
+        )],
+    );
 }

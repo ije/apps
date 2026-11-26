@@ -283,11 +283,18 @@ fn registered_values_compute_strings_keep_var_and_rules_follow_layers() {
     };
     assert_eq!(
         all("#a"),
-        ["20%", "1.5s", "2", "96px 3px", "rgb(0 0 255 / 50%)", "100"]
+        [
+            "20%",
+            "1.5s",
+            "2",
+            "96px 3px",
+            "rgba(0, 0, 255, 0.5)",
+            "100"
+        ]
     );
     assert_eq!(all("#b"), ["1%", "1s", "1", "1px", "currentcolor", "0"]);
     assert_eq!(get("#c", "--l").as_deref(), Some("96px 3px"));
-    assert_eq!(get("#c", "--c").as_deref(), Some("rgb(0 0 255 / 50%)"));
+    assert_eq!(get("#c", "--c").as_deref(), Some("rgba(0, 0, 255, 0.5)"));
     assert_eq!(get("#a", "--e"), None);
     assert_eq!(get("#a", "--u").as_deref(), Some("100  x"));
     assert_eq!(get("#a", "width").as_deref(), Some("1px"));
@@ -421,8 +428,8 @@ fn registered_properties_follow_syntax_inheritance_and_initial_values() {
     assert_eq!(get("#c9", "--r"), None);
     assert_eq!(get("#b", "border-top-style").as_deref(), Some("solid"));
     assert_eq!(get("#c10", "width").as_deref(), Some("5px"));
-    assert_eq!(get("#c11", "--q").as_deref(), Some("green"));
-    assert_eq!(get("#c12", "--q").as_deref(), Some("blue"));
+    assert_eq!(get("#c11", "--q").as_deref(), Some("rgb(0, 128, 0)"));
+    assert_eq!(get("#c12", "--q").as_deref(), Some("rgb(0, 0, 255)"));
     assert_eq!(get("#c13", "--bad").as_deref(), Some("1px"));
     assert_eq!(get("#sh", "box-shadow").as_deref(), Some("0 1px 2px red"));
     assert_eq!(get("#ch", "box-shadow").as_deref(), Some("0 0 #0000"));
@@ -1247,4 +1254,59 @@ fn content_visibility_and_intrinsic_sizes_parse_like_chrome() {
     ] {
         assert_eq!(get(selector, name), expected, "{selector} {name}");
     }
+}
+
+#[test]
+fn registered_values_compute_as_their_first_matching_type() {
+    use crate::css::value::grammar::computed;
+    let of = |syntax: &str, value: &str| computed(syntax, value, None).0;
+    assert_eq!(of("<custom-ident> | <color>", "red"), "red");
+    assert_eq!(of("<color> | <custom-ident>", "red"), "rgb(255, 0, 0)");
+    assert_eq!(of("<length> | <color>", "red"), "rgb(255, 0, 0)");
+    assert_eq!(of("<length-percentage>", "max(1px, 5%)"), "max(1px, 5%)");
+    assert_eq!(
+        of("<length-percentage>", "calc(5% - 1px)"),
+        "calc(5% - 1px)"
+    );
+}
+
+#[test]
+fn text_and_font_values_parse_and_compute_like_chrome() {
+    for (name, value, supported) in [
+        ("font-variant", "all-small-caps tabular-nums", true),
+        ("font-variant", "normal none", false),
+        ("font-variant-caps", "super", false),
+        ("font-variant-numeric", "lining-nums oldstyle-nums", false),
+        ("font-size-adjust", "cap-height .7", true),
+        ("font-size-adjust", "from-font", false),
+        ("hyphens", "auto", true),
+        ("hyphens", "all", false),
+        ("hyphenate-character", "'='", true),
+        ("hyphenate-character", "'=' '-'", false),
+        ("text-indent", "hanging 2em each-line", true),
+        ("text-indent", "hanging", false),
+        ("text-underline-position", "under left", true),
+        ("text-underline-position", "left right", false),
+        ("text-decoration-skip-ink", "none", true),
+        ("text-emphasis", "dot", false),
+    ] {
+        assert_eq!(
+            crate::css::value::grammar::supports(name, value),
+            (name != "text-emphasis").then_some(supported),
+            "{name}: {value}"
+        );
+    }
+    let doc = Document::parse(
+        "<p style='font:italic small-caps 20px Times;font-variant-position:super'><b style='font-variant:ruby unicase'></b></p>\
+         <i style='font:20px Times;text-indent:each-line 1em'></i>",
+    );
+    let styles = styles(&doc, 800., 600.);
+    let get = |selector, name| styles[element(&doc, selector)].get(name).cloned();
+    assert_eq!(get("p", "font-variant-caps").as_deref(), Some("small-caps"));
+    assert_eq!(get("p", "font-variant-position").as_deref(), Some("super"));
+    assert_eq!(get("b", "font-variant-caps").as_deref(), Some("unicase"));
+    assert_eq!(get("b", "font-variant-east-asian").as_deref(), Some("ruby"));
+    assert_eq!(get("b", "font-variant-position").as_deref(), Some("normal"));
+    assert_eq!(get("i", "font-variant-caps").as_deref(), Some("normal"));
+    assert_eq!(get("i", "text-indent").as_deref(), Some("20px each-line"));
 }

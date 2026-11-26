@@ -154,6 +154,10 @@ pub(crate) struct TextHighlight {
     pub(crate) background: renderer::Color,
     /// Like Chrome, a `::selection` style draws the text without its stroke.
     pub(crate) stroke: bool,
+    /// The background of a custom highlight is as tall as the font, not the line.
+    pub(crate) tight: bool,
+    /// The underline, line-through and overline.
+    pub(crate) lines: [Option<renderer::Decoration>; 3],
 }
 
 // A background or border of an inline box in a group of the text: the group, rect, corners, fill and border.
@@ -209,22 +213,182 @@ pub(crate) fn paint_text(
         )
     });
     let shown = |row: usize| top(row) < mask.bottom() && top(row) + tall > mask.top();
-    let decorated = runs.iter().any(|run| {
-        run.underline.is_some() || run.strikethrough.is_some() || run.overline.is_some()
-    });
-    // Backgrounds and highlights of all rows draw first, then decorations, then glyphs.
-    for decorations in [false, true] {
-        if decorations && !decorated {
-            break;
+    // The parts of the highlights in this line.
+    let highlights: Vec<_> = highlights
+        .iter()
+        .filter(|part| part.range.start < offset + line.len && part.range.end > offset)
+        .collect();
+    let lined = |highlight: &&TextHighlight| highlight.lines.iter().any(Option::is_some);
+    let decorated = highlights.iter().any(lined)
+        || runs.iter().any(|run| {
+            run.underline.is_some() || run.strikethrough.is_some() || run.overline.is_some()
+        });
+    let over = |index: usize| {
+        let mut over = highlights.iter().rev();
+        over.find(|part| part.range.contains(&index) && (part.color.is_some() || !part.stroke))
+    };
+    let paint_glyphs = |window: &mut Window| {
+        let Some(mut wrap) = (0..=wraps.len()).find(|&row| top(row) + tall > mask.top()) else {
+            return;
+        };
+        let (mut left, from) = match wrap.checked_sub(1).map(|row| wraps[row] as usize) {
+            Some(at) => (line.glyphs[at].x, at),
+            None => (px(0.), 0),
+        };
+        let mut text_run = 0;
+        let mut run_end = runs.first().map_or(0, |run| run.len);
+        let mut spaced = (usize::MAX, 0, 0.);
+        let (mut face, mut glyph_box) = (None, Rect::default());
+        for (at, glyph) in line.glyphs.iter().enumerate().skip(from) {
+            if face.replace((glyph.font, glyph.size)) != Some((glyph.font, glyph.size)) {
+                glyph_box = window.text_system().glyph_box(glyph.font, glyph.size);
+            }
+            if wraps.get(wrap) == Some(&(at as u32)) {
+                wrap += 1;
+                left = glyph.x;
+            }
+            if top(wrap) >= mask.bottom() {
+                break;
+            }
+            let index = offset + glyph.index as usize;
+            // Right-to-left text goes back.
+            if index < run_end - runs[text_run].len {
+                (text_run, run_end) = (0, runs[0].len);
+            }
+            while index >= run_end && text_run + 1 < runs.len() {
+                text_run += 1;
+                run_end += runs[text_run].len;
+            }
+            let highlight = over(index);
+            let color = ink.unwrap_or_else(|| {
+                (highlight.and_then(|highlight| highlight.color)).unwrap_or(runs[text_run].color)
+            });
+            let stroke = runs[text_run]
+                .stroke
+                .filter(|_| !glyph.emoji && highlight.is_none_or(|highlight| highlight.stroke));
+            let fill = color.a > 0. || window.clips_text();
+            if !fill && stroke.is_none_or(|(_, color)| color.a == 0.) {
+                continue;
+            }
+            let gap = rows
+                .get(wrap)
+                .filter(|row| row.gap > px(0.))
+                .map_or(px(0.), |row| {
+                    if !line.sorted() {
+                        if spaced.0 != wrap {
+                            spaced = (wrap, 0, 0.);
+                        }
+                        let gap = row.gap * spaced.2;
+                        spaced.2 += spaces(text.get(index..index + 1).unwrap_or(""));
+                        return gap;
+                    }
+                    if spaced.0 != wrap || index < spaced.1 {
+                        spaced = (wrap, row.start.min(index), 0.);
+                    }
+                    spaced.2 += spaces(text.get(spaced.1..index).unwrap_or(""));
+                    spaced.1 = index;
+                    row.gap * spaced.2
+                });
+            let position = point(
+                origin.x + shift(wrap) + glyph.x - left + gap,
+                origin.y + line_height * wrap + baseline + drop(wrap),
+            );
+            // The font box has y up from the baseline. A miter of the stroke reaches twice its width past the outline.
+            let reach = stroke.map_or(px(0.), |(width, _)| width * 2.);
+            if !Rect::new(
+                point(
+                    position.x + glyph_box.left() - reach,
+                    position.y - glyph_box.bottom() - reach,
+                ),
+                size(
+                    glyph_box.size.width + reach * 2.,
+                    glyph_box.size.height + reach * 2.,
+                ),
+            )
+            .intersects(window.content_mask().bounds)
+            {
+                window.cull();
+                continue;
+            }
+            if fill {
+                let id = glyph.id;
+                window.draw_glyph(
+                    position,
+                    glyph.font,
+                    id,
+                    glyph.size,
+                    color,
+                    glyph.emoji,
+                    px(0.),
+                );
+            }
+            // Like Chrome, the stroke draws above the fill.
+            if let Some((width, stroke)) = stroke {
+                let color = ink.unwrap_or(stroke);
+                window.draw_glyph(
+                    position, glyph.font, glyph.id, glyph.size, color, false, width,
+                );
+            }
+        }
+        if !text_line.hyphenates() {
+            return;
+        }
+        let mut left = px(0.);
+        for (row, &at) in wraps.iter().enumerate() {
+            let next = &line.glyphs[at as usize];
+            if let Some(hyphen) = text_line.hyphen(row).filter(|_| shown(row)) {
+                let end = offset + next.index as usize;
+                let mut run_end = 0;
+                let run = runs.iter().find(|run| {
+                    run_end += run.len;
+                    end <= run_end
+                });
+                let highlight = over(end - 1).filter(|part| !part.tight);
+                let color = (ink.or(highlight.and_then(|highlight| highlight.color)))
+                    .or(run.map(|run| run.color))
+                    .unwrap_or_default();
+                // At the end of the row, the left one in right-to-left text.
+                let x = origin.x
+                    + shift(row)
+                    + match text_line.rtl() {
+                        true => -hyphen.line.width,
+                        false => next.x - left + justify(row, end),
+                    };
+                for glyph in &hyphen.line.glyphs {
+                    let position = point(x + glyph.x, top(row) + baseline);
+                    window.draw_glyph(
+                        position,
+                        glyph.font,
+                        glyph.id,
+                        glyph.size,
+                        color,
+                        glyph.emoji,
+                        px(0.),
+                    );
+                }
+            }
+            left = next.x;
+        }
+    };
+    // Backgrounds and highlights of all rows draw first, then the lines below the glyphs. Lines through the glyphs
+    // draw last.
+    let row_parts = |pass: usize, window: &mut Window| {
+        if pass > 0 && !decorated {
+            return;
         }
         let mut start = 0;
         let mut left = px(0.);
         let mut first_run = (0, 0);
+        let mut first_glyph = 0;
+        let mut gaps: Vec<[Pixels; 2]> = Vec::new();
         for (row, boundary) in wraps.iter().map(Some).chain([None]).enumerate() {
-            let (end, right) = boundary.map_or((line.len, line.width), |&at| {
-                let glyph = &line.glyphs[at as usize];
-                (glyph.index as usize, glyph.x)
-            });
+            let end = text_line.row_index(row + 1);
+            let right = boundary.map_or(line.width, |&at| line.glyphs[at as usize].x);
+            let hyphen = text_line
+                .hyphen(row)
+                .map_or(px(0.), |hyphen| hyphen.line.width);
+            let glyphs = first_glyph..boundary.map_or(line.glyphs.len(), |&at| at as usize);
+            first_glyph = glyphs.end;
             if !shown(row) {
                 window.cull();
                 start = end;
@@ -233,6 +397,27 @@ pub(crate) fn paint_text(
             }
             let row_left = origin.x + shift(row) - left;
             let top = top(row);
+            let preserved = runs.first().is_some_and(|run| run.preserve);
+            let rtl = text_line.rtl();
+            // The ends of text in visual order. Right-to-left text can have more than one part.
+            let parts =
+                |a: usize, b: usize, hyphen: Pixels, each: &mut dyn FnMut(Pixels, Pixels)| {
+                    if line.sorted() {
+                        let end_x = if b == offset + end {
+                            right + hyphen + justify(row, b)
+                        } else {
+                            line.x_at(b - offset) + justify(row, b)
+                        };
+                        return each(line.x_at(a - offset) + justify(row, a), end_x);
+                    }
+                    let gap = rows.get(row).map_or(px(0.), |row| row.gap);
+                    for part in text_line.parts(row, a - offset..b - offset, gap, preserved) {
+                        each(left + part.left, left + part.right);
+                    }
+                    if rtl && hyphen > px(0.) && b == offset + end {
+                        each(left - hyphen, left);
+                    }
+                };
             while first_run.0 < runs.len() && first_run.1 + runs[first_run.0].len <= offset + start
             {
                 first_run.1 += runs[first_run.0].len;
@@ -248,187 +433,196 @@ pub(crate) fn paint_text(
                     (run_start + run.len).min(offset + end),
                 );
                 run_start += run.len;
-                let background = run
-                    .background_color
-                    .filter(|_| ink.is_none() && !decorations);
-                if a >= b
-                    || background.is_none()
-                        && (!decorations
-                            || run.underline.is_none()
-                                && run.strikethrough.is_none()
-                                && run.overline.is_none())
-                {
+                let background = run.background_color.filter(|_| ink.is_none());
+                if a >= b {
                     continue;
                 }
-                let x = line.x_at(a - offset) + justify(row, a);
-                let end_x = if b == offset + end {
-                    right + justify(row, b)
-                } else {
-                    line.x_at(b - offset) + justify(row, b)
-                };
-                if let Some(background) = background {
-                    window.draw_rect(
-                        Rect::new(
-                            point(row_left + x, top + baseline - line.ascent),
-                            size(end_x - x, line.ascent + line.descent),
-                        ),
-                        background,
-                    );
-                    continue;
-                }
-                // Like Chromium: in device pixels, from the rounded ascent of the run's font, lines as thick as a
-                // whole number of pixels, an underline below the baseline by half its thickness, a line-through a
-                // third of the ascent above it, and an overline on top of the ascent.
-                let scale = window.scale_factor();
-                let system = window.text_system();
-                let size = run.font_size.unwrap_or(line.font_size) * scale;
-                let ascent = f32::from(system.line_metrics(system.face(&run.font), size)[0]);
-                let base = ((top + baseline).0 * scale).round();
-                for (decoration, kind) in [
-                    (&run.underline, 0),
-                    (&run.strikethrough, 1),
-                    (&run.overline, 2),
-                ] {
-                    let Some(decoration) = decoration else {
-                        continue;
-                    };
-                    let thick = (decoration.thickness.0 * scale).max(1.);
-                    let y = match kind {
-                        0 => {
-                            base + (thick / 2.).ceil()
-                                + decoration
-                                    .offset
-                                    .map_or(0., |offset| (offset.0 * scale).round())
+                if pass == 0 {
+                    if let Some(background) = background {
+                        parts(a, b, hyphen, &mut |x, end_x| {
+                            window.draw_rect(
+                                Rect::new(
+                                    point(row_left + x, top + baseline - line.ascent),
+                                    size(end_x - x, line.ascent + line.descent),
+                                ),
+                                background,
+                            )
+                        });
+                    }
+                    // Like Chrome, a custom highlight is as tall as the font, and leaves out the hyphen and the spaces that hang at
+                    // the end of the row.
+                    for part in highlights.iter().filter(|part| part.tight) {
+                        let (a, mut b) = (part.range.start.max(a), part.range.end.min(b));
+                        if a < b
+                            && b == offset + end
+                            && boundary.is_some()
+                            && let Some(shown) = text.get(a..b)
+                        {
+                            b = a + shown.trim_end_matches(' ').len();
                         }
-                        1 => (base - ascent / 3. - thick / 2.).round(),
-                        _ => base - ascent - thick.floor(),
-                    };
-                    window.draw_line(
-                        point(row_left + x, px(y / scale)),
-                        end_x - x,
-                        px(thick.floor() / scale),
-                        ink.or(decoration.color).unwrap_or_default(),
-                        decoration.style,
-                    );
+                        if a >= b || part.background.a == 0. {
+                            continue;
+                        }
+                        let system = window.text_system();
+                        let size = run.font_size.unwrap_or(line.font_size);
+                        let [ascent, descent, _] =
+                            system.line_metrics(system.face(&run.font), size);
+                        parts(a, b, px(0.), &mut |x, end_x| {
+                            window.draw_rect(
+                                Rect::new(
+                                    point(row_left + x, top + baseline - ascent),
+                                    renderer::size(end_x - x, ascent + descent),
+                                ),
+                                part.background,
+                            )
+                        });
+                    }
+                    continue;
+                }
+                // Lines under and over the text are below the glyphs.
+                let passed = |[under, through, over]: [Option<renderer::Decoration>; 3]| match pass
+                {
+                    1 => [under, None, over],
+                    _ => [None, through, None],
+                };
+                // Like Chrome, a collapsible space where the row wraps has no line.
+                let mut shown = b;
+                if !run.preserve && boundary.is_some() && b == offset + end {
+                    shown = a + text.get(a..b).unwrap_or("").trim_end_matches(' ').len();
+                }
+                let own = [run.underline, run.strikethrough, run.overline];
+                let marked = highlights.iter().filter(|part| lined(part)).map(|part| {
+                    let (start, end) = (part.range.start.max(a), part.range.end.min(b));
+                    (start, end.min(shown), px(0.), part.lines)
+                });
+                for (a, b, hyphen, lines) in std::iter::once((a, shown, hyphen, own)).chain(marked)
+                {
+                    let lines = passed(lines);
+                    if a >= b || lines.iter().all(Option::is_none) {
+                        continue;
+                    }
+                    // Like Chromium: in device pixels, from the rounded ascent of the run's font, lines as thick as a
+                    // whole number of pixels, an underline below the baseline by half its thickness, a line-through a
+                    // third of the ascent above it, and an overline on top of the ascent.
+                    let scale = window.scale_factor();
+                    let system = window.text_system();
+                    let size = run.font_size.unwrap_or(line.font_size) * scale;
+                    let ascent = f32::from(system.line_metrics(system.face(&run.font), size)[0]);
+                    let base = ((top + baseline).0 * scale).round();
+                    for (kind, decoration) in lines.into_iter().enumerate() {
+                        let Some(decoration) = decoration else {
+                            continue;
+                        };
+                        let thick = (decoration.thickness.0 * scale).max(1.);
+                        let double = decoration.style == renderer::DecorationStyle::Double;
+                        let wavy = decoration.style == renderer::DecorationStyle::Wavy;
+                        let mut y = match kind {
+                            0 if decoration.under => {
+                                let system = window.text_system();
+                                let em = system.metrics(system.face(&run.font)).em_ascent;
+                                let offset =
+                                    decoration.offset.map_or(0., |offset| offset.0 * scale);
+                                base + (size.0 * (1. - em) + offset).floor() + 1.
+                            }
+                            0 => {
+                                base + (decoration.offset).map_or((thick / 2.).ceil(), |offset| {
+                                    (offset.0 * scale).round()
+                                })
+                            }
+                            1 => (base - ascent / 3. - thick / 2.).round(),
+                            _ => base - ascent - thick.floor(),
+                        };
+                        y -= match kind {
+                            2 if double => thick.floor() + 1.,
+                            1 | 2 if wavy => (thick + 1.) * kind as f32,
+                            _ => 0.,
+                        };
+                        let mut ends = Vec::new();
+                        parts(a, b, hyphen, &mut |x, end_x| ends.push([x, end_x]));
+                        gaps.clear();
+                        if decoration.skip_ink {
+                            // Like Chrome, ink that reaches less than half a device pixel into the line makes no gap.
+                            let [above, below] = if wavy {
+                                let reach = renderer::wave_reach(thick);
+                                [thick + 1. - reach, thick + 1. + reach]
+                            } else if double {
+                                [0., thick * 2. + 1.]
+                            } else {
+                                [0., thick]
+                            };
+                            let band = [y - base + above + 0.5, y - base + below - 0.5];
+                            let around = px(thick.min(13.) / scale);
+                            let system = window.text_system();
+                            let (mut counted, mut gap) = (a, justify(row, a));
+                            for glyph in &line.glyphs[glyphs.clone()] {
+                                let index = offset + glyph.index as usize;
+                                if !(a..b).contains(&index) || glyph.emoji {
+                                    continue;
+                                }
+                                if index != counted {
+                                    gap = justify(row, index);
+                                    counted = index;
+                                }
+                                if let Some(ends) = system.intercept(
+                                    glyph.font,
+                                    glyph.id,
+                                    glyph.size * scale,
+                                    band.map(|y| y - glyph.y.0 * scale),
+                                ) && !text
+                                    .get(index..)
+                                    .is_some_and(|text| text.starts_with(covered))
+                                {
+                                    let at = row_left + glyph.x + gap;
+                                    let [left, right] = ends.map(|x| at + px(x / scale));
+                                    gaps.push([left - around, right + around]);
+                                }
+                            }
+                        }
+                        for [x, end_x] in ends {
+                            window.draw_line_between(
+                                point(row_left + x, px(y / scale)),
+                                end_x - x,
+                                px(if wavy { thick } else { thick.floor() } / scale),
+                                ink.or(decoration.color).unwrap_or_default(),
+                                decoration.style,
+                                &gaps,
+                            );
+                        }
+                    }
                 }
             }
-            for highlight in highlights.iter().filter(|_| !decorations) {
+            for highlight in highlights.iter().filter(|part| pass == 0 && !part.tight) {
                 let a = highlight.range.start.max(offset + start);
                 let b = highlight.range.end.min(offset + end);
                 if a >= b {
                     continue;
                 }
-                let x = line.x_at(a - offset) + justify(row, a);
-                let end_x = if b == offset + end {
-                    right + justify(row, b)
-                } else {
-                    line.x_at(b - offset) + justify(row, b)
-                };
-                if end_x > x && highlight.background.a > 0. {
-                    window.draw_rect(
-                        Rect::new(point(row_left + x, top), size(end_x - x, line_height)),
-                        highlight.background,
-                    );
-                }
+                parts(a, b, hyphen, &mut |x, end_x| {
+                    if end_x > x && highlight.background.a > 0. {
+                        window.draw_rect(
+                            Rect::new(point(row_left + x, top), size(end_x - x, line_height)),
+                            highlight.background,
+                        );
+                    }
+                });
             }
             start = end;
             left = right;
         }
-    }
-    let Some(mut wrap) = (0..=wraps.len()).find(|&row| top(row) + tall > mask.top()) else {
-        return;
     };
-    let (mut left, from) = match wrap.checked_sub(1).map(|row| wraps[row] as usize) {
-        Some(at) => (line.glyphs[at].x, at),
-        None => (px(0.), 0),
-    };
-    let mut text_run = 0;
-    let mut run_end = runs.first().map_or(0, |run| run.len);
-    let mut spaced = (usize::MAX, 0, 0.);
-    let (mut face, mut glyph_box) = (None, Rect::default());
-    for (at, glyph) in line.glyphs.iter().enumerate().skip(from) {
-        if face.replace((glyph.font, glyph.size)) != Some((glyph.font, glyph.size)) {
-            glyph_box = window.text_system().glyph_box(glyph.font, glyph.size);
-        }
-        if wraps.get(wrap) == Some(&(at as u32)) {
-            wrap += 1;
-            left = glyph.x;
-        }
-        if top(wrap) >= mask.bottom() {
-            break;
-        }
-        let index = offset + glyph.index as usize;
-        while index >= run_end && text_run + 1 < runs.len() {
-            text_run += 1;
-            run_end += runs[text_run].len;
-        }
-        let highlight = highlights
-            .iter()
-            .find(|highlight| highlight.range.contains(&index));
-        let color = ink.unwrap_or_else(|| {
-            (highlight.and_then(|highlight| highlight.color)).unwrap_or(runs[text_run].color)
-        });
-        let stroke = runs[text_run]
-            .stroke
-            .filter(|_| !glyph.emoji && highlight.is_none_or(|highlight| highlight.stroke));
-        let fill = color.a > 0. || window.clips_text();
-        if !fill && stroke.is_none_or(|(_, color)| color.a == 0.) {
-            continue;
-        }
-        let gap = rows
-            .get(wrap)
-            .filter(|row| row.gap > px(0.))
-            .map_or(px(0.), |row| {
-                if spaced.0 != wrap || index < spaced.1 {
-                    spaced = (wrap, row.start.min(index), 0.);
-                }
-                spaced.2 += spaces(text.get(spaced.1..index).unwrap_or(""));
-                spaced.1 = index;
-                row.gap * spaced.2
-            });
-        let position = point(
-            origin.x + shift(wrap) + glyph.x - left + gap,
-            origin.y + line_height * wrap + baseline + drop(wrap),
-        );
-        // The font box has y up from the baseline. A miter of the stroke reaches twice its width past the outline.
-        let reach = stroke.map_or(px(0.), |(width, _)| width * 2.);
-        if !Rect::new(
-            point(
-                position.x + glyph_box.left() - reach,
-                position.y - glyph_box.bottom() - reach,
-            ),
-            size(
-                glyph_box.size.width + reach * 2.,
-                glyph_box.size.height + reach * 2.,
-            ),
-        )
-        .intersects(window.content_mask().bounds)
-        {
-            window.cull();
-            continue;
-        }
-        if fill {
-            let id = glyph.id;
-            window.draw_glyph(
-                position,
-                glyph.font,
-                id,
-                glyph.size,
-                color,
-                glyph.emoji,
-                px(0.),
-            );
-        }
-        // Like Chrome, the stroke draws above the fill.
-        if let Some((width, stroke)) = stroke {
-            let color = ink.unwrap_or(stroke);
-            window.draw_glyph(
-                position, glyph.font, glyph.id, glyph.size, color, false, width,
-            );
-        }
-    }
+    row_parts(0, window);
+    row_parts(1, window);
+    paint_glyphs(window);
+    row_parts(2, window);
 }
 
+// Like Chrome, lines don't skip the ink of these characters.
+fn covered(ch: char) -> bool {
+    matches!(ch, '_' | '\u{2e80}'..='\u{a4cf}' | '\u{f900}'..='\u{faff}' | '\u{fe30}'..='\u{fe4f}' | '\u{ff00}'..='\u{ffef}'
+        | '\u{20000}'..='\u{3ffff}')
+}
+
+#[inline(never)]
 pub(crate) fn spaces(text: &str) -> f32 {
     text.bytes().filter(|byte| *byte == b' ').count() as f32
 }
@@ -442,8 +636,15 @@ pub(crate) fn text_position(
     let mut position = layout.point_at(index)?;
     let row = ((position.y - layout.bounds().top()) / layout.line_height()).round();
     if let Some(row) = rows.get(row as usize) {
-        position.x +=
-            row.shift + row.gap * spaces(text.get(row.start.min(index)..index).unwrap_or(""));
+        let spaces = match row.gap > px(0.) && layout.reordered() {
+            true => {
+                let x = position.x - layout.bounds().left();
+                let at = ((position.y - layout.bounds().top()) / layout.line_height()).round();
+                layout.spaces_before(at as usize, x) as f32
+            }
+            false => spaces(text.get(row.start.min(index)..index).unwrap_or("")),
+        };
+        position.x += row.shift + row.gap * spaces;
         position.y += row.drop;
     }
     Some(position)
@@ -493,13 +694,17 @@ pub(crate) fn text_rects(
             .map(|at| vec![rect(at, at)])
             .unwrap_or_default();
     }
+    if let Some(parts) = visual_parts(layout, rows, &(start..end), true) {
+        return parts
+            .into_iter()
+            .map(|(_, top, part)| rect(point(part.left, top), point(part.right, top)))
+            .collect();
+    }
     let mut starts = Vec::new();
     let mut offset = 0;
     for line in layout.lines().iter() {
         starts.push(offset);
-        for &at in line.breaks.iter() {
-            starts.push(offset + line.line.glyphs[at as usize].index as usize);
-        }
+        starts.extend((1..line.rows()).map(|row| offset + line.row_index(row)));
         offset += line.len() + 1;
     }
     let mut rects = Vec::new();
@@ -525,6 +730,77 @@ pub(crate) fn text_rects(
     rects
 }
 
+// The parts of `range` in text of several directions, with their rows and their places in the window.
+fn visual_parts(
+    layout: &renderer::Paragraph,
+    rows: &[crate::render::layout::Row],
+    range: &std::ops::Range<usize>,
+    hang: bool,
+) -> Option<Vec<(usize, Pixels, renderer::Part)>> {
+    if !layout.reordered() {
+        return None;
+    }
+    let lines = layout.lines();
+    let bounds = layout.bounds();
+    let (mut parts, mut offset, mut row) = (Vec::new(), 0, 0);
+    for line in lines.iter() {
+        for at in 0..line.rows() {
+            let own = range.start.max(offset + line.row_index(at))
+                ..range.end.min(offset + line.row_index(at + 1));
+            if own.start < own.end {
+                let placed = rows.get(row);
+                let [shift, gap, drop] = placed.map_or([px(0.); 3], |placed| {
+                    [placed.shift, placed.gap, placed.drop]
+                });
+                let top = bounds.top() + layout.line_height() * row as f32 + drop;
+                let left = bounds.left() + shift;
+                for part in line.parts(
+                    at,
+                    own.start - offset..own.end - offset,
+                    gap,
+                    hang && line.preserves(),
+                ) {
+                    let part = renderer::Part {
+                        left: left + part.left,
+                        right: left + part.right,
+                        first: offset + part.first,
+                        last: offset + part.last,
+                        ..part
+                    };
+                    parts.push((row, top, part));
+                }
+            }
+            row += 1;
+        }
+        offset += line.len() + 1;
+    }
+    Some(parts)
+}
+
+/// The parts of an inline box whose line places its edges: the top of the row, the left and the right edge in the
+/// window, and whether the part has the sides of the box.
+fn box_parts(
+    layout: &renderer::Paragraph,
+    rows: &[crate::render::layout::Row],
+    id: usize,
+) -> Vec<(Pixels, [Pixels; 2], [bool; 2])> {
+    let (mut parts, mut first) = (Vec::new(), 0);
+    let bounds = layout.bounds();
+    for line in layout.lines().iter() {
+        let gap = |row: usize| rows.get(first + row).map_or(px(0.), |row| row.gap);
+        for (row, edges, sides) in line.box_parts(id, gap) {
+            let row = first + row;
+            let [shift, drop] = rows
+                .get(row)
+                .map_or([px(0.); 2], |row| [row.shift, row.drop]);
+            let top = bounds.top() + layout.line_height() * row as f32 + drop;
+            parts.push((top, edges.map(|x| bounds.left() + shift + x), sides));
+        }
+        first += line.rows();
+    }
+    parts
+}
+
 fn inline_box(
     layout: &renderer::Paragraph,
     text: &str,
@@ -534,8 +810,27 @@ fn inline_box(
     base: Pixels,
     window: &Window,
 ) -> Option<(Point<Pixels>, Point<Pixels>, Pixels, Pixels)> {
-    let a = text_start(layout, text, rows, range.start, range.end)?;
-    let b = text_position(layout, text, rows, range.end)?;
+    let visual = visual_parts(layout, rows, range, false).filter(|parts| !parts.is_empty());
+    let (a, b) = match visual {
+        Some(parts) => {
+            let (first, last) = (&parts[0], &parts[parts.len() - 1]);
+            let ends = |row: usize| {
+                let own = parts.iter().filter(move |part| part.0 == row);
+                own.fold(
+                    [px(f32::INFINITY), px(f32::NEG_INFINITY)],
+                    |ends, (.., part)| [ends[0].min(part.left), ends[1].max(part.right)],
+                )
+            };
+            (
+                point(ends(first.0)[0], first.1),
+                point(ends(last.0)[1], last.1),
+            )
+        }
+        None => (
+            text_start(layout, text, rows, range.start, range.end)?,
+            text_position(layout, text, rows, range.end)?,
+        ),
+    };
     let Some((style, units)) = style else {
         return Some((a, b, px(0.), layout.line_height()));
     };
@@ -611,9 +906,9 @@ fn first_line(
     width: Option<Pixels>,
     font_size: Pixels,
     text_system: &renderer::TextSystem,
-) -> (SharedString, Vec<renderer::TextRun>) {
+) -> (SharedString, Rc<[renderer::TextRun]>) {
     let Some((base, pseudo, mode)) = data.first_line.as_deref() else {
-        return (data.text.clone(), data.runs.to_vec());
+        return (data.text.clone(), data.runs.clone());
     };
     let mut text = data.text.to_string();
     let len = text.find('\n').unwrap_or(text.len());
@@ -631,16 +926,13 @@ fn first_line(
             ..Default::default()
         },
     );
-    let end = lines
-        .first()
-        .and_then(|line| Some(line.line.glyphs[*line.breaks.first()? as usize].index as usize))
-        .unwrap_or(len);
+    let end = lines.first().map_or(len, |line| line.row_index(1));
     if let Some(mode) = mode {
         style::text_transform(&mut text, 0..end, mode);
     }
     (
         text.into(),
-        style::restyle(&data.runs, 0..end, base, pseudo),
+        style::restyle(&data.runs, 0..end, base, pseudo).into(),
     )
 }
 
@@ -651,11 +943,18 @@ pub(crate) struct InlineText {
     pub(crate) view: Rc<super::super::ViewState>,
     pub(crate) atoms: Rc<[AtomSlot]>,
     // The static places in the text.
-    pub(crate) marks: Rc<[std::cell::Cell<Point<Pixels>>]>,
-    pub(crate) justify: Option<bool>,
+    pub(crate) marks: Rc<[std::cell::Cell<MarkPlace>]>,
+    // Each line starts at the side of its own direction.
+    pub(crate) plaintext: bool,
+    // Whether rows stretch, and rows that end a line of the text.
+    pub(crate) justify: [bool; 2],
+    // The alignment of the rows that end a line, from `text-align-last`.
+    pub(crate) last: Option<renderer::TextAlign>,
     /// Right-to-left text: indents and rows that overflow start at the right.
     pub(crate) rtl: bool,
-    pub(crate) shaped: std::cell::RefCell<Option<(renderer::Paragraph, Vec<renderer::TextRun>)>>,
+    /// The lines go from the bottom, like in `vertical-lr`.
+    pub(crate) reversed: bool,
+    pub(crate) shaped: std::cell::RefCell<Option<(renderer::Paragraph, Rc<[renderer::TextRun]>)>>,
     pub(crate) prepainted: std::cell::RefCell<Prepainted>,
 }
 
@@ -678,9 +977,12 @@ pub(crate) struct AtomSlot {
     pub(crate) at: std::cell::Cell<Point<Pixels>>,
 }
 
+// Where the text has a mark, and the direction there in mixed text.
+pub(crate) type MarkPlace = (Point<Pixels>, Option<bool>);
+
 // Moves the mark of a static place to where the text has it. A box that was a block is at the start of the line.
 pub(crate) struct MarkBox {
-    pub(crate) marks: Rc<[std::cell::Cell<Point<Pixels>>]>,
+    pub(crate) marks: Rc<[std::cell::Cell<MarkPlace>]>,
     pub(crate) index: usize,
     pub(crate) key: usize,
     pub(crate) block: bool,
@@ -692,11 +994,12 @@ impl renderer::Hooks for MarkBox {
     }
 
     fn prepaint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
-        let mut by = self.marks[self.index].get() - cx.exact.origin;
+        let (at, mut rtl) = self.marks[self.index].get();
+        let mut by = at - cx.exact.origin;
         if self.block {
-            by.x = px(0.);
+            (by.x, rtl) = (px(0.), None);
         }
-        cx.window.place_mark(self.key as u64, by);
+        cx.window.place_mark(self.key as u64, by, rtl);
         inner(cx.window);
     }
 }
@@ -764,16 +1067,18 @@ impl renderer::Hooks for AtomBox {
 fn with_atoms(
     data: &crate::render::inline::InlineText,
     sizes: impl Fn(usize) -> f32,
-    runs: &mut [renderer::TextRun],
+    runs: &mut Rc<[renderer::TextRun]>,
 ) {
-    if data.first_line.is_some() {
+    if data.first_line.is_some() || data.atoms.is_empty() {
         return;
     }
+    let mut sized = runs.to_vec();
     for (index, atom) in data.atoms.iter().enumerate() {
-        if let Some(run) = runs.get_mut(atom.run) {
-            run.inset[1] = px(sizes(index));
+        if let Some(run) = sized.get_mut(atom.run) {
+            run.inset[1] += px(sizes(index));
         }
     }
+    *runs = sized.into();
 }
 
 type MeasuredSize = ((bool, Option<Pixels>), renderer::Size<Pixels>);
@@ -799,7 +1104,7 @@ impl From<InlineText> for renderer::Node {
     fn from(text: InlineText) -> Self {
         let data = &text.data;
         if data.first_line.is_none() && !text.mixed {
-            return renderer::text(data.text.clone(), Some(data.runs.to_vec())).hooks(text);
+            return renderer::text(data.text.clone(), Some(data.runs.clone())).hooks(text);
         }
         renderer::node()
             .measure(
@@ -845,8 +1150,7 @@ impl From<InlineText> for renderer::Node {
                     });
                     let width = room.filter(|_| wraps);
                     // A percentage of `text-indent` is of the width of the paragraph.
-                    let indent = style.text_indent
-                        + px(style.text_indent_percent * room.map_or(0., f32::from));
+                    let indent = style.indent(room.unwrap_or_default());
                     let key = (
                         min_content,
                         room.filter(|_| style.text_indent_percent != 0.).or(width),
@@ -897,14 +1201,14 @@ impl From<InlineText> for renderer::Node {
                     );
                     for (index, line) in lines.iter().enumerate() {
                         let mut line_size = line.extent(line_height);
-                        if index == 0 && line.breaks.is_empty() {
-                            line_size.width = (line_size.width + indent).max(px(0.));
+                        if line.breaks.is_empty() {
+                            line_size.width = (line_size.width + indent.of(index)[0]).max(px(0.));
                         }
                         size.height += line_size.height;
                         size.width = size.width.max(line_size.width);
                     }
                     if min_content {
-                        size.width = renderer::widest_piece(&lines, -indent);
+                        size.width = renderer::widest_piece(&lines, px(0.), indent);
                     }
                     // Rows that moved below floats make the text taller.
                     if let Some(&[.., top]) = lines.last().and_then(|line| line.shifts.last()) {
@@ -954,6 +1258,9 @@ fn place(
     id: usize,
     rect: [f32; 4],
 ) {
+    if !dom.geometry.shapes.is_empty() {
+        dom.geometry.shapes.remove(&id);
+    }
     if !data.cuts.contains(&id) {
         dom.geometry.mirror.insert(id, rect);
         return;
@@ -993,10 +1300,10 @@ impl InlineText {
         for line in layout.lines().iter() {
             starts.push((offset, false));
             let mut left = px(0.);
-            for &at in line.breaks.iter() {
+            for (row, &at) in line.breaks.iter().enumerate() {
                 let glyph = &line.line.glyphs[at as usize];
                 let wide = glyph.x - left > bounds.size.width + px(0.01);
-                starts.push((offset + glyph.index as usize, wide));
+                starts.push((offset + line.row_index(row + 1), wide));
                 left = glyph.x;
             }
             offset += line.len() + 1;
@@ -1028,7 +1335,28 @@ impl InlineText {
                 Some(last) => last.drop + extents.last().map_or(px(0.), |extent| extent[1]),
                 None => px(0.),
             };
-            let x = if mark.block {
+            let visible = match starts.get(row + 1) {
+                Some(next) if next.0 == at => text[..at].trim_end_matches(' ').len(),
+                _ => at,
+            };
+            let mut first = [0; 2];
+            let mixed = layout.lines().iter().find_map(|line| {
+                let [offset, rows] = first;
+                first = [offset + line.len() + 1, rows + line.rows()];
+                let inside = row < first[1] && at <= offset + line.len();
+                inside.then(|| {
+                    line.mark(
+                        visible - offset,
+                        row - rows,
+                        placed.gap,
+                        [mark.lead, mark.trail].map(px),
+                    )
+                })
+            });
+            let mixed = mixed.flatten().filter(|_| !mark.block);
+            let x = if let Some((x, _)) = mixed {
+                bounds.left() + placed.shift + x
+            } else if mark.block {
                 if start < at.min(text.len()) || mark.opened {
                     y += above + height + below;
                 }
@@ -1052,7 +1380,8 @@ impl InlineText {
                 text_position(layout, text, rows, at)
                     .map_or(bounds.left(), |at| at.x - px(mark.trail))
             };
-            place.set(point(x, y) - bounds.origin + origin);
+            let rtl = mixed.map(|(_, rtl)| rtl);
+            place.set((point(x, y) - bounds.origin + origin, rtl));
         }
     }
 
@@ -1209,7 +1538,7 @@ impl renderer::Hooks for InlineText {
             })
             .flatten()
             .unwrap_or(bounds.size.width);
-        let indent = style.text_indent + px(style.text_indent_percent * f32::from(base));
+        let indent = style.indent(base);
         let strut = window.text_system().face(&style.font());
         let extents = super::super::layout::line::row_extents(
             layout.lines().iter(),
@@ -1235,28 +1564,41 @@ impl renderer::Hooks for InlineText {
             || banded
             || !self.data.boxes.is_empty()
             || !self.data.outlines.is_empty()
-            || indent != px(0.)
-            || self.justify.is_some()
+            || indent != renderer::Indent::default()
+            || self.justify != [false; 2]
+            || self.last.is_some()
+            || self.plaintext
+            || self.reversed
             || extents.iter().flatten().any(|extra| *extra > px(0.))
             || !moves.is_empty()
         {
             let mut offset = 0;
-            for line in layout.lines().iter() {
+            for (index, line) in layout.lines().iter().enumerate() {
                 let glyphs = &line.line.glyphs;
+                let (rtl, side) = match (self.plaintext, line.rtl()) {
+                    (false, _) => (self.rtl, style.text_align),
+                    (true, false) => (false, renderer::TextAlign::Left),
+                    (true, true) => (true, renderer::TextAlign::Right),
+                };
                 let mut left = px(0.);
                 let mut start = offset;
                 for (line_rows, boundary) in line.breaks.iter().map(Some).chain([None]).enumerate()
                 {
+                    let lead = line.lead(line_rows).filter(|_| line_rows > 0);
                     let (right, end) = boundary.map_or((line.line.width, line.line.width), |&at| {
-                        let x = glyphs[at as usize].x;
-                        let previous = (at as usize).checked_sub(1).map(|glyph| &glyphs[glyph]);
-                        let hanging = previous.filter(|glyph| {
-                            self.data.text.as_bytes().get(offset + glyph.index as usize)
-                                == Some(&b' ')
+                        let x =
+                            glyphs[at as usize].x - line.lead(line_rows + 1).unwrap_or_default();
+                        let hanging = glyphs[..at as usize].iter().rev().take_while(|glyph| {
+                            glyph.x >= left
+                                && self.data.text.as_bytes().get(offset + glyph.index as usize)
+                                    == Some(&b' ')
                         });
-                        (x, hanging.map_or(x, |glyph| glyph.x))
+                        (x, hanging.last().map_or(x, |glyph| glyph.x))
                     });
-                    let indent = if rows.is_empty() { indent } else { px(0.) };
+                    let hyphen = line.hyphen(line_rows);
+                    let hyphen = hyphen.map_or(px(0.), |hyphen| hyphen.line.width);
+                    let end = end + hyphen;
+                    let indent = indent.of(index)[usize::from(line_rows > 0)];
                     // Beside floats, a row starts after the left ones, and moves down below the ones it doesn't fit.
                     let [inset, outset, lowered] = line
                         .shifts
@@ -1270,22 +1612,18 @@ impl renderer::Hooks for InlineText {
                         })
                         .map(px);
                     let free = bounds.size.width - inset - outset - indent - (end - left);
-                    let next = boundary.map_or(offset + line.len(), |&at| {
-                        offset + glyphs[at as usize].index as usize
-                    });
+                    let next = offset + line.row_index(line_rows + 1);
                     let gaps = spaces(self.data.text.get(start..next).unwrap_or("").trim_end());
-                    let justified = match self.justify {
-                        Some(last) => (boundary.is_some() || last) && gaps > 0.,
-                        None => false,
-                    };
+                    let ends = boundary.is_none();
+                    let justified = self.justify[usize::from(ends)] && gaps > 0.;
                     // The indent and a row that overflows are at the start edge, the right one in right-to-left text.
-                    let first = inset + if self.rtl { px(0.) } else { indent };
+                    let first = inset + if rtl { px(0.) } else { indent };
                     let (shift, gap) = if free < px(0.) {
-                        (first + if self.rtl { free } else { px(0.) }, px(0.))
+                        (first + if rtl { free } else { px(0.) }, px(0.))
                     } else if justified {
                         (first, free / gaps)
                     } else {
-                        let shift = match style.text_align {
+                        let shift = match self.last.filter(|_| ends).unwrap_or(side) {
                             renderer::TextAlign::Left => px(0.),
                             renderer::TextAlign::Center => free / 2.,
                             renderer::TextAlign::Right => free,
@@ -1294,7 +1632,8 @@ impl renderer::Hooks for InlineText {
                     };
                     let [above, below] = extents.get(rows.len()).copied().unwrap_or_default();
                     rows.push(crate::render::layout::Row {
-                        shift,
+                        // The hyphen of a right-to-left row is at its left.
+                        shift: shift + lead.unwrap_or_default() + if rtl { hyphen } else { px(0.) },
                         right: shift + end - left + gap * gaps,
                         gap,
                         start,
@@ -1311,9 +1650,10 @@ impl renderer::Hooks for InlineText {
                 }
             }
         }
+        let edged = layout.lines().iter().any(|line| line.lead(0).is_some());
         for inline in &self.data.boxes {
             let (id, range) = &self.data.ranges[inline.index];
-            if inline.lead == 0. || range.start == range.end {
+            if inline.lead == 0. || range.start == range.end || edged {
                 continue;
             }
             let clone = lead_styles
@@ -1344,6 +1684,13 @@ impl renderer::Hooks for InlineText {
                 row.shift += by.x;
                 row.right += by.x;
                 row.drop += by.y;
+            }
+        }
+        // The first line is at the bottom.
+        if self.reversed {
+            let line = layout.line_height();
+            for (index, row) in rows.iter_mut().enumerate() {
+                row.drop = bounds.size.height - line * (2 * index + 1) as f32 - row.drop;
             }
         }
         let rows: crate::render::layout::Rows = rows.into();
@@ -1417,12 +1764,19 @@ impl renderer::Hooks for InlineText {
                 window,
             ) {
                 let font = [top, height];
+                let mut whole: Option<[Pixels; 2]> = None;
                 if let Some(inline) = boxed {
-                    a.x -= px(inline.lead);
-                    b.x = if inline.trail.is_nan() {
-                        a.x + px(inline.edges[1] + inline.edges[3])
-                    } else {
-                        b.x - px(inline.trail)
+                    for (_, [left, right], _) in box_parts(layout, &rows, at) {
+                        let [low, high] = whole.unwrap_or([left, right]);
+                        whole = Some([low.min(left), high.max(right)]);
+                    }
+                    (a.x, b.x) = match whole {
+                        Some([left, right]) => (left, right),
+                        None if inline.trail.is_nan() => {
+                            let left = a.x - px(inline.lead);
+                            (left, left + px(inline.edges[1] + inline.edges[3]))
+                        }
+                        None => (a.x - px(inline.lead), b.x - px(inline.trail)),
                     };
                     top -= px(inline.edges[0]);
                     height += px(inline.edges[0] + inline.edges[2]);
@@ -1446,7 +1800,7 @@ impl renderer::Hooks for InlineText {
                         ),
                     );
                 }
-                let (left, width) = if a.y == b.y {
+                let (left, width) = if a.y == b.y || whole.is_some() {
                     (a.x, b.x - a.x)
                 } else {
                     let spans = spans.get_or_insert_with(|| {
@@ -1455,7 +1809,11 @@ impl renderer::Hooks for InlineText {
                         for line in layout.lines().iter() {
                             let glyphs = &line.line.glyphs;
                             let (mut left, mut start) = (px(0.), offset);
-                            for boundary in line.breaks.iter().map(Some).chain([None]) {
+                            for (row, boundary) in
+                                line.breaks.iter().map(Some).chain([None]).enumerate()
+                            {
+                                let hyphen =
+                                    line.hyphen(row).map_or(px(0.), |hyphen| hyphen.line.width);
                                 let (x, end, next) = boundary.map_or(
                                     (line.line.width, line.line.width, offset + line.len()),
                                     |&at| {
@@ -1484,7 +1842,7 @@ impl renderer::Hooks for InlineText {
                                         )
                                     },
                                 );
-                                spans.push((start, end - left));
+                                spans.push((start, end + hyphen - left));
                                 (left, start) = (x, next);
                             }
                             offset += line.len() + 1;
@@ -1740,7 +2098,58 @@ impl renderer::Hooks for InlineText {
                         inline.map_or([0.; 4], |inline| inline.edges).map(px);
                     let (lead, trail) =
                         inline.map_or((0., 0.), |inline| (inline.lead, inline.trail));
-                    let parts = (first..=last).map(move |row| {
+                    let placed = match inline {
+                        Some(inline) => box_parts(layout, rows, inline.index),
+                        None => Vec::new(),
+                    };
+                    let visual = match placed.is_empty() {
+                        true => visual_parts(layout, rows, range, false),
+                        false => None,
+                    };
+                    let count = match placed.len() {
+                        0 => visual.as_ref().map_or(last + 1 - first, Vec::len),
+                        count => count,
+                    };
+                    let [begins, ends] =
+                        visual.iter().flatten().fold([usize::MAX, 0], |ends, part| {
+                            [ends[0].min(part.2.first), ends[1].max(part.2.last)]
+                        });
+                    let parts = (0..count).map(move |at| {
+                        if let Some(&(y, [left, right], sides)) = placed.get(at) {
+                            let rect = Rect::new(
+                                point(left, y + offset - above),
+                                size(right - left, height + above + below),
+                            );
+                            return (rect, sides.map(|side| side || clone));
+                        }
+                        // The start of right-to-left text is at its right.
+                        if let Some((_, y, part)) = visual.as_ref().map(|parts| &parts[at]) {
+                            let [start, end] =
+                                [part.first == begins || clone, part.last == ends || clone];
+                            let (left, right, sides) = match part.odd {
+                                true => (
+                                    part.left - if end { left_edge } else { px(0.) },
+                                    part.right,
+                                    [end, start],
+                                ),
+                                false => (
+                                    part.left - if start { px(lead) } else { px(0.) },
+                                    part.right
+                                        - if end && !trail.is_nan() {
+                                            px(trail)
+                                        } else {
+                                            px(0.)
+                                        },
+                                    [start, end],
+                                ),
+                            };
+                            let rect = Rect::new(
+                                point(left, *y + offset - above),
+                                size(right - left, height + above + below),
+                            );
+                            return (rect, sides);
+                        }
+                        let row = first + at;
                         let (start, end) = (row == first, row == last);
                         let extent = rows
                             .get(row)
@@ -1972,6 +2381,88 @@ impl renderer::Hooks for InlineText {
                         }
                     }
                 }
+                let doc = &store.pages[&view.id].doc;
+                // Like Chrome, a highlight leaves out the ellipsis of truncated text.
+                let mut shown = 0;
+                if !dom.interaction.highlights.is_empty() {
+                    for line in layout.lines().iter() {
+                        let rest = self.data.text.get(shown..).unwrap_or("");
+                        let same = line
+                            .text
+                            .bytes()
+                            .zip(rest.bytes())
+                            .take_while(|(a, b)| a == b);
+                        let same = same.count();
+                        shown += same;
+                        if same < line.text.len() {
+                            break;
+                        }
+                        shown += 1;
+                    }
+                }
+                for (name, highlight) in &dom.interaction.highlights {
+                    let Some(highlight) = dom.interaction.highlighted.get(highlight) else {
+                        continue;
+                    };
+                    for (id, range) in &self.data.ranges {
+                        let Some(parts) = highlight.nodes.get(id) else {
+                            continue;
+                        };
+                        // Highlights change without a new box, like the selection.
+                        window.paint_volatile();
+                        let element = doc.nodes[*id].parent.unwrap_or(*id);
+                        let kept = &mut dom.styles.highlights.borrow_mut();
+                        let cache = &dom.styles.cache;
+                        let Some(style) = cache.highlight(styles, kept, element, name) else {
+                            continue;
+                        };
+                        let own = &styles.values[*id];
+                        let mut look = (**own).clone();
+                        look.remove(Prop::TEXT_DECORATION_LINE);
+                        look.extend(style.own().map(|(prop, value)| (prop, value.clone())));
+                        if !style.contains(Prop::WEBKIT_TEXT_FILL_COLOR)
+                            && let Some(value) = style.value(Prop::COLOR)
+                        {
+                            look.insert(Prop::WEBKIT_TEXT_FILL_COLOR, value.clone());
+                        }
+                        for prop in [Prop::COLOR, Prop::WEBKIT_TEXT_FILL_COLOR] {
+                            if look
+                                .get(prop)
+                                .is_some_and(|value| value.eq_ignore_ascii_case("currentcolor"))
+                                && let Some(value) = own.value(Prop::COLOR)
+                            {
+                                look.insert(prop, value.clone());
+                            }
+                        }
+                        let run = style::text_run(&look, &styles.lengths[*id], 0);
+                        let colored = style.get(Prop::COLOR).is_some()
+                            || style.get(Prop::WEBKIT_TEXT_FILL_COLOR).is_some();
+                        let background = match style.get(Prop::BACKGROUND_COLOR) {
+                            Some(value) if value.eq_ignore_ascii_case("currentcolor") => run.color,
+                            value => value
+                                .and_then(css::value::color::paint)
+                                .unwrap_or(Color::TRANSPARENT),
+                        };
+                        let text = &self.data.text[range.clone()];
+                        let source = doc.nodes[*id].text.as_str();
+                        for (_, part) in parts {
+                            let [start, end] = part.map(|at| {
+                                range.start + crate::dom::text::shown_index(source, text, at)
+                            });
+                            let end = end.min(shown);
+                            if start < end {
+                                highlights.push(TextHighlight {
+                                    range: start..end,
+                                    color: colored.then_some(run.color),
+                                    background,
+                                    stroke: true,
+                                    tight: true,
+                                    lines: [run.underline, run.strikethrough, run.overline],
+                                });
+                            }
+                        }
+                    }
+                }
                 for (id, range) in &self.data.ranges {
                     let Some([start, end]) = dom.interaction.selection.get(id) else {
                         continue;
@@ -2019,6 +2510,8 @@ impl renderer::Hooks for InlineText {
                             color: color.map(Color::hex),
                             background: Color::hex(background),
                             stroke: styles.extras(*id).selection.is_none(),
+                            tight: false,
+                            lines: Default::default(),
                         });
                     }
                 }

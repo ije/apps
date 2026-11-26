@@ -1,8 +1,12 @@
+pub(crate) mod anchor;
 pub mod color;
 pub(crate) mod counter;
 pub(crate) mod easing;
+pub(crate) mod font;
 pub(crate) mod grammar;
+pub(crate) mod image;
 pub(crate) mod resolved;
+pub(crate) mod shape;
 pub(crate) mod shorthand;
 pub(crate) mod specified;
 pub(crate) mod tokens;
@@ -36,6 +40,50 @@ pub(crate) fn corner_shape(value: &str) -> Option<f64> {
             },
         },
     })
+}
+
+// The basis and the calculation of `calc-size()`.
+pub(crate) fn calc_size(value: &str) -> Option<(&str, &str)> {
+    let (name, args) = value.trim().strip_suffix(')')?.split_once('(')?;
+    let [basis, size] = components(args, ',')[..] else {
+        return None;
+    };
+    name.eq_ignore_ascii_case("calc-size")
+        .then(|| (basis.trim(), size.trim()))
+}
+
+// Whether the size reads the content of its box: not a length or the space around it.
+pub(crate) fn content_size(value: &str) -> bool {
+    match calc_size(value) {
+        Some((basis, _)) => content_size(basis) || matches!(basis, "auto" | "content"),
+        None => matches!(value, "min-content" | "max-content" | "fit-content"),
+    }
+}
+
+// Whether a height is the one that `auto` gives in a block.
+pub(crate) fn auto_size(value: &str) -> bool {
+    match calc_size(value) {
+        Some((basis, size)) => size.trim() == "size" && auto_size(basis),
+        None => value == "auto" || content_size(value),
+    }
+}
+
+// A calculation of `calc-size()` with a value for its `size`.
+pub(crate) fn with_size(calculation: &str, size: &str) -> String {
+    let word = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '%' | '.');
+    let mut out = String::new();
+    let mut rest = calculation;
+    while !rest.is_empty() {
+        let end = rest.find(|c| !word(c)).unwrap_or(rest.len()).max(1);
+        match &rest[..end] {
+            part if part.eq_ignore_ascii_case("size") => {
+                out.push_str(size);
+            }
+            part => out.push_str(part),
+        }
+        rest = &rest[end..];
+    }
+    out
 }
 
 pub fn length(value: &str, base: f32, font: f32, vw: f32, vh: f32) -> f32 {
@@ -235,123 +283,26 @@ impl Filter {
     }
 }
 
-pub(crate) fn clip_path(
-    value: &str,
-    units: &Lengths,
-    size: [f32; 2],
-) -> Option<([f32; 4], [f32; 4])> {
-    let [width, height] = size;
-    let (name, args) = components(value, ' ')
-        .into_iter()
-        .find_map(|part| part.strip_suffix(')')?.split_once('('))?;
-    let tokens = components(args, ' ');
-    let split = tokens
-        .iter()
-        .position(|token| matches!(*token, "round" | "at"))
-        .unwrap_or(tokens.len());
-    let (head, tail) = (
-        &tokens[..split],
-        tokens.get(split + 1..).unwrap_or_default(),
-    );
-    let edges = |values: &[&str]| -> Option<[f32; 4]> {
-        let values = match values {
-            [a] => [*a; 4],
-            [a, b] => [*a, *b, *a, *b],
-            [a, b, c] => [*a, *b, *c, *b],
-            [a, b, c, d] => [*a, *b, *c, *d],
-            _ => return None,
+// The shape and the box of a `shape-outside`.
+pub(crate) fn shape_outside(value: &str) -> Option<shape::Shaped<'_>> {
+    use shape::Shape::{Circle, Ellipse, Inset, Polygon};
+    shape::Shaped::parse(value).filter(|shaped| {
+        let known = |frame| shape::BOXES[..4].contains(&frame);
+        let basic = |shape: &shape::Shape| {
+            matches!(shape, Inset(..) | Circle(..) | Ellipse(..) | Polygon(..))
         };
-        let mut result = [0.; 4];
-        for (side, value) in values.into_iter().enumerate() {
-            result[side] = units.resolve(value, if side % 2 == 0 { height } else { width })?;
-        }
-        Some(result)
-    };
-    let radii = || {
-        let corners = tail.split(|token| *token == "/").next().unwrap_or_default();
-        edges(corners)
-            .map(|[a, b, c, d]| [a, b, c, d].map(|value| value.max(0.)))
-            .unwrap_or_default()
-    };
-    let rect = |x: f32, y: f32, w: f32, h: f32| [x, y, w.max(0.), h.max(0.)];
-    match name.to_ascii_lowercase().as_str() {
-        "inset" => {
-            let [top, right, bottom, left] = edges(head)?;
-            Some((
-                rect(left, top, width - left - right, height - top - bottom),
-                radii(),
-            ))
-        }
-        "rect" => {
-            let [top, right, bottom, left] = <[&str; 4]>::try_from(head).ok()?;
-            let edge = |token: &str, base: f32, auto: f32| {
-                if token == "auto" {
-                    Some(auto)
-                } else {
-                    units.resolve(token, base)
-                }
-            };
-            let [top, bottom] = [edge(top, height, 0.)?, edge(bottom, height, height)?];
-            let [left, right] = [edge(left, width, 0.)?, edge(right, width, width)?];
-            Some((rect(left, top, right - left, bottom - top), radii()))
-        }
-        "xywh" => {
-            let [x, y, w, h] = <[&str; 4]>::try_from(head).ok()?;
-            let [x, w] = [x, w].map(|value| units.resolve(value, width));
-            let [y, h] = [y, h].map(|value| units.resolve(value, height));
-            Some((rect(x?, y?, w?, h?), radii()))
-        }
-        "circle" | "ellipse" => {
-            let (x, y) = match tail {
-                [only] if matches!(*only, "top" | "bottom") => ("center", *only),
-                [only] => (*only, "center"),
-                [a, b, ..] if matches!(*a, "top" | "bottom") || matches!(*b, "left" | "right") => {
-                    (*b, *a)
-                }
-                [a, b, ..] => (*a, *b),
-                [] => ("center", "center"),
-            };
-            let [x, y] = [(x, width), (y, height)].map(|(token, extent)| match token {
-                "left" | "top" => Some(0.),
-                "center" => Some(extent / 2.),
-                "right" | "bottom" => Some(extent),
-                value => units.resolve(value, extent),
-            });
-            let (x, y) = (x?, y?);
-            let sides = [x.abs(), (width - x).abs(), y.abs(), (height - y).abs()];
-            let radius = |token: Option<&&str>, near: f32, far: f32, base: f32| match token {
-                None | Some(&"closest-side") => Some(near),
-                Some(&"farthest-side") => Some(far),
-                Some(value) => units.resolve(value, base).map(|value| value.max(0.)),
-            };
-            let (rx, ry) = if name.eq_ignore_ascii_case("circle") {
-                let r = radius(
-                    head.first(),
-                    sides.into_iter().fold(f32::MAX, f32::min),
-                    sides.into_iter().fold(0., f32::max),
-                    width.hypot(height) / std::f32::consts::SQRT_2,
-                )?;
-                (r, r)
-            } else {
-                (
-                    radius(
-                        head.first(),
-                        sides[0].min(sides[1]),
-                        sides[0].max(sides[1]),
-                        width,
-                    )?,
-                    radius(
-                        head.get(1),
-                        sides[2].min(sides[3]),
-                        sides[2].max(sides[3]),
-                        height,
-                    )?,
-                )
-            };
-            Some((rect(x - rx, y - ry, 2. * rx, 2. * ry), [rx.min(ry); 4]))
-        }
-        _ => None,
-    }
+        shaped.reference.is_none_or(known) && shaped.shape.as_ref().is_none_or(basic)
+    })
+}
+
+// The text of a `shape-outside` with a shape, where the margin box is the default.
+pub(crate) fn outside_text(value: &str, units: Option<&Lengths>) -> Option<String> {
+    let shaped = shape_outside(value)?;
+    let text = shaped.shape?.text(units);
+    Some(match shaped.reference {
+        None | Some("margin-box") => text,
+        Some(frame) => format!("{text} {frame}"),
+    })
 }
 
 #[cfg(test)]

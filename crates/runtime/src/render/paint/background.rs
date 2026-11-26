@@ -124,10 +124,13 @@ pub(crate) fn canvas_source(
 }
 
 enum ImageLayer {
-    // The file of a `url()`, or `None` when it names none.
-    File(Option<std::path::PathBuf>),
+    // The file of a `url()`, or `None` when it names none, and its resolution.
+    File(Option<std::path::PathBuf>, f32),
     Text(String),
 }
+
+// An image of a layer. A cross-fade is two images of one layer, each with its share.
+type LayerImage = (usize, ImageLayer, Option<f32>);
 
 // The layers of `background-image`. A box that builds again on each frame keeps its style value, which can hold
 // large `data:` URLs, so its layers are parsed once per value.
@@ -135,8 +138,9 @@ fn image_layers(
     style: &css::properties::Style,
     base: Option<&url::Url>,
     assets: &HashMap<String, std::path::PathBuf>,
-) -> Rc<[ImageLayer]> {
-    type Parsed = (Rc<str>, Option<url::Url>, Rc<[ImageLayer]>);
+    scale: f32,
+) -> Rc<[LayerImage]> {
+    type Parsed = (Rc<str>, Option<url::Url>, f32, Rc<[LayerImage]>);
     thread_local! {
         static PARSED: std::cell::RefCell<rustc_hash::FxHashMap<usize, Parsed>> = Default::default();
     }
@@ -146,26 +150,47 @@ fn image_layers(
     let key = Rc::as_ptr(value).cast::<u8>() as usize;
     PARSED.with_borrow_mut(|parsed| {
         // The entry holds its value, so no other value takes its address.
-        if let Some((_, known, layers)) = parsed.get(&key)
+        if let Some((_, known, drawn, layers)) = parsed.get(&key)
             && known.as_ref() == base
+            && *drawn == scale
         {
             return layers.clone();
         }
-        let layers: Rc<[ImageLayer]> = css::value::tokens::components(value, ',')
+        let parse = |image: &str| {
+            let (image, resolution) = css::value::image::shown(image, scale);
+            match image.strip_prefix("url(").and_then(|v| v.strip_suffix(')')) {
+                Some(source) => ImageLayer::File(
+                    super::super::raster::image::url_file(source, base, assets),
+                    resolution,
+                ),
+                None => ImageLayer::Text(image.into_owned()),
+            }
+        };
+        let layers: Rc<[LayerImage]> = css::value::tokens::components(value, ',')
             .into_iter()
-            .map(
-                |image| match image.strip_prefix("url(").and_then(|v| v.strip_suffix(')')) {
-                    Some(source) => ImageLayer::File(super::super::raster::image::url_file(
-                        source, base, assets,
-                    )),
-                    None => ImageLayer::Text(image.to_owned()),
+            .enumerate()
+            .flat_map(
+                |(index, image)| match css::value::image::cross_fade(image) {
+                    // Like Chrome, a cross-fade with no image draws nothing.
+                    Some(([a, b], _))
+                        if [a, b]
+                            .iter()
+                            .any(|image| image.eq_ignore_ascii_case("none")) =>
+                    {
+                        vec![(index, ImageLayer::Text("none".into()), None)]
+                    }
+                    Some(([a, b], share)) => vec![
+                        (index, parse(a), Some(1. - share)),
+                        (index, parse(b), Some(share)),
+                    ],
+                    None => vec![(index, parse(image), None)],
                 },
             )
             .collect();
         if parsed.len() >= 1024 {
             parsed.clear();
         }
-        parsed.insert(key, (value.clone(), base.cloned(), layers.clone()));
+        parsed.insert(key, (value.clone(), base.cloned(), scale, layers.clone()));
         layers
     })
 }
@@ -185,6 +210,12 @@ pub(crate) fn css_background(
     // Layers of the canvas tile over the whole viewport, from the box of the root element.
     canvas: bool,
 ) -> Vec<Child> {
+    let scale = {
+        let store = view.store.borrow();
+        store
+            .page_state(view.id)
+            .map_or(1., |state| state.pixel_ratio)
+    };
     let list = |prop| {
         css::value::tokens::components(style.get(prop).unwrap_or(""), ',')
             .into_iter()
@@ -222,7 +253,14 @@ pub(crate) fn css_background(
     }
     let mut layers = Vec::new();
     let mut indexes = Vec::new();
-    for (index, image) in image_layers(style, base, assets).iter().enumerate().rev() {
+    let images = image_layers(style, base, assets, scale);
+    for (position, (index, image, share)) in images.iter().enumerate().rev() {
+        let index = *index;
+        // The second image of a cross-fade has a raster of its own.
+        let raster = match share.is_some() && position > 0 && images[position - 1].0 == index {
+            true => index + 32,
+            false => index,
+        };
         let (size, position, repeat) = (
             pick(&sizes, index),
             pick(&positions, index),
@@ -284,7 +322,8 @@ pub(crate) fn css_background(
                 .bottom(px(clip[2]))
                 .left(px(clip[3]))
         };
-        if let ImageLayer::File(path) = image {
+        if let ImageLayer::File(path, resolution) = image {
+            let resolution = *resolution;
             if let Some(path) = path.clone() {
                 let file = path.to_string_lossy().into_owned();
                 let view = view.clone();
@@ -315,7 +354,7 @@ pub(crate) fn css_background(
                         let (backgrounds, bitmaps, sources) =
                             (&mut dom.rasters.backgrounds, &mut dom.rasters.bitmaps, &mut dom.rasters.layer_sources);
                         let scale = window.scale_factor();
-                        let key = (id, slot * 64 + index);
+                        let key = (id, slot * 64 + raster);
                         let words: Vec<&str> = repeat.split_whitespace().collect();
                         let modes = match words.as_slice() {
                             ["repeat-x"] => ["repeat", "no-repeat"],
@@ -427,7 +466,8 @@ pub(crate) fn css_background(
                     natural.set(Some(match &tree {
                                     Some((tree, _)) => [tree.size().width(), tree.size().height()],
                                     None => {
-                                        [bitmap.size().width as f32, bitmap.size().height as f32]
+                                        [bitmap.size().width, bitmap.size().height]
+                                            .map(|side| side as f32 / resolution)
                                     }
                                 }));
                             }
@@ -641,7 +681,7 @@ pub(crate) fn css_background(
                         }
                     },
                 )));
-                indexes.push(index);
+                indexes.push((index, *share));
             }
             continue;
         }
@@ -774,7 +814,7 @@ pub(crate) fn css_background(
             let view = &*view;
             let mut store = view.store.borrow_mut();
             let dom = store.state(view.id);
-            let key = (id, slot * 64 + index);
+            let key = (id, slot * 64 + raster);
             let fits = |image: &renderer::RenderImage| {
                 [image.size().width, image.size().height].map(|side| side as u32) == [rw, rh]
             };
@@ -911,7 +951,44 @@ pub(crate) fn css_background(
                 window.draw_image(bounds, target, radii, image.clone(), false, false);
             }
         })));
-        indexes.push(index);
+        indexes.push((index, *share));
+    }
+    if images.iter().any(|image| image.2.is_some()) {
+        let mut joined: Vec<(renderer::Node, usize)> = Vec::new();
+        for (node, (index, share)) in layers.into_iter().zip(indexes) {
+            let Some(share) = share else {
+                joined.push((node, index));
+                continue;
+            };
+            let part = node.hooks(Effected {
+                effect: renderer::PaintEffect {
+                    opacity: share,
+                    blend_mode: renderer::BlendMode::PlusLighter,
+                    ..Default::default()
+                },
+                backdrop: None,
+            });
+            match joined.last_mut().filter(|(_, last)| *last == index) {
+                Some((group, _)) => *group = std::mem::take(group).child(part),
+                None => joined.push((
+                    renderer::node()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .child(part)
+                        .hooks(Effected {
+                            effect: renderer::PaintEffect::default(),
+                            backdrop: None,
+                        }),
+                    index,
+                )),
+            }
+        }
+        (layers, indexes) = joined
+            .into_iter()
+            .map(|(node, index)| (node, (index, None)))
+            .unzip();
     }
     let modes = list(Prop::BACKGROUND_BLEND_MODE);
     if modes
@@ -929,7 +1006,7 @@ pub(crate) fn css_background(
         color.style().corner_radii = radius;
         group = group.child(color);
     }
-    for (layer, index) in layers.into_iter().zip(indexes) {
+    for (layer, (index, _)) in layers.into_iter().zip(indexes) {
         let blend_mode = super::super::effects::filter::blend_mode(&pick(&modes, index));
         group = group.child(layer.hooks(Effected {
             effect: renderer::PaintEffect {
@@ -965,6 +1042,13 @@ pub(crate) fn border_image(
     let source = style
         .get(Prop::BORDER_IMAGE_SOURCE)
         .filter(|value| *value != "none")?;
+    let ratio = {
+        let store = view.store.borrow();
+        store
+            .page_state(view.id)
+            .map_or(1., |state| state.pixel_ratio)
+    };
+    let source = css::value::image::shown(source, ratio).0;
     let (path, gradient) = match source
         .strip_prefix("url(")
         .and_then(|v| v.strip_suffix(')'))

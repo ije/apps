@@ -1,6 +1,6 @@
 use crate::css::{
-    properties::LOGICAL, properties::Prop, properties::Registry, properties::Style,
-    properties::Vars, value::color::serialize as serialize_color,
+    properties::Prop, properties::Registry, properties::Style, properties::Vars,
+    properties::physical, value::color::serialize as serialize_color,
     value::color::system as system_color, value::grammar::computed, value::grammar::fold,
     value::grammar::syntax_matches, value::shorthand::expand,
 };
@@ -200,7 +200,7 @@ impl Substitution<'_> {
                 match (value, registered) {
                     (Some(value), Some((syntax, ..))) if syntax.trim() != "*" => {
                         match syntax_matches(syntax, &value) {
-                            true => Some(computed(syntax, &value).0.into()),
+                            true => Some(computed(syntax, &value, None).0.into()),
                             false => unset(),
                         }
                     }
@@ -293,25 +293,20 @@ pub(crate) fn resolve_style(
             .as_deref()
             .and_then(|value| value.strip_prefix('\u{1}')?.split_once('\u{1}'))
         {
-            Some((shorthand, value)) => {
-                let rtl = style.get(Prop::DIRECTION) == Some("rtl");
-                expanded
-                    .get_or_insert_with(|| {
-                        let mut expanded = Vec::new();
-                        if !crate::css::sheet::parser::invalid(shorthand, value) {
-                            expand(shorthand, value.trim(), &mut expanded);
-                        }
-                        expanded
-                    })
-                    .iter()
-                    .find(|(name, _)| {
-                        name == prop.name()
-                            || LOGICAL.iter().any(|(logical, ltr, rtl_side)| {
-                                logical.name() == name && *if rtl { rtl_side } else { ltr } == prop
-                            })
-                    })
-                    .map(|(_, value)| value.clone())
-            }
+            Some((shorthand, value)) => expanded
+                .get_or_insert_with(|| {
+                    let mut expanded = Vec::new();
+                    if !crate::css::sheet::parser::invalid(shorthand, value) {
+                        expand(shorthand, value.trim(), &mut expanded);
+                    }
+                    expanded
+                })
+                .iter()
+                .find(|(name, _)| {
+                    name == prop.name()
+                        || Prop::find(name).is_some_and(|name| physical(name, style) == prop)
+                })
+                .map(|(_, value)| value.clone()),
             // Values that start with U+0001 can be shared by other properties.
             None if raw.starts_with('\u{1}') => substituted.clone(),
             None => substituted.take(),
@@ -413,7 +408,10 @@ pub(crate) fn resolve_style(
         );
     }
     let convert = |value: &str, current: &str| {
-        if !value.starts_with("color-mix(") && !value.contains("(from ") {
+        if !value.starts_with("color-mix(")
+            && !value.contains("(from ")
+            && !value.starts_with("contrast-color(")
+        {
             return None;
         }
         serialize_color(&value.to_ascii_lowercase().replace("currentcolor", current))

@@ -580,8 +580,8 @@ fn blurred_box(p: vec2<f32>, box: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>, shape
 
 fn wave_coverage(p: vec2<f32>, rect: vec4<f32>, thickness: f32) -> f32 {
     let x = p.x - rect.x;
-    let frequency = 2.0 * PI * thickness / (rect.w * rect.w);
-    let amplitude = 0.8 * thickness;
+    let frequency = 2.0 * PI / (1.0 + 2.0 * floor(2.0 * thickness + 1.0));
+    let amplitude = 0.2887 * (0.5 + floor(3.0 * thickness + 1.0));
     let slope = amplitude * frequency * cos(x * frequency);
     let distance = (p.y - rect.y - rect.w * 0.5 - amplitude * sin(x * frequency)) / sqrt(1.0 + slope * slope);
     return saturate(0.5 - (abs(distance) - thickness * 0.5));
@@ -657,6 +657,10 @@ fn draw_fragment(v: Varyings) -> @location(0) vec4<f32> {
             color = premultiply(v.color);
             if (flags & 1u) != 0u {
                 color *= wave_coverage(p, v.rect, v.info.z);
+            } else if (flags & 6u) != 0u {
+                let x = p.x - v.rect.x - v.aux.x * 0.5;
+                let spot = vec2<f32>(x - round(x / v.aux.y) * v.aux.y, p.y - v.rect.y - v.rect.w * 0.5);
+                color *= saturate(0.5 + v.aux.x * 0.5 - select(abs(spot.x), length(spot), (flags & 4u) != 0u));
             }
         }
         case GLYPH: {
@@ -852,7 +856,9 @@ fn composite_fragment(v: Placed) -> @location(0) vec4<f32> {
     if (c.flags & COMPOSITE_BLEND) != 0u && color.a > 0.0 {
         let below = textureSampleLevel(t2, filtered, (p - c.backdrop_rect.xy) / c.backdrop_rect.zw, 0.0);
         if c.blend == 16u {
-            return vec4<f32>(min(color.rgb + below.rgb, vec3<f32>(1.0)) - below.rgb * (1.0 - color.a), color.a);
+            // The source-over blend of the result gives the sums of the colors and of the alphas.
+            let kept = select(1.0 - color.a, max(1.0 - color.a - below.a, 0.0) / (1.0 - below.a), below.a < 1.0);
+            return vec4<f32>(min(color.rgb + below.rgb, vec3<f32>(1.0)) - below.rgb * kept, 1.0 - kept);
         }
         let b = select(vec3<f32>(0.0), below.rgb / below.a, below.a > 0.0);
         let s = color.rgb / color.a;

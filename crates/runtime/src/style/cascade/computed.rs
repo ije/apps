@@ -1,6 +1,9 @@
 use crate::css::{
-    properties::Prop, properties::Registry, properties::Style, properties::Vars,
-    value::units::Lengths,
+    properties::Prop,
+    properties::Registry,
+    properties::Style,
+    properties::Vars,
+    value::{tokens::number, units::Lengths},
 };
 use crate::style::cascade::Container;
 use crate::style::cascade::shadow::Shadowed;
@@ -85,6 +88,21 @@ impl ComputedStyles {
 
     pub(crate) fn extras(&self, id: usize) -> &Extras {
         self.extras.get(id).unwrap_or(&NO_EXTRAS)
+    }
+
+    // What the anchors give a box.
+    pub(crate) fn used(&self, id: usize) -> Option<&Rc<Used>> {
+        let nodes = self.anchors.as_ref()?;
+        self.anchored.get(&id).filter(|_| nodes.boxes.contains(&id))
+    }
+
+    // The style of a node without the values of its anchors, which start no transitions.
+    pub(crate) fn unanchored(&self, id: usize) -> &Rc<Style> {
+        let boxed = self
+            .anchors
+            .as_ref()
+            .is_some_and(|nodes| nodes.boxes.contains(&id));
+        (self.authored.get(&id).filter(|_| boxed)).unwrap_or(&self.values[id])
     }
 
     pub(crate) fn animations(&self) -> impl Iterator<Item = (usize, &Rc<[Animation]>)> {
@@ -246,6 +264,8 @@ impl std::ops::Index<usize> for NodeLengths {
 #[derive(Clone, Default)]
 pub(crate) struct ComputedStyles {
     pub(crate) blended: std::cell::Cell<Option<bool>>,
+    // The background colors that the cells of a table take from its `<col>` and `<colgroup>`, filled when asked.
+    pub(crate) columns: std::cell::RefCell<FxHashMap<usize, Rc<FxHashMap<usize, usize>>>>,
     pub values: Chunked<Rc<Style>>,
     pub vars: Chunked<Vars>,
     pub flags: Chunked<u16>,
@@ -262,10 +282,77 @@ pub(crate) struct ComputedStyles {
     pub(crate) anonymous: FxHashMap<usize, u16>,
     pub(crate) containers: Chunked<Option<Rc<Container>>>,
     pub(crate) counted: bool,
+    pub(crate) anchors: Option<Rc<AnchorNodes>>,
+    // What the anchors give the boxes.
+    pub(crate) anchored: Rc<FxHashMap<usize, Rc<Used>>>,
     // The node revision of the document that this pass styled.
     pub(crate) revision: u64,
     // The native theme bits that this pass styled with.
     pub(crate) theme: u32,
+}
+
+// The nodes that anchor positioning places, with their own styles in `authored`, and the ones with an anchor name.
+#[derive(Clone, Default, PartialEq)]
+pub(crate) struct AnchorNodes {
+    pub(crate) boxes: FxHashSet<usize>,
+    pub(crate) names: FxHashSet<usize>,
+}
+
+// What the anchors of a node give its style. `None` values are the initial ones.
+#[derive(Clone, Default, PartialEq)]
+pub(crate) struct Used {
+    // The style of a position option.
+    pub(crate) own: Option<Rc<Style>>,
+    pub(crate) lengths: Vec<(Prop, Option<f32>)>,
+    // The insets in the containing block, and those that scripts read, which are in the position area.
+    pub(crate) insets: [Option<Option<f32>>; 4],
+    pub(crate) shown: [Option<Option<f32>>; 4],
+    // On the axes where the box aligns: whether its auto size fits its content, whether it stretches, and its place.
+    pub(crate) fit: [bool; 2],
+    pub(crate) stretch: [Option<bool>; 2],
+    pub(crate) place: [Option<renderer::Aligned>; 2],
+    // The axes on which the box follows scrolls of its anchor.
+    pub(crate) axes: [bool; 2],
+    // Layout places it, and scrolls can move or hide it.
+    pub(crate) anchored: bool,
+    pub(crate) scrolls: bool,
+}
+
+impl Used {
+    // Puts the values into a style, for layout or for scripts.
+    pub(crate) fn apply(&self, style: &mut Style, shown: bool) {
+        if let Some(own) = &self.own {
+            // An option changes only these properties.
+            let placed = &crate::css::value::anchor::DESCRIPTORS;
+            style.retain(|prop, _| !placed.contains(prop));
+            let placed = own.own().filter(|(prop, _)| placed.contains(*prop));
+            style.extend(placed.map(|(prop, value)| (prop, value.clone())));
+        }
+        let insets = if shown { &self.shown } else { &self.insets };
+        let insets = (insets.iter().zip(crate::css::properties::INSETS))
+            .filter_map(|(inset, prop)| Some((prop, (*inset)?)));
+        for (prop, value) in insets.chain(self.lengths.iter().copied()) {
+            match value {
+                Some(value) => style.insert(prop, format!("{}px", number(f64::from(value)))),
+                None => drop(style.remove(prop)),
+            }
+        }
+        if shown {
+            return;
+        }
+        for (axis, stretch) in self.stretch.iter().enumerate() {
+            let [size, align] = [
+                [Prop::WIDTH, Prop::JUSTIFY_SELF],
+                [Prop::HEIGHT, Prop::ALIGN_SELF],
+            ][axis];
+            if let Some(stretch) = stretch {
+                style.insert(align, if *stretch { "stretch" } else { "start" });
+            }
+            if self.fit[axis] {
+                style.insert(size, "fit-content");
+            }
+        }
+    }
 }
 
 // The rare results of a node, kept together so a pass adds, drops and copies them at once. Cached styles share

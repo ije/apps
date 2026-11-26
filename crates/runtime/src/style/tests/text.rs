@@ -718,7 +718,7 @@ fn parser_keeps_nested_font_faces_prefixed_keyframes_and_media_types() {
     assert_eq!(
         faces
             .iter()
-            .map(|(family, _, range)| (family.as_str(), range.as_deref()))
+            .map(|face| (face.family.as_str(), face.range.as_deref()))
             .collect::<Vec<_>>(),
         [("B", Some("U+0400-04FF")), ("D", None)]
     );

@@ -60,6 +60,11 @@ pub(super) fn vertical_align(
         hashed(parent_font(doc, styles, id)),
     );
     let align = style.get(Prop::VERTICAL_ALIGN).unwrap_or("baseline");
+    // As in Chrome, the middle of the box sits on the baseline.
+    let (align, ex) = match align {
+        "-webkit-baseline-middle" => ("middle", 0.),
+        _ => (align, styles.lengths[parent].font.ex),
+    };
     let middle = match el.style().size.height {
         _ if align != "middle" => None,
         _ if display == "inline" => Some(units.font.lh),
@@ -127,7 +132,7 @@ pub(super) fn vertical_align(
         el.style().baseline = renderer::Baseline::None;
     }
     let lift = if centered {
-        line.ex / 2. + (margin[2] - margin[0]) / 2.
+        ex / 2. + (margin[2] - margin[0]) / 2.
     } else if !edge {
         0.
     } else if matches!(align, "text-top" | "text-bottom") {
@@ -144,7 +149,7 @@ pub(super) fn vertical_align(
             _ => margin[2] - descent,
         }
     } else if let Some(height) = middle {
-        line.ex / 2. - height / 2.
+        ex / 2. - height / 2.
     } else if swatch {
         -padding[2] - borders[2] - 4.
     } else if node.tag == "button"

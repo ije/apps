@@ -35,6 +35,8 @@ fn known(name: &str) -> Option<Prop> {
 // parser check values against.
 props! {
     CANVAS_CONTENT "-canvas-content" inherited "fallback|drawable",
+    // The `writing-mode` of a box that starts vertical lines. The boxes in it lay out in its turned frame.
+    INTERNAL_LINES "-internal-lines",
     // Set by blockification on an out-of-flow box that was inline-level, whose static place is then in its line.
     INTERNAL_STATIC_INLINE "-internal-static-inline",
     MACOS_GLASS "-macos-glass" "none|regular|clear",
@@ -62,11 +64,13 @@ props! {
     WEBKIT_BACKDROP_FILTER "-webkit-backdrop-filter" "none|[blur(|brightness(|contrast(|drop-shadow(|grayscale(|hue-rotate(|invert(|opacity(|saturate(|sepia(|url(]+",
     WEBKIT_BACKGROUND_CLIP "-webkit-background-clip" "[border-box|padding-box|content-box|text]#",
     WEBKIT_BOX_ORIENT "-webkit-box-orient" "horizontal|vertical|inline-axis|block-axis",
-    WEBKIT_CLIP_PATH "-webkit-clip-path" "none|[inset(|circle(|ellipse(|polygon(|path(|url(|border-box|padding-box|content-box|margin-box|fill-box|stroke-box|view-box]+",
+    WEBKIT_CLIP_PATH "-webkit-clip-path" "*",
     WEBKIT_FILTER "-webkit-filter" "none|[blur(|brightness(|contrast(|drop-shadow(|grayscale(|hue-rotate(|invert(|opacity(|saturate(|sepia(|url(]+",
     WEBKIT_FONT_SMOOTHING "-webkit-font-smoothing" inherited "auto|none|antialiased|subpixel-antialiased",
     WEBKIT_LINE_CLAMP "-webkit-line-clamp" "none|<integer>",
     WEBKIT_MASK "-webkit-mask" "*",
+    WEBKIT_MASK_CLIP "-webkit-mask-clip" "[border-box|padding-box|content-box|border|padding|content]#",
+    WEBKIT_MASK_COMPOSITE "-webkit-mask-composite" "[clear|copy|source-over|source-in|source-out|source-atop|destination-over|destination-in|destination-out|destination-atop|xor]#",
     WEBKIT_MASK_IMAGE "-webkit-mask-image" "[none|<image>]#",
     WEBKIT_MASK_POSITION "-webkit-mask-position" "*",
     WEBKIT_MASK_REPEAT "-webkit-mask-repeat" "[repeat|repeat-x|repeat-y|no-repeat|space|round]#",
@@ -78,10 +82,12 @@ props! {
     WEBKIT_TEXT_STROKE_WIDTH "-webkit-text-stroke-width" inherited "thin|medium|thick|<non-negative-length>",
     WEBKIT_USER_SELECT "-webkit-user-select" "auto|none|text|all|contain",
     ACCENT_COLOR "accent-color" inherited "auto|<color>",
-    ALIGN_CONTENT "align-content" "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto|anchor-center]+",
-    ALIGN_ITEMS "align-items" "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto|anchor-center]+",
-    ALIGN_SELF "align-self" "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto|anchor-center]+",
+    ALIGN_CONTENT "align-content" "normal|stretch|baseline|first baseline|space-between|space-around|space-evenly|<place>",
+    ALIGN_ITEMS "align-items" "normal|stretch|baseline|first baseline|last baseline|<place>|<place-self>",
+    ALIGN_SELF "align-self" "auto|normal|stretch|baseline|first baseline|last baseline|<place>|<place-self>|<place-anchor>",
     ALL "all" "*",
+    ANCHOR_NAME "anchor-name" "*",
+    ANCHOR_SCOPE "anchor-scope" "*",
     ANIMATION "animation" "*",
     ANIMATION_COMPOSITION "animation-composition" "[replace|add|accumulate]#",
     ANIMATION_DELAY "animation-delay" "[<time>]#",
@@ -109,7 +115,7 @@ props! {
     BACKGROUND_POSITION_Y "background-position-y",
     BACKGROUND_REPEAT "background-repeat" "*",
     BACKGROUND_SIZE "background-size" "*",
-    BLOCK_SIZE "block-size" "auto|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available|-webkit-min-content|-webkit-max-content|-webkit-fit-content",
+    BLOCK_SIZE "block-size" "auto|<non-negative-length-percentage>|<size>",
     BORDER "border" "[thin|medium|thick|<non-negative-length>|none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset|<color>]{1,3}",
     BORDER_BLOCK "border-block" "[thin|medium|thick|<non-negative-length>|none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset|<color>]{1,3}",
     BORDER_BLOCK_COLOR "border-block-color" "[<color>]{1,2}",
@@ -184,7 +190,7 @@ props! {
     CARET_SHAPE "caret-shape" inherited "auto|bar|block|underscore",
     CLEAR "clear" "none|left|right|both|inline-start|inline-end",
     CLIP "clip",
-    CLIP_PATH "clip-path" "none|[inset(|circle(|ellipse(|polygon(|path(|url(|border-box|padding-box|content-box|margin-box|fill-box|stroke-box|view-box]+",
+    CLIP_PATH "clip-path" "*",
     CLIP_RULE "clip-rule" inherited "nonzero|evenodd",
     COLOR "color" inherited "<color>",
     COLOR_SCHEME "color-scheme" inherited "normal|[light|dark|only]+",
@@ -236,8 +242,8 @@ props! {
     FILL_OPACITY "fill-opacity" inherited "<number>|<percentage>",
     FILL_RULE "fill-rule" inherited "nonzero|evenodd",
     FILTER "filter" "none|[blur(|brightness(|contrast(|drop-shadow(|grayscale(|hue-rotate(|invert(|opacity(|saturate(|sepia(|url(]+",
-    FLEX "flex" "none|[<non-negative-number>|content|auto|<length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available]{1,3}",
-    FLEX_BASIS "flex-basis" "content|auto|<length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available|-webkit-min-content|-webkit-max-content|-webkit-fit-content",
+    FLEX "flex" "none|[<non-negative-number>|content|auto|<length-percentage>|min-content|max-content|fit-content|stretch]{1,3}",
+    FLEX_BASIS "flex-basis" "content|auto|<non-negative-length-percentage>|min-content|max-content|fit-content|stretch",
     FLEX_DIRECTION "flex-direction" "row|row-reverse|column|column-reverse",
     FLEX_FLOW "flex-flow" "[row|row-reverse|column|column-reverse|nowrap|wrap|wrap-reverse]+",
     FLEX_GROW "flex-grow" "<non-negative-number>",
@@ -253,13 +259,17 @@ props! {
     FONT_KERNING "font-kerning" inherited "auto|normal|none",
     FONT_OPTICAL_SIZING "font-optical-sizing" inherited "auto|none",
     FONT_SIZE "font-size" inherited "xx-small|x-small|small|medium|large|x-large|xx-large|xxx-large|larger|smaller|<non-negative-length-percentage>",
-    FONT_SIZE_ADJUST "font-size-adjust" inherited,
+    FONT_SIZE_ADJUST "font-size-adjust" inherited "*",
     FONT_STRETCH "font-stretch" inherited "normal|ultra-condensed|extra-condensed|condensed|semi-condensed|semi-expanded|expanded|extra-expanded|ultra-expanded|<percentage>",
     FONT_STYLE "font-style" inherited "normal|italic|oblique|*",
     FONT_SYNTHESIS "font-synthesis" inherited "*",
-    FONT_VARIANT "font-variant" inherited "normal|small-caps",
+    FONT_VARIANT "font-variant" "*",
+    FONT_VARIANT_ALTERNATES "font-variant-alternates" inherited "*",
+    FONT_VARIANT_CAPS "font-variant-caps" inherited "*",
+    FONT_VARIANT_EAST_ASIAN "font-variant-east-asian" inherited "*",
     FONT_VARIANT_LIGATURES "font-variant-ligatures" inherited "*",
     FONT_VARIANT_NUMERIC "font-variant-numeric" inherited "*",
+    FONT_VARIANT_POSITION "font-variant-position" inherited "*",
     FONT_VARIATION_SETTINGS "font-variation-settings" inherited "*",
     FONT_WEIGHT "font-weight" inherited "normal|bold|bolder|lighter|<number>",
     FORCED_COLOR_ADJUST "forced-color-adjust" inherited,
@@ -282,10 +292,11 @@ props! {
     GRID_TEMPLATE_AREAS "grid-template-areas" "*",
     GRID_TEMPLATE_COLUMNS "grid-template-columns" "*",
     GRID_TEMPLATE_ROWS "grid-template-rows" "*",
-    HEIGHT "height" "auto|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available|-webkit-min-content|-webkit-max-content|-webkit-fit-content",
-    HYPHENS "hyphens" inherited,
+    HEIGHT "height" "auto|<non-negative-length-percentage>|<size>",
+    HYPHENATE_CHARACTER "hyphenate-character" inherited "auto|<string>",
+    HYPHENS "hyphens" inherited "none|manual|auto",
     IMAGE_RENDERING "image-rendering" inherited "auto|smooth|high-quality|pixelated|crisp-edges|optimizespeed|optimizequality|-webkit-optimize-contrast",
-    INLINE_SIZE "inline-size" "auto|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available|-webkit-min-content|-webkit-max-content|-webkit-fit-content",
+    INLINE_SIZE "inline-size" "auto|<non-negative-length-percentage>|<size>",
     INSET "inset" "[auto|<length-percentage>]{1,4}",
     INSET_BLOCK "inset-block" "[auto|<length-percentage>]{1,2}",
     INSET_BLOCK_END "inset-block-end" "auto|<length-percentage>",
@@ -293,10 +304,11 @@ props! {
     INSET_INLINE "inset-inline" "[auto|<length-percentage>]{1,2}",
     INSET_INLINE_END "inset-inline-end" "auto|<length-percentage>",
     INSET_INLINE_START "inset-inline-start" "auto|<length-percentage>",
+    INTERPOLATE_SIZE "interpolate-size" inherited "numeric-only|allow-keywords",
     ISOLATION "isolation" "auto|isolate",
-    JUSTIFY_CONTENT "justify-content" "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto|anchor-center]+",
-    JUSTIFY_ITEMS "justify-items" "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto|anchor-center]+",
-    JUSTIFY_SELF "justify-self" "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto|anchor-center]+",
+    JUSTIFY_CONTENT "justify-content" "normal|stretch|space-between|space-around|space-evenly|<place>|<place-side>",
+    JUSTIFY_ITEMS "justify-items" "normal|stretch|baseline|first baseline|last baseline|<place>|<place-self>|<place-side>|legacy|legacy left|legacy right|legacy center|left legacy|right legacy|center legacy",
+    JUSTIFY_SELF "justify-self" "auto|normal|stretch|baseline|first baseline|last baseline|<place>|<place-self>|<place-side>|<place-anchor>",
     LEFT "left" "auto|<length-percentage>",
     LETTER_SPACING "letter-spacing" inherited "normal|<length-percentage>",
     LIGHTING_COLOR "lighting-color" "<color>",
@@ -318,29 +330,35 @@ props! {
     MARGIN_LEFT "margin-left" "auto|<length-percentage>",
     MARGIN_RIGHT "margin-right" "auto|<length-percentage>",
     MARGIN_TOP "margin-top" "auto|<length-percentage>",
+    MARGIN_TRIM "margin-trim" "none|block|block-start|block-end",
     MARKER "marker" inherited,
     MASK "mask" "*",
-    MASK_CLIP "mask-clip",
+    MASK_CLIP "mask-clip" "[border-box|padding-box|content-box|fill-box|stroke-box|view-box|no-clip]#",
     MASK_COMPOSITE "mask-composite" "[add|subtract|intersect|exclude]#",
     MASK_IMAGE "mask-image" "[none|<image>]#",
-    MASK_MODE "mask-mode",
-    MASK_ORIGIN "mask-origin",
+    MASK_MODE "mask-mode" "[alpha|luminance|match-source]#",
+    MASK_ORIGIN "mask-origin" "[border-box|padding-box|content-box|fill-box|stroke-box|view-box]#",
     MASK_POSITION "mask-position" "*",
-    MASK_REPEAT "mask-repeat" "[repeat|repeat-x|repeat-y|no-repeat|space|round]#",
+    MASK_REPEAT "mask-repeat" "*",
     MASK_SIZE "mask-size" "*",
     MASK_TYPE "mask-type" "luminance|alpha",
-    MAX_BLOCK_SIZE "max-block-size" "none|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available",
-    MAX_HEIGHT "max-height" "none|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available",
-    MAX_INLINE_SIZE "max-inline-size" "none|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available",
-    MAX_WIDTH "max-width" "none|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available",
-    MIN_BLOCK_SIZE "min-block-size" "auto|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available|-webkit-min-content|-webkit-max-content|-webkit-fit-content",
-    MIN_HEIGHT "min-height" "auto|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available|-webkit-min-content|-webkit-max-content|-webkit-fit-content",
-    MIN_INLINE_SIZE "min-inline-size" "auto|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available|-webkit-min-content|-webkit-max-content|-webkit-fit-content",
-    MIN_WIDTH "min-width" "auto|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available|-webkit-min-content|-webkit-max-content|-webkit-fit-content",
+    MAX_BLOCK_SIZE "max-block-size" "none|<non-negative-length-percentage>|<size>",
+    MAX_HEIGHT "max-height" "none|<non-negative-length-percentage>|<size>",
+    MAX_INLINE_SIZE "max-inline-size" "none|<non-negative-length-percentage>|<size>",
+    MAX_WIDTH "max-width" "none|<non-negative-length-percentage>|<size>",
+    MIN_BLOCK_SIZE "min-block-size" "auto|<non-negative-length-percentage>|<size>",
+    MIN_HEIGHT "min-height" "auto|<non-negative-length-percentage>|<size>",
+    MIN_INLINE_SIZE "min-inline-size" "auto|<non-negative-length-percentage>|<size>",
+    MIN_WIDTH "min-width" "auto|<non-negative-length-percentage>|<size>",
     MIX_BLEND_MODE "mix-blend-mode" "[normal|multiply|screen|overlay|darken|lighten|color-dodge|color-burn|hard-light|soft-light|difference|exclusion|hue|saturation|color|luminosity|plus-lighter]#",
     OBJECT_FIT "object-fit" "fill|contain|cover|none|scale-down",
     OBJECT_POSITION "object-position" "*",
-    OFFSET "offset",
+    OFFSET "offset" "*",
+    OFFSET_ANCHOR "offset-anchor" "*",
+    OFFSET_DISTANCE "offset-distance" "<length-percentage>",
+    OFFSET_PATH "offset-path" "*",
+    OFFSET_POSITION "offset-position" "*",
+    OFFSET_ROTATE "offset-rotate" "*",
     OPACITY "opacity" "<number>|<percentage>",
     ORDER "order" "<integer>",
     ORPHANS "orphans" inherited,
@@ -351,7 +369,7 @@ props! {
     OUTLINE_WIDTH "outline-width" "thin|medium|thick|<non-negative-length>",
     OVERFLOW "overflow" "[visible|hidden|clip|scroll|auto|overlay]{1,2}",
     OVERFLOW_ANCHOR "overflow-anchor" "auto|none",
-    OVERFLOW_CLIP_MARGIN "overflow-clip-margin",
+    OVERFLOW_CLIP_MARGIN "overflow-clip-margin" "[content-box|padding-box|border-box|<length>]{1,2}",
     OVERFLOW_WRAP "overflow-wrap" inherited "normal|break-word|anywhere",
     OVERFLOW_X "overflow-x" "visible|hidden|clip|scroll|auto|overlay",
     OVERFLOW_Y "overflow-y" "visible|hidden|clip|scroll|auto|overlay",
@@ -378,11 +396,17 @@ props! {
     PAINT_ORDER "paint-order" inherited "normal|[fill|stroke|markers]+",
     PERSPECTIVE "perspective" "none|<non-negative-length>",
     PERSPECTIVE_ORIGIN "perspective-origin" "*",
-    PLACE_CONTENT "place-content" "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto|anchor-center]+",
-    PLACE_ITEMS "place-items" "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto|anchor-center]+",
+    PLACE_CONTENT "place-content" "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto]+",
+    PLACE_ITEMS "place-items" "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto]+",
     PLACE_SELF "place-self" "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto|anchor-center]+",
     POINTER_EVENTS "pointer-events" inherited "auto|none|visiblepainted|visiblefill|visiblestroke|visible|painted|fill|stroke|all",
     POSITION "position" "static|relative|absolute|fixed|sticky",
+    POSITION_ANCHOR "position-anchor" "*",
+    POSITION_AREA "position-area" "*",
+    POSITION_TRY "position-try" "*",
+    POSITION_TRY_FALLBACKS "position-try-fallbacks" "*",
+    POSITION_TRY_ORDER "position-try-order" "*",
+    POSITION_VISIBILITY "position-visibility" "*",
     PRINT_COLOR_ADJUST "print-color-adjust" inherited,
     QUOTES "quotes" inherited "*",
     R "r" "<length-percentage>|<number>",
@@ -422,7 +446,8 @@ props! {
     SCROLLBAR_COLOR "scrollbar-color" inherited "auto|[<color>]+",
     SCROLLBAR_GUTTER "scrollbar-gutter" "auto|stable|[stable|both-edges]+",
     SCROLLBAR_WIDTH "scrollbar-width" "auto|thin|none",
-    SHAPE_OUTSIDE "shape-outside",
+    SHAPE_MARGIN "shape-margin" "<non-negative-length-percentage>",
+    SHAPE_OUTSIDE "shape-outside" "none|<shape-outside>",
     SHAPE_RENDERING "shape-rendering" inherited "auto|optimizespeed|crispedges|geometricprecision",
     SPEAK "speak" inherited,
     STOP_COLOR "stop-color" "<color>",
@@ -437,8 +462,8 @@ props! {
     STROKE_WIDTH "stroke-width" inherited "<length-percentage>|<number>",
     TAB_SIZE "tab-size" inherited "<non-negative-number>|<non-negative-length-percentage>",
     TABLE_LAYOUT "table-layout" "auto|fixed",
-    TEXT_ALIGN "text-align" inherited "start|end|left|right|center|justify|match-parent|-webkit-left|-webkit-right|-webkit-center|-internal-center",
-    TEXT_ALIGN_LAST "text-align-last" inherited "auto|start|end|left|right|center|justify|match-parent",
+    TEXT_ALIGN "text-align" inherited "start|end|left|right|center|justify|match-parent|-webkit-left|-webkit-right|-webkit-center",
+    TEXT_ALIGN_LAST "text-align-last" inherited "auto|start|end|left|right|center|justify",
     TEXT_ANCHOR "text-anchor" inherited "start|middle|end",
     TEXT_BOX "text-box" "*",
     TEXT_BOX_EDGE "text-box-edge" inherited "*",
@@ -446,7 +471,7 @@ props! {
     TEXT_DECORATION "text-decoration" "*",
     TEXT_DECORATION_COLOR "text-decoration-color" inherited "<color>",
     TEXT_DECORATION_LINE "text-decoration-line" inherited "none|[underline|overline|line-through|blink]+",
-    TEXT_DECORATION_SKIP_INK "text-decoration-skip-ink" inherited,
+    TEXT_DECORATION_SKIP_INK "text-decoration-skip-ink" inherited "auto|none",
     TEXT_DECORATION_STYLE "text-decoration-style" inherited "solid|double|dotted|dashed|wavy",
     TEXT_DECORATION_THICKNESS "text-decoration-thickness" inherited "auto|from-font|<length-percentage>",
     TEXT_EMPHASIS "text-emphasis" inherited,
@@ -458,7 +483,7 @@ props! {
     TEXT_SIZE_ADJUST "text-size-adjust" inherited,
     TEXT_TRANSFORM "text-transform" inherited "none|capitalize|uppercase|lowercase|full-width|full-size-kana",
     TEXT_UNDERLINE_OFFSET "text-underline-offset" inherited "auto|<length-percentage>",
-    TEXT_UNDERLINE_POSITION "text-underline-position" inherited,
+    TEXT_UNDERLINE_POSITION "text-underline-position" inherited "*",
     TEXT_WRAP "text-wrap" inherited "[wrap|nowrap|balance|pretty|stable|auto]+",
     TEXT_WRAP_MODE "text-wrap-mode" inherited,
     TEXT_WRAP_STYLE "text-wrap-style" inherited,
@@ -478,13 +503,13 @@ props! {
     UNICODE_BIDI "unicode-bidi" "normal|embed|isolate|bidi-override|isolate-override|plaintext",
     USER_SELECT "user-select" "auto|none|text|all|contain",
     VECTOR_EFFECT "vector-effect" "none|non-scaling-stroke",
-    VERTICAL_ALIGN "vertical-align" "baseline|sub|super|text-top|text-bottom|middle|top|bottom|<length-percentage>",
+    VERTICAL_ALIGN "vertical-align" "baseline|sub|super|text-top|text-bottom|middle|top|bottom|-webkit-baseline-middle|<length-percentage>",
     VIEW_TRANSITION_NAME "view-transition-name",
     VISIBILITY "visibility" inherited "visible|hidden|collapse",
     WHITE_SPACE "white-space" inherited "normal|pre|nowrap|pre-wrap|pre-line|break-spaces",
     WHITE_SPACE_COLLAPSE "white-space-collapse" inherited,
     WIDOWS "widows" inherited,
-    WIDTH "width" "auto|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available|-webkit-min-content|-webkit-max-content|-webkit-fit-content",
+    WIDTH "width" "auto|<non-negative-length-percentage>|<size>",
     WILL_CHANGE "will-change" "*",
     WORD_BREAK "word-break" inherited "normal|break-all|break-word|keep-all",
     WORD_SPACING "word-spacing" inherited "normal|<length>",
@@ -575,7 +600,7 @@ impl Prop {
 
     // The standard property that Chrome also takes under this `-webkit-` name.
     pub(crate) fn unprefixed(name: &str) -> Option<&str> {
-        const ALIASES: &str = "align-content align-items align-self background-origin background-size animation animation-delay animation-direction animation-duration animation-fill-mode animation-iteration-count animation-name animation-play-state animation-timing-function appearance backface-visibility border-bottom-left-radius border-bottom-right-radius border-radius border-top-left-radius border-top-right-radius box-shadow box-sizing clip-path column-count column-gap column-rule column-rule-color column-rule-style column-rule-width column-span column-width columns filter flex flex-basis flex-direction flex-flow flex-grow flex-shrink flex-wrap justify-content mask mask-clip mask-image mask-origin mask-position mask-repeat mask-size order perspective perspective-origin transform transform-origin transform-style transition transition-delay transition-duration transition-property transition-timing-function user-select";
+        const ALIASES: &str = "hyphenate-character align-content align-items align-self background-origin background-size animation animation-delay animation-direction animation-duration animation-fill-mode animation-iteration-count animation-name animation-play-state animation-timing-function appearance backface-visibility border-bottom-left-radius border-bottom-right-radius border-radius border-top-left-radius border-top-right-radius box-shadow box-sizing clip-path column-count column-gap column-rule column-rule-color column-rule-style column-rule-width column-span column-width columns filter flex flex-basis flex-direction flex-flow flex-grow flex-shrink flex-wrap justify-content mask mask-image mask-origin mask-position mask-repeat mask-size order perspective perspective-origin transform transform-origin transform-style transition transition-delay transition-duration transition-property transition-timing-function user-select";
         let base = name.strip_prefix("-webkit-")?;
         ALIASES
             .split(' ')
@@ -620,6 +645,13 @@ impl PropSet {
             at += 1;
         }
         Self(bits)
+    }
+
+    pub(crate) fn contains(&self, prop: Prop) -> bool {
+        let id = prop.0 as usize;
+        self.0
+            .get(id / 64)
+            .is_some_and(|word| word >> (id % 64) & 1 == 1)
     }
 }
 
@@ -737,6 +769,19 @@ impl Style {
             }
         }
         false
+    }
+
+    pub(crate) fn values_in<'a>(&'a self, set: &'a PropSet) -> impl Iterator<Item = &'a str> + 'a {
+        (0..WORDS).flat_map(move |word| {
+            let mut bits = self.known[word] & set.0[word];
+            std::iter::from_fn(move || {
+                let below = (1u64 << (bits != 0).then(|| bits.trailing_zeros())?) - 1;
+                bits &= bits - 1;
+                let at =
+                    self.before[word] as usize + (self.known[word] & below).count_ones() as usize;
+                Some(&*self.entries[at].1)
+            })
+        })
     }
 
     pub(crate) fn contains(&self, prop: Prop) -> bool {
@@ -912,6 +957,7 @@ pub(crate) const PADDING: [Prop; 4] = [
     Prop::PADDING_BOTTOM,
     Prop::PADDING_LEFT,
 ];
+pub(crate) const INSETS: [Prop; 4] = [Prop::TOP, Prop::RIGHT, Prop::BOTTOM, Prop::LEFT];
 pub(crate) const MARGIN: [Prop; 4] = [
     Prop::MARGIN_TOP,
     Prop::MARGIN_RIGHT,
@@ -949,7 +995,144 @@ fn names_are_sorted() {
 
 pub(crate) type Registry = FxHashMap<Prop, (Rc<str>, bool, Option<Rc<str>>)>;
 
-pub(crate) const LOGICAL: [(Prop, Prop, Prop); 24] = [
+/// The physical property of a logical one in the box of a style, and other properties as they are.
+pub(crate) fn physical(prop: Prop, style: &Style) -> Prop {
+    if !prop.is_logical() {
+        return prop;
+    }
+    let rtl = style.get(Prop::DIRECTION) == Some("rtl");
+    side(prop, rtl, style.get(Prop::INTERNAL_LINES))
+}
+
+pub(crate) fn side(prop: Prop, rtl: bool, lines: Option<&str>) -> Prop {
+    let prop = match LOGICAL.iter().find(|(logical, ..)| *logical == prop) {
+        Some(&(_, _, right)) if rtl => right,
+        Some(&(_, left, _)) => left,
+        None => return prop,
+    };
+    let Some(mode) = lines else { return prop };
+    // The sides where vertical lines put the top, bottom, left and right of horizontal ones.
+    let sides = match mode {
+        "vertical-lr" => ["left", "right", "top", "bottom"],
+        "sideways-lr" => ["left", "right", "bottom", "top"],
+        _ => ["right", "left", "top", "bottom"],
+    };
+    let name = prop.name();
+    let names = ["top", "bottom", "left", "right"];
+    let at = |side: usize| name.contains(names[side]);
+    let found = (0..4).find(|&side| at(side));
+    let corner;
+    let (old, new) = match found {
+        // Corners have two sides.
+        Some(block @ (0 | 1)) if at(2) || at(3) => {
+            let line = if at(2) { 2 } else { 3 };
+            corner = [
+                format!("{}-{}", names[block], names[line]),
+                format!("{}-{}", sides[line], sides[block]),
+            ];
+            (&*corner[0], &*corner[1])
+        }
+        Some(side) => (names[side], sides[side]),
+        None if name.ends_with("height") => ("height", "width"),
+        None if name.ends_with("width") => ("width", "height"),
+        None => return prop,
+    };
+    let name = name.replacen(old, new, 1);
+    Prop::find(&name).unwrap_or(prop)
+}
+
+fn logical() -> &'static [u64; 16] {
+    static BITS: std::sync::OnceLock<[u64; 16]> = std::sync::OnceLock::new();
+    BITS.get_or_init(|| {
+        let mut bits = [0; 16];
+        for (Prop(prop, _), ..) in LOGICAL {
+            bits[prop as usize / 64] |= 1 << (prop % 64);
+        }
+        bits
+    })
+}
+
+impl Prop {
+    pub(crate) fn is_logical(self) -> bool {
+        (logical().get(self.0 as usize / 64)).is_some_and(|bits| bits >> (self.0 % 64) & 1 != 0)
+    }
+}
+
+pub(crate) const LOGICAL: [(Prop, Prop, Prop); 46] = [
+    (Prop::MARGIN_BLOCK_START, Prop::MARGIN_TOP, Prop::MARGIN_TOP),
+    (
+        Prop::MARGIN_BLOCK_END,
+        Prop::MARGIN_BOTTOM,
+        Prop::MARGIN_BOTTOM,
+    ),
+    (
+        Prop::PADDING_BLOCK_START,
+        Prop::PADDING_TOP,
+        Prop::PADDING_TOP,
+    ),
+    (
+        Prop::PADDING_BLOCK_END,
+        Prop::PADDING_BOTTOM,
+        Prop::PADDING_BOTTOM,
+    ),
+    (
+        Prop::SCROLL_MARGIN_BLOCK_START,
+        Prop::SCROLL_MARGIN_TOP,
+        Prop::SCROLL_MARGIN_TOP,
+    ),
+    (
+        Prop::SCROLL_MARGIN_BLOCK_END,
+        Prop::SCROLL_MARGIN_BOTTOM,
+        Prop::SCROLL_MARGIN_BOTTOM,
+    ),
+    (
+        Prop::SCROLL_PADDING_BLOCK_START,
+        Prop::SCROLL_PADDING_TOP,
+        Prop::SCROLL_PADDING_TOP,
+    ),
+    (
+        Prop::SCROLL_PADDING_BLOCK_END,
+        Prop::SCROLL_PADDING_BOTTOM,
+        Prop::SCROLL_PADDING_BOTTOM,
+    ),
+    (Prop::INSET_BLOCK_START, Prop::TOP, Prop::TOP),
+    (
+        Prop::BORDER_BLOCK_START_WIDTH,
+        Prop::BORDER_TOP_WIDTH,
+        Prop::BORDER_TOP_WIDTH,
+    ),
+    (
+        Prop::BORDER_BLOCK_START_STYLE,
+        Prop::BORDER_TOP_STYLE,
+        Prop::BORDER_TOP_STYLE,
+    ),
+    (
+        Prop::BORDER_BLOCK_START_COLOR,
+        Prop::BORDER_TOP_COLOR,
+        Prop::BORDER_TOP_COLOR,
+    ),
+    (Prop::INSET_BLOCK_END, Prop::BOTTOM, Prop::BOTTOM),
+    (
+        Prop::BORDER_BLOCK_END_WIDTH,
+        Prop::BORDER_BOTTOM_WIDTH,
+        Prop::BORDER_BOTTOM_WIDTH,
+    ),
+    (
+        Prop::BORDER_BLOCK_END_STYLE,
+        Prop::BORDER_BOTTOM_STYLE,
+        Prop::BORDER_BOTTOM_STYLE,
+    ),
+    (
+        Prop::BORDER_BLOCK_END_COLOR,
+        Prop::BORDER_BOTTOM_COLOR,
+        Prop::BORDER_BOTTOM_COLOR,
+    ),
+    (Prop::INLINE_SIZE, Prop::WIDTH, Prop::WIDTH),
+    (Prop::BLOCK_SIZE, Prop::HEIGHT, Prop::HEIGHT),
+    (Prop::MIN_INLINE_SIZE, Prop::MIN_WIDTH, Prop::MIN_WIDTH),
+    (Prop::MIN_BLOCK_SIZE, Prop::MIN_HEIGHT, Prop::MIN_HEIGHT),
+    (Prop::MAX_INLINE_SIZE, Prop::MAX_WIDTH, Prop::MAX_WIDTH),
+    (Prop::MAX_BLOCK_SIZE, Prop::MAX_HEIGHT, Prop::MAX_HEIGHT),
     (
         Prop::MARGIN_INLINE_START,
         Prop::MARGIN_LEFT,

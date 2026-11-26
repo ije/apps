@@ -92,8 +92,19 @@ pub(super) fn margins(
     let walked = build.walks.borrow().get(&parent).cloned();
     let walked = walked.unwrap_or_else(|| {
         let collapses = container(build, parent);
-        let open =
+        let mut open =
             [0, 2].map(|side| collapses && margin_collapses_through(build, parent, side, width));
+        // Like Chrome, a content height is without the last margin, also where it doesn't pass on.
+        let sized = |prop| {
+            build.styles.values[parent]
+                .get(prop)
+                .is_some_and(css::value::content_size)
+        };
+        open[1] |= collapses
+            && [Prop::HEIGHT, Prop::MIN_HEIGHT, Prop::MAX_HEIGHT]
+                .into_iter()
+                .any(sized)
+            && margin_collapses_through(build, parent, 3, width);
         // Skip animated boxes. Clear walks when fonts or the viewport change: the key excludes them.
         let key = (
             build.info[parent].revision,
@@ -115,7 +126,9 @@ pub(super) fn margins(
             let value = |set: [f32; 2]| set[0] + set[1];
             let mut pending = [0f32; 2];
             let mut emitted = 0.;
-            let mut leading = open[0];
+            // The box trims the margins that adjoin its edges.
+            let style = &build.styles.values[parent];
+            let mut leading = open[0] || trims(style, 0);
             for &child in &children {
                 if !block(build, child) {
                     // Like Chrome, margins collapse across inline content that makes no line.
@@ -148,7 +161,7 @@ pub(super) fn margins(
                 }
                 used.insert(child, sides);
             }
-            if open[1] {
+            if open[1] || trims(style, 2) {
                 let mut trailing = Vec::new();
                 for child in children.into_iter().rev() {
                     if !block(build, child)
@@ -287,6 +300,24 @@ pub(super) fn body_overflow_moves(doc: &Document, styles: &ComputedStyles, id: u
         })
 }
 
+/// Whether `margin-trim` drops the margins at the top, side 0, or the bottom of a block.
+pub(crate) fn trims(style: &css::properties::Style, side: usize) -> bool {
+    match style.get(Prop::MARGIN_TRIM) {
+        Some("block") => true,
+        Some("block-start") => side == 0,
+        Some("block-end") => side != 0,
+        _ => false,
+    }
+}
+
+// Whether the first line of a list item holds only its inside marker, because a block follows it.
+pub(super) fn marker_line(build: &Build<'_>, id: usize) -> bool {
+    crate::render::layout::size::inside_marker(build.styles, id)
+        && flow(build, id)
+            .first()
+            .is_some_and(|&child| block(build, child))
+}
+
 // `side` 3 is the bottom edge of a box that margins collapse through, which can also have a zero height.
 pub(super) fn margin_collapses_through(
     build: &Build<'_>,
@@ -341,13 +372,12 @@ pub(super) fn margin_collapses_through(
             .get(Prop::DISPLAY)
             .is_some_and(|value| matches!(value, "block" | "list-item"))
         && float_side(style).is_none()
+        && !(side == 0 && marker_line(build, id))
+        && !trims(style, side)
         // A pseudo-element in the flow, like a clearfix, holds the margin of its side.
         && styles.generated(id).is_none_or(|pseudos| {
             let pseudo = &pseudos[side / 2];
-            pseudo
-                .get(Prop::CONTENT)
-                .is_none_or(|value| matches!(value, "none" | "normal"))
-                || pseudo.get(Prop::DISPLAY) == Some("none")
+            crate::render::inline::drawn(pseudo, style).is_none()
                 || pseudo
                     .get(Prop::POSITION)
                     .is_some_and(|value| matches!(value, "absolute" | "fixed"))
@@ -379,7 +409,10 @@ pub(super) fn margin_collapses_through(
                 .get(kind)
                 .is_none_or(|value| matches!(value, "none" | "hidden")))
         && (side == 0
-            || (side == 3 || style.get(Prop::HEIGHT).is_none_or(|value| value == "auto"))
+            || (side == 3
+                || style.get(Prop::HEIGHT).is_none_or(css::value::auto_size)
+                    && (style.get(Prop::MAX_HEIGHT))
+                        .is_none_or(|value| !value.starts_with("calc-size(")))
                 && style
                     .get(Prop::MIN_HEIGHT)
                     .is_none_or(|value| value == "auto" || edge(Prop::MIN_HEIGHT) == 0.))
@@ -728,9 +761,9 @@ pub(super) fn adjoining(
     }
     let empty = first
         && (last || blocks && margin_collapses_through(build, id, 3, width))
-        && style
-            .get(Prop::HEIGHT)
-            .is_none_or(|value| value == "auto" || units.resolve(value, width) == Some(0.))
+        && style.get(Prop::HEIGHT).is_none_or(|value| {
+            css::value::auto_size(value) || units.resolve(value, width) == Some(0.)
+        })
         && children.iter().all(|&child| {
             if block(build, child) {
                 adjoining(build, child, width, around).2

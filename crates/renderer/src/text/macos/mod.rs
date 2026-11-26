@@ -10,25 +10,29 @@ use crate::{
     text::{
         FaceMetrics, Features, Font, FontId, FontStyle, Glyph, GlyphId, GlyphRaster, Line,
         SUBPIXEL_STEPS, SharedString, Span, best,
+        intercept::{Segment, intercept},
     },
 };
 use anyhow::{Context as _, Result, bail};
 use objc2_core_foundation::{
-    CFArray, CFData, CFDictionary, CFIndex, CFMutableAttributedString, CFNumber, CFRange,
+    CFArray, CFData, CFDictionary, CFIndex, CFLocale, CFMutableAttributedString, CFNumber, CFRange,
     CFRetained, CFString, CFType, CGAffineTransform, CGFloat, CGPoint, CGRect, CGSize,
 };
 use objc2_core_graphics::{
-    CGBitmapContextCreate, CGColorSpace, CGContext, CGPathDrawingMode, CGTextDrawingMode,
+    CGBitmapContextCreate, CGColorSpace, CGContext, CGPathDrawingMode, CGPathElement,
+    CGPathElementType, CGTextDrawingMode,
 };
 use objc2_core_text::{
     CTFont, CTFontCollection, CTFontDescriptor, CTFontManagerCopyAvailableFontFamilyNames,
-    CTFontManagerCreateFontDescriptorsFromData, CTFontOrientation, CTFontSymbolicTraits, CTLine,
-    CTRun, kCTFontAttributeName, kCTFontCascadeListAttribute, kCTFontFamilyNameAttribute,
-    kCTFontSlantTrait, kCTFontSymbolicTrait, kCTFontWeightTrait, kCTFontWidthTrait,
+    CTFontManagerCreateFontDescriptorsFromData, CTFontOrientation, CTFontSymbolicTraits,
+    CTFontTableOptions, CTLine, CTRun, kCTFontAttributeName, kCTFontCascadeListAttribute,
+    kCTFontFamilyNameAttribute, kCTFontSlantTrait, kCTFontSymbolicTrait, kCTFontWeightTrait,
+    kCTFontWidthTrait,
 };
 use rustc_hash::FxHashMap;
 use std::{
     cell::{OnceCell, RefCell},
+    ffi::c_void,
     hash::Hash,
     mem,
     ops::Range,
@@ -358,6 +362,8 @@ struct Book {
     natives: FxHashMap<usize, (CFRetained<CTFont>, FontId)>,
     words: Words,
     scratch: Scratch,
+    /// The last language that hyphenated, with its locale.
+    locale: Option<(String, Option<CFRetained<CFLocale>>)>,
 }
 
 #[derive(Default)]
@@ -398,6 +404,17 @@ impl TextSystem {
         self.0.borrow().face(font).metrics()
     }
 
+    /// The `GSUB` table, and the tags of other small capitals that CoreText knows.
+    pub fn substitutions(&self, font: FontId) -> (Vec<u8>, Vec<[u8; 4]>) {
+        let tag = u32::from_be_bytes(*b"GSUB");
+        let book = self.0.borrow();
+        let font = &book.face(font).font;
+        // SAFETY: the table is copied out of the font.
+        let table = unsafe { font.table(tag, CTFontTableOptions::NoOptions) };
+        let table = table.map_or_else(Vec::new, |table| table.to_vec());
+        (table, open_type::small_caps(font))
+    }
+
     pub fn glyph(&self, font: FontId, ch: char) -> Option<GlyphId> {
         self.0.borrow().face(font).glyph(ch)
     }
@@ -412,8 +429,124 @@ impl TextSystem {
         Some([x0, x1, y1, y0])
     }
 
+    pub fn intercept(
+        &self,
+        font: FontId,
+        glyph: GlyphId,
+        size: f32,
+        top: f32,
+        bottom: f32,
+    ) -> Option<[f32; 2]> {
+        let mut book = self.0.borrow_mut();
+        let sized = book.sized(font, size);
+        let face = book.face(font);
+        let skew = if face.oblique { SKEW } else { 0. };
+        let matrix = CGAffineTransform {
+            a: 1.,
+            b: 0.,
+            c: skew.into(),
+            d: 1.,
+            tx: 0.,
+            ty: 0.,
+        };
+        // SAFETY: a path of one glyph of a live font.
+        let path = unsafe { sized.path_for_glyph(glyph, &matrix) }?;
+        let out = if face.bold {
+            embolden(size, 1.) / 2.
+        } else {
+            0.
+        };
+        struct Walk {
+            segments: Vec<Segment>,
+            start: [f32; 2],
+            at: [f32; 2],
+        }
+        extern "C-unwind" fn add(info: *mut c_void, element: NonNull<CGPathElement>) {
+            // SAFETY: CoreGraphics passes `info` back, and each element with as many points as its type has.
+            let (walk, element) = unsafe { (&mut *info.cast::<Walk>(), element.as_ref()) };
+            let point = |at: usize| {
+                let point = unsafe { *element.points.as_ptr().add(at) };
+                [point.x as f32, -point.y as f32]
+            };
+            let from = walk.at;
+            let kind = element.r#type;
+            let (segment, to) = match kind {
+                CGPathElementType::MoveToPoint => {
+                    (walk.start, walk.at) = (point(0), point(0));
+                    return;
+                }
+                CGPathElementType::AddLineToPoint => (Segment::Line([from, point(0)]), point(0)),
+                CGPathElementType::AddQuadCurveToPoint => {
+                    (Segment::quad([from, point(0), point(1)]), point(1))
+                }
+                CGPathElementType::AddCurveToPoint => (
+                    Segment::Cubic([from, point(0), point(1), point(2)]),
+                    point(2),
+                ),
+                _ => (Segment::Line([from, walk.start]), walk.start),
+            };
+            walk.segments.push(segment);
+            walk.at = to;
+        }
+        let mut walk = Walk {
+            segments: Vec::new(),
+            start: [0.; 2],
+            at: [0.; 2],
+        };
+        // SAFETY: `add` gets the live walk.
+        unsafe {
+            objc2_core_graphics::CGPath::apply(Some(&path), (&raw mut walk).cast(), Some(add))
+        };
+        intercept(walk.segments, top - out, bottom + out)
+            .map(|[left, right]| [left - out, right + out])
+    }
+
     pub fn shape(&self, text: &str, font_size: Pixels, spans: &[Span]) -> Line {
         self.0.borrow_mut().shape(text, font_size, spans)
+    }
+
+    /// The byte offsets where a word of `language` can break.
+    pub fn hyphenate(&self, word: &str, language: &str) -> Vec<usize> {
+        let mut book = self.0.borrow_mut();
+        let locale = match &book.locale {
+            Some((known, locale)) if known == language => locale.clone(),
+            _ => {
+                let locale = CFLocale::new(None, Some(&CFString::from_str(language)))
+                    .filter(|locale| CFString::is_hyphenation_available_for_locale(Some(locale)));
+                book.locale = Some((language.to_owned(), locale.clone()));
+                locale
+            }
+        };
+        let Some(locale) = locale else {
+            return Vec::new();
+        };
+        let string = CFString::from_str(word);
+        let length = string.length();
+        let (mut places, mut end) = (Vec::new(), length);
+        while end > 0 {
+            // SAFETY: the range is the whole string, and the hyphen character is not asked for.
+            end = unsafe {
+                string.hyphenation_location_before_index(
+                    end,
+                    CFRange::new(0, length),
+                    0,
+                    Some(&locale),
+                    ptr::null_mut(),
+                )
+            };
+            if end > 0 {
+                places.push(end);
+            }
+        }
+        let mut utf16 = 0;
+        let mut offsets = Vec::new();
+        for (count, (at, ch)) in word.char_indices().enumerate() {
+            if count > 1 && places.contains(&utf16) && word[at..].chars().nth(1).is_some() {
+                offsets.push(at);
+            }
+            utf16 += ch.len_utf16() as CFIndex;
+        }
+        offsets
     }
 
     pub fn warm(lists: Vec<Vec<String>>) {
@@ -486,6 +619,7 @@ impl Book {
         let id = self.matched(font)?;
         let face = self.face(id);
         let weight = face.matching().0;
+        let [own_bold, own_oblique] = font.synthetic;
         let bold = font.synthesis[0]
             && font.weight >= 600.
             && weight < 600.
@@ -495,6 +629,8 @@ impl Book {
         let italic =
             unsafe { face.font.symbolic_traits() }.contains(CTFontSymbolicTraits::TraitItalic);
         let oblique = font.synthesis[1] && font.style != FontStyle::Normal && !italic;
+        let bold = own_bold.unwrap_or(bold);
+        let oblique = own_oblique.unwrap_or(oblique);
         if face.emoji || !bold && !oblique {
             return Some(id);
         }
@@ -523,7 +659,7 @@ impl Book {
             .iter()
             .map(|&id| self.face(id).matching())
             .collect();
-        let id = candidates[best(&matching, font.weight, font.style)?];
+        let id = candidates[best(&matching, font.weight, font.style, font.stretch)?];
         let face = self.face(id);
         let axes = face.axes();
         if axes.is_empty() {
@@ -546,6 +682,10 @@ impl Book {
                 .map(|&(_, value)| value);
             let value = set.or(match tag {
                 open_type::WGHT if default.is_some() => Some(font.weight),
+                // Old Apple fonts like Skia have another scale.
+                open_type::WDTH if max >= 50. && (face.local || font.stretch != 1.) => {
+                    Some(font.stretch * 100.)
+                }
                 // Like Chromium, web fonts follow the font size. CoreText sizes system fonts itself.
                 open_type::OPSZ if face.local => font.optical_size,
                 _ => None,
@@ -585,6 +725,7 @@ impl Book {
             .filter_map(|family| {
                 let id = self.font(&Font {
                     family: family.into(),
+                    synthetic: [None; 2],
                     ..font.clone()
                 })?;
                 // SAFETY: plain CoreText query.
@@ -897,7 +1038,7 @@ mod tests {
             let book = text.0.borrow();
             (id, book.face(id).bold, book.face(id).oblique)
         };
-        let on = [true; 2];
+        let on = [true; 3];
         let (regular, ..) = face(400., FontStyle::Normal, on);
         assert_eq!(face(500., FontStyle::Normal, on).0, regular);
         let (bold, true, false) = face(600., FontStyle::Normal, on) else {
@@ -911,9 +1052,9 @@ mod tests {
             (_, true, true)
         ));
         // `font-synthesis` turns each off.
-        assert_eq!(face(700., FontStyle::Italic, [false; 2]).0, regular);
+        assert_eq!(face(700., FontStyle::Italic, [false; 3]).0, regular);
         assert!(matches!(
-            face(700., FontStyle::Italic, [false, true]),
+            face(700., FontStyle::Italic, [false, true, true]),
             (_, false, true)
         ));
         // Helvetica has its own bold and italic faces.
@@ -1009,15 +1150,15 @@ mod tests {
             (700., FontStyle::Normal, 1.),
             (300., FontStyle::Italic, 1.),
         ];
-        assert_eq!(best(&faces, 400., FontStyle::Normal), Some(0));
-        assert_eq!(best(&faces, 600., FontStyle::Normal), Some(1));
-        assert_eq!(best(&faces, 500., FontStyle::Normal), Some(0));
-        assert_eq!(best(&faces, 900., FontStyle::Italic), Some(2));
+        assert_eq!(best(&faces, 400., FontStyle::Normal, 1.), Some(0));
+        assert_eq!(best(&faces, 600., FontStyle::Normal, 1.), Some(1));
+        assert_eq!(best(&faces, 500., FontStyle::Normal, 1.), Some(0));
+        assert_eq!(best(&faces, 900., FontStyle::Italic, 1.), Some(2));
         let narrow = [
             (400., FontStyle::Normal, 0.75),
             (400., FontStyle::Normal, 1.25),
         ];
-        assert_eq!(best(&narrow, 400., FontStyle::Normal), Some(0));
+        assert_eq!(best(&narrow, 400., FontStyle::Normal, 1.), Some(0));
         assert_eq!(
             (css_weight(0.), css_weight(0.23), css_weight(-1.)),
             (400., 500., 100.)

@@ -715,7 +715,7 @@ impl LayoutTree<'_> {
                     width + margin.left + margin.right,
                     output.size.height + margin.top + margin.bottom,
                 ];
-                let [x, y] = self.place(edges, size, origin[1] + total, bits);
+                let [x, y] = self.place(edges, size, origin[1] + total, bits, child);
                 if perform {
                     let mut layout = Layout::with_order(order as u32);
                     layout.size = taffy::Size {
@@ -843,27 +843,39 @@ impl LayoutTree<'_> {
                             - own_border.left
                             - own_border.right;
                         let scale = self.scale;
-                        let floats: Vec<[f32; 4]> = self
-                            .floats
-                            .iter()
-                            .filter(|float| float[3] > content[1])
-                            .filter_map(|float| {
-                                let sides = if float[4] == 0. {
-                                    [(float[2] - content[0]).max(0.), 0.]
-                                } else {
-                                    [0., (content[0] + span - float[0]).max(0.)]
-                                };
-                                (sides != [0.; 2]).then(|| {
-                                    [
-                                        float[1] - content[1],
-                                        float[3] - content[1],
-                                        sides[0],
-                                        sides[1],
-                                    ]
-                                    .map(|value| value / scale)
+                        let mut floats: Vec<[f32; 4]> = Vec::new();
+                        let mut band = |[left, top, right, bottom]: [f32; 4], side: f32| {
+                            let sides = if side % 2. == 0. {
+                                [(right - content[0]).max(0.), 0.]
+                            } else {
+                                [0., (content[0] + span - left).max(0.)]
+                            };
+                            if sides != [0.; 2] && bottom > content[1] {
+                                let [top, bottom] = [top - content[1], bottom - content[1]];
+                                floats.push(
+                                    [top, bottom, sides[0], sides[1]].map(|value| value / scale),
+                                );
+                            }
+                        };
+                        for &[left, top, right, bottom, side] in &self.floats {
+                            let shape = (side >= 2.)
+                                .then(|| {
+                                    self.slots[(side / 2.) as usize - 1].style.outside.as_ref()
                                 })
-                            })
-                            .collect();
+                                .flatten();
+                            let Some(shape) = shape else {
+                                band([left, top, right, bottom], side);
+                                continue;
+                            };
+                            let size = [(right - left) / scale, (bottom - top) / scale];
+                            let end = side % 2. != 0.;
+                            for &[above, below, x] in shape.rows(size, end, 1. / scale).iter() {
+                                let x = left + x * scale;
+                                let [above, below] = [above, below].map(|y| top + y * scale);
+                                let (from, to) = if end { (x, right) } else { (left, x) };
+                                band([from, above, to, below], side);
+                            }
+                        }
                         let floats = (!floats.is_empty()).then(|| Rc::from(floats));
                         let system = self.window.text_system().clone();
                         self.active = true;
@@ -1009,7 +1021,17 @@ impl LayoutTree<'_> {
                 layout.margin = margin;
                 self.set_unrounded_layout(child, &layout);
                 if items == 0 {
-                    first = Some(top + output.baselines.first.unwrap_or(height));
+                    let base = output.baselines.first.unwrap_or(height);
+                    // Like Taffy, the baseline of a scroll container is inside its box.
+                    let scrolls =
+                        (self.slots[usize::from(child)].taffy().overflow.y).is_scroll_container();
+                    first = Some(
+                        top + if scrolls {
+                            base.min(height).max(0.)
+                        } else {
+                            base
+                        },
+                    );
                 }
             }
             total += offset + margins + height + drop;
@@ -1186,8 +1208,19 @@ impl LayoutTree<'_> {
     }
 
     /// Places a float with its margin box `size` at or below `y`, between `edges`, like CSS 2 9.5.1.
-    fn place(&mut self, edges: [f32; 2], size: [f32; 2], mut y: f32, bits: u8) -> [f32; 2] {
+    fn place(
+        &mut self,
+        edges: [f32; 2],
+        size: [f32; 2],
+        mut y: f32,
+        bits: u8,
+        node: NodeId,
+    ) -> [f32; 2] {
         let right = bits & Flow::RIGHT != 0;
+        let shape = match self.slots[usize::from(node)].style.outside {
+            Some(_) => 2. * (usize::from(node) + 1) as f32,
+            None => 0.,
+        };
         // The flow only moves down, so floats that ended above it can't touch this one or the boxes after it.
         self.floats.retain(|float| float[3] > y);
         y = y.max(self.ceiling).max(self.cleared(bits));
@@ -1195,8 +1228,13 @@ impl LayoutTree<'_> {
             let (room, low) = self.beside(edges, y, size[1]);
             if room[1] - room[0] >= size[0] - 0.01 || low == f32::INFINITY {
                 let x = if right { room[1] - size[0] } else { room[0] };
-                self.floats
-                    .push([x, y, x + size[0], y + size[1], f32::from(u8::from(right))]);
+                self.floats.push([
+                    x,
+                    y,
+                    x + size[0],
+                    y + size[1],
+                    f32::from(u8::from(right)) + shape,
+                ]);
                 (self.ceiling, self.reach) = (self.ceiling.max(y), self.reach.max(y + size[1]));
                 return [x, y];
             }
@@ -1210,7 +1248,7 @@ impl LayoutTree<'_> {
             .iter()
             .fold((edges, f32::INFINITY), |(room, low), float| {
                 if float[1] < y + height.max(0.01) && float[3] > y {
-                    let room = match float[4] == 0. {
+                    let room = match float[4] % 2. == 0. {
                         true => [room[0].max(float[2]), room[1]],
                         false => [room[0], room[1].min(float[0])],
                     };
@@ -1224,7 +1262,7 @@ impl LayoutTree<'_> {
     /// The bottom of the floats that `bits` clears.
     fn cleared(&self, bits: u8) -> f32 {
         self.floats.iter().fold(f32::NEG_INFINITY, |bottom, float| {
-            let side = if float[4] == 0. {
+            let side = if float[4] % 2. == 0. {
                 Flow::CLEAR_LEFT
             } else {
                 Flow::CLEAR_RIGHT
@@ -1630,7 +1668,16 @@ impl LayoutTree<'_> {
         let (first, last) = match baseline {
             _ if style.contain.suppresses_baseline() => (None, None),
             _ if source.is_some() => (source, source),
-            Baseline::First => (first, first),
+            Baseline::First if style.display == taffy::Display::Flex && !row => {
+                let mut items = children;
+                let item = match style.flex_direction {
+                    FlexDirection::ColumnReverse => items.next(),
+                    _ => items.next_back(),
+                };
+                let last = item.and_then(|child| Some(at(child, child.baselines.last?)));
+                (first, last.or(first))
+            }
+            Baseline::First if !row => (first, first),
             Baseline::FirstOnly => (first, None),
             _ if row => {
                 let last = children

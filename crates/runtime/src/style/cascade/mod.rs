@@ -1,6 +1,6 @@
 use crate::css::{
-    properties::Prop, properties::Registry, properties::Style, properties::Vars, sheet::Stylesheet,
-    value::units::Lengths,
+    properties::Prop, properties::Registry, properties::Style, properties::Vars,
+    properties::physical, sheet::Stylesheet, value::units::Lengths,
 };
 use crate::dom::{Document, SelectorCache};
 use crate::style::cascade::computed::{ComputedStyles, empty};
@@ -13,6 +13,7 @@ use crate::style::cascade::shadow::Shadowed;
 use crate::style::cascade::sheets::{Cssom, Derived, Sheet};
 use crate::style::cascade::table::CollapsedTable;
 use crate::style::fonts::font_names;
+use crate::style::{used::resolve_keywords, vars::resolve_style};
 use counters::number_lists;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
@@ -23,6 +24,8 @@ pub(crate) mod computed;
 mod container;
 mod counters;
 mod declared;
+mod highlight;
+mod hints;
 mod memo;
 mod moves;
 mod node;
@@ -31,9 +34,12 @@ pub(super) mod scope;
 mod shadow;
 mod sheets;
 mod table;
+pub(crate) use table::{Slots, span};
 mod used_values;
 
+pub(crate) use computed::Used;
 pub(crate) use container::Container;
+pub(crate) use highlight::Highlights;
 pub(crate) use shadow::Passed;
 
 #[derive(Default)]
@@ -42,7 +48,7 @@ pub(crate) struct StyleCache {
     pub(crate) scopes: Vec<StyleScope>,
     pub(crate) next: usize,
     pub(crate) pass: u64,
-    pub(crate) states: u16,
+    pub(crate) states: u32,
     pub(crate) sheets: HashMap<usize, Sheet>,
     pub(crate) cssom: HashMap<usize, Cssom>,
     pub(crate) constructed: FxHashMap<u32, Rc<Stylesheet>>,
@@ -58,6 +64,14 @@ pub(crate) struct StyleCache {
     pub(crate) queries: QueryCache,
     // Resized containers with nodes that use container units.
     pub(crate) units: Vec<usize>,
+    // A style had anchor positioning, the results of the last layout, and the styles made with them, from the own
+    // ones.
+    pub(crate) anchoring: bool,
+    pub(crate) anchored: Rc<FxHashMap<usize, Rc<Used>>>,
+    #[allow(clippy::type_complexity)]
+    pub(crate) anchored_styles: FxHashMap<usize, (Rc<Style>, Rc<Used>, Rc<Style>)>,
+    // Counts the changes of the `@position-try` rules.
+    pub(crate) rules: u64,
     pub(crate) changed: Vec<u64>,
     pub(crate) stamp: u64,
     pub(crate) tables: FxHashMap<usize, CollapsedTable>,
@@ -89,6 +103,8 @@ pub(crate) struct Environment {
     pub(crate) native_theme: u32,
     pub(crate) registry: Rc<Registry>,
     pub(crate) scheme: Option<Rc<str>>,
+    // The Tailwind theme, whose variables the document node has.
+    pub(crate) theme: Option<Rc<Style>>,
 }
 
 // `scopes` must stay sorted by root, and a tree that the stored pass styled must use the same scope again.
@@ -516,6 +532,14 @@ pub(crate) fn compute_styles(
         style_cache.environment.scheme = scheme.clone();
         style_cache.uncache();
     }
+    let same = match (&theme, &style_cache.environment.theme) {
+        (Some(new), Some(old)) => Rc::ptr_eq(new, old) || **new == **old,
+        (new, old) => new.is_none() && old.is_none(),
+    };
+    if !same {
+        style_cache.environment.theme = theme.clone();
+        style_cache.uncache();
+    }
     let environment = style_cache.environment.clone();
     let registry = environment.registry.clone();
     let mut used: Vec<(usize, usize, usize)> = walk
@@ -551,6 +575,15 @@ pub(crate) fn compute_styles(
     out.flags.resize(count, 0);
     out.containers.resize(count, None);
     let mut orphans = std::mem::take(&mut style_cache.orphans);
+    if let Some(previous) = previous.filter(|_| fast)
+        && let Some(nodes) = &previous.anchors
+    {
+        for id in nodes.boxes.iter().copied().filter(|&id| id < count) {
+            if let Some(own) = previous.authored.get(&id) {
+                out.values[id] = own.clone();
+            }
+        }
+    }
     match previous.filter(|_| fast) {
         // The cascade must read the own styles of the nodes that the last anonymous tables changed.
         Some(previous) => {
@@ -601,6 +634,9 @@ pub(crate) fn compute_styles(
     style_cache.collapse_tables(doc, &walk, &mut out, [width, height], previous, fast);
     anonymous_tables(doc, &walk, &shadows, &mut out, previous, fast, &mut orphans);
     style_cache.orphans = orphans;
+    if style_cache.anchoring {
+        style_cache.anchor(&walk, &mut out, previous.filter(|_| fast));
+    }
     #[cfg(debug_assertions)]
     if fast {
         check_incremental(
@@ -615,6 +651,120 @@ pub(crate) fn compute_styles(
         );
     }
     out
+}
+
+impl StyleCache {
+    // Finds the nodes of anchor positioning, and gives the boxes the styles that the last layout found for them.
+    fn anchor(
+        &mut self,
+        walk: &TreeWalk,
+        out: &mut ComputedStyles,
+        previous: Option<&ComputedStyles>,
+    ) {
+        let old = previous.and_then(|previous| Some((previous, previous.anchors.as_ref()?)));
+        let mut nodes = old.map_or_else(Default::default, |(_, nodes)| nodes.clone());
+        let mut add = |id: usize, style: &Style| {
+            let boxed = crate::css::value::anchor::positions(style);
+            let named = style
+                .get(Prop::ANCHOR_NAME)
+                .is_some_and(|name| name != "none");
+            if (nodes.boxes.contains(&id), nodes.names.contains(&id)) != (boxed, named) {
+                let nodes = Rc::make_mut(&mut nodes);
+                for (set, has) in [(&mut nodes.boxes, boxed), (&mut nodes.names, named)] {
+                    match has {
+                        true => set.insert(id),
+                        false => set.remove(&id),
+                    };
+                }
+            }
+        };
+        match old {
+            Some((previous, _)) => {
+                for id in out.values.differing(&previous.values).flatten() {
+                    add(id, &out.values[id]);
+                }
+            }
+            None => {
+                for &(id, _) in walk.walk.order().iter() {
+                    add(id as usize, &out.values[id as usize]);
+                }
+            }
+        }
+        self.anchored_styles
+            .retain(|id, _| nodes.boxes.contains(id));
+        for &id in &nodes.boxes {
+            let Some(used) = self.anchored.get(&id) else {
+                continue;
+            };
+            let own = out.values[id].clone();
+            let kept = self
+                .anchored_styles
+                .get(&id)
+                .filter(|(base, with, _)| Rc::ptr_eq(base, &own) && Rc::ptr_eq(with, used));
+            let style = match kept {
+                Some((.., style)) => style.clone(),
+                None => {
+                    let mut style = (*own).clone();
+                    used.apply(&mut style, false);
+                    let style = Rc::new(style);
+                    self.anchored_styles
+                        .insert(id, (own.clone(), used.clone(), style.clone()));
+                    style
+                }
+            };
+            out.values[id] = style;
+            out.authored.entry(id).or_insert(own);
+        }
+        // A style that the cache shares turns it on again.
+        self.anchoring = !nodes.boxes.is_empty();
+        out.anchors = self.anchoring.then_some(nodes);
+        out.anchored = self.anchored.clone();
+    }
+
+    // Puts the declarations of the `@position-try` rule `name` into the style of the node `id`, if there is such a rule.
+    pub(crate) fn position_try(
+        &self,
+        doc: &Document,
+        (id, name): (usize, &str),
+        style: &mut Style,
+        parent: Option<&Style>,
+        styles: &ComputedStyles,
+    ) -> Option<()> {
+        let root = std::iter::successors(Some(id), |&at| doc.nodes[at].parent).last()?;
+        let scopes = &self.styled.as_ref()?.scopes;
+        let scope = scopes.iter().find(|scope| scope.0 == root)?.1;
+        let scope = self.scopes.iter().find(|found| found.id == scope)?;
+        let (_, values) = scope.keyframes.get(&format!("\0{name}"))?.first()?;
+        let mut cascade = bbtree::unsync::BBTreeMap::new();
+        for (prop, value, important, position) in values.resolved(false) {
+            let rank = rank::CascadeRank {
+                position,
+                ..rank::CascadeRank::new(rank::AUTHOR, important, 0, [0; 3], 0)
+            };
+            rank::put(&mut cascade, physical(prop, style), rank, value);
+        }
+        let mut values = Style::new();
+        values.set_vars(styles.vars[id].clone());
+        for (&prop, (_, value)) in &cascade {
+            values.insert(prop, value.clone());
+        }
+        resolve_style(
+            &mut values,
+            parent,
+            None,
+            &[],
+            &styles.registry,
+            styles.theme,
+        );
+        resolve_keywords(&mut values, parent, None);
+        for &prop in cascade.keys() {
+            match values.value(prop) {
+                Some(value) => style.insert(prop, value.clone()),
+                None => drop(style.remove(prop)),
+            }
+        }
+        Some(())
+    }
 }
 
 // Checks that an incremental pass gives what a full pass gives.
@@ -636,6 +786,7 @@ fn check_incremental(
         constructed: style_cache.constructed.clone(),
         adopted: style_cache.adopted.clone(),
         containers: style_cache.containers.clone(),
+        anchored: style_cache.anchored.clone(),
         scripted: style_cache.scripted.clone(),
         tailwind: std::mem::take(&mut style_cache.tailwind),
         unshared: true,

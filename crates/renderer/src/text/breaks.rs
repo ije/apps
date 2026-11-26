@@ -1,13 +1,41 @@
-use super::{Line, TextWrap, WordBreak};
+use super::{Hyphen, Line, TextWrap, WordBreak};
 use crate::{Pixels, px};
 use std::ops::Range;
+
+/// `text-indent`: the room before the first row of the text, and before the other rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Hash)]
+pub struct Indent {
+    pub first: Pixels,
+    pub rest: Pixels,
+    /// The row after each line break is like the first one.
+    pub each: bool,
+}
+
+impl Indent {
+    pub(super) fn line(self, line: usize) -> Self {
+        let [first, rest] = self.of(line);
+        Self {
+            first,
+            rest,
+            ..self
+        }
+    }
+
+    /// The room before the first row of a line, and before its other rows.
+    pub fn of(self, line: usize) -> [Pixels; 2] {
+        match line == 0 || self.each {
+            true => [self.first, self.rest],
+            false => [self.rest; 2],
+        }
+    }
+}
 
 #[derive(Clone, Copy, Default, PartialEq, Hash)]
 pub struct Wrapping {
     /// No breaks without a width.
     pub width: Option<Pixels>,
     pub max_lines: Option<usize>,
-    pub indent: Pixels,
+    pub indent: Indent,
     pub wrap: TextWrap,
     pub word_break: WordBreak,
 }
@@ -29,6 +57,15 @@ pub struct Banded<'a> {
 }
 
 impl Banded<'_> {
+    /// Moves the next row below the floats on the left, bit 1, or the right, bit 2.
+    pub(crate) fn clear(&mut self, sides: u8) {
+        for &[_, bottom, left, right] in self.floats {
+            if sides & 1 != 0 && left > 0. || sides & 2 != 0 && right > 0. {
+                self.y = self.y.max(bottom);
+            }
+        }
+    }
+
     /// The insets of a row at `y`, and the first float bottom below it.
     pub(crate) fn edges(&self, y: f32) -> ([f32; 2], f32) {
         self.floats
@@ -50,7 +87,7 @@ pub(crate) fn breaks(
     wrapping: &Wrapping,
     nowrap: &[Range<usize>],
 ) -> Vec<u32> {
-    breaks_beside(line, text, wrapping, nowrap, None)
+    breaks_beside(line, text, wrapping, nowrap, &[], None)
 }
 
 impl Banded<'_> {
@@ -72,6 +109,7 @@ pub(crate) fn breaks_beside(
     text: &str,
     wrapping: &Wrapping,
     nowrap: &[Range<usize>],
+    hyphens: &[Hyphen],
     mut banded: Option<&mut Banded<'_>>,
 ) -> Vec<u32> {
     let width = wrapping.width.unwrap_or_default();
@@ -97,9 +135,14 @@ pub(crate) fn breaks_beside(
         });
     }
     let mut chance: Option<(u32, Pixels)> = None;
+    // The chance is in the last word, which starts the row.
+    let mut alone = false;
     let (mut row_glyph, mut row_x) = (0, px(0.));
     let (mut started, mut words_end, mut previous_index) = (false, 0., 0);
     let (mut previous, mut before_previous) = ('\0', '\0');
+    let whole = matches!(wrapping.word_break, WordBreak::Normal | WordBreak::KeepAll);
+    let mut room = width - wrapping.indent.first - px(edges[0] + edges[1]);
+    let mut marks = hyphens.iter().peekable();
     for (at, glyph) in glyphs.iter().enumerate() {
         let index = glyph.index as usize;
         let Some(ch) = text[index..].chars().next() else {
@@ -112,7 +155,26 @@ pub(crate) fn breaks_beside(
         previous_index = index;
         let at = at as u32;
         let class = line_class(ch);
-        if started
+        let mut mark = None;
+        if !hyphens.is_empty() {
+            while (marks.next_if(|hyphen| (hyphen.at as usize) < index)).is_some() {}
+            mark = marks.next_if(|hyphen| hyphen.at as usize == index);
+        }
+        if let Some(hyphen) = mark
+            && !joined
+            && (chance.is_none() || !hyphen.last || alone)
+            && (chance.is_none() && whole || glyph.x + hyphen.line.width - row_x <= room + px(0.01))
+        {
+            chance = Some((at, glyph.x));
+            alone = hyphen.last;
+            if even {
+                chances.push(Chance {
+                    glyph: at,
+                    x: glyph.x.0,
+                    words_end: words_end + hyphen.line.width.0,
+                });
+            }
+        } else if started
             && ch != ' '
             && !joined
             // A zero width joiner holds the characters on both sides together.
@@ -132,6 +194,7 @@ pub(crate) fn breaks_beside(
                         && LETTERS & 1 << class != 0))
         {
             chance = Some((at, glyph.x));
+            alone = false;
             if even {
                 chances.push(Chance {
                     glyph: at,
@@ -147,11 +210,6 @@ pub(crate) fn breaks_beside(
         if ch != ' ' {
             words_end = next_x.0;
         }
-        let mut room = if rows.is_empty() {
-            width - wrapping.indent
-        } else {
-            width
-        } - px(edges[0] + edges[1]);
         // Like Chrome, a row where the first word doesn't fit beside the floats moves below the first of them.
         while ch != ' '
             && chance.is_none()
@@ -169,9 +227,7 @@ pub(crate) fn breaks_beside(
         if ch != ' '
             && next_x - row_x > room + px(0.01)
             && at > row_glyph
-            && (chance.is_some()
-                || !matches!(wrapping.word_break, WordBreak::Normal | WordBreak::KeepAll)
-                    && !joined)
+            && (chance.is_some() || !whole && !joined)
         {
             if wrapping
                 .max_lines
@@ -186,6 +242,7 @@ pub(crate) fn breaks_beside(
                 edges = banded.edges(banded.y).0;
                 banded.rows.push([edges[0], edges[1], banded.y]);
             }
+            room = width - wrapping.indent.rest - px(edges[0] + edges[1]);
         }
         if class != CM {
             (before_previous, previous) = (previous, ch);
@@ -212,10 +269,11 @@ fn even_out(
     font_size: f32,
     wrapping: &Wrapping,
 ) -> Vec<u32> {
-    let (wrap, indent) = (wrapping.wrap, wrapping.indent.0);
+    let (wrap, indent) = (wrapping.wrap, wrapping.indent);
     let last = chances.len() - 1;
     let span = |from: usize, to: usize| {
-        chances[to].words_end - chances[from].x + if from == 0 { indent } else { 0. }
+        let indent = if from == 0 { indent.first } else { indent.rest };
+        chances[to].words_end - chances[from].x + indent.0
     };
     let mut greedy = vec![0];
     for row in &rows {
@@ -572,6 +630,7 @@ mod tests {
             text,
             &wrapping(100., TextWrap::Wrap),
             &[],
+            &[],
             Some(&mut banded),
         );
         // Rows of 50px, 50px, 80px, then 100px.
@@ -581,6 +640,10 @@ mod tests {
             [[30., 20., 0.], [30., 20., 10.], [0., 20., 20.]]
         );
         assert_eq!(banded.y, 30.);
+        banded.clear(1);
+        assert_eq!(banded.y, 30.);
+        banded.clear(2);
+        assert_eq!(banded.y, 35.);
         // A word wider than the room beside the floats moves below the first float that ends.
         let mut banded = Banded {
             floats: &floats,
@@ -593,6 +656,7 @@ mod tests {
             &line(text),
             text,
             &wrapping(100., TextWrap::Wrap),
+            &[],
             &[],
             Some(&mut banded),
         );
@@ -724,7 +788,7 @@ mod tests {
         assert_eq!(breaks(&line, text, &wrapping, &[]), [3, 6]);
         wrapping.max_lines = Some(2);
         assert_eq!(breaks(&line, text, &wrapping, &[]), [3]);
-        wrapping.indent = px(10.);
+        wrapping.indent.first = px(10.);
         wrapping.max_lines = None;
         assert_eq!(breaks(&line, text, &wrapping, &[]), [2, 5]);
     }

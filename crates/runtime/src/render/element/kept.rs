@@ -36,6 +36,8 @@ pub(crate) enum Query {
     Viewport,
     Theme,
     LineBase(u32),
+    // Whether the parent of the node has a definite height.
+    Definite(u32),
     Shrinks(u32),
     Spliced(u32),
 }
@@ -57,6 +59,7 @@ impl Query {
             Query::Boxless(node) => Query::Boxless(at(node)?),
             Query::Value(node) => Query::Value(at(node)?),
             Query::LineBase(node) => Query::LineBase(at(node)?),
+            Query::Definite(node) => Query::Definite(at(node)?),
             Query::Shrinks(node) => Query::Shrinks(at(node)?),
             Query::Spliced(node) => Query::Spliced(at(node)?),
             query => query,
@@ -96,6 +99,7 @@ pub(crate) struct Patch {
     pub(crate) slot: Option<([f32; 4], super::super::layout::grid::Grid)>,
     pub(crate) flex_parent: bool,
     pub(crate) columned: bool,
+    pub(crate) space: bool,
     pub(crate) perspective: Option<(f32, String)>,
     pub(crate) value: u64,
 }
@@ -149,6 +153,7 @@ pub(crate) struct Call {
     pub(super) container: [f32; 2],
     pub(super) flex_parent: bool,
     pub(super) columned: bool,
+    pub(super) space: bool,
     pub(super) cell: Option<(bool, bool, u64)>,
 }
 

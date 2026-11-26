@@ -30,9 +30,7 @@ pub(crate) fn row_extents<'a>(
     let mut offset = 0;
     for line in lines {
         let layout = &line.line;
-        let ends: Vec<usize> = (line.breaks.iter())
-            .map(|&at| layout.glyphs[at as usize].index as usize)
-            .collect();
+        let ends: Vec<usize> = (1..line.rows()).map(|row| line.row_index(row)).collect();
         let first = rows.len();
         rows.resize(first + ends.len() + 1, root);
         // Glyphs of one face and size measure once per row, line height and source run.
@@ -68,16 +66,16 @@ pub(crate) fn row_extents<'a>(
                 continue;
             }
             last = Some((glyph.font, glyph.size, row, kind, source));
-            let size = f32::from(glyph.size);
+            let styled = source.and_then(|index| runs.get(index));
+            // Synthetic small capitals and adjusted sizes don't change the line.
+            let size = styled.map_or(glyph.size, |run| run.font_size.unwrap_or(layout.font_size));
             let [above, below] = inline(
-                source
-                    .and_then(|index| runs.get(index))
-                    .map_or(glyph.font, |styled| system.face(&styled.font)),
-                glyph.size,
+                styled.map_or(glyph.font, |styled| system.face(&styled.font)),
+                size,
                 match kind {
                     style::LineHeight::Normal => None,
                     style::LineHeight::Scale(factor) => {
-                        Some((factor * size * scale * 64.).floor() / 64.)
+                        Some((factor * f32::from(size) * scale * 64.).floor() / 64.)
                     }
                     style::LineHeight::Fixed(line) => Some((line * scale * 64.).round() / 64.),
                 },

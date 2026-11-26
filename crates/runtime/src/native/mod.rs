@@ -13,6 +13,7 @@ unsafe extern "C" {
     fn apps_native_call(operation: *const c_char, arguments: *const c_char) -> *mut c_char;
     fn apps_native_free(text: *mut c_char);
     fn apps_theme_state() -> u32;
+    fn apps_date_patterns() -> *mut c_char;
     fn apps_theme_observe(wake: extern "C" fn());
 }
 
@@ -24,6 +25,32 @@ pub(crate) fn theme_state() -> u32 {
     #[cfg(not(target_os = "macos"))]
     {
         0
+    }
+}
+
+/// The patterns of dates, times and months, the names of the halves of the day and of the months, one on each line.
+pub(crate) fn date_patterns() -> String {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let text = apps_date_patterns();
+        let lines = CStr::from_ptr(text).to_string_lossy().into_owned();
+        apps_native_free(text);
+        lines
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let locale = ["LC_ALL", "LC_TIME", "LANG"]
+            .iter()
+            .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+            .unwrap_or_default();
+        let (date, time) = match locale.starts_with("en_US") {
+            true => ("MM/dd/yyyy", "hh:mm a"),
+            false => ("dd/MM/yyyy", "HH:mm"),
+        };
+        format!(
+            "{date}\n{time}\nMMMM yyyy\nAM\nPM\nJanuary\nFebruary\nMarch\nApril\nMay\nJune\nJuly\nAugust\n\
+             September\nOctober\nNovember\nDecember"
+        )
     }
 }
 

@@ -16,7 +16,8 @@ pub(crate) type CellKey = (StyleRef, [(u32, Option<[Option<Rc<str>>; 2]>); 4]);
 pub(crate) struct Line {
     pub(crate) row: (usize, StyleRef),
     pub(crate) group: Option<(usize, StyleRef)>,
-    pub(crate) cells: Vec<(usize, StyleRef, usize)>,
+    // Each cell with its first column, columns and rows.
+    pub(crate) cells: Vec<(usize, StyleRef, [usize; 3])>,
 }
 
 #[derive(Default)]
@@ -25,8 +26,79 @@ pub(crate) struct CollapsedTable {
     pub(crate) size: [f32; 2],
     pub(crate) table: Option<(StyleRef, [u32; 4], Rc<Style>)>,
     pub(crate) lines: Vec<Line>,
+    // The count of columns, or 0 when cells span many rows or columns have borders of their own.
+    pub(crate) columns: usize,
     pub(crate) adjusted: Vec<(Vec<Rc<Style>>, [f32; 4])>,
     pub(crate) styles: FxHashMap<CellKey, Rc<Style>>,
+}
+
+// The columns or rows of a cell, where 0 stands for all rows to the end of the row group.
+pub(crate) fn span(node: &crate::dom::Node, name: &str) -> usize {
+    let span = node
+        .attrs
+        .get(name)
+        .and_then(|value| value.trim().parse::<usize>().ok());
+    match (span, name) {
+        (Some(0), "rowspan") => 4095,
+        (Some(span), "rowspan") => span.min(4095),
+        (Some(span), _) if span > 0 => span.min(1000),
+        _ => 1,
+    }
+}
+
+// The columns of the cells of a table, row by row.
+#[derive(Default)]
+pub(crate) struct Slots {
+    // The columns that cells of rows above take, and the row after these cells.
+    taken: Vec<[usize; 3]>,
+    fresh: Vec<[usize; 3]>,
+    row: usize,
+    next: usize,
+    column: usize,
+    // Cells start in the columns before `dense` and in `starts`.
+    dense: usize,
+    starts: Vec<usize>,
+}
+
+impl Slots {
+    pub(crate) fn place(&mut self, row: usize, columns: usize, rows: usize) -> usize {
+        if row != self.row {
+            self.taken.retain(|run| run[2] > row);
+            for run in self.fresh.drain(..).filter(|run| run[2] > row) {
+                let at = self.taken.partition_point(|taken| taken[0] < run[0]);
+                self.taken.insert(at, run);
+            }
+            (self.row, self.next, self.column) = (row, 0, 0);
+        }
+        while let Some(run) = self
+            .taken
+            .get(self.next)
+            .filter(|run| run[0] <= self.column)
+        {
+            self.column = self.column.max(run[1]);
+            self.next += 1;
+        }
+        let column = self.column;
+        self.column += columns;
+        if rows > 1 {
+            self.fresh.push([column, self.column, row + rows]);
+        }
+        if column == self.dense {
+            self.dense += 1;
+        } else if column > self.dense
+            && let Err(at) = self.starts.binary_search(&column)
+        {
+            self.starts.insert(at, column);
+        }
+        column
+    }
+
+    // Like Chrome, columns past `kept` where no cell starts are no columns of their own.
+    pub(crate) fn merge(mut self, kept: usize) -> impl Fn(usize) -> usize {
+        let kept = kept.max(self.dense);
+        self.starts.retain(|&start| start >= kept);
+        move |column| column.min(kept) + self.starts.partition_point(|&start| start < column)
+    }
 }
 
 impl StyleCache {
@@ -100,10 +172,22 @@ impl StyleCache {
             {
                 continue;
             }
-            let lines: Vec<Line> = doc.nodes[table]
-                .children
-                .iter()
-                .flat_map(|child| {
+            // Headers come first and footers last, like the rows of the grid.
+            let mut lines: Vec<Line> = (0..3)
+                .flat_map(|rank| {
+                    doc.nodes[table]
+                        .children
+                        .iter()
+                        .map(move |child| (rank, child))
+                })
+                .filter(|&(rank, &child)| {
+                    rank == match doc.nodes[child].tag.as_str() {
+                        "thead" => 0,
+                        "tfoot" => 2,
+                        _ => 1,
+                    }
+                })
+                .flat_map(|(_, child)| {
                     let group =
                         matches!(doc.nodes[*child].tag.as_str(), "thead" | "tbody" | "tfoot");
                     let rows = if group {
@@ -120,20 +204,99 @@ impl StyleCache {
                     cells: doc.nodes[row]
                         .children
                         .iter()
-                        .filter(|&&cell| matches!(doc.nodes[cell].tag.as_str(), "td" | "th"))
+                        .filter(|&&cell| {
+                            matches!(doc.nodes[cell].tag.as_str(), "td" | "th")
+                                && styles[cell].get(Prop::DISPLAY) != Some("none")
+                        })
                         .map(|&cell| {
-                            let span = doc.nodes[cell]
-                                .attrs
-                                .get("colspan")
-                                .and_then(|value| value.parse::<usize>().ok())
-                                .unwrap_or(1)
-                                .clamp(1, 1000);
-                            (cell, StyleRef(own_style(styles, cell)), span)
+                            let node = &doc.nodes[cell];
+                            let place = [0, span(node, "colspan"), span(node, "rowspan")];
+                            (cell, StyleRef(own_style(styles, cell)), place)
                         })
                         .collect(),
                 })
                 .filter(|line| !line.cells.is_empty())
                 .collect();
+            let group_of = |line: &Line| line.group.as_ref().map(|group| group.0);
+            let mut slots = Slots::default();
+            let mut tallest = 1;
+            let mut end = 0;
+            for index in 0..lines.len() {
+                if index == end {
+                    let group = group_of(&lines[index]);
+                    let same = |line: &&Line| group_of(line) == group;
+                    end += lines[index..].iter().take_while(same).count();
+                }
+                for (.., [column, columns, rows]) in &mut lines[index].cells {
+                    *rows = (*rows).min(end - index);
+                    tallest = tallest.max(*rows);
+                    *column = slots.place(index, *columns, *rows);
+                }
+            }
+            let real = slots.merge(0);
+            let columns = real(usize::MAX);
+            let rtl = table_style.get(Prop::DIRECTION) == Some("rtl");
+            let range = |start: usize, end: usize| match [real(start), real(end)] {
+                [start, end] if rtl => [columns - end, columns - start],
+                range => range,
+            };
+            for line in &mut lines {
+                for (.., [column, span, _]) in &mut line.cells {
+                    let [start, end] = range(*column, *column + *span);
+                    [*column, *span] = [start, end - start];
+                }
+                if rtl {
+                    line.cells.reverse();
+                }
+            }
+            // The `<col>` and `<colgroup>` with borders: the node, its style and its columns.
+            let mut cols: [Vec<(usize, StyleRef, [usize; 2])>; 2] = Default::default();
+            let mut add = |list: usize, node: usize, [start, end]: [usize; 2]| {
+                let style = own_style(styles, node);
+                let bordered = SIDES
+                    .iter()
+                    .any(|side| style.get(side[0]).is_some_and(|kind| kind != "none"));
+                let range = range(start, end);
+                if bordered && range[0] < range[1] {
+                    cols[list].push((node, StyleRef(style), range));
+                }
+            };
+            let mut at = 0;
+            for &group in &doc.nodes[table].children {
+                if doc.nodes[group].tag != "colgroup" {
+                    continue;
+                }
+                let start = at;
+                for &col in &doc.nodes[group].children {
+                    if doc.nodes[col].tag == "col" {
+                        let end = at + span(&doc.nodes[col], "span");
+                        add(0, col, [at, end]);
+                        at = end;
+                    }
+                }
+                if at == start {
+                    at += span(&doc.nodes[group], "span");
+                }
+                add(1, group, [start, at]);
+            }
+            if rtl {
+                cols.iter_mut().for_each(|list| list.reverse());
+            }
+            // The cells that span rows, by column: the rows and the place in the first row.
+            let mut tall: Vec<Vec<[usize; 3]>> = Vec::new();
+            if tallest > 1 {
+                tall = vec![Vec::new(); columns];
+                for (index, line) in lines.iter().enumerate() {
+                    for (at, (.., [column, columns, rows])) in line.cells.iter().enumerate() {
+                        if *rows > 1 {
+                            for list in &mut tall[*column..*column + *columns] {
+                                list.push([index, index + rows, at]);
+                            }
+                        }
+                    }
+                }
+            }
+            // The width, where a hidden border is infinite, the rank of the style, the owner and its side.
             type Edge = (f32, u8, usize, usize);
             let wins = |a: Edge, b: Edge| if (b.0, b.1) > (a.0, a.1) { b } else { a };
             let mut edge = |style: &Rc<Style>, id: usize, side: usize| -> Edge {
@@ -142,7 +305,8 @@ impl StyleCache {
                     None => {
                         let sides = SIDES.map(|[kind, width, ..]| {
                             match style.get(kind).unwrap_or("none") {
-                                "none" | "hidden" => (0., 0),
+                                "none" => (0., 0),
+                                "hidden" => (f32::INFINITY, 0),
                                 kind => (
                                     style
                                         .get(width)
@@ -170,66 +334,118 @@ impl StyleCache {
                 (sides[side].0, sides[side].1, id, side)
             };
             let frame = [0, 1, 2, 3].map(|side| edge(&table_style, table, side));
-            let mut own = |index: usize| -> Vec<[Edge; 4]> {
-                let line = &lines[index];
-                let group = line.group.as_ref().map(|group| group.0);
-                let first =
-                    index == 0 || lines[index - 1].group.as_ref().map(|group| group.0) != group;
-                let last = lines
-                    .get(index + 1)
-                    .is_none_or(|next| next.group.as_ref().map(|group| group.0) != group);
-                line.cells
-                    .iter()
-                    .enumerate()
-                    .map(|(column, (cell, style, _))| {
-                        let mut sides = [0, 1, 2, 3].map(|side| edge(&style.0, *cell, side));
-                        for (position, (owner, style)) in [Some(&line.row), line.group.as_ref()]
-                            .into_iter()
-                            .flatten()
-                            .enumerate()
-                        {
-                            let whole = position == 0;
-                            for (side, applies) in [
-                                (0, whole || first),
-                                (1, column + 1 == line.cells.len()),
-                                (2, whole || last),
-                                (3, column == 0),
-                            ] {
-                                if applies {
-                                    sides[side] = wins(sides[side], edge(&style.0, *owner, side));
-                                }
+            // The border of a side of a cell, before its neighbors and the table.
+            let mut own = |index: usize, at: usize, side: usize| -> Edge {
+                let (cell, style, [column, span, rows]) = &lines[index].cells[at];
+                let row = if side == 2 { index + rows - 1 } else { index };
+                let line = &lines[row];
+                let mut found = edge(&style.0, *cell, side);
+                let outer = match side {
+                    1 => column + span >= columns,
+                    3 => *column == 0,
+                    _ => true,
+                };
+                if outer {
+                    found = wins(found, edge(&line.row.1.0, line.row.0, side));
+                }
+                if let Some((group, style)) = &line.group {
+                    let next = match side {
+                        0 => row.checked_sub(1),
+                        _ => Some(row + 1),
+                    };
+                    let outer = match side {
+                        0 | 2 => next
+                            .and_then(|next| lines.get(next))
+                            .is_none_or(|next| group_of(next) != Some(*group)),
+                        _ => outer,
+                    };
+                    if outer {
+                        found = wins(found, edge(&style.0, *group, side));
+                    }
+                }
+                for (list, inside) in cols.iter().zip([true, false]) {
+                    let last = column + span - 1;
+                    let at = if side == 1 { last } else { *column };
+                    let found_at = list.partition_point(|(.., [_, end])| *end <= at);
+                    let applies = |[start, end]: &[usize; 2]| match side {
+                        0 => row == 0 && start <= column,
+                        // Each column of a `<col>` has its borders.
+                        1 => *start <= last && (inside || *end == column + span),
+                        2 => row + 1 == lines.len() && start <= column,
+                        _ => start == column || inside && start < column,
+                    };
+                    if let Some((col, style, _)) =
+                        list.get(found_at).filter(|(.., range)| applies(range))
+                    {
+                        found = wins(found, edge(&style.0, *col, side));
+                    }
+                }
+                found
+            };
+            // The cell at a row and column.
+            let find = |row: usize, column: usize| -> Option<(usize, usize)> {
+                let cells = &lines.get(row)?.cells;
+                let at = cells.partition_point(|(.., [start, span, _])| start + span <= column);
+                if cells
+                    .get(at)
+                    .is_some_and(|(.., [start, ..])| *start <= column)
+                {
+                    return Some((row, at));
+                }
+                let list = tall.get(column)?;
+                let &[start, end, at] = list[..list.partition_point(|run| run[0] <= row)].last()?;
+                (end > row).then_some((start, at))
+            };
+            // The borders of the cells of a line. Of equal ones, the border of the cell at the left or top wins.
+            let mut resolve = |index: usize| -> Vec<[Edge; 4]> {
+                (0..lines[index].cells.len())
+                    .map(|at| {
+                        let (.., [column, span, rows]) = lines[index].cells[at];
+                        std::array::from_fn(|side| {
+                            let mut found = own(index, at, side);
+                            let (outer, along) = match side {
+                                0 => (index == 0, column..column + span),
+                                1 => (column + span >= columns, index..index + rows),
+                                2 => (index + rows >= lines.len(), column..column + span),
+                                _ => (column == 0, index..index + rows),
+                            };
+                            if outer {
+                                return wins(found, frame[side]);
                             }
-                        }
-                        sides
+                            let mut last = None;
+                            for place in along {
+                                let other = match side {
+                                    0 => find(index - 1, place),
+                                    1 => find(place, column + span),
+                                    2 => find(index + rows, place),
+                                    _ => find(place, column - 1),
+                                };
+                                let Some(other) = other.filter(|_| other != last) else {
+                                    continue;
+                                };
+                                last = Some(other);
+                                let theirs = own(other.0, other.1, (side + 2) % 4);
+                                found = match side {
+                                    0 | 3 => wins(theirs, found),
+                                    _ => wins(found, theirs),
+                                };
+                            }
+                            found
+                        })
                     })
                     .collect()
             };
-            let share = |above: &mut [[Edge; 4]], a: &Line, below: &mut [[Edge; 4]], b: &Line| {
-                let ends = |line: &Line| {
-                    line.cells
-                        .iter()
-                        .scan(0, |end, cell| {
-                            *end += cell.2;
-                            Some(*end)
-                        })
-                        .collect::<Vec<_>>()
-                };
-                let (top, bottom) = (ends(a), ends(b));
-                let (mut i, mut j) = (0, 0);
-                while i < above.len() && j < below.len() {
-                    if top[i] - a.cells[i].2 < bottom[j] && bottom[j] - b.cells[j].2 < top[i] {
-                        let shared = wins(above[i][2], below[j][0]);
-                        (above[i][2], below[j][0]) = (shared, shared);
-                    }
-                    if top[i] <= bottom[j] {
-                        i += 1;
-                    } else {
-                        j += 1;
-                    }
-                }
-            };
             let mut old = self.tables.remove(&table).unwrap_or_default();
-            let whole = old.size != [width, height]
+            // The lines that the borders of a line depend on, before and after it.
+            let reach = if tallest > 1 { 2 * tallest } else { 1 };
+            let plain = if reach > 8 || cols.iter().any(|list| !list.is_empty()) {
+                0
+            } else {
+                columns
+            };
+            let whole = plain == 0
+                || old.columns != plain
+                || old.size != [width, height]
                 || old
                     .table
                     .as_ref()
@@ -255,47 +471,30 @@ impl StyleCache {
                 };
                 let same = before.filter(|&before| {
                     !whole
-                        && (0..3).all(|step| {
-                            lines.get((index + step).wrapping_sub(1))
-                                == old.lines.get((before + step).wrapping_sub(1))
+                        && (0..=2 * reach).all(|step| {
+                            lines.get((index + step).wrapping_sub(reach))
+                                == old.lines.get((before + step).wrapping_sub(reach))
                         })
                 });
                 let line = match same {
                     Some(before) => std::mem::take(&mut old.adjusted[before]),
                     None => {
-                        let mut cells = own(index);
-                        if index > 0 {
-                            share(
-                                &mut own(index - 1),
-                                &lines[index - 1],
-                                &mut cells,
-                                &lines[index],
-                            );
-                        }
-                        if index + 1 < lines.len() {
-                            share(
-                                &mut cells,
-                                &lines[index],
-                                &mut own(index + 1),
-                                &lines[index + 1],
-                            );
-                        }
-                        for column in 1..cells.len() {
-                            let shared = wins(cells[column - 1][1], cells[column][3]);
-                            (cells[column - 1][1], cells[column][3]) = (shared, shared);
-                        }
+                        let mut cells = resolve(index);
                         let mut outer = [0f32; 4];
-                        let count = cells.len();
-                        for (column, sides) in cells.iter_mut().enumerate() {
+                        for (sides, (.., [column, span, rows])) in
+                            cells.iter_mut().zip(&lines[index].cells)
+                        {
                             for (side, outer) in outer.iter_mut().enumerate() {
+                                if sides[side].0 == f32::INFINITY {
+                                    sides[side].0 = 0.;
+                                }
                                 let at = match side {
                                     0 => index == 0,
-                                    1 => column + 1 == count,
-                                    2 => index + 1 == lines.len(),
-                                    _ => column == 0,
+                                    1 => column + span >= columns,
+                                    2 => index + rows >= lines.len(),
+                                    _ => *column == 0,
                                 };
                                 if at {
-                                    sides[side] = wins(sides[side], frame[side]);
                                     *outer = outer.max(sides[side].0);
                                 }
                             }
@@ -306,21 +505,24 @@ impl StyleCache {
                             .zip(cells)
                             .map(|((cell, own, _), sides)| {
                                 let side = |side: usize| {
-                                    let (width, _, owner, from) = sides[side];
+                                    let (width, rank, owner, from) = sides[side];
                                     let [_, kind, color] = BORDERS[from];
                                     (
                                         width,
-                                        (owner != *cell || from != side).then(|| {
-                                            let owner = own_style(styles, owner);
-                                            [
-                                                if width > 0. {
-                                                    owner.value(kind).cloned()
-                                                } else {
-                                                    Some("none".into())
-                                                },
-                                                owner.value(color).cloned(),
-                                            ]
-                                        }),
+                                        (owner != *cell || from != side || matches!(rank, 1 | 3))
+                                            .then(|| {
+                                                let owner = own_style(styles, owner);
+                                                [
+                                                    // Collapsed borders draw `inset` as `ridge` and `outset` as `groove`.
+                                                    match rank {
+                                                        _ if width <= 0. => Some("none".into()),
+                                                        1 => Some("ridge".into()),
+                                                        3 => Some("groove".into()),
+                                                        _ => owner.value(kind).cloned(),
+                                                    },
+                                                    owner.value(color).cloned(),
+                                                ]
+                                            }),
                                     )
                                 };
                                 let sides = [side(0), side(1), side(2), side(3)];
@@ -404,6 +606,7 @@ impl StyleCache {
                     size: [width, height],
                     table: Some((key.0, key.1, style)),
                     lines,
+                    columns: plain,
                     adjusted,
                     styles: shared,
                 },

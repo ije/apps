@@ -509,6 +509,12 @@ pub(super) fn layers(
                     value == "none" || effects::filter::lone_blur(Some(value)).is_some()
                 })
                 && style.get(Prop::BACKFACE_VISIBILITY) != Some("hidden")
+                // Planes of a 3D rendering context sort and turn together, which only full frames do.
+                && ![Some(*id), crate::render::element::box_parent(doc, styles, *id)]
+                    .into_iter()
+                    .flatten()
+                    .any(|id| effects::establishes(&styles.values[id]).preserves)
+                && style.get(Prop::OFFSET_PATH).is_none_or(|path| path == "none")
         })
         .map(|(id, style, _)| {
             let base = &styles.values[*id];
@@ -716,7 +722,7 @@ mod tests {
                     &mut Vec::new(),
                 );
                 let visible = frame.painted.unwrap_or(visible);
-                drop_hidden_images(dom, &visible, &styles, |image| released.push(image.id));
+                drop_hidden_images(doc, dom, &visible, &styles, |image| released.push(image.id));
                 visible[span]
             };
         assert!(frame(&mut doc, &mut dom, 0.));

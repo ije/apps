@@ -1,4 +1,5 @@
 use super::super::Build;
+use super::super::margin::marker_line;
 use super::super::query::text_indent;
 use super::cx::{Cx, Frame};
 use crate::css;
@@ -19,6 +20,7 @@ pub(super) fn list_marker(cx: &Cx<'_>, fr: &Frame, mut el: renderer::Node) -> re
         parsed,
         display,
         containing,
+        rtl,
         ..
     } = *cx;
     let Build {
@@ -98,7 +100,13 @@ pub(super) fn list_marker(cx: &Cx<'_>, fr: &Frame, mut el: renderer::Node) -> re
             | "simp-chinese-informal"
             | "hiragana"
             | "katakana" => format!("{}、", css::value::counter::counter_text(kind, number)),
-            _ => format!("{}.", css::value::counter::counter_text(kind, number)),
+            _ => {
+                let number = css::value::counter::counter_text(kind, number);
+                match rtl {
+                    true => format!(".{number}"),
+                    false => number + ".",
+                }
+            }
         };
         let marker = content.map_or(marker, |content| {
             let mut text = String::new();
@@ -134,6 +142,21 @@ pub(super) fn list_marker(cx: &Cx<'_>, fr: &Frame, mut el: renderer::Node) -> re
             None => units.font.lh,
         };
         let mut top = padding[0];
+        // Like Chrome, an inside marker before a block is in a line of its own.
+        let alone = marker_line(reader, id);
+        // The marker starts the first line, so the content of that line starts after its width.
+        let start = |mut el: renderer::Node, width: f32| {
+            if alone {
+                return el;
+            }
+            if cx.all_inline && cx.inline_text().is_none() {
+                return el.child(renderer::node().w(px(width)).flex_shrink_0());
+            }
+            el.text_style()
+                .set_text_indent(px(indent + width))
+                .set_text_indent_percent(0.);
+            el
+        };
         if !inside && marker_style.is_some() {
             let own = text.face(&parsed.face);
             let rise = f32::from(text.baseline(face, px(size), px(line), pixel_ratio))
@@ -161,12 +184,14 @@ pub(super) fn list_marker(cx: &Cx<'_>, fr: &Frame, mut el: renderer::Node) -> re
                     .map_or(0, |(ink, _)| ink),
                 ..Default::default()
             };
-            let triangle = renderer::node()
-                .absolute()
-                .left_0()
-                .top(px((leading + ascent - side) / pixel_ratio))
-                .size(px(side / pixel_ratio))
-                .child(crate::render::paint::control::layer(id, look, view.clone()));
+            let triangle = renderer::node().absolute();
+            let triangle = match rtl {
+                true => triangle.right(px(0.)),
+                false => triangle.left_0(),
+            }
+            .top(px((leading + ascent - side) / pixel_ratio))
+            .size(px(side / pixel_ratio))
+            .child(crate::render::paint::control::layer(id, look, view.clone()));
             let above = (leading + ascent) / pixel_ratio;
             let marker = renderer::node()
                 .flex_shrink_0()
@@ -178,26 +203,30 @@ pub(super) fn list_marker(cx: &Cx<'_>, fr: &Frame, mut el: renderer::Node) -> re
             if inside {
                 marker
             } else {
-                marker.absolute().top(px(top)).right(relative(1.))
+                let marker = marker.absolute().top(px(top));
+                match rtl {
+                    true => marker.left(relative(1.)),
+                    false => marker.right(relative(1.)),
+                }
             }
         } else if inside && !(content.is_none() && matches!(kind, "disc" | "circle" | "square")) {
-            // The marker starts the first line, so the text of that line is indented by its width.
-            let marker = if marker.ends_with(' ') {
-                marker
-            } else {
-                marker + " "
+            let marker = match rtl {
+                _ if marker.ends_with(' ') => marker,
+                true => format!(" {marker}"),
+                false => marker + " ",
             };
             let run = style::text_run(marker_style.unwrap_or(style), &units, marker.len());
             let width = f32::from(text.shape_line(&marker, px(size), &run).line.width);
-            el.text_style()
-                .set_text_indent(px(indent + width))
-                .set_text_indent_percent(0.);
-            renderer::node()
+            el = start(el, width);
+            let marker = renderer::node()
                 .absolute()
                 .top(px(top))
-                .left(px(padding[3] + indent))
                 .whitespace_nowrap()
-                .child(marker)
+                .child(marker);
+            match rtl {
+                true => marker.right(px(padding[1] + indent)),
+                false => marker.left(px(padding[3] + indent)),
+            }
         } else if content.is_none() && matches!(kind, "disc" | "circle" | "square") {
             let color = marker_style
                 .unwrap_or(style)
@@ -208,23 +237,24 @@ pub(super) fn list_marker(cx: &Cx<'_>, fr: &Frame, mut el: renderer::Node) -> re
             let offset = (ascent * 2. / 3.).floor();
             let leading = ((line * pixel_ratio - ascent - descent) / 2.).floor();
             let side = ((offset + 1.) / 2.).floor() / pixel_ratio;
-            // Like Chrome, an inside symbol takes its size, 1px and 1em before the text.
+            // Like Chrome, an inside symbol takes its size, a device pixel and 1em before the text.
             if inside {
-                el.text_style()
-                    .set_text_indent(px(indent + side + 1. + size))
-                    .set_text_indent_percent(0.);
+                el = start(el, side + 1. / pixel_ratio + size);
             }
-            let dot = renderer::node()
-                .absolute()
-                .left(px(if inside {
-                    padding[3] + indent
-                } else {
-                    padding[3] - (offset + 7.) / pixel_ratio
-                }))
-                .top(px(top
-                    + (leading + (3. * (ascent - offset) / 2.).floor())
-                        / pixel_ratio))
-                .size(px(side));
+            let start = if inside {
+                indent
+            } else {
+                -(offset + 7.) / pixel_ratio
+            };
+            let dot = renderer::node().absolute();
+            let dot = match rtl {
+                true => dot.right(px(padding[1] + start)),
+                false => dot.left(px(padding[3] + start)),
+            }
+            .top(px(top
+                + (leading + (3. * (ascent - offset) / 2.).floor())
+                    / pixel_ratio))
+            .size(px(side));
             match kind {
                 "disc" => dot.rounded_full().bg(color),
                 "circle" => dot
@@ -234,24 +264,25 @@ pub(super) fn list_marker(cx: &Cx<'_>, fr: &Frame, mut el: renderer::Node) -> re
                 _ => dot.bg(color),
             }
         } else {
-            renderer::node()
+            // Like Chrome, a counter marker ends with a space, and strings and `、` end as they are.
+            let space = if content.is_some()
+                || marker.ends_with(['、', ' '])
+                || kind.starts_with(['"', '\''])
+            {
+                0.
+            } else {
+                text.advance(face, px(size), ' ')
+                    .map_or(size / 4., f32::from)
+            };
+            let marker = renderer::node()
                 .absolute()
                 .top(px(top))
-                .right(relative(1.))
-                // Like Chrome, a counter marker ends with a space, and strings and `、` end as they are.
-                .pr(px(
-                    if content.is_some()
-                        || marker.ends_with(['、', ' '])
-                        || kind.starts_with(['"', '\''])
-                    {
-                        0.
-                    } else {
-                        text.advance(face, px(size), ' ')
-                            .map_or(size / 4., f32::from)
-                    },
-                ))
                 .whitespace_nowrap()
-                .child(marker)
+                .child(marker);
+            match rtl {
+                true => marker.left(relative(1.)).pl(px(space)),
+                false => marker.right(relative(1.)).pr(px(space)),
+            }
         };
         if let Some(marker) = marker_style {
             let face = style::font(marker);
@@ -272,12 +303,19 @@ pub(super) fn list_marker(cx: &Cx<'_>, fr: &Frame, mut el: renderer::Node) -> re
         marker_box
             .text_style()
             .set_font_features(Rc::from([("tnum".to_owned(), 1)]));
+        if alone {
+            return el.child(
+                renderer::node()
+                    .w_full()
+                    .h(px(line))
+                    .flex_shrink_0()
+                    .child(marker_box),
+            );
+        }
         // Like Chrome, an empty item keeps the line of its marker.
-        if !inside
-            && node.children.iter().all(|&child| {
-                doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim_ascii().is_empty()
-            })
-            && style.get(Prop::HEIGHT).is_none_or(|v| v == "auto")
+        if node.children.iter().all(|&child| {
+            doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim_ascii().is_empty()
+        }) && style.get(Prop::HEIGHT).is_none_or(|v| v == "auto")
             && style.get(Prop::MIN_HEIGHT).is_none_or(|v| v == "auto")
         {
             let edges = padding[0] + padding[2] + borders[0] + borders[2];

@@ -1,4 +1,6 @@
+mod controls;
 mod matching;
+use controls::{Controls, indexed};
 pub use matching::matches;
 use matching::{has, next_stamp, ranged, reads};
 #[cfg(test)]
@@ -108,6 +110,7 @@ pub(crate) struct SelectorCache {
     // The `:has()` results of each anchor that read only below it or its parent. `update` checks them again,
     // so a match reads them without a scan.
     within: rustc_hash::FxHashMap<usize, Vec<Found>>,
+    controls: Controls,
 }
 
 impl SelectorCache {
@@ -350,13 +353,22 @@ impl SelectorCache {
         let mut retagged = Vec::new();
         let mut moved = Vec::new();
         let start = self.revision;
+        let (mut touched, mut reparented, mut reordered) = (Vec::new(), Vec::new(), false);
         // Since the last update, only a node with a newer revision, a forgotten one or one that a patched walk
         // touched can have another snapshot. Debug builds check all nodes against that.
-        let touched = match self.walked == walk.serial {
+        let delta = match self.walked == walk.serial {
             true => Some(&[][..]),
             false => walk.since(self.walked),
         };
-        let listed: Option<Vec<usize>> = touched.map(|touched| {
+        if !self.controls.is_empty() {
+            let gone = |&id: &usize| self.controls.contains(id) && !walk.contains(id);
+            touched.extend(self.forgotten.iter().copied().filter(gone));
+            match delta {
+                Some(delta) => touched.extend(delta.iter().map(|&id| id as usize).filter(gone)),
+                None => touched.extend(self.controls.ids().filter(gone)),
+            }
+        }
+        let listed: Option<Vec<usize>> = delta.map(|touched| {
             let newer = doc.nodes.changed_since(self.latest);
             let touched = touched.iter().map(|&id| id as usize);
             let nodes = newer.chain(touched).chain(self.forgotten.iter().copied());
@@ -382,6 +394,9 @@ impl SelectorCache {
             );
             self.seen[id] = revision;
             let node = &doc.nodes[id];
+            if indexed(node) || !self.controls.is_empty() && self.controls.contains(id) {
+                touched.push(id);
+            }
             let Snapshot { values, revisions } = &mut self.nodes[id];
             let hash = rustc_hash::FxBuildHasher;
             let tag = hash.hash_one(&node.tag);
@@ -416,16 +431,20 @@ impl SelectorCache {
                 node.parent.map_or(0, |parent| parent as u32 + 1),
                 hash.hash_one(&node.children) as u32,
                 u32::from(!node.text.is_empty())
+                    // The direction of the text, for `dir=auto`.
+                    | (renderer::right_to_left(node.current_value().unwrap_or(&node.text)))
+                        .map_or(0, |rtl| 8 << u32::from(rtl))
                     | node.value.as_deref().map_or(0, |value| {
-                        // Ranged inputs match by their value, other inputs only by whether they have one.
-                        if ranged(node) {
-                            hash.hash_one(value) as u32 | 2
+                        // Ranged inputs and custom states match by their value, other inputs only by whether
+                        // they have one.
+                        if ranged(node) || node.tag.contains('-') {
+                            (hash.hash_one(value) as u32) << 5 | 2
                         } else {
                             2 << u32::from(value.is_empty())
                         }
                     }),
                 tag as u32,
-                u32::from(node.state) | u32::from(doc.target == Some(id)) << 16,
+                node.state | u32::from(doc.target == Some(id)) << 31,
                 hash.hash_one((node.attrs.get("style"), &node.inline)) as u32,
                 node.attrs
                     .get("class")
@@ -441,6 +460,7 @@ impl SelectorCache {
                     _ => 0,
                 },
             ];
+            let placed = values[1] != 0;
             debug_assert!(
                 fresh || new[1..8] == values[1..8],
                 "node {id} changed without a new revision"
@@ -463,6 +483,10 @@ impl SelectorCache {
                         // A result that read the siblings holds for the old parent only. Its readers
                         // depend on the parent too.
                         1 => {
+                            reordered = true;
+                            if placed {
+                                reparented.push(id);
+                            }
                             moved.extend(node.parent);
                             if let Some(results) = self.within.get_mut(&id) {
                                 results.retain(|result| !result.2);
@@ -471,7 +495,10 @@ impl SelectorCache {
                                 }
                             }
                         }
-                        2 => moved.push(id),
+                        2 => {
+                            reordered = true;
+                            moved.push(id);
+                        }
                         _ => {}
                     }
                     if kind == 7 {
@@ -480,6 +507,25 @@ impl SelectorCache {
                         changes.push((id * KINDS + kind) as u32);
                     }
                 }
+            }
+        }
+        if !self.controls.is_empty() {
+            next_stamp(&mut self.stamp, &mut self.stamps, self.seen.len());
+            while let Some(id) = reparented.pop() {
+                if std::mem::replace(&mut self.stamps[id], self.stamp) != self.stamp {
+                    if self.controls.contains(id) {
+                        touched.push(id);
+                    }
+                    reparented.extend(&doc.nodes[id].children);
+                }
+            }
+        }
+        // These reads use the children kind, which keeps a node from sharing its style.
+        for id in (self.controls).update(doc, touched, |id| walk.contains(id), reordered) {
+            if let Some(slot) = self.nodes.get_mut(id) {
+                self.revision = self.revision.wrapping_add(1);
+                slot.revisions[2] = self.revision;
+                changes.push((id * KINDS + 2) as u32);
             }
         }
         // Retag each parent once per update to avoid revisiting its dependents for every child.

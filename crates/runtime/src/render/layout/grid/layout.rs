@@ -256,6 +256,21 @@ pub(crate) fn layout(
     let mut memo: rustc_hash::FxHashMap<(*const css::properties::Style, bool), Item> =
         Default::default();
     let table = style::table_box(style::role(styles, id));
+    // A caption sits outside the border box of its table: top, right, bottom, left.
+    // An anonymous table has only its border spacing inside the box around it.
+    let anonymous = table && style::role(styles, id) >= 10;
+    let outside: [f32; 4] = match table {
+        true if anonymous => [gap[1], gap[0], gap[1], gap[0]],
+        true => {
+            let base = block.unwrap_or(0.);
+            let [edges, margin] = [
+                frame(style, units, base),
+                units.edges(style, css::properties::MARGIN, base),
+            ];
+            std::array::from_fn(|side| edges[side] - margin[side])
+        }
+        false => [0.; 4],
+    };
     let legend = (doc.nodes[id].tag == "fieldset")
         .then(|| super::super::size::legend(doc, styles, id))
         .flatten()
@@ -376,6 +391,8 @@ pub(crate) fn layout(
         });
         // Each row, caption and run of cells outside rows is a lane of the grid.
         let mut lane = None;
+        // The first lane after each row group.
+        let mut ends: Vec<(Option<usize>, usize)> = Vec::new();
         for (child, item) in &mut children {
             let key = if style::role(styles, *child) == style::CAPTION {
                 Some(*child)
@@ -391,6 +408,62 @@ pub(crate) fn layout(
             };
             lane = Some((index, key));
             item.placed.0[1] = item.placed.0[1].or(Some(index));
+            let group = key.and_then(|row| doc.nodes[row].parent);
+            match ends.last_mut() {
+                Some((last, end)) if *last == group => *end = index + 1,
+                _ => ends.push((group, index + 1)),
+            }
+        }
+        let fixed = style
+            .get(Prop::TABLE_LAYOUT)
+            .is_some_and(|value| value == "fixed");
+        let mut slots = style::Slots::default();
+        let mut ends = ends.into_iter().peekable();
+        for (child, item) in &mut children {
+            let ([column, row], [columns, rows]) = &mut item.placed;
+            let (Some(row), false) = (*row, style::role(styles, *child) == style::CAPTION) else {
+                *column = Some(0);
+                continue;
+            };
+            // A cell ends with its row group.
+            while ends.next_if(|&(_, end)| end <= row).is_some() {}
+            if let Some(&(_, end)) = ends.peek() {
+                *rows = (*rows).min(end - row);
+            }
+            *column = Some(slots.place(row, *columns, *rows));
+        }
+        if !fixed && children.iter().any(|(_, item)| item.placed.1[0] > 1) {
+            // The columns up to the last `<col>` with a width stay.
+            let (mut at, mut kept) = (0, 0);
+            for &group in &doc.nodes[id].children {
+                if doc.nodes[group].tag != "colgroup" {
+                    continue;
+                }
+                let start = at;
+                let width = |node: usize| {
+                    styles.values[node]
+                        .get(Prop::WIDTH)
+                        .is_some_and(|v| v != "auto")
+                };
+                for &col in &doc.nodes[group].children {
+                    if doc.nodes[col].tag == "col" {
+                        at += style::span(&doc.nodes[col], "span");
+                        kept = if width(col) { at } else { kept };
+                    }
+                }
+                if at == start {
+                    at += style::span(&doc.nodes[group], "span");
+                }
+                kept = if width(group) { at } else { kept };
+            }
+            let real = slots.merge(kept);
+            for (_, item) in &mut children {
+                if let Some(column) = &mut item.placed.0[0] {
+                    let end = real(*column + item.placed.1[0]);
+                    *column = real(*column);
+                    item.placed.1[0] = end.saturating_sub(*column).max(1);
+                }
+            }
         }
     } else {
         children.sort_by_key(|(_, item)| item.order);
@@ -431,6 +504,9 @@ pub(crate) fn layout(
     for (index, (position, span)) in items.iter().enumerate() {
         if let [Some(column), Some(row)] = *position {
             placed[index] = [column, row];
+            if table {
+                continue;
+            }
             mark(&mut occupied, placed[index], *span);
         }
     }
@@ -623,9 +699,27 @@ pub(crate) fn layout(
             {
                 continue;
             }
-            let size = match value.strip_suffix('%').and_then(|v| v.parse::<f32>().ok()) {
+            // `calc(1 / 2 * 100%)` is a percentage too. Like Chrome, other math with percentages is `auto`.
+            let lengths = &styles.lengths[child];
+            let unit = || {
+                (value.as_bytes().windows(2))
+                    .any(|pair| pair[0].is_ascii_digit() && pair[1].is_ascii_alphabetic())
+            };
+            let compares = || {
+                ["min(", "max(", "clamp("]
+                    .iter()
+                    .any(|name| value.contains(name))
+            };
+            let percent = match value.contains('%') {
+                true if lengths.resolve(value, 0.) != Some(0.) || compares() && unit() => continue,
+                true => lengths.resolve(value, 100.).map(|percent| percent.max(0.)),
+                false => None,
+            };
+            let size = match percent {
                 Some(percent) => {
-                    percents[cell[0]] = percents[cell[0]].max(percent / 100.);
+                    if let Some(old) = percents.get_mut(cell[0]) {
+                        *old = old.max(percent / 100.);
+                    }
                     match available[0] {
                         Some(_) => percent / 100. * base,
                         None => continue,
@@ -642,6 +736,20 @@ pub(crate) fn layout(
             }
         }
         if fixed {
+            // Percentages over the width that other sizes leave shrink to it.
+            let share = |percent: bool| -> f32 {
+                let sizes = columns.iter().zip(&percents);
+                let sizes = sizes.filter(|(_, share)| (**share > 0.) == percent);
+                sizes.filter_map(|(size, _)| *size).sum()
+            };
+            let (taken, rest) = (share(true), (base - share(false)).max(0.));
+            if taken > rest {
+                for (size, _) in
+                    (columns.iter_mut().zip(&percents)).filter(|(_, share)| **share > 0.)
+                {
+                    *size = size.map(|size| size * rest / taken);
+                }
+            }
             for (track, size) in definitions[0].iter_mut().zip(&columns) {
                 *track = match *size {
                     Some(size) => (Fixed(size), Fixed(size)),
@@ -697,9 +805,8 @@ pub(crate) fn layout(
                     intrinsic(doc, child, styles, Some(area), None, text, measured);
                 let fraction = derived[index].alignment[0];
                 let caption = table && style::role(styles, child) == style::CAPTION;
-                // A caption sits outside the border spacing of the table.
                 let [x, area] = if caption {
-                    [x - gap[0], area + 2. * gap[0]]
+                    [x - outside[3], area + outside[1] + outside[3]]
                 } else {
                     [x, area]
                 };
@@ -711,6 +818,13 @@ pub(crate) fn layout(
                     && styles.values[child].get(Prop::WIDTH) == Some("fit-content")
                 {
                     area.max(min)
+                // The lines of a turned box run down, so its width is its content, but it stretches too.
+                } else if fraction.is_none()
+                    && derived[index].auto_width
+                    && pseudo_item(child).is_none()
+                    && super::super::size::turned(doc, styles, child).is_some()
+                {
+                    area.max(used)
                 } else if fraction.is_some() && derived[index].auto_width {
                     max.min(area).max(min)
                 } else {
@@ -721,6 +835,15 @@ pub(crate) fn layout(
                 } else {
                     intrinsic(doc, child, styles, Some(size), None, text, measured)[3]
                 };
+                // The caption of a stretched table has the width of the table.
+                if size > used && style::table_box(style::role(styles, child)) {
+                    let frame = frame(&styles.values[child], &styles.lengths[child], area);
+                    let inner = Some(size - frame[1] - frame[3]);
+                    let grid = layout(doc, child, styles, inner, None, None, None, text, measured);
+                    if grid.captions != [0.; 2] {
+                        height = grid.extent(1) + frame[0] + frame[2];
+                    }
+                }
                 // A subgrid of columns is as tall as its rows on the parent's columns.
                 if derived[index].subgrid == [true, false]
                     && derived[index].height.is_none_or(|v| v == "auto")
@@ -744,10 +867,26 @@ pub(crate) fn layout(
                     height = inner.extent(1) + frame[0] + frame[2];
                 }
                 boxes[index] = [x + (area - size) * fraction.unwrap_or(0.), 0., size, height];
-                if let (Some(last), Some(&[first, end])) = (
-                    derived[index].baseline,
-                    baselines.and_then(|baselines| baselines.get(&child)),
-                ) {
+                if let Some(last) = derived[index].baseline
+                    && pseudo_item(child).is_none()
+                {
+                    let known = baselines
+                        .and_then(|baselines| baselines.get(&child))
+                        .copied();
+                    let [first, end] = known.unwrap_or_else(|| {
+                        let mut base = |last| {
+                            super::intrinsic::baseline(
+                                doc,
+                                child,
+                                styles,
+                                Some(size),
+                                last,
+                                text,
+                                measured,
+                            )
+                        };
+                        [base(false), base(true)]
+                    });
                     let [top, _, bottom, _] = styles.lengths[child].edges(
                         &styles.values[child],
                         css::properties::MARGIN,
@@ -775,6 +914,15 @@ pub(crate) fn layout(
                 }
             }
         }
+        // The free height of a table goes to its rows.
+        if axis == 1 && table {
+            for (index, &child) in children.iter().enumerate() {
+                if style::role(styles, child) == style::CAPTION {
+                    let height = (boxes[index][3] - gap[1]).max(0.);
+                    definitions[1][cells[index][1]] = (Fixed(height), Fixed(height));
+                }
+            }
+        }
         let sized = |cell: &[usize; 4]| {
             available[axis].is_some()
                 && definitions[axis]
@@ -799,7 +947,11 @@ pub(crate) fn layout(
                     let value = intrinsic(doc, child, styles, None, None, text, measured);
                     // A caption widens the table to its min-content width only.
                     let caption = table && style::role(styles, child) == style::CAPTION;
-                    [value[0], if caption { value[0] } else { value[1] }]
+                    if caption {
+                        [value[0] - outside[1] - outside[3]; 2]
+                    } else {
+                        [value[0], value[1]]
+                    }
                 } else {
                     // A caption takes the border spacing beside it from its row.
                     let spacing = if table && style::role(styles, child) == style::CAPTION {
@@ -897,6 +1049,20 @@ pub(crate) fn layout(
         let content = get([Prop::JUSTIFY_CONTENT, Prop::ALIGN_CONTENT][axis]).unwrap_or("normal");
         let stretch = matches!(content, "normal" | "stretch");
         let mut space = available[axis];
+        // The `height` of a table leaves out its captions, but its grid area or flex line holds them.
+        if axis == 1
+            && table
+            && get(Prop::HEIGHT).is_some_and(|v| v != "auto")
+            && inherited.is_none()
+        {
+            space = space.map(|space| {
+                space
+                    + (children.iter().zip(&boxes))
+                        .filter(|&(&child, _)| style::role(styles, child) == style::CAPTION)
+                        .map(|(_, place)| place[3])
+                        .sum::<f32>()
+            });
+        }
         let mut sizes = size(
             &definitions[axis],
             &contributions,
@@ -1026,11 +1192,38 @@ pub(crate) fn layout(
         if value.is_some_and(|v| v.contains('%')) {
             height = intrinsic(doc, child, styles, Some(width), Some(area), text, measured)[3];
         }
+        // As in Chrome, the `auto` of a stretched item in `calc-size()` is the height of its area.
+        if let Some(value) = value.filter(|v| fraction.is_none() && v.starts_with("calc-size(auto"))
+            && pseudo_item(child).is_none()
+        {
+            let (own, lengths) = (&styles.values[child], &styles.lengths[child]);
+            let edges = frame(own, lengths, width);
+            let sides = match own.get(Prop::BOX_SIZING) {
+                Some("border-box") => {
+                    let margin = lengths.edges(own, css::properties::MARGIN, width);
+                    margin[0] + margin[2]
+                }
+                _ => edges[0] + edges[2],
+            };
+            let space = (area - sides).max(0.);
+            if let Some(size) = super::intrinsic::keyword_content(
+                value,
+                lengths,
+                [space; 2],
+                Some(space),
+                space,
+                area,
+                0.,
+            ) {
+                height = (size + sides).max(edges[0] + edges[2]);
+            }
+        }
         let caption = table && style::role(styles, child) == style::CAPTION;
         if if table {
             !caption
         } else {
             fraction.is_none() && value.is_none_or(|v| v == "auto")
+                || value.is_some_and(|v| matches!(v, "stretch" | "-webkit-fill-available"))
         } {
             // A min-height of a content keyword keeps the content height in a smaller row.
             let least = item_style(child)
@@ -1039,10 +1232,16 @@ pub(crate) fn layout(
             height = if least { area.max(height) } else { area };
         }
         let y = if caption && styles.values[child].get(Prop::CAPTION_SIDE) != Some("bottom") {
-            y - gap[1]
+            y - outside[0]
+        } else if caption {
+            y - gap[1] + outside[2]
         } else {
             y
         };
+        if caption && !anonymous {
+            let bottom = styles.values[child].get(Prop::CAPTION_SIDE) == Some("bottom");
+            grid.captions[usize::from(bottom)] += height;
+        }
         let shim = shims.get(index).copied().unwrap_or(0.);
         grid.cells.push((
             child,
@@ -1061,10 +1260,18 @@ pub(crate) fn layout(
             derived[index].baseline.is_some(),
         ));
     }
-    let top = cells.iter().map(|cell| cell[1]).min();
+    // A caption gives its table no baseline.
+    let based = |&(index, _): &(usize, &[usize; 4])| {
+        !(table && style::role(styles, children[index]) == style::CAPTION)
+    };
+    let top = (cells.iter().enumerate())
+        .filter(based)
+        .map(|(_, cell)| cell[1])
+        .min();
     if let Some((index, cell)) = cells
         .iter()
         .enumerate()
+        .filter(based)
         .filter(|(_, cell)| Some(cell[1]) == top)
         .min_by_key(|(index, cell)| (derived[*index].baseline != Some(false), cell[0]))
     {

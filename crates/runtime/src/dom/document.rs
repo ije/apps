@@ -121,7 +121,8 @@ pub struct Node {
     // Clear this cache on every style attribute write.
     pub(crate) inline: Option<crate::css::sheet::Declarations>,
     #[serde(skip)]
-    pub(crate) state: u16,
+    pub(crate) state: u32,
+    // The value of a form control, or the states of a custom element.
     #[serde(skip)]
     pub(crate) value: Option<String>,
 }

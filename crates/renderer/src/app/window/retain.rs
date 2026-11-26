@@ -175,6 +175,11 @@ impl Window {
         })
     }
 
+    #[cfg(debug_assertions)]
+    pub(crate) fn reads_removed(&self, span: &PaintSpan) -> bool {
+        self.scene.reads_removed(&span.scene)
+    }
+
     // Copies a span of the last paint.
     pub(crate) fn replay(
         &mut self,

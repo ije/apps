@@ -24,6 +24,7 @@ pub(crate) struct Styles {
     pub(crate) sheets: HashMap<Rc<str>, Rc<Stylesheet>>,
     pub(crate) inserted: Vec<(String, Rc<Stylesheet>, bool)>,
     pub(crate) cache: StyleCache,
+    pub(crate) highlights: std::cell::RefCell<crate::style::cascade::Highlights>,
     pub(crate) key: Key,
     pub(crate) queries: FxHashMap<Box<str>, Rc<[Selector]>>,
     pub(crate) linted: bool,
@@ -84,6 +85,11 @@ impl Styles {
         if let Some(computed) = self.computed.take() {
             self.previous = Some(computed);
         }
+    }
+
+    // The styles of the last pass, which can be old.
+    pub(crate) fn latest(&self) -> Option<Rc<ComputedStyles>> {
+        self.computed.clone().or_else(|| self.previous.clone())
     }
 
     // A node joins the arena with `len` nodes.

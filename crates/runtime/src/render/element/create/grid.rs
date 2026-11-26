@@ -416,7 +416,17 @@ pub(super) fn grid_container(
         let rows = grid.extent(1).max(definite);
         let vertical = padding[0] + padding[2] + borders[0] + borders[2];
         if auto_height && !flexed {
-            el = el.h(px(rows + vertical));
+            // The rows give the content height.
+            let height = match el
+                .style()
+                .sizing
+                .take()
+                .and_then(|sizing| Some(sizing.height.as_ref()?(rows + vertical)))
+            {
+                Some(height) => height,
+                None => rows + vertical,
+            };
+            el = el.h(px(height));
             el.style().aspect_ratio = None;
         }
         // The items are out of flow, so the rows give the min-content height for `min-height: auto` in a column.

@@ -1,5 +1,7 @@
 use super::{FONT_NAMES, Lengths, Style, color, components};
-use crate::css::{properties::Prop, value::color::paint, value::color::rgba};
+use crate::css::{
+    properties::Prop, value::color::paint, value::color::rgba, value::font::size_adjust,
+};
 use crate::dom::Document;
 use std::rc::Rc;
 
@@ -90,6 +92,9 @@ pub(crate) fn restyle(
                 }
                 if piece.font.style == base.font.style {
                     piece.font.style = pseudo.font.style;
+                }
+                if piece.font.caps == base.font.caps {
+                    piece.font.caps = pseudo.font.caps;
                 }
                 if piece.underline == base.underline {
                     piece.underline = pseudo.underline;
@@ -283,6 +288,7 @@ pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::
         Some("wavy") => renderer::DecorationStyle::Wavy,
         _ => renderer::DecorationStyle::Solid,
     };
+    let skip_ink = style.get(Prop::TEXT_DECORATION_SKIP_INK) != Some("none");
     renderer::TextRun {
         len,
         font: font(style),
@@ -296,6 +302,9 @@ pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::
             color: Some(decoration),
             style: decoration_style,
             offset: length(Prop::TEXT_UNDERLINE_OFFSET),
+            under: (style.get(Prop::TEXT_UNDERLINE_POSITION))
+                .is_some_and(|value| value.contains("under")),
+            skip_ink,
         }),
         strikethrough: lines
             .contains("line-through")
@@ -304,18 +313,31 @@ pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::
                 color: Some(decoration),
                 style: decoration_style,
                 offset: None,
+                under: false,
+                skip_ink: false,
             }),
         overline: lines.contains("overline").then_some(renderer::Decoration {
             thickness,
             color: Some(decoration),
             style: decoration_style,
             offset: None,
+            under: false,
+            skip_ink,
         }),
         letter_spacing: spacing(style, units, Prop::LETTER_SPACING),
         word_spacing: spacing(style, units, Prop::WORD_SPACING),
         font_size: None,
         inset: Default::default(),
         nowrap: false,
+        hyphenation: hyphenation(style, None),
+        rtl: style.get(Prop::DIRECTION) == Some("rtl"),
+        plaintext: style.get(Prop::UNICODE_BIDI) == Some("plaintext"),
+        embedding: None,
+        preserve: matches!(
+            style.get(Prop::WHITE_SPACE),
+            Some("pre" | "pre-wrap" | "break-spaces")
+        ),
+        clear: 0,
         tab_size: style.get(Prop::TAB_SIZE).map_or(8., |value| {
             value
                 .parse::<f32>()
@@ -332,6 +354,50 @@ pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::
                 (renderer::px(width), color.map_or(ink, rgba))
             }),
     }
+}
+
+/// Whether the block of a text has `unicode-bidi: plaintext`.
+pub(crate) fn plaintext(doc: &Document, styles: &super::ComputedStyles, id: usize) -> bool {
+    let block = std::iter::successors(Some(id), |&up| doc.nodes[up].parent).find(|&up| {
+        doc.nodes[up].tag != "#text"
+            && (styles.values[up].get(Prop::DISPLAY))
+                .is_some_and(|value| !matches!(value, "inline" | "contents"))
+    });
+    block.is_some_and(|block| styles.values[block].get(Prop::UNICODE_BIDI) == Some("plaintext"))
+}
+
+/// Whether the rows of a text stretch, and its last rows, and the alignment of the last rows.
+pub(crate) fn row_aligns(style: &Style, rtl: bool) -> ([bool; 2], Option<renderer::TextAlign>) {
+    use renderer::TextAlign::{Center, Left, Right};
+    let justify = style.get(Prop::TEXT_ALIGN) == Some("justify");
+    let last = match (style.get(Prop::TEXT_ALIGN_LAST), rtl) {
+        (Some("left"), _) | (Some("start"), false) | (Some("end"), true) => Some(Left),
+        (Some("right"), _) | (Some("start"), true) | (Some("end"), false) => Some(Right),
+        (Some("center"), _) => Some(Center),
+        _ => None,
+    };
+    (
+        [justify, style.get(Prop::TEXT_ALIGN_LAST) == Some("justify")],
+        last,
+    )
+}
+
+pub(crate) fn hyphenation(
+    style: &Style,
+    language: Option<&str>,
+) -> Option<Rc<renderer::Hyphenation>> {
+    let hyphens = style.get(Prop::HYPHENS).unwrap_or("manual");
+    let character = style
+        .get(Prop::HYPHENATE_CHARACTER)
+        .and_then(|value| value.strip_prefix(['"', '\''])?.strip_suffix(['"', '\'']));
+    let auto = language.filter(|_| hyphens == "auto");
+    (hyphens == "none" || auto.is_some() || character.is_some()).then(|| {
+        Rc::new(renderer::Hyphenation {
+            manual: hyphens != "none",
+            auto: auto.map(Into::into),
+            character: character.map(Into::into),
+        })
+    })
 }
 
 pub(crate) fn spacing(style: &Style, units: &Lengths, prop: Prop) -> renderer::Pixels {
@@ -422,6 +488,22 @@ pub(crate) fn word_break(style: &Style) -> renderer::WordBreak {
         (_, Some("break-word")) => renderer::WordBreak::BreakWord,
         _ => renderer::WordBreak::Normal,
     }
+}
+
+/// A `font-stretch` keyword or percentage, where 1 is normal.
+pub(crate) fn stretch(value: &str) -> Option<f32> {
+    Some(match value {
+        "ultra-condensed" => 0.5,
+        "extra-condensed" => 0.625,
+        "condensed" => 0.75,
+        "semi-condensed" => 0.875,
+        "normal" => 1.,
+        "semi-expanded" => 1.125,
+        "expanded" => 1.25,
+        "extra-expanded" => 1.5,
+        "ultra-expanded" => 2.,
+        value => value.strip_suffix('%')?.parse::<f32>().ok()? / 100.,
+    })
 }
 
 pub(crate) fn font(style: &Style) -> renderer::Font {
@@ -515,9 +597,12 @@ pub(crate) fn font(style: &Style) -> renderer::Font {
         None => 400.,
     };
     font.weight = weight.clamp(1., 1000.);
+    if let Some(value) = style.get(Prop::FONT_STRETCH).and_then(stretch) {
+        font.stretch = value;
+    }
     if let Some(value) = style.get(Prop::FONT_SYNTHESIS) {
         let has = |name| value.split_ascii_whitespace().any(|word| word == name);
-        font.synthesis = [has("weight"), has("style")];
+        font.synthesis = [has("weight"), has("style"), has("small-caps")];
     }
     font.style = match style.get(Prop::FONT_STYLE) {
         Some("italic") => renderer::FontStyle::Italic,
@@ -528,15 +613,58 @@ pub(crate) fn font(style: &Style) -> renderer::Font {
     if style.get(Prop::FONT_KERNING) == Some("none") {
         features.push(("kern".into(), 0));
     }
-    let keywords = [Prop::FONT_VARIANT_LIGATURES, Prop::FONT_VARIANT_NUMERIC]
-        .into_iter()
-        .filter_map(|prop| style.get(prop))
-        .flat_map(str::split_ascii_whitespace);
+    font.caps = match style.get(Prop::FONT_VARIANT_CAPS) {
+        Some("small-caps") => renderer::Caps::Small,
+        Some("all-small-caps") => renderer::Caps::AllSmall,
+        Some("petite-caps") => renderer::Caps::Petite,
+        Some("all-petite-caps") => renderer::Caps::AllPetite,
+        Some("unicase") => renderer::Caps::Unicase,
+        Some("titling-caps") => renderer::Caps::Titling,
+        _ => renderer::Caps::Normal,
+    };
+    font.size_adjust = style
+        .get(Prop::FONT_SIZE_ADJUST)
+        .and_then(|value| size_adjust(value)?)
+        .map(|(metric, value)| renderer::SizeAdjust {
+            metric: match metric {
+                "cap-height" => renderer::AdjustMetric::CapHeight,
+                "ch-width" => renderer::AdjustMetric::Advance,
+                _ => renderer::AdjustMetric::XHeight,
+            },
+            value,
+        });
+    let keywords = [
+        Prop::FONT_VARIANT_LIGATURES,
+        Prop::FONT_VARIANT_ALTERNATES,
+        Prop::FONT_VARIANT_NUMERIC,
+        Prop::FONT_VARIANT_EAST_ASIAN,
+        Prop::FONT_VARIANT_POSITION,
+    ]
+    .into_iter()
+    .filter_map(|prop| style.get(prop))
+    .flat_map(str::split_ascii_whitespace);
     for keyword in keywords {
         let tags: &[(&str, u32)] = match keyword {
             "none" | "no-common-ligatures" => &[("liga", 0), ("clig", 0)],
             "no-contextual" => &[("calt", 0)],
+            "common-ligatures" => &[("liga", 1), ("clig", 1)],
+            "contextual" => &[("calt", 1)],
             "discretionary-ligatures" => &[("dlig", 1)],
+            "no-discretionary-ligatures" => &[("dlig", 0)],
+            "historical-ligatures" => &[("hlig", 1)],
+            "no-historical-ligatures" => &[("hlig", 0)],
+            "historical-forms" => &[("hist", 1)],
+            "sub" => &[("subs", 1)],
+            "super" => &[("sups", 1)],
+            "jis78" => &[("jp78", 1)],
+            "jis83" => &[("jp83", 1)],
+            "jis90" => &[("jp90", 1)],
+            "jis04" => &[("jp04", 1)],
+            "simplified" => &[("smpl", 1)],
+            "traditional" => &[("trad", 1)],
+            "full-width" => &[("fwid", 1)],
+            "proportional-width" => &[("pwid", 1)],
+            "ruby" => &[("ruby", 1)],
             "lining-nums" => &[("lnum", 1)],
             "oldstyle-nums" => &[("onum", 1)],
             "proportional-nums" => &[("pnum", 1)],
@@ -614,9 +742,9 @@ mod tests {
             let style = Style::from_iter(value.map(|value| (Prop::FONT_SYNTHESIS, value.into())));
             font(&style).synthesis
         };
-        assert_eq!(synthesis(None), [true, true]);
-        assert_eq!(synthesis(Some("none")), [false, false]);
-        assert_eq!(synthesis(Some("style")), [false, true]);
-        assert_eq!(synthesis(Some("weight small-caps")), [true, false]);
+        assert_eq!(synthesis(None), [true, true, true]);
+        assert_eq!(synthesis(Some("none")), [false, false, false]);
+        assert_eq!(synthesis(Some("style")), [false, true, false]);
+        assert_eq!(synthesis(Some("weight small-caps")), [true, false, true]);
     }
 }

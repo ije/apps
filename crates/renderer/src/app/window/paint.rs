@@ -53,6 +53,11 @@ impl crate::text::TextCanvas for Window {
     }
 }
 
+/// How far a wavy line of `thickness` device pixels reaches from its middle.
+pub fn wave_reach(thickness: f32) -> f32 {
+    0.2887 * (0.5 + (3. * thickness + 0.5).round()) + thickness * 0.5
+}
+
 impl Window {
     pub(super) fn snap_bounds(&self, bounds: Rect<Pixels>) -> Rect<f32> {
         let scale = self.scale_factor;
@@ -458,6 +463,40 @@ impl Window {
                 .then(|| self.text_clip.map(|(layer, _)| layer))
                 .flatten(),
         };
+        let outer = self.space.take();
+        let Space {
+            joins,
+            preserves,
+            hidden,
+        } = effect.space;
+        let mut state = state;
+        let mut text_clip = None;
+        let root = match outer.as_deref().filter(|_| joins) {
+            // The plane around it ends, and a new one continues it after this plane.
+            Some(space) => {
+                state.content_mask = space.plane.content_mask;
+                self.scene.end_plane(space.hidden);
+                text_clip = self.text_clip.take();
+                false
+            }
+            None => preserves,
+        };
+        let start = self.scene.nested_len();
+        if root {
+            self.planes.push(Vec::new());
+        }
+        if root || joins && outer.is_some() {
+            self.begin_plane(effect.plane.scale(scale));
+        }
+        if let Some(matrix) = effect.transform.filter(|_| preserves) {
+            self.space = Some(Box::new(PlaneSpace {
+                matrix,
+                plane: state.clone(),
+                bounds: effect.plane.scale(scale),
+                depth: self.scene.depth() + 1,
+                hidden,
+            }));
+        }
         self.scene.push_effect(state, effect.key);
         // Ancestor clips apply after the effect, in window space, so the layer starts unclipped.
         self.push_content_mask(unbounded_mask());
@@ -465,8 +504,56 @@ impl Window {
         let result = f(self);
         self.group_clips = groups;
         self.content_masks.pop();
-        self.scene.pop_effect();
+        self.scene.end_plane(hidden);
+        self.space = outer;
+        if root {
+            self.sort_planes(start);
+        } else if let Some(space) = self.space.as_deref().filter(|_| joins) {
+            let (plane, bounds) = (space.plane.clone(), space.bounds);
+            self.begin_plane(bounds);
+            self.scene.push_effect(plane, None);
+            self.text_clip = text_clip;
+        }
         result
+    }
+
+    /// The matrix of the 3D rendering context that a layer here can join.
+    pub fn space(&self) -> Option<&[f32; 16]> {
+        (self.space.as_deref())
+            .filter(|space| space.depth == self.scene.depth())
+            .map(|space| &space.matrix)
+    }
+
+    fn begin_plane(&mut self, bounds: Rect<f32>) {
+        let plane = (self.scene.next_layer(), bounds, self.pending.lens());
+        if let Some(planes) = self.planes.last_mut() {
+            planes.push(plane);
+        }
+    }
+
+    // Draws the planes of a context from back to front, and gives them the pointer in the reverse order.
+    fn sort_planes(&mut self, start: usize) {
+        let Some(planes) = self.planes.pop() else {
+            return;
+        };
+        let last = self.pending.lens();
+        let ends = planes.iter().skip(1).map(|plane| plane.2).chain([last]);
+        let parts: Vec<_> = (planes.iter().zip(ends))
+            .map(|(plane, end)| [1, 3].map(|at| [plane.2[at], end[at]]))
+            .collect();
+        // A plane that draws nothing takes its place for the pointer.
+        let listed = (planes.iter().zip(&parts))
+            .filter(|(_, [_, marks])| marks[0] < marks[1])
+            .map(|(&(layer, bounds, _), _)| (layer, bounds));
+        let order = self.scene.sort_planes(start, listed);
+        let mut parts: Vec<_> = (planes.iter().zip(parts))
+            .map(|(plane, part)| (order.iter().rposition(|drawn| *drawn == plane.0), part))
+            .collect();
+        if !parts.is_sorted_by_key(|part| part.0) {
+            parts.sort_by_key(|part| part.0);
+            let order = parts.into_iter().map(|part| part.1).collect();
+            self.pending.sorted.push(order);
+        }
     }
 
     /// Glyphs and text lines that `f` draws outside nested effects also draw into a mask, which an effect
@@ -518,58 +605,89 @@ impl Window {
         color: Color,
         style: DecorationStyle,
     ) {
+        self.draw_line_between(origin, width, thickness, color, style, &[]);
+    }
+
+    /// Like `draw_line`, without the parts in `gaps`, which are in order.
+    pub fn draw_line_between(
+        &mut self,
+        origin: Point<Pixels>,
+        width: Pixels,
+        thickness: Pixels,
+        color: Color,
+        style: DecorationStyle,
+        gaps: &[[Pixels; 2]],
+    ) {
         if self.opacity <= 0. {
             return;
         }
-        let thickness = self.snap_stroke(thickness);
+        let scale = self.scale_factor;
+        let wavy = style == DecorationStyle::Wavy;
+        let thickness = if wavy {
+            (thickness.0 * scale).max(1.)
+        } else {
+            self.snap_stroke(thickness)
+        };
         let clip = self.snapped_content_mask();
-        let rows = match style {
-            DecorationStyle::Wavy => 3.,
-            _ => 1.,
-        };
-        let mut instance = Instance::new(
-            LINE,
-            Rect::new(
-                origin.map(|value| snap(value.0 * self.scale_factor)),
-                size(self.snap_stroke(width), thickness * rows),
-            ),
-            clip,
+        let mut rect = Rect::new(
+            origin.map(|value| snap(value.0 * scale)),
+            size(self.snap_stroke(width), thickness),
         );
-        instance.color = color.fade(self.opacity).to_array();
-        instance.info[1] = f32::from(u8::from(style == DecorationStyle::Wavy));
-        instance.info[2] = thickness;
-        let dash = match style {
-            DecorationStyle::Dotted => thickness,
-            DecorationStyle::Dashed => thickness * 2.,
-            _ => 0.,
+        if wavy {
+            let reach = wave_reach(thickness).ceil() + 1.;
+            rect.origin.y += thickness + 1. - reach;
+            rect.size.height = reach * 2.;
+        }
+        let mut line = Instance::new(LINE, rect, clip);
+        line.color = color.fade(self.opacity).to_array();
+        line.info[2] = thickness;
+        // Like Chrome, dashes fit the line with one at each end, and dots wider than 3 pixels are round.
+        let dots = style == DecorationStyle::Dotted;
+        let ratios = match style {
+            DecorationStyle::Dotted => Some([1., 1.]),
+            DecorationStyle::Dashed if thickness >= 3. => Some([2., 1.]),
+            DecorationStyle::Dashed => Some([3., 2.]),
+            _ => None,
         };
-        for row in &[0., 2.][..1 + usize::from(style == DecorationStyle::Double)] {
-            let mut line = instance;
-            line.rect[1] += thickness * row;
+        line.info[1] = f32::from(u8::from(wavy));
+        if let Some([dash, gap]) = ratios.map(|ratios| ratios.map(|ratio| ratio * thickness))
+            && rect.size.width > dash * 2.
+        {
+            let length = rect.size.width;
+            let count = ((length + gap) / (dash + gap)).floor();
+            let fit = |count: f32| (length - count * dash) / (count - 1.);
+            let (wide, narrow) = (fit(count), fit(count + 1.));
+            let gap = if narrow <= 0. || (wide - gap).abs() < (narrow - gap).abs() {
+                wide
+            } else {
+                narrow
+            };
+            line.info[1] = if dots && thickness > 3. { 4. } else { 2. };
+            (line.aux[0], line.aux[1]) = (dash, dash + gap);
+        }
+        for _ in 0..1 + usize::from(style == DecorationStyle::Double) {
             let full = crate::gpu::rect(line.rect);
             let shown = full.intersect(clip.bounds);
             if shown != full {
                 self.scene.cull();
             }
-            if shown.is_empty() {
-                continue;
-            }
-            if dash <= 0. {
+            if gaps.is_empty() && !shown.is_empty() {
                 self.push_text(line);
-                continue;
-            }
-            let period = dash * 2.;
-            let skipped = ((shown.left() - line.rect[0]) / period).floor().max(0.);
-            let mut start = line.rect[0] + skipped * period;
-            while start < shown.right() {
-                let left = start.max(shown.left());
-                let right = (start + dash).min(shown.right());
-                if left < right {
-                    line.clip = [left, shown.top(), right - left, shown.size.height];
-                    self.push_text(line);
+            } else if !shown.is_empty() {
+                let mut left = shown.left();
+                for at in 0..=gaps.len() {
+                    let [end, next] = (gaps.get(at))
+                        .map_or([shown.right(); 2], |gap| gap.map(|x| snap(x.0 * scale)));
+                    let end = end.min(shown.right());
+                    if left < end {
+                        let mut piece = line;
+                        piece.clip = [left, shown.top(), end - left, shown.size.height];
+                        self.push_text(piece);
+                    }
+                    left = left.max(next);
                 }
-                start += period;
             }
+            line.rect[1] += thickness + 1.;
         }
     }
 

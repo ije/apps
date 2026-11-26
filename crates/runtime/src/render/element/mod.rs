@@ -11,13 +11,14 @@ pub(crate) mod svg;
 
 use self::create::create;
 use self::kept::{Call, Kept, Patch, Query, Read, Replay, hashed};
-use self::margin::{definite_line, float_side, margins, shrinks_around};
+use self::margin::{definite_height, definite_line, float_side, margins, shrinks_around};
 #[cfg(debug_assertions)]
 use self::oracle::{TRACE, check, print};
+pub(crate) use self::query::box_parent;
 use self::query::{
-    LOOK, backdrop, baselines, box_parent, boxless, collapses, content_editable, insets,
-    padding_start, parent_font, parent_style, passed, pictured, positioner, row_fill, scrolled,
-    scroller, shrinks, starts_line, uses,
+    LOOK, backdrop, baselines, boxless, collapses, content_editable, insets, padding_start,
+    parent_font, parent_style, passed, pictured, positioner, row_fill, scrolled, scroller, shrinks,
+    starts_line, uses,
 };
 use super::layout::size::{broken_image, place, text_field};
 use super::{ViewState, layout::cull};
@@ -48,6 +49,8 @@ pub(crate) struct Build<'a> {
     pub(super) zone: Option<Rc<cull::Zone>>,
     // Inside a multi-column box, where boxes take break flags.
     pub(super) columned: bool,
+    // The box around it extends its 3D rendering context to its children.
+    pub(super) space: bool,
     pub(super) top_layer: &'a [usize],
     pub(super) tree: &'a renderer::Tree,
     pub(super) culls: &'a std::cell::Cell<usize>,
@@ -223,6 +226,11 @@ impl<'a> Build<'a> {
             Query::Value(node) => hashed(&doc.nodes[node as usize].value),
             Query::Viewport => hashed(self.port.map(f32::to_bits)),
             Query::Theme => hashed(crate::native::theme_state() & 1),
+            Query::Definite(node) => hashed(definite_height(
+                doc,
+                styles,
+                box_parent(doc, styles, node as usize),
+            )),
             Query::LineBase(node) => hashed(definite_line(doc, styles, node as usize)),
             Query::Shrinks(node) => hashed(shrinks_around(doc, styles, node as usize)),
         };
@@ -307,6 +315,7 @@ pub(crate) fn element(
         container,
         flex_parent: build.flex_parent,
         columned: build.columned,
+        space: build.space,
         cell: slot.as_ref().map(|(_, grid)| {
             use std::hash::{Hash, Hasher};
             let mut tracks = rustc_hash::FxHasher::default();
@@ -464,6 +473,7 @@ pub(crate) fn element(
         slot: slot.clone(),
         flex_parent: build.flex_parent,
         columned: build.columned,
+        space: build.space,
         perspective: build.perspective.clone(),
         value: hashed(&build.doc.nodes[id].value),
     });
@@ -564,6 +574,7 @@ pub(crate) fn repaint(build: &Build<'_>, id: usize) -> Option<renderer::Node> {
         ancestors: ancestors.clone(),
         flex_parent,
         columned: old.call.columned,
+        space: old.call.space,
         perspective: None,
         zone: None,
         #[cfg(debug_assertions)]

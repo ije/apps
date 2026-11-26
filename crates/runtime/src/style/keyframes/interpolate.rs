@@ -1,7 +1,8 @@
 use crate::css::{
-    properties::Prop, properties::Registry, properties::Style, value::color::color,
-    value::easing::Easing, value::easing::time, value::easing::timing_function,
-    value::tokens::components, value::units::Lengths,
+    properties::Prop, properties::Registry, properties::Style, value::calc_size,
+    value::color::color, value::easing::Easing, value::easing::time,
+    value::easing::timing_function, value::grammar::matched, value::tokens::components,
+    value::units::Lengths,
 };
 use std::borrow::Cow;
 use std::rc::Rc;
@@ -110,7 +111,12 @@ pub(crate) fn keeps_box_in_place<'a>(
     mut values: impl Iterator<Item = &'a str>,
 ) -> bool {
     match prop {
-        Prop::TRANSLATE => false,
+        Prop::TRANSLATE
+        | Prop::OFFSET_ANCHOR
+        | Prop::OFFSET_DISTANCE
+        | Prop::OFFSET_PATH
+        | Prop::OFFSET_POSITION
+        | Prop::OFFSET_ROTATE => false,
         Prop::TRANSFORM => values.all(|value| {
             !["translate", "matrix", "perspective"]
                 .iter()
@@ -124,7 +130,7 @@ pub(crate) fn animatable(prop: Prop, registry: &Registry) -> bool {
     let key = prop.name();
     if prop.is_custom() {
         return registry.get(&prop).is_some_and(|(syntax, ..)| {
-            syntax.split('|').all(|kind| {
+            syntax.split('|').any(|kind| {
                 matches!(
                     kind.trim().trim_end_matches(['+', '#']),
                     "<length>"
@@ -134,6 +140,10 @@ pub(crate) fn animatable(prop: Prop, registry: &Registry) -> bool {
                         | "<color>"
                         | "<angle>"
                         | "<time>"
+                        | "<integer>"
+                        | "<resolution>"
+                        | "<transform-function>"
+                        | "<transform-list>"
                 )
             })
         });
@@ -142,6 +152,28 @@ pub(crate) fn animatable(prop: Prop, registry: &Registry) -> bool {
         && !key.starts_with("transition")
         && !key.starts_with("container")
         && key != "will-change"
+}
+
+// The property that interpolates like this one.
+fn kind(prop: Prop, registry: &Registry) -> &'static str {
+    match registry.get(&prop).filter(|_| prop.is_custom()) {
+        Some((syntax, ..)) if syntax.contains("<transform") => "transform",
+        Some((syntax, ..)) if syntax.contains("<integer>") && !syntax.contains("<number>") => {
+            "z-index"
+        }
+        _ => prop.name(),
+    }
+}
+
+pub(crate) fn lerp_of(prop: Prop, registry: &Registry, from: &str, to: &str) -> Option<Rc<Lerp>> {
+    // Values of two types of a syntax switch halfway.
+    if prop.is_custom()
+        && let Some((syntax, ..)) = registry.get(&prop)
+        && matched(syntax, from) != matched(syntax, to)
+    {
+        return None;
+    }
+    lerp(kind(prop, registry), from, to)
 }
 
 pub(crate) fn computed<'a>(
@@ -166,6 +198,9 @@ pub(crate) fn computed<'a>(
         "row-gap" | "column-gap" | "letter-spacing" | "word-spacing" | "outline-offset"
         | "text-indent" => Some("0px"),
         "background-position" => Some("0% 0%"),
+        "offset-distance" => Some("0px"),
+        "offset-rotate" => Some("auto"),
+        "offset-path" | "clip-path" => Some("none"),
         "visibility" => Some("visible"),
         "display" => Some("inline"),
         "overlay" => Some("none"),
@@ -317,6 +352,31 @@ pub(crate) enum Lerp {
     Number(f64, f64, String, bool),
     Calc(String, String, bool),
     Matrix(Box<[[f64; 13]; 2]>, bool),
+    // The basis and both calculations of `calc-size()`.
+    Size(String, String, String),
+}
+
+// The sizes that interpolate with keywords under `interpolate-size: allow-keywords`.
+const SIZES: [Prop; 6] = [
+    Prop::WIDTH,
+    Prop::HEIGHT,
+    Prop::MIN_WIDTH,
+    Prop::MIN_HEIGHT,
+    Prop::MAX_WIDTH,
+    Prop::MAX_HEIGHT,
+];
+
+/// The size keyword as `calc-size()` when the element interpolates it, and other values as they are.
+pub(crate) fn sized<'a>(style: &Style, prop: Prop, value: &'a str) -> Cow<'a, str> {
+    if matches!(
+        value,
+        "auto" | "min-content" | "max-content" | "fit-content" | "stretch"
+    ) && SIZES.contains(&prop)
+        && style.get(Prop::INTERPOLATE_SIZE) == Some("allow-keywords")
+    {
+        return format!("calc-size({value}, size)").into();
+    }
+    value.into()
 }
 
 pub(crate) const IDENTITY: [f64; 16] = [
@@ -481,7 +541,9 @@ impl Lerp {
             return Some(Self::Same(from.to_owned()));
         }
         // Chrome switches images, gradients too, halfway instead of blending them.
-        if property.ends_with("-image") || property == "border-image-source" {
+        if property.ends_with("-image")
+            || matches!(property, "border-image-source" | "overflow-clip-margin")
+        {
             return None;
         }
         let keyword = |value| match (property, value) {
@@ -515,6 +577,58 @@ impl Lerp {
                 to.to_owned(),
                 shown.to_owned(),
             ));
+        }
+        if matches!(property, "clip-path" | "offset-path") {
+            let (text, pairs) = crate::css::value::shape::between(from, to)?;
+            let mut items = Vec::with_capacity(pairs.len() * 2 + 1);
+            let mut gaps = text.split('\0');
+            items.push(Self::Same(gaps.next()?.to_owned()));
+            for ([a, b], text) in pairs.iter().zip(gaps) {
+                items.push(Self::new("", a, b)?);
+                items.push(Self::Same(text.to_owned()));
+            }
+            return Some(Self::List(items, ""));
+        }
+        if property == "offset-rotate" {
+            let units = Lengths::new(16., 1., 1.);
+            let turn = |value| crate::css::value::shape::turn(value, &units);
+            let ((auto, a), (other, b)) = (turn(from)?, turn(to)?);
+            let angle = Self::Number(a, b, "deg".into(), false);
+            return (auto == other).then(|| match auto {
+                true => Self::List(vec![Self::Same("auto".into()), angle], " "),
+                false => angle,
+            });
+        }
+        if matches!(property, "offset-anchor" | "offset-position") {
+            let [[a, b], [c, d]] = [from, to].map(|value| {
+                let parts = components(value, ' ');
+                crate::css::value::shape::Position::parse(&parts)
+                    .map_or_else(Default::default, |position| position.offsets())
+            });
+            return Some(Self::List(
+                vec![Self::new("", &a, &c)?, Self::new("", &b, &d)?],
+                " ",
+            ));
+        }
+        if from.starts_with("calc-size(") || to.starts_with("calc-size(") {
+            let [a, b] = [from, to].map(calc_size);
+            let basis = match (a, b) {
+                (Some(("any", _)), Some((basis, _))) | (Some((basis, _)), Some(("any", _))) => {
+                    basis
+                }
+                (Some((a, _)), Some((b, _))) if a == b => a,
+                (Some((basis, _)), None) | (None, Some((basis, _))) => basis,
+                _ => return None,
+            };
+            // A length has no basis of its own, and other keywords don't interpolate.
+            let [a, b] = [(a, from), (b, to)].map(|(parts, value)| match parts {
+                Some((_, size)) => Some(size),
+                None => match Lengths::new(16., 100., 100.).parse(value, 100.)? {
+                    (_, true) => Some(value),
+                    (number, _) => (number == 0.).then_some("0px"),
+                },
+            });
+            return Some(Self::Size(basis.into(), a?.into(), b?.into()));
         }
         if property == "transform" {
             fn primitive<'a>(name: &str, args: &'a str) -> Option<(&'static str, Vec<&'a str>)> {
@@ -807,27 +921,7 @@ impl Lerp {
         if let (Some((name, a)), Some((other, b))) = (function(from), function(to))
             && name == other
         {
-            let sides = |args: &str| {
-                let (box_, round) = args.split_once(" round ").unwrap_or((args, ""));
-                let sides = components(box_, ' ');
-                if !(1..=4).contains(&sides.len()) {
-                    return args.to_owned();
-                }
-                let order = [[0, 0, 0, 0], [0, 1, 0, 1], [0, 1, 2, 1], [0, 1, 2, 3]];
-                let mut out = order[sides.len() - 1].map(|index| sides[index]).join(" ");
-                if !round.is_empty() {
-                    out.push_str(" round ");
-                    out.push_str(round);
-                }
-                out
-            };
-            let [a, b] = if name == "inset" && components(a, ' ').len() != components(b, ' ').len()
-            {
-                [sides(a), sides(b)].map(Cow::Owned)
-            } else {
-                [a, b].map(Cow::Borrowed)
-            };
-            return Self::new(property, &a, &b)
+            return Self::new(property, a, b)
                 .map(|args| Self::Function(name.into(), Box::new(args)));
         }
         fn number(value: &str) -> Option<(f64, &str)> {
@@ -874,6 +968,13 @@ impl Lerp {
             }
         };
         match self {
+            Self::Size(basis, from, to) => {
+                let _ = write!(
+                    out,
+                    "calc-size({basis}, ({from}) * {} + ({to}) * {t})",
+                    1. - t
+                );
+            }
             Self::Same(value) => out.push_str(value),
             Self::Between(from, to, shown) => out.push_str(if t <= 0. {
                 from
@@ -1026,4 +1127,9 @@ pub(crate) const PAINT: &[Prop] = &[
     Prop::WEBKIT_FILTER,
     Prop::BACKDROP_FILTER,
     Prop::WEBKIT_BACKDROP_FILTER,
+    Prop::OFFSET_ANCHOR,
+    Prop::OFFSET_DISTANCE,
+    Prop::OFFSET_PATH,
+    Prop::OFFSET_POSITION,
+    Prop::OFFSET_ROTATE,
 ];

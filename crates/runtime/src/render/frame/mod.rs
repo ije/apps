@@ -1,3 +1,4 @@
+pub(crate) mod anchor;
 mod changes;
 mod iframes;
 mod lint;
@@ -180,7 +181,13 @@ impl ViewState {
         let (mut visible, mut previous, flips) =
             visibility::update(&doc, dom, &styles, last.as_ref(), same, &walked, serial);
         let mut events = Vec::new();
-        let now = std::time::Instant::now();
+        // The passes that boxes with anchors settle in show one time, or a moving anchor would move in each.
+        let now = (dom.layout.anchors.now.take())
+            .filter(|_| window.redrawing())
+            .unwrap_or_else(std::time::Instant::now);
+        if styles.anchors.is_some() {
+            dom.layout.anchors.now = Some(now);
+        }
         let bounds = &dom.geometry.mirror;
         let side = |id| {
             bounds
@@ -471,6 +478,7 @@ impl ViewState {
             }
         }
         let autos = !dom.layout.autos.is_empty();
+        let anchored = styles.anchors.is_some() || !dom.layout.anchors.boxes.is_empty();
         let measured = RefCell::new(std::mem::take(&mut dom.layout.measurements));
         let walk = dom.styles.walk.snapshot();
         drop(store);
@@ -505,6 +513,7 @@ impl ViewState {
             info: &info,
             zone,
             columned: false,
+            space: false,
             top_layer: &top_layer,
             tree,
             culls: &Cell::new(0),
@@ -645,7 +654,7 @@ impl ViewState {
             pointer_events,
             root,
             overlay,
-            autos,
+            [autos, anchored],
             started,
         )
     }

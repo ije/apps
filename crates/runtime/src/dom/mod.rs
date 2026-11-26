@@ -17,18 +17,22 @@ pub(crate) use selector::{Dependency, SelectorCache};
 pub use tree::Tree;
 pub(crate) use walk::{ABSENT, Walk};
 
-pub(crate) const CHECKED: u16 = 16;
-pub(crate) const DIRTY: u16 = 32;
-pub(crate) const MODAL: u16 = 64;
-pub(crate) const POPOVER: u16 = 256;
-pub(crate) const FULLSCREEN: u16 = 512;
-pub(crate) const BROKEN: u16 = 1024;
+pub(crate) const CHECKED: u32 = 16;
+pub(crate) const DIRTY: u32 = 32;
+pub(crate) const MODAL: u32 = 64;
+pub(crate) const POPOVER: u32 = 256;
+pub(crate) const FULLSCREEN: u32 = 512;
+pub(crate) const BROKEN: u32 = 1024;
 // Warning: one bit for both, as only custom elements can be undefined and they are never inputs.
-pub(crate) const INDETERMINATE: u16 = 4096;
-pub(crate) const DEFINED: u16 = INDETERMINATE;
-pub(crate) const INVALID: u16 = 32768;
-pub(crate) const TOP_LAYER: u16 = MODAL | POPOVER | FULLSCREEN;
-pub(crate) const LEAVING: u16 = TOP_LAYER << 5;
+pub(crate) const INDETERMINATE: u32 = 4096;
+pub(crate) const DEFINED: u32 = INDETERMINATE;
+pub(crate) const INVALID: u32 = 32768;
+// The user changed the control, or a submit of its form checked it.
+pub(crate) const USER: u32 = 1 << 16;
+// A form-associated custom element.
+pub(crate) const FORM_ASSOCIATED: u32 = 1 << 17;
+pub(crate) const TOP_LAYER: u32 = MODAL | POPOVER | FULLSCREEN;
+pub(crate) const LEAVING: u32 = TOP_LAYER << 5;
 
 // A `contenteditable` value makes the element editable or not, or inherits when `None`.
 pub(crate) fn editable_value(value: &str) -> Option<bool> {

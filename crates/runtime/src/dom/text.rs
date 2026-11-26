@@ -23,7 +23,9 @@ pub(crate) fn shown_index(source: &str, shown: &str, offset: usize) -> usize {
 
 pub(crate) fn source_offset(source: &str, shown: &str, byte: usize) -> usize {
     if source.is_empty() || source == shown {
-        return shown[..byte].encode_utf16().count();
+        return shown[..shown.floor_char_boundary(byte)]
+            .encode_utf16()
+            .count();
     }
     let (mut at, mut units) = (0, 0);
     for c in source.chars() {

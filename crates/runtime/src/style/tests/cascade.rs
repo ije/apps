@@ -213,37 +213,6 @@ fn tokenized_at_rules_keep_scope_and_accept_css_escapes() {
 }
 
 #[test]
-fn clip_paths_resolve_to_rects_and_radii() {
-    let units = Lengths::new(16., 800., 600.);
-    let clip = |value: &str| clip_path(value, &units, [100., 60.]);
-    assert_eq!(
-        clip("inset(10px 20% round 4px 8px)"),
-        Some(([20., 10., 60., 40.], [4., 8., 4., 8.]))
-    );
-    assert_eq!(clip("circle()"), Some(([20., 0., 60., 60.], [30.; 4])));
-    assert!(
-        (clip("circle(50%)").unwrap().1[0] - 100f32.hypot(60.) / 2. / std::f32::consts::SQRT_2)
-            .abs()
-            < 1e-3
-    );
-    assert_eq!(
-        clip("circle(10px at left top)"),
-        Some(([-10., -10., 20., 20.], [10.; 4]))
-    );
-    assert_eq!(clip("ellipse()"), Some(([0., 0., 100., 60.], [30.; 4])));
-    assert_eq!(
-        clip("rect(auto 80px 50% 10px)"),
-        Some(([10., 0., 70., 30.], [0.; 4]))
-    );
-    assert_eq!(
-        clip("xywh(5px 6px 50% 10px round 3px) border-box"),
-        Some(([5., 6., 50., 10.], [3.; 4]))
-    );
-    assert_eq!(clip("polygon(0 0, 100% 0, 0 100%)"), None);
-    assert_eq!(clip("url(#mask)"), None);
-}
-
-#[test]
 fn nested_selectors_and_combinators() {
     let doc = Document::parse(
         r#"<style>

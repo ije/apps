@@ -360,18 +360,33 @@ impl<'i> AtRuleParser<'i> for Rules {
     ) -> Result<Item, ParseError<()>> {
         if name.eq_ignore_ascii_case("import") && self.top_level {
             let url = input.expect_url_or_string()?.clone();
-            let preflight = match url.strip_suffix(".css").unwrap_or(&url) {
-                "tailwindcss" | "tailwindcss/index" | "tailwindcss/preflight" => true,
-                "tailwindcss/theme" | "tailwindcss/utilities" => false,
-                _ => return Err(ParseError::unexpected_token()),
-            };
-            while input.next().is_ok() {}
-            return Ok(Item::Rule(Rule::Tailwind(Some(preflight))));
+            let name = url.strip_suffix(".css").unwrap_or(&url);
+            if !matches!(
+                name,
+                "tailwindcss"
+                    | "tailwindcss/index"
+                    | "tailwindcss/preflight"
+                    | "tailwindcss/theme"
+                    | "tailwindcss/utilities"
+            ) {
+                return Err(ParseError::unexpected_token());
+            }
+            let options = text(input)?;
+            return Ok(Item::Rule(Rule::Tailwind(format!(
+                "import \"{name}\" {options}"
+            ))));
         }
-        if name.eq_ignore_ascii_case("reference") && self.top_level {
-            input.expect_url_or_string()?;
+        if (name.eq_ignore_ascii_case("reference") || name.eq_ignore_ascii_case("source"))
+            && self.top_level
+        {
+            let options = text(input)?;
+            let name = name.to_ascii_lowercase();
+            return Ok(Item::Rule(Rule::Tailwind(format!("{name} {options}"))));
+        }
+        if name.eq_ignore_ascii_case("tailwind") && self.parent.is_none() {
+            input.expect_ident_matching("utilities")?;
             while input.next().is_ok() {}
-            return Ok(Item::Rule(Rule::Tailwind(None)));
+            return Ok(Item::Rule(Rule::Tailwind("tailwind utilities".into())));
         }
         if (name.eq_ignore_ascii_case("keyframes")
             || name.eq_ignore_ascii_case("-webkit-keyframes"))
@@ -381,30 +396,28 @@ impl<'i> AtRuleParser<'i> for Rules {
             input.expect_exhausted()?;
             return Ok(Item::Rule(Rule::Keyframes(name, Vec::new())));
         }
-        if name.eq_ignore_ascii_case("custom-variant") && self.top_level {
-            let name = input.expect_ident_cloned()?.to_string();
-            let mut template = String::new();
-            if !input.is_exhausted() {
-                input.expect_parenthesis_block()?;
-                input.parse_nested_block(|input| source(input, &mut template, "/**/"))?;
-                input.expect_exhausted()?;
-            }
-            return Ok(Item::Rule(Rule::Variant(name, template.trim().to_owned())));
+        let custom = name.eq_ignore_ascii_case("custom-variant") && self.top_level;
+        if custom || name.eq_ignore_ascii_case("variant") && !self.declarations_only {
+            let text = text(input)?;
+            let end = text
+                .find(|c: char| c == '(' || c.is_whitespace())
+                .unwrap_or(text.len());
+            let (name, template) = (&text[..end], text[end..].trim());
+            return Ok(Item::Rule(match template.strip_prefix('(') {
+                Some(template) if self.top_level => Rule::Variant(
+                    name.to_owned(),
+                    template
+                        .strip_suffix(')')
+                        .unwrap_or(template)
+                        .trim()
+                        .to_owned(),
+                ),
+                _ if custom && !template.is_empty() => return Err(ParseError::unexpected_token()),
+                _ => Rule::Variant(text, String::new()),
+            }));
         }
-        if name.eq_ignore_ascii_case("variant") && self.parent.is_some() {
-            let mut name = String::new();
-            source(input, &mut name, "/**/")?;
-            return Ok(Item::Rule(Rule::Variant(
-                name.trim().to_owned(),
-                String::new(),
-            )));
-        }
-        if name.eq_ignore_ascii_case("theme") && self.top_level {
-            let mut inline = false;
-            while let Ok(option) = input.try_parse(|input| input.expect_ident_cloned()) {
-                inline |= option.eq_ignore_ascii_case("inline");
-            }
-            return Ok(Item::Rule(Rule::Theme(inline, Vec::new())));
+        if name.eq_ignore_ascii_case("theme") && self.parent.is_none() {
+            return Ok(Item::Rule(Rule::Theme(text(input)?, Vec::new())));
         }
         if name.eq_ignore_ascii_case("property")
             && self.parent.is_none()
@@ -447,18 +460,27 @@ impl<'i> AtRuleParser<'i> for Rules {
             input.expect_exhausted()?;
             return Ok(Item::Rule(Rule::FontFace(Declarations::default())));
         }
+        if name.eq_ignore_ascii_case("position-try")
+            && self.parent.is_none()
+            && !self.declarations_only
+            && !self.theme
+        {
+            let name = input.expect_ident_cloned()?.to_string();
+            input.expect_exhausted()?;
+            if !name.starts_with("--") {
+                return Err(ParseError::unexpected_token());
+            }
+            return Ok(Item::Rule(Rule::PositionTry(name, Declarations::default())));
+        }
         if name.eq_ignore_ascii_case("utility") && self.top_level {
-            let mut name = String::new();
-            source(input, &mut name, "")?;
+            let mut name = text(input)?;
             name.retain(|c| !c.is_whitespace());
             return Ok(Item::Rule(Rule::Utility(name, String::new())));
         }
         if name.eq_ignore_ascii_case("apply") && self.parse_declarations() {
-            let mut value = String::new();
             // Class names keep adjacent tokens as written, like `py-1.5`.
-            source(input, &mut value, "")?;
             return Ok(Item::Declaration(Declaration::Apply(
-                components(&value, ' ')
+                components(&text(input)?, ' ')
                     .into_iter()
                     .map(str::to_owned)
                     .collect(),
@@ -687,13 +709,17 @@ impl<'i> AtRuleParser<'i> for Rules {
             Item::Rule(Rule::Supports(condition, supported, _)) => {
                 Rule::Supports(condition, supported, nested(input))
             }
-            Item::Rule(Rule::Theme(inline, _)) => Rule::Theme(
-                inline,
+            Item::Rule(Rule::Theme(options, _)) => Rule::Theme(
+                options,
                 Rules {
                     theme: true,
                     ..Rules::default()
                 }
                 .body(input),
+            ),
+            Item::Rule(Rule::PositionTry(name, _)) => Rule::PositionTry(
+                name,
+                Declarations::position_try(Declarations::parse_input(input, false)),
             ),
             Item::Rule(Rule::FontFace(_)) => Rule::FontFace(Declarations::parse_input(input, true)),
             Item::Rule(Rule::Property(name, ..)) => {
@@ -715,15 +741,15 @@ impl<'i> AtRuleParser<'i> for Rules {
                 let (Some(syntax), Some(inherits)) = (syntax, inherits) else {
                     return Err(ParseError::unexpected_token());
                 };
-                if syntax.trim() != "*" {
-                    // The initial value must not depend on an element, so `2em` drops the rule.
-                    let Some((value, true)) = initial
-                        .filter(|value| !value.contains("var(") && syntax_matches(&syntax, value))
-                        .map(|value| computed(&syntax, &value))
-                    else {
-                        return Err(ParseError::unexpected_token());
-                    };
-                    initial = Some(value);
+                // The initial value must not depend on an element, so `2em` drops the rule.
+                if syntax.trim() != "*"
+                    && !initial.as_deref().is_some_and(|value| {
+                        !value.contains("var(")
+                            && syntax_matches(&syntax, value)
+                            && computed(&syntax, value, None).1
+                    })
+                {
+                    return Err(ParseError::unexpected_token());
                 }
                 Rule::Property(name, syntax, inherits == 1, initial)
             }
@@ -735,7 +761,7 @@ impl<'i> AtRuleParser<'i> for Rules {
             Item::Rule(Rule::Variant(name, template)) if template.is_empty() => {
                 let mut body = String::new();
                 source(input, &mut body, "/**/")?;
-                if !self.top_level {
+                if !self.top_level || !body.contains("@slot") {
                     body = format!("{{{body}}}");
                 }
                 Rule::Variant(name, body)
@@ -765,6 +791,21 @@ impl<'i> RuleBodyItemParser<'i, Item, ()> for Rules {
         !self.declarations_only && !self.theme
     }
 }
+
+const AT_RULES: [&str; 12] = [
+    "-webkit-keyframes",
+    "container",
+    "font-face",
+    "import",
+    "keyframes",
+    "layer",
+    "media",
+    "namespace",
+    "property",
+    "scope",
+    "starting-style",
+    "supports",
+];
 
 fn condition(
     input: &mut Parser<'_>,
@@ -803,6 +844,9 @@ fn condition(
                     Some("font-tech") => FONT_TECHS
                         .iter()
                         .any(|tech| text.eq_ignore_ascii_case(tech)),
+                    Some("at-rule") => text
+                        .strip_prefix('@')
+                        .is_some_and(|name| AT_RULES.contains(&&*name.to_ascii_lowercase())),
                     Some(_) => false,
                     None => text.split_once(':').is_some_and(|(name, value)| {
                         let value = value.trim();
@@ -1023,6 +1067,12 @@ fn environment(value: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+fn text(input: &mut Parser<'_>) -> Result<String, ParseError<()>> {
+    let mut text = String::new();
+    source(input, &mut text, "")?;
+    Ok(text.trim().to_owned())
 }
 
 fn source(
@@ -1478,8 +1528,8 @@ mod tests {
             ("(forced-colors: none)", true),
             ("(forced-colors)", false),
             ("(inverted-colors: none)", true),
-            ("(display-mode: standalone)", true),
-            ("(display-mode: browser)", false),
+            ("(display-mode: standalone)", false),
+            ("(display-mode: browser)", true),
             ("(color)", true),
             ("(min-color: 8)", true),
             ("(color-index)", false),
@@ -1609,6 +1659,9 @@ mod tests {
             ("not selector(a > b)", Some(false)),
             ("font-tech(color-colrv1)", Some(false)),
             ("font-tech(variations)", Some(true)),
+            ("at-rule(@Scope)", Some(true)),
+            ("at-rule(@counter-style)", Some(false)),
+            ("at-rule(scope)", Some(false)),
             ("not font-format(woff2)", Some(false)),
             ("font-format(opentype)", Some(true)),
             ("font-format(embedded-opentype)", Some(false)),

@@ -453,6 +453,20 @@ fn parse(value: &str, depth: u8) -> Option<(Space, [f64; 3], f64)> {
             .find(|(space, _)| space.eq_ignore_ascii_case(name))
             .map(|(_, space)| *space)
     };
+    // Like Chrome, the one of white and black with more WCAG contrast to the opaque color.
+    if name == "contrast-color" {
+        let (space, channels, _) = parse(body.trim(), depth + 1)?;
+        let [r, g, b] = convert(space, channels, Space::SrgbLinear).map(|value| {
+            if value.is_nan() {
+                0.
+            } else {
+                value.clamp(0., 1.)
+            }
+        });
+        let light = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let white = 1.05 / (light + 0.05) > (light + 0.05) / 0.05;
+        return Some((Space::Srgb, [f64::from(u8::from(white)); 3], 1.));
+    }
     if name == "color-mix" {
         let parts = components(body, ',');
         let (method, colors) = match parts.as_slice() {

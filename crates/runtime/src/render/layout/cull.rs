@@ -109,7 +109,17 @@ pub(crate) fn reads_height(style: &css::properties::Style) -> bool {
         Prop::BORDER_BOTTOM_RIGHT_RADIUS,
     ]
     .into_iter()
-    .any(|prop| style.get(prop).is_some_and(|value| value.contains('%')))
+    .any(|prop| {
+        style.get(prop).is_some_and(|value| {
+            value.contains('%')
+                || value.starts_with("calc-size(")
+                || matches!(value, "stretch" | "-webkit-fill-available")
+        })
+    })
+        // A box with vertical lines takes its room from the height.
+        || style
+            .get(Prop::WRITING_MODE)
+            .is_some_and(|value| !value.starts_with("horizontal"))
         || style
             .get(Prop::POSITION)
             .is_some_and(|value| matches!(value, "absolute" | "fixed"))
@@ -258,6 +268,11 @@ pub(crate) fn cosmetic(old: &css::properties::Style, new: &css::properties::Styl
                     | Prop::Z_INDEX
                     | Prop::TRANSFORM
                     | Prop::TRANSFORM_ORIGIN
+                    | Prop::OFFSET_ANCHOR
+                    | Prop::OFFSET_DISTANCE
+                    | Prop::OFFSET_PATH
+                    | Prop::OFFSET_POSITION
+                    | Prop::OFFSET_ROTATE
                     | Prop::TRANSLATE
                     | Prop::ROTATE
                     | Prop::SCALE
@@ -320,7 +335,8 @@ pub(crate) fn content(
     node.tag.hash(&mut shape);
     node.text.hash(&mut shape);
     // Exclude field values from revisions: element::kept::Patch rebuilds changed fields in place.
-    if !super::size::text_field(node, style) {
+    // The fields of a date or time depend on its value, so its size does too.
+    if !super::size::text_field(node, style) || super::temporal::temporal(node) {
         node.value.hash(&mut shape);
     }
     (node.state & (crate::dom::CHECKED | crate::dom::DIRTY | crate::dom::BROKEN)).hash(&mut shape);
@@ -710,7 +726,7 @@ mod tests {
             ("s", UNCULLABLE | PLAIN_BLOCK),
             ("t", PLAIN_BLOCK),
             ("g", UNCULLABLE),
-            ("h", MOVES_CONTENT | UNCULLABLE | PLAIN_BLOCK),
+            ("h", MOVES_CONTENT | UNCULLABLE | PLAIN_BLOCK | READS_HEIGHT),
             ("i", PLAIN_BLOCK),
             ("j", PLAIN_BLOCK),
             ("k", 0),

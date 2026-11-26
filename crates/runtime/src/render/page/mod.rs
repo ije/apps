@@ -56,6 +56,7 @@ impl PageState {
                     computed.values.get(node).is_some_and(|style| {
                         [
                             Prop::TRANSFORM,
+                            Prop::OFFSET_PATH,
                             Prop::TRANSLATE,
                             Prop::ROTATE,
                             Prop::SCALE,
@@ -294,13 +295,15 @@ impl PageState {
         // Parent links are current during a batch. `stale` has obsolete child entries. `run` has children
         // awaiting insertion.
         let (mut stale, mut run, mut runs) = (None, None, Vec::new());
+        // The last parent and child, and whether they are in the document.
+        let mut linked: Option<([usize; 2], bool)> = None;
         'ops: for op in codes.as_chunks::<16>().0 {
             let [code, a, b, c] =
                 [0, 4, 8, 12].map(|i| i32::from_ne_bytes([op[i], op[i + 1], op[i + 2], op[i + 3]]));
             let mut parts = ["", ""];
             for (part, units) in parts.iter_mut().zip([b, c]).take(match code {
                 0 | 4 => 2,
-                1 | 5 | 7 => 1,
+                1 | 5 | 7 | 11 => 1,
                 _ => 0,
             }) {
                 let units = usize::try_from(units).unwrap_or(usize::MAX);
@@ -323,6 +326,9 @@ impl PageState {
                 };
                 (*part, text) = text.split_at(end);
             }
+            if !matches!(code, 0 | 2 | 4 | 5 | 7 | 8 | 10) {
+                linked = None;
+            }
             let result = (|| -> Result<bool> {
                 Ok(match code {
                     0 => {
@@ -332,7 +338,8 @@ impl PageState {
                                 tag,
                                 "#text" | "#comment" | "#fragment" | "#document" | "#doctype"
                             ) || !tag.is_empty()
-                                && tag.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'),
+                                && !tag.starts_with('#')
+                                && !tag.contains(['<', '>', '/', ' ', '\0']),
                             "Invalid tag"
                         );
                         ensure!(self.tree.claim(id), "Invalid node");
@@ -362,6 +369,8 @@ impl PageState {
                         }
                         if !(current.tag == "#text"
                             && current.text.is_empty() == value.is_empty()
+                            && renderer::right_to_left(&current.text)
+                                == renderer::right_to_left(value)
                             && current
                                 .parent
                                 .is_none_or(|parent| doc.nodes[parent].tag != "style"))
@@ -398,15 +407,25 @@ impl PageState {
                                 .is_some_and(|node| node.parent == Some(parent))),
                             "Reference is not a child"
                         );
+                        // A node without children is above nothing, so building a deep tree downward walks up for
+                        // no node.
+                        let leaf = child != parent
+                            && doc.nodes[child].children.is_empty()
+                            && run.is_none_or(|(pending, _)| pending != child)
+                            && !self.tree.shadows.contains_key(&child);
                         ensure!(
-                            !self.tree.reaches(doc, parent, child),
+                            leaf || !self.tree.reaches(doc, parent, child),
                             "Cannot create a DOM cycle"
                         );
-                        if self.styles.computed.is_some()
-                            && (self.tree.reaches(doc, parent, 0)
-                                || self.tree.reaches(doc, child, 0))
-                        {
-                            self.styles.invalidate();
+                        if self.styles.computed.is_some() {
+                            let connected = match linked {
+                                Some((known, connected)) if known.contains(&parent) => connected,
+                                _ => self.tree.reaches(doc, parent, 0),
+                            };
+                            if connected || self.tree.reaches(doc, child, 0) {
+                                self.styles.invalidate();
+                            }
+                            linked = Some(([parent, child], connected));
                         }
                         if before == Some(child) {
                             return Ok(false);
@@ -508,14 +527,13 @@ impl PageState {
                             return Ok(false);
                         }
                         let fallback = current.attrs.get("value").map(String::as_str);
-                        let empty = |value: Option<&String>| {
-                            value
-                                .map(String::as_str)
-                                .or(fallback)
-                                .is_none_or(str::is_empty)
+                        // Selectors read whether the value is empty, and `dir=auto` its direction.
+                        let read = |value: Option<&String>| {
+                            let value = value.map(String::as_str).or(fallback).unwrap_or("");
+                            (value.is_empty(), renderer::right_to_left(value))
                         };
                         if self.styles.computed.is_some()
-                            && empty(current.value.as_ref()) != empty(value.as_ref())
+                            && read(current.value.as_ref()) != read(value.as_ref())
                             && self.tree.reaches(doc, id, 0)
                         {
                             self.styles.invalidate();
@@ -527,8 +545,8 @@ impl PageState {
                     }
                     8 => {
                         use crate::dom::{
-                            BROKEN, CHECKED, DIRTY, FULLSCREEN, INDETERMINATE, INVALID, LEAVING,
-                            MODAL, POPOVER, TOP_LAYER,
+                            BROKEN, CHECKED, DIRTY, FORM_ASSOCIATED, FULLSCREEN, INDETERMINATE,
+                            INVALID, LEAVING, MODAL, POPOVER, TOP_LAYER, USER,
                         };
                         let id = node(doc, a)?;
                         let bits = [
@@ -540,6 +558,8 @@ impl PageState {
                             BROKEN,
                             INDETERMINATE,
                             INVALID,
+                            USER,
+                            FORM_ASSOCIATED,
                         ]
                         .into_iter()
                         .enumerate()
@@ -553,7 +573,9 @@ impl PageState {
                             | FULLSCREEN
                             | BROKEN
                             | INDETERMINATE
-                            | INVALID;
+                            | INVALID
+                            | USER
+                            | FORM_ASSOCIATED;
                         let old = doc.nodes[id].state;
                         if old & mask == bits {
                             return Ok(false);
@@ -601,6 +623,15 @@ impl PageState {
                         };
                         self.place(doc, id, copy);
                         false
+                    }
+                    // The custom states of an element, for `:state()`.
+                    11 => {
+                        let id = node(doc, a)?;
+                        self.mutated(doc, id);
+                        if let Some(node) = doc.nodes.edit(id) {
+                            node.value = (!parts[0].is_empty()).then(|| parts[0].to_owned());
+                        }
+                        true
                     }
                     _ => bail!("Unknown DOM operation"),
                 })

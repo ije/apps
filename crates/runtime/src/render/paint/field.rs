@@ -32,7 +32,7 @@ pub(crate) struct FieldText {
 
 impl From<FieldText> for renderer::Node {
     fn from(field: FieldText) -> Self {
-        renderer::text(field.text.clone(), Some(vec![field.run.clone()])).hooks(field)
+        renderer::text(field.text.clone(), Some(Rc::new([field.run.clone()]))).hooks(field)
     }
 }
 
@@ -58,8 +58,9 @@ fn aligned_rows(
     layout: &renderer::Paragraph,
     align: renderer::TextAlign,
     rtl: bool,
+    plaintext: bool,
 ) -> crate::render::layout::Rows {
-    if align == renderer::TextAlign::Left {
+    if align == renderer::TextAlign::Left && !plaintext {
         return Rc::default();
     }
     let width = layout.bounds().size.width;
@@ -67,8 +68,13 @@ fn aligned_rows(
     let mut offset = 0;
     for line in layout.lines().iter() {
         let glyphs = &line.line.glyphs;
+        let (align, rtl) = match (plaintext, line.rtl()) {
+            (false, _) => (align, rtl),
+            (true, false) => (renderer::TextAlign::Left, false),
+            (true, true) => (renderer::TextAlign::Right, true),
+        };
         let (mut left, mut start) = (px(0.), offset);
-        for boundary in line.breaks.iter().map(Some).chain([None]) {
+        for (row, boundary) in line.breaks.iter().map(Some).chain([None]).enumerate() {
             let next = boundary.map_or(line.line.width, |&at| glyphs[at as usize].x);
             // A space at the end of a wrapped row hangs past its edge.
             let end = boundary
@@ -87,7 +93,8 @@ fn aligned_rows(
                     }
                 }
                 renderer::TextAlign::Center => free / 2.,
-                _ => free,
+                renderer::TextAlign::Left => px(0.),
+                renderer::TextAlign::Right => free,
             };
             rows.push(crate::render::layout::Row {
                 shift,
@@ -97,9 +104,7 @@ fn aligned_rows(
                 drop: px(0.),
                 above: px(0.),
             });
-            if let Some(&at) = boundary {
-                (left, start) = (next, offset + glyphs[at as usize].index as usize);
-            }
+            (left, start) = (next, offset + line.row_index(row + 1));
         }
         offset += line.len() + 1;
     }
@@ -127,7 +132,7 @@ impl renderer::Hooks for FieldText {
                     rows.clone()
                 }
                 _ => {
-                    let rows = aligned_rows(&layout, align, self.rtl);
+                    let rows = aligned_rows(&layout, align, self.rtl, self.run.plaintext);
                     *kept = Some((lines, width, align as u8, rows.clone()));
                     rows
                 }
@@ -240,6 +245,8 @@ impl renderer::Hooks for FieldText {
                 color: self.selection.0.map(renderer::Color::hex),
                 background: renderer::Color::hex(self.selection.1),
                 stroke: true,
+                tight: false,
+                lines: Default::default(),
             })
             .into_iter()
             .collect();

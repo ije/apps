@@ -652,6 +652,7 @@ impl Radii {
 
     // The radii of the box inside borders of these widths. Like Chrome, a curve that meets its sides at an
     // angle (bevel and concave shapes) keeps an even thickness, so its radii shrink less or grow.
+    #[inline(never)]
     pub fn inset(self, top: Pixels, right: Pixels, bottom: Pixels, left: Pixels) -> Self {
         let (mut x, mut y) = (self.x.to_array(), self.y.to_array());
         let shapes = self.shape.to_array();
@@ -797,6 +798,59 @@ pub(crate) fn snap_width(logical: f32, scale_factor: f32) -> f32 {
 
 // Column-major 3x3 matrices of the z = 0 plane of a CSS transform.
 pub(crate) type Plane = [f32; 9];
+
+pub(crate) fn multiply(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
+    std::array::from_fn(|index| {
+        let (column, row) = (index / 4, index % 4);
+        (0..4).map(|k| a[k * 4 + row] * b[column * 4 + k]).sum()
+    })
+}
+
+// The determinant, and the minor of the x, y and w rows and columns.
+fn determinant(m: &[f32; 16]) -> (f64, f64) {
+    let m = m.map(f64::from);
+    let minor = |columns: [usize; 3], rows: [usize; 3]| {
+        let at = |i: usize, j: usize| m[columns[i] * 4 + rows[j]];
+        at(0, 0) * (at(1, 1) * at(2, 2) - at(1, 2) * at(2, 1))
+            - at(1, 0) * (at(0, 1) * at(2, 2) - at(0, 2) * at(2, 1))
+            + at(2, 0) * (at(0, 1) * at(1, 2) - at(0, 2) * at(1, 1))
+    };
+    let det = m[0] * minor([1, 2, 3], [1, 2, 3]) - m[4] * minor([0, 2, 3], [1, 2, 3])
+        + m[8] * minor([0, 1, 3], [1, 2, 3])
+        - m[12] * minor([0, 1, 2], [1, 2, 3]);
+    (det, minor([0, 1, 3], [0, 1, 3]))
+}
+
+/// Whether a transform turns the back of its plane to the viewer, as the z axis of its inverse shows.
+pub fn faces_away(m: &[f32; 16]) -> bool {
+    let (det, minor) = determinant(m);
+    minor * det < 0.
+}
+
+/// Whether a transform has no inverse, so its box draws nothing and takes no pointer.
+pub fn singular(m: &[f32; 16]) -> bool {
+    determinant(m).0.abs() < 1e-12
+}
+
+// The corners of a shape whose last coordinate is w, cut at the plane before the viewer and divided by w.
+pub(crate) fn before_viewer<const N: usize>(points: &[[f64; N]; 4]) -> Vec<[f64; N]> {
+    const NEAR: f64 = 1e-3;
+    let mut corners = Vec::with_capacity(5);
+    for (at, p) in points.iter().enumerate() {
+        let q = &points[(at + 1) % 4];
+        let (from, to) = (p[N - 1], q[N - 1]);
+        if from > NEAR {
+            corners.push(p.map(|value| value / from));
+        }
+        if (from > NEAR) != (to > NEAR) {
+            let t = (NEAR - from) / (to - from);
+            corners.push(std::array::from_fn(|row| {
+                (p[row] + (q[row] - p[row]) * t) / NEAR
+            }));
+        }
+    }
+    corners
+}
 
 pub(crate) fn plane_of(m: &[f32; 16]) -> Plane {
     [m[0], m[1], m[3], m[4], m[5], m[7], m[12], m[13], m[15]]

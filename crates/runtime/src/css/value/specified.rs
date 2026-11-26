@@ -1,8 +1,9 @@
-use crate::css::value::grammar::grammar;
+use crate::css::value::{font::ordered, grammar::grammar};
 use crate::css::{
-    value::color::serialize as serialize_color, value::tokens::components, value::tokens::number,
-    value::tokens::write_number, value::tokens::write_printed, value::units::Kind,
-    value::units::Lengths,
+    value::anchor, value::color::serialize as serialize_color, value::shape::Position,
+    value::shape::Shaped, value::shorthand::expand, value::tokens::components,
+    value::tokens::number, value::tokens::write_number, value::tokens::write_printed,
+    value::units::Kind, value::units::Lengths,
 };
 use std::borrow::Cow;
 
@@ -18,6 +19,17 @@ pub(crate) fn specified(name: &str, value: &str) -> String {
     {
         return value.to_owned();
     }
+    if let Some(text) = anchor::specified(name, value) {
+        return text;
+    }
+    let functions = anchor::has_function(value)
+        .then(|| anchor::canonical(name, value))
+        .flatten();
+    let value = functions.as_deref().unwrap_or(value);
+    let ordered = ordered(name, value)
+        .flatten()
+        .filter(|_| !value.contains(['"', '\'']));
+    let value = ordered.as_deref().unwrap_or(value);
     let grammar = grammar(name).unwrap_or("*");
     let length =
         grammar.contains("length") && !grammar.contains("number>") && !grammar.contains("integer>")
@@ -45,6 +57,57 @@ pub(crate) fn specified(name: &str, value: &str) -> String {
             .join(", ")
     };
     match name {
+        "clip-path" | "offset-path" if let Some(shaped) = Shaped::parse(value) => shaped.text(None),
+        "overflow-clip-margin" => match components(&out, ' ')[..] {
+            ["padding-box"] => "0px".into(),
+            [edge, length] | [length, edge] if edge.ends_with("-box") => match (edge, length) {
+                ("padding-box", length) => length.into(),
+                (edge, "0px") => edge.into(),
+                _ => format!("{edge} {length}"),
+            },
+            _ => out,
+        },
+        "offset-path" if out.starts_with("url(") => out.trim_end_matches(" border-box").to_owned(),
+        "offset-rotate" => match components(&out, ' ')[..] {
+            [angle, auto @ ("auto" | "reverse")] => format!("{auto} {angle}"),
+            _ => out,
+        },
+        "offset-anchor" | "offset-position" => match Position::parse(&components(value, ' ')) {
+            Some(position) => position.text(None),
+            None => out,
+        },
+        "offset" => {
+            let mut parts = Vec::new();
+            let wide = matches!(
+                out.as_str(),
+                "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+            );
+            if wide || !expand(name, value, &mut parts) || parts.len() != 5 {
+                return out;
+            }
+            let [position, path, distance, rotate, anchor] =
+                std::array::from_fn(|index| specified(&parts[index].0, &parts[index].1));
+            let mut text = Vec::new();
+            text.extend(Some(position).filter(|position| position != "normal"));
+            if path != "none" {
+                text.push(path);
+                text.extend(Some(distance).filter(|distance| distance != "0px"));
+                text.extend(Some(rotate).filter(|rotate| rotate != "auto"));
+            }
+            if text.is_empty() {
+                text.push("normal".into());
+            }
+            if anchor != "auto" {
+                text.push(format!("/ {anchor}"));
+            }
+            text.join(" ")
+        }
+        "mask-repeat" | "background-repeat" => layers(&out, &|parts| match parts[..] {
+            ["repeat", "no-repeat"] => "repeat-x".into(),
+            ["no-repeat", "repeat"] => "repeat-y".into(),
+            [a, b] if a == b => a.into(),
+            _ => parts.join(" "),
+        }),
         "font-family" => layers(&out, &|parts| match parts[..] {
             // Chrome quotes names of several words and unquotes names that are one identifier.
             [quoted]
@@ -83,6 +146,12 @@ pub(crate) fn specified(name: &str, value: &str) -> String {
             }
             _ => parts.join(" "),
         }),
+        "align-items" | "align-self" | "align-content" | "justify-items" | "justify-self"
+            if out == "first baseline" =>
+        {
+            "baseline".into()
+        }
+        "shape-outside" => crate::css::value::outside_text(&out, None).unwrap_or(out),
         "grid-auto-flow" if out.contains("dense") => if out.contains("column") {
             "column dense"
         } else {
@@ -473,7 +542,7 @@ pub(super) fn math_sum(text: &str, units: Option<&Lengths>) -> Option<String> {
     Some(out)
 }
 
-fn canonical(value: &str, length: bool, named: bool, out: &mut String) {
+pub(super) fn canonical(value: &str, length: bool, named: bool, out: &mut String) {
     for (index, item) in components(value, ',').into_iter().enumerate() {
         if index > 0 {
             out.push_str(", ");

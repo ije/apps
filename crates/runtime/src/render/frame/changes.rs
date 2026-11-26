@@ -280,10 +280,13 @@ pub(super) fn detect(
                 let inside = child_info.flags & cull::HIDDEN == 0
                     && cx.view.outs.borrow().contains_key(&child)
                     && cx.view.kept.borrow().contains_key(&child);
-                out = out.wrapping_add(match inside {
-                    true => child_info.shell,
-                    false => child_info.subtree,
-                });
+                // Positioned boxes paint in their order.
+                out = (out.rotate_left(5)
+                    ^ match inside {
+                        true => child_info.shell,
+                        false => child_info.subtree,
+                    })
+                .wrapping_mul(0x517c_c1b7_2722_0a95);
             } else {
                 std::hash::Hasher::write_usize(&mut list, child);
                 std::hash::Hasher::write_usize(&mut kids, child);
@@ -645,7 +648,9 @@ pub(super) fn repaint(state: &mut PageState, window: &mut renderer::Window) {
     let selection = (state.interaction.selection.iter())
         .map(|entry| hash(&|h| entry.hash(h)))
         .fold(0u64, u64::wrapping_add);
-    let inputs = hash(&|h| (images, selection, state.interaction.selection_caret).hash(h));
+    let interaction = &state.interaction;
+    let marks = (interaction.selection_caret, interaction.highlight_changes);
+    let inputs = hash(&|h| (images, selection, marks).hash(h));
     if std::mem::replace(&mut state.layout.paint_inputs, inputs) != inputs {
         window.repaint();
     }

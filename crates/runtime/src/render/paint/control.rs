@@ -17,6 +17,8 @@ pub(crate) enum Control {
     Color,
     Disclosure,
     Resizer,
+    Date,
+    Time,
 }
 
 /// The control, whether it draws its native box, and whether it has `appearance: none` and draws its parts
@@ -337,8 +339,8 @@ fn svg(look: &Look, w: f32, h: f32) -> Option<String> {
         Control::Menu => {
             write!(
                 body,
-                r#"<path d="M{} {}l3.5 3.5l3.5 -3.5" fill="none" stroke="{}" stroke-width="1.5"/>"#,
-                w - 9.5,
+                r#"<path d="M{} {}l3.6 3.6l3.6 -3.6" fill="none" stroke="{}"/>"#,
+                w - 9.2,
                 h / 2. - 1.75,
                 hex(look.ink),
             )
@@ -351,6 +353,24 @@ fn svg(look: &Look, w: f32, h: f32) -> Option<String> {
                 (w - 9.).max(0.),
                 (h - 11.).max(0.),
                 hex(look.accent),
+            )
+            .ok()?;
+        }
+        Control::Date | Control::Time => {
+            let path = match look.control {
+                Control::Date => {
+                    "M5.7 1.1h1.8v1.8h10V1.1h1.8v1.8h1C21.5 2.9 22 3.6 22 4.5v15c0 1-.7 1.6-1.6 1.6H4.6C3.6 21.1 3 20.4 3 19.5v-15c0-1 .7-1.6 1.6-1.6h1.1zM4.8 7.6v11.6h15.4V7.6z"
+                }
+                _ => {
+                    "M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z"
+                }
+            };
+            write!(
+                body,
+                r#"<path transform="scale({} {})" d="{path}" fill-rule="evenodd" fill="{}"/>"#,
+                w / 24.,
+                h / 24.,
+                hex(look.ink)
             )
             .ok()?;
         }

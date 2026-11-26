@@ -1,7 +1,7 @@
 use super::{
     RunCursor, SharedString, TextAlign, TextCanvas, TextLine, TextRun, TextStyle, TextSystem,
     TextWrap, WhiteSpace, WordBreak, Wrapping,
-    breaks::{Banded, breaks_beside},
+    breaks::{Banded, Indent, breaks_beside},
 };
 use crate::{AvailableSpace, Pixels, Point, Rect, Size, px};
 use std::{
@@ -25,6 +25,8 @@ struct ParagraphState {
     wrap_width: Option<Pixels>,
     floats: Option<Rc<[[f32; 4]]>>,
     truncated: bool,
+    // Where the ellipsis starts.
+    cut: Option<usize>,
     size: Size<Pixels>,
     baselines: [Pixels; 2],
     bounds: Option<Rect<Pixels>>,
@@ -36,7 +38,7 @@ struct ParagraphState {
 
 pub(crate) struct TextState {
     text: SharedString,
-    runs: RefCell<Vec<TextRun>>,
+    runs: RefCell<Rc<[TextRun]>>,
     style: RefCell<TextStyle>,
     scale: f32,
     pub(crate) layout: Paragraph,
@@ -54,12 +56,12 @@ type Base = (Rc<[TextLine]>, [Pixels; 2]);
 impl TextState {
     pub(crate) fn new(
         text: SharedString,
-        runs: Option<Vec<TextRun>>,
+        runs: Option<Rc<[TextRun]>>,
         style: &TextStyle,
         scale: f32,
     ) -> Self {
         Self {
-            runs: RefCell::new(runs.unwrap_or_else(|| vec![style.run(text.len())])),
+            runs: RefCell::new(runs.unwrap_or_else(|| Rc::new([style.run(text.len())]))),
             text,
             style: RefCell::new(style.clone()),
             scale,
@@ -90,7 +92,8 @@ impl TextState {
         let (old, runs) = (self.runs.borrow(), new.runs.borrow());
         let mut last: Option<(&TextRun, &TextRun)> = None;
         // Runs split where their decoration changes, which breaks ligatures, so those places must stay.
-        let same = old.len() == runs.len()
+        let same = Rc::ptr_eq(&old, &runs)
+            || old.len() == runs.len()
             && old
                 .iter()
                 .zip(runs.iter())
@@ -102,12 +105,13 @@ impl TextState {
                     });
                     last = Some((a, b));
                     joined
-                        && same!(a, b; len, font, letter_spacing, word_spacing, font_size, inset, nowrap)
+                        && same!(a, b; len, font, letter_spacing, word_spacing, font_size, inset, nowrap, clear, hyphenation, rtl, plaintext, embedding)
                 });
         if !same {
             return false;
         }
-        if *old != *runs || *self.style.borrow() != *new.style.borrow() {
+        if !Rc::ptr_eq(&old, &runs) && *old != *runs || *self.style.borrow() != *new.style.borrow()
+        {
             drop((old, runs));
             self.runs.swap(&new.runs);
             self.style.swap(&new.style);
@@ -145,7 +149,7 @@ impl TextState {
             ..
         } = self;
         let (runs, style) = (self.runs.borrow(), self.style.borrow());
-        let (runs, style) = (&*runs, &*style);
+        let (runs, style): (&[TextRun], _) = (&runs, &*style);
         // Like Chrome's layout units, which count device pixels, a line is at most 2^25 device pixels tall.
         let line_height = style.line_height.min(px(33_554_431. / scale.max(1.)));
         let definite = |space: AvailableSpace| match space {
@@ -155,10 +159,7 @@ impl TextState {
         let width = known.width.or(definite(available.width));
         let wraps = style.white_space == WhiteSpace::Normal;
         let wrap_width = width.filter(|_| wraps);
-        let indent = match style.text_indent_percent {
-            0. => style.text_indent,
-            percent => style.text_indent + px(width.map_or(0., |width| width.0) * percent),
-        };
+        let indent = style.indent(width.unwrap_or_default());
         let truncate = style.text_overflow.clone().zip(width);
         let probe = ((wraps || style.float > px(0.)) && width.is_none())
             .then(|| (available.width != AvailableSpace::MinContent) as usize);
@@ -221,13 +222,15 @@ impl TextState {
             float == px(0.)
                 && wrap_width.is_none()
                 && style.line_clamp.is_none()
-                && indent == px(0.)
+                && style.text_indent == px(0.)
+                && style.text_indent_percent == 0.
                 && {
                     let mut kept = self.base.borrow_mut();
                     let (lines, _) = kept.get_or_insert_with(base);
                     lines.len() == 1 && lines[0].line.width <= *width - lean
                 }
         });
+        let mut cut = None;
         let (lines, top, truncated) = if (truncate.is_none() || fits) && float == px(0.) {
             let mut kept = self.base.borrow_mut();
             let (lines, [first, rest]) = kept.get_or_insert_with(base);
@@ -238,8 +241,8 @@ impl TextState {
             let lines = match wrap {
                 Some((width, ..))
                     if banded.is_none()
-                        && *first <= width.min(width - indent)
-                        && *rest <= width =>
+                        && *first <= width.min(width - indent.first)
+                        && *rest <= width.min(width - indent.of(1)[0]) =>
                 {
                     lines.clone()
                 }
@@ -256,36 +259,49 @@ impl TextState {
                         .enumerate()
                         .map(|(index, line)| {
                             let (mut ranges, mut at) = (Vec::new(), 0);
+                            let mut pieces = Vec::new();
                             cursor.take(line.len(), |len, run| {
+                                if line.extra.is_some() {
+                                    pieces.push((len, run));
+                                }
                                 if run.nowrap {
                                     ranges.push(at..at + len);
                                 }
                                 at += len;
                             });
-                            cursor.take(1, |_, _| {});
+                            let mut clear = 0;
+                            cursor.take(1, |_, run| clear = run.clear);
                             let wrapping = Wrapping {
                                 width: Some(width),
                                 max_lines: clamp.map(|max: usize| max.saturating_sub(wrapped)),
-                                indent: if index == 0 { indent } else { px(0.) },
+                                indent: indent.line(index),
                                 wrap,
                                 word_break,
                             };
                             let boundaries = breaks_beside(
-                                &line.line,
+                                line.logical(),
                                 &line.text,
                                 &wrapping,
                                 &ranges,
+                                line.hyphens().unwrap_or_default(),
                                 banded.as_mut(),
                             );
                             wrapped += boundaries.len() + 1;
-                            TextLine {
+                            let mut line = TextLine {
                                 breaks: boundaries.into(),
                                 wrap: Some(width),
                                 shifts: banded.as_mut().map_or_else(Rc::default, |banded| {
+                                    if clear > 0 {
+                                        banded.clear(clear);
+                                    }
                                     std::mem::take(&mut banded.rows).into()
                                 }),
                                 ..line.clone()
+                            };
+                            if let Some(extra) = &line.extra {
+                                line.arrange(extra.rtl, &pieces);
                             }
+                            line
                         })
                         .collect()
                 }
@@ -296,6 +312,7 @@ impl TextState {
                 Some((affix, width)) => {
                     let (text, runs, truncated) =
                         truncate_text(system, style, text, runs, &affix, width - lean, wrap_width);
+                    cut = truncated.then(|| text.len() - affix.len());
                     (text, Cow::Owned(runs), truncated)
                 }
                 None => (text.clone(), Cow::Borrowed(runs), false),
@@ -349,17 +366,17 @@ impl TextState {
         let mut size = Size::<Pixels>::default();
         for (index, line) in lines.iter().enumerate() {
             let mut line_size = line.extent(line_height);
-            if index == 0 && line.breaks.is_empty() {
-                line_size.width = (line_size.width + indent).max(px(0.));
+            if line.breaks.is_empty() {
+                line_size.width = (line_size.width + indent.of(index)[0]).max(px(0.));
             }
             size.height += line_size.height;
             size.width = size.width.max(line_size.width);
         }
         if min_content {
-            size.width = widest_piece(&lines, float - top - indent);
+            size.width = widest_piece(&lines, float - top, indent);
         } else if wrap_width.is_some() && !truncated {
             // Like CSS, a box that fits its content in the available width is never narrower than its widest word.
-            size.width = size.width.max(widest_piece(&lines, float - top - indent));
+            size.width = size.width.max(widest_piece(&lines, float - top, indent));
         }
         if let Some(banded) = &banded {
             size.height = px(banded.y);
@@ -389,6 +406,7 @@ impl TextState {
                 wrap_width,
                 floats,
                 truncated,
+                cut,
                 size,
                 baselines,
                 bounds: None,
@@ -400,13 +418,18 @@ impl TextState {
     }
 }
 
-pub fn widest_piece(lines: &[TextLine], mut start: Pixels) -> Pixels {
+pub fn widest_piece(lines: &[TextLine], float: Pixels, indent: Indent) -> Pixels {
     let mut width = px(0.);
-    for line in lines {
+    for (index, line) in lines.iter().enumerate() {
+        let first = indent.of(index)[0];
+        let mut start = if index == 0 { float } else { px(0.) } - first;
         let glyphs = &line.line.glyphs;
         let mut breaks = line.breaks.iter().peekable();
         for (at, glyph) in glyphs.iter().enumerate() {
             if breaks.next_if(|&&next| next as usize == at).is_some() {
+                if let Some(hyphen) = line.hyphen_before(glyph.index as usize) {
+                    width = width.max(glyph.x + hyphen.line.width - start);
+                }
                 start = glyph.x;
             }
             let end = glyphs.get(at + 1).map_or(line.line.width, |next| next.x);
@@ -414,7 +437,6 @@ pub fn widest_piece(lines: &[TextLine], mut start: Pixels) -> Pixels {
                 width = width.max(end - start);
             }
         }
-        start = px(0.);
     }
     width
 }
@@ -456,10 +478,12 @@ impl Paragraph {
     pub(crate) fn overflow(&self) -> Option<Pixels> {
         let inner = self.0.borrow();
         let state = inner.as_ref()?;
-        let width = state
-            .overflow
-            .get()
-            .unwrap_or_else(|| state.size.width.max(widest_piece(&state.lines, px(0.))));
+        let width = state.overflow.get().unwrap_or_else(|| {
+            state
+                .size
+                .width
+                .max(widest_piece(&state.lines, px(0.), Indent::default()))
+        });
         state.overflow.set(Some(width));
         Some(width)
     }
@@ -523,18 +547,36 @@ impl Paragraph {
                 start += line.len() + 1;
             } else {
                 let at = position - origin;
+                // The ellipsis is not in the text.
+                let place = |index| inner.cut.unwrap_or(usize::MAX).min(start + index);
                 return match line.hit((at.y / inner.line_height) as usize, at.x, nearest) {
-                    Ok(index) => Ok(start + index),
-                    Err(index) => Err(start + index),
+                    Ok(index) => Ok(place(index)),
+                    Err(index) => Err(place(index)),
                 };
             }
         }
-        Err(start.saturating_sub(1))
+        Err(inner.cut.unwrap_or(usize::MAX).min(start.saturating_sub(1)))
+    }
+
+    /// The spaces left of `x` in a row of the paragraph.
+    pub fn spaces_before(&self, mut row: usize, x: Pixels) -> usize {
+        let inner = self.0.borrow();
+        for line in inner.iter().flat_map(|inner| inner.lines.iter()) {
+            if row < line.rows() {
+                return line.spaces_before(row, x);
+            }
+            row -= line.rows();
+        }
+        0
     }
 
     pub fn point_at(&self, index: usize) -> Option<Point<Pixels>> {
         let inner = self.0.borrow();
         let inner = inner.as_ref()?;
+        // Like the text after it, the text under the ellipsis has no place.
+        if inner.cut.is_some_and(|cut| index > cut) {
+            return None;
+        }
         let mut origin = inner.bounds?.origin + Point::new(px(0.), inner.top);
         let mut start = 0;
         for line in inner.lines.iter() {
@@ -550,6 +592,15 @@ impl Paragraph {
             }
         }
         None
+    }
+
+    /// Some glyphs are not in the order of the text, or a right-to-left row can have spaces at its left, or a line places edges of inline boxes.
+    pub fn reordered(&self) -> bool {
+        (self.0.borrow().as_ref()).is_some_and(|inner| {
+            (inner.lines.iter()).any(|line| {
+                line.rtl() || line.lead(0).is_some() || line.extra.is_some() && !line.line.sorted()
+            })
+        })
     }
 
     pub fn lines(&self) -> Rc<[TextLine]> {
@@ -569,7 +620,7 @@ impl Paragraph {
 
     pub fn shape(
         text: SharedString,
-        runs: Vec<TextRun>,
+        runs: Rc<[TextRun]>,
         style: &TextStyle,
         width: Pixels,
         bounds: Rect<Pixels>,
@@ -613,8 +664,8 @@ impl Paragraph {
 }
 
 pub(crate) fn same_shaping(a: &TextStyle, b: &TextStyle) -> bool {
-    same!(a, b; font_family, font_features, font_size, line_height, font_weight, font_style, font_synthesis,
-        white_space, text_overflow, line_clamp, letter_spacing, word_spacing, text_indent, text_indent_percent, float, text_wrap, word_break)
+    same!(a, b; font_family, font_features, font_size, line_height, font_weight, font_style, font_synthesis, font_size_adjust,
+        white_space, text_overflow, line_clamp, letter_spacing, word_spacing, text_indent, text_indent_percent, text_indent_rows, float, text_wrap, word_break)
 }
 
 fn truncate_text(
@@ -651,7 +702,8 @@ fn truncate_text(
                 for end in ends {
                     rows += 1;
                     if rows == max && (end < glyphs || line.text.len() + start < text.len()) {
-                        found = Some((start, line.line.clone(), row_start..end, wrap));
+                        let layout = line.logical().clone();
+                        found = Some((start, layout, row_start..end, wrap));
                         break;
                     }
                     row_start = end;
@@ -666,7 +718,10 @@ fn truncate_text(
         None => lines
             .first()
             .filter(|line| lines.len() > 1 || line.line.width > width)
-            .map(|line| (0, line.line.clone(), 0..line.line.glyphs.len(), width)),
+            .map(|line| {
+                let layout = line.logical().clone();
+                (0, layout, 0..line.line.glyphs.len(), width)
+            }),
     };
     let Some((offset, layout, row, room)) = cut else {
         return unchanged();
@@ -682,26 +737,29 @@ fn truncate_text(
         })
         .unwrap_or_else(|| style.run(affix.len()));
     let affix_width = system.shape_line(affix, font_size, &affix_run).line.width;
-    // Rows wrap glyphs in visual order, so a right-to-left line has falling text indexes. Its cut keeps the text
-    // from its logical start that is as wide as the rows before the cut row and the room in that row.
     let glyphs = &layout.glyphs;
-    let rtl = (glyphs.first())
-        .zip(glyphs.last())
-        .is_some_and(|(first, last)| first.index > last.index);
     let left = glyphs.get(row.start).map_or(px(0.), |glyph| glyph.x);
     let room = left + (room - affix_width).max(px(0.));
-    let mut used = if rtl { px(0.) } else { left };
-    let fits = |at: usize| {
-        used += glyphs.get(at + 1).map_or(layout.width, |next| next.x) - glyphs[at].x;
-        (used > room).then_some(glyphs[at].index as usize)
-    };
-    let index = if rtl {
-        (0..glyphs.len()).rev().find_map(fits).unwrap_or(layout.len)
-    } else {
-        let row_end = glyphs
-            .get(row.end)
-            .map_or(layout.len, |glyph| glyph.index as usize);
-        row.into_iter().find_map(fits).unwrap_or(row_end)
+    let mut used = left;
+    let row_end = glyphs
+        .get(row.end)
+        .map_or(layout.len, |glyph| glyph.index as usize);
+    let index = row
+        .into_iter()
+        .find_map(|at| {
+            used += glyphs.get(at + 1).map_or(layout.width, |next| next.x) - glyphs[at].x;
+            (used > room).then_some(glyphs[at].index as usize)
+        })
+        .unwrap_or(row_end);
+    // Like Chrome, a run of the other direction is whole or not there.
+    let level = |at: usize| layout.levels.get(at).map_or(0, |level| level % 2);
+    let base = u8::from(runs.first().is_some_and(|run| run.rtl));
+    let at = glyphs.partition_point(|glyph| (glyph.index as usize) < index);
+    let index = match at < glyphs.len() && at > 0 && level(at) != base && level(at - 1) != base {
+        true => (0..at)
+            .rfind(|&at| level(at) == base)
+            .map_or(index, |at| glyphs[at + 1].index as usize),
+        false => index,
     };
     let end = offset + index;
     let mut kept = String::with_capacity(end + affix.len());
@@ -715,7 +773,7 @@ fn truncate_text(
             break;
         }
         let len = run.len.min(remaining);
-        new_runs.push(TextRun { len, ..run.clone() });
+        new_runs.push(run.part(len, run.inset));
         remaining -= len;
     }
     match new_runs.last_mut() {
@@ -761,7 +819,8 @@ mod tests {
             color: Color::hex(color),
             ..style.run(len)
         };
-        let state = |runs: Vec<TextRun>| TextState::new("ab cd".into(), Some(runs), &style, 1.);
+        let state =
+            |runs: Vec<TextRun>| TextState::new("ab cd".into(), Some(runs.into()), &style, 1.);
         let old = state(vec![run(2, 0xff0000ff), run(3, 0x0000ffff)]);
         *old.layout.0.borrow_mut() = Some(ParagraphState {
             shaped_width: None,
@@ -771,6 +830,7 @@ mod tests {
             wrap_width: None,
             floats: None,
             truncated: false,
+            cut: None,
             size: Size::default(),
             baselines: [px(0.); 2],
             bounds: None,

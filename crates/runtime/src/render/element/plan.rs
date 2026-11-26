@@ -106,9 +106,11 @@ impl Plan {
                 ]
                 .iter()
                 .all(|&prop| {
-                    style
-                        .get(prop)
-                        .is_none_or(|value| !value.contains("content"))
+                    style.get(prop).is_none_or(|value| {
+                        !["content", "calc-size", "stretch", "-webkit-fill"]
+                            .iter()
+                            .any(|keyword| value.contains(keyword))
+                    })
                 }),
         }
     }

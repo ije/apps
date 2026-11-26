@@ -1168,3 +1168,107 @@ fn inline_boxes_split_around_their_blocks_like_chrome() {
         "{text}"
     );
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn empty_inline_pseudo_elements_make_no_line() {
+    let text = run_hidden(
+        r#"
+        await load('empty.html');
+        console.log('EMPTY ' + await run("['p', 'i', 'b', 't'].map(id => document.getElementById(id).getBoundingClientRect()).map(box => [box.top, box.height].join('/')).join()"));
+        "#,
+        &[(
+            "empty.html",
+            "<body style='margin:0;font:16px/20px Helvetica'><style>.q::before{content:''}p{margin:10px 0}table{border-spacing:0;table-layout:fixed;width:100px}td{padding:0}</style>\
+             <p class=q id=p></p><p class=q></p><div>text<i class=q id=i></i></div><div><b class=q id=b>text</b></div><table><tr><td id=t class=q style='width:calc(1 / 2 * 100%)'><td></table></body>",
+        )],
+    );
+    assert!(
+        text.contains("EMPTY 10/0,10.5/18.5,30.5/18.5,50/0\n"),
+        "{text}"
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn custom_highlights_draw_and_follow_their_ranges() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const marked = async () => {
+          const data = (await win.webContents.capturePage({ x: 0, y: 0, width: 300, height: 24 })).toBitmap();
+          let count = 0;
+          for (let i = 0; i < data.length; i += 4) if (data[i] < 40 && data[i + 1] > 200 && data[i + 2] < 40) count++;
+          return count;
+        };
+        await run(`globalThis.range = new Range(), range.setStart(p.firstChild, 0), range.setEnd(p.firstChild, 3), globalThis.mark = new Highlight(range), CSS.highlights.set('m', mark), 0`.replaceAll('p.firstChild', `document.getElementById('p').firstChild`));
+        const first = await marked();
+        await run(`range.setEnd(document.getElementById('p').firstChild, 8), 0`);
+        const wider = await marked();
+        await run(`document.getElementById('p').firstChild.insertData(0, 'iii '), 0`);
+        const moved = await marked();
+        await run(`mark.clear(), 0`);
+        const none = await marked();
+        if (!(first > 100 && wider > first * 1.5 && moved >= wider && none === 0)) fail(JSON.stringify([first, wider, moved, none]));
+        // In mixed text, a highlight of the end of one word and the start of the next has two parts.
+        await run(`globalThis.mixed = new Range(), mixed.setStart(document.getElementById('r').firstChild, 2), mixed.setEnd(document.getElementById('r').firstChild, 5), CSS.highlights.set('m', new Highlight(mixed)), 0`);
+        const size = (await win.webContents.capturePage({ x: 0, y: 24, width: 300, height: 24 })).getSize();
+        const data = (await win.webContents.capturePage({ x: 0, y: 24, width: 300, height: 24 })).toBitmap();
+        let green = [], at = (Math.floor(data.length / 4 / size.width / 2)) * size.width * 4;
+        for (let x = 0; x < size.width; x++) green.push(data[at + x * 4] < 40 && data[at + x * 4 + 1] > 200);
+        const spans = green.filter((on, x) => on && !green[x - 1]).length;
+        if (spans < 2) fail('mixed ' + spans);
+        "#,
+        &[(
+            "page.html",
+            "<body style='margin:0;font:16px/24px Helvetica;background:#fff'><style>::highlight(m){background-color:#0f0}</style><div id=p>one two three</div><div id=r dir=rtl style='width:300px'>abc אבג</div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn hyphens_indents_last_lines_and_mixed_directions_lay_out_like_chrome() {
+    let (text, rects) = picture_rects(
+        "lines.html",
+        "<meta charset=utf-8><body style='margin:0;font:18px/20px Helvetica'>\
+         <div class=w style='width:100px'><span id=a>extra&shy;ordi&shy;nary</span></div>\
+         <div class=w style='width:100px;hyphens:none'><span id=b>extra&shy;ordi&shy;nary</span></div>\
+         <div class=w style='width:min-content'><span id=c>extra&shy;ordi&shy;nary</span></div>\
+         <div class=w style='width:300px;text-align-last:right'><span id=d>last</span></div>\
+         <div class=w style='width:300px;text-align-last:justify'>a <span id=e>b</span></div>\
+         <div class=w style='width:100px;text-indent:30px hanging'>hanging indents of <span id=f>rows</span></div>\
+         <div class=w dir=rtl style='width:100px'><span id=g>אבג</span> דהו זחט יכל <span id=h>מנס</span></div>\
+         <div class=w style='width:300px'>ab <span id=i>אב</span> גד</div>\
+         <div class=w style='width:300px'><bdo dir=rtl>a<span id=j>b</span>cd</bdo></div></body>",
+    );
+    let at = |id: &str| -> Vec<f32> {
+        rects[id]
+            .split(',')
+            .map(|value| value.parse().unwrap())
+            .collect()
+    };
+    assert_eq!(at("a")[3], 40.5, "two rows: {text}");
+    assert!(
+        at("a")[2] < 100.,
+        "the first row and its hyphen fit: {text}"
+    );
+    assert!(at("b")[3] < 30. && at("b")[2] > 100., "one row: {text}");
+    assert_eq!(at("c")[3], 60.5, "a row for each syllable: {text}");
+    let right = |id| at(id)[0] + at(id)[2];
+    assert!((right("d") - 300.).abs() < 1., "{text}");
+    assert!((right("e") - 300.).abs() < 1., "{text}");
+    assert!(at("f")[0] >= 30., "{text}");
+    assert!(
+        (right("g") - 100.).abs() < 1. && at("g")[1] < at("h")[1],
+        "{text}"
+    );
+    assert!(
+        at("i")[0] > 45.,
+        "the first word of a run is at its right: {text}"
+    );
+    assert!(
+        at("j")[0] > 10. && at("j")[0] < 25.,
+        "c and d come before b: {text}"
+    );
+}

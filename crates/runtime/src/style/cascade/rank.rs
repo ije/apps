@@ -1,5 +1,5 @@
 // Origin values are in precedence order and important ones rank `IMPORTANT - origin`, so don't reorder them.
-use crate::css::{properties::LOGICAL, properties::Prop, properties::Style};
+use crate::css::{properties::LOGICAL, properties::Prop, properties::Style, properties::side};
 use crate::style::cascade::shadow::ShadowRule;
 use bbtree::unsync::BBTreeMap;
 pub(crate) const AGENT: u8 = 0;
@@ -115,29 +115,32 @@ pub(crate) fn put<V>(
     }
 }
 
-pub(crate) fn physical<V: AsRef<str>>(
+pub(crate) fn physical<V: AsRef<str> + Clone>(
     cascade: &mut BBTreeMap<Prop, (CascadeRank, V)>,
     parent: &Style,
 ) {
-    if !LOGICAL
-        .iter()
-        .any(|(logical, ..)| cascade.contains_key(logical))
-    {
-        return;
-    }
-    let rtl = match cascade
-        .get(&Prop::DIRECTION)
-        .map(|(_, value)| value.as_ref())
-    {
-        Some("rtl") => true,
-        Some("ltr") => false,
-        _ => parent.get(Prop::DIRECTION) == Some("rtl"),
-    };
-    for (logical, ltr, rtl_side) in LOGICAL {
-        if let Some((rank, value)) = cascade.remove(&logical) {
-            let physical = if rtl { rtl_side } else { ltr };
-            put(cascade, physical, rank, value);
+    let vertical = |mode: &str| mode.starts_with("vertical") || mode.starts_with("sideways");
+    let lines = cascade
+        .get(&Prop::WRITING_MODE)
+        .filter(|(_, mode)| {
+            vertical(mode.as_ref()) && !parent.get(Prop::WRITING_MODE).is_some_and(vertical)
+        })
+        .cloned();
+    if cascade.keys().any(|prop| prop.is_logical()) {
+        let rtl = match cascade.get(&Prop::DIRECTION).map(|value| value.1.as_ref()) {
+            Some("rtl") => true,
+            Some("ltr") => false,
+            _ => parent.get(Prop::DIRECTION) == Some("rtl"),
+        };
+        let mode = lines.as_ref().map(|(_, mode)| mode.as_ref());
+        for (logical, ..) in LOGICAL {
+            if let Some((rank, value)) = cascade.remove(&logical) {
+                put(cascade, side(logical, rtl, mode), rank, value);
+            }
         }
+    }
+    if let Some((rank, mode)) = lines {
+        put(cascade, Prop::INTERNAL_LINES, rank, mode);
     }
 }
 // While rules are collected, `rank` is the index of the layer in `Collect.layers`, not its rank.

@@ -503,8 +503,8 @@ float blurred_box(float2 p, float4 box, float4 rx, float4 ry, float2 shape, floa
 
 float wave_coverage(float2 p, float4 rect, float thickness) {
     float x = p.x - rect.x;
-    float frequency = 2.0 * PI * thickness / (rect.w * rect.w);
-    float amplitude = 0.8 * thickness;
+    float frequency = 2.0 * PI / (1.0 + 2.0 * floor(2.0 * thickness + 1.0));
+    float amplitude = 0.2887 * (0.5 + floor(3.0 * thickness + 1.0));
     float slope = amplitude * frequency * cos(x * frequency);
     float gap = (p.y - rect.y - rect.w * 0.5 - amplitude * sin(x * frequency)) / sqrt(1.0 + slope * slope);
     return saturate(0.5 - (abs(gap) - thickness * 0.5));
@@ -575,6 +575,10 @@ float4 draw_fragment(Varyings v) : SV_Target {
         color = premultiply(v.color);
         if ((flags & 1u) != 0u) {
             color *= wave_coverage(p, v.rect, v.info.z);
+        } else if ((flags & 6u) != 0u) {
+            float x = p.x - v.rect.x - v.aux.x * 0.5;
+            float2 spot = float2(x - round(x / v.aux.y) * v.aux.y, p.y - v.rect.y - v.rect.w * 0.5);
+            color *= saturate(0.5 + v.aux.x * 0.5 - ((flags & 4u) != 0u ? length(spot) : abs(spot.x)));
         }
     } else if (kind == GLYPH) {
         float coverage = t0.SampleLevel(filtered, v.texel / texture_size(t0), 0.0).r;
@@ -750,7 +754,9 @@ float4 composite_fragment(Placed v) : SV_Target {
     if ((c.flags & COMPOSITE_BLEND) != 0u && color.a > 0.0) {
         float4 below = t2.SampleLevel(filtered, (p - c.backdrop_rect.xy) / c.backdrop_rect.zw, 0.0);
         if (c.blend == 16u) {
-            return float4(min(color.rgb + below.rgb, (float3)1.0) - below.rgb * (1.0 - color.a), color.a);
+            // The source-over blend of the result gives the sums of the colors and of the alphas.
+            float kept = below.a < 1.0 ? max(1.0 - color.a - below.a, 0.0) / (1.0 - below.a) : 1.0 - color.a;
+            return float4(min(color.rgb + below.rgb, (float3)1.0) - below.rgb * kept, 1.0 - kept);
         }
         float3 b = below.a > 0.0 ? below.rgb / below.a : (float3)0.0;
         float3 s = color.rgb / color.a;

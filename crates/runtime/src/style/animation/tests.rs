@@ -143,6 +143,20 @@ fn values_interpolate_by_type() {
     };
     assert_eq!(mix("color", "red", "blue", 0.5).unwrap(), "#800080ff");
     assert_eq!(
+        mix("height", "0", "calc-size(auto, size)", 0.25).unwrap(),
+        "calc-size(auto, (0px) * 0.75 + (size) * 0.25)"
+    );
+    assert_eq!(
+        mix(
+            "height",
+            "calc-size(min-content, size)",
+            "calc-size(auto, size)",
+            0.25
+        ),
+        None
+    );
+    assert_eq!(mix("height", "0px", "auto", 0.25), None);
+    assert_eq!(
         mix("color", "transparent", "red", 0.5).unwrap(),
         "#ff000080"
     );
@@ -425,7 +439,10 @@ fn registered_custom_properties_animate_and_transition() {
     assert_eq!(values.get(Prop::new("--c")), Some("#008080ff"));
     assert_eq!(values.get(Prop::new("--u")), None);
     let restyled = restyle(&doc, frame.custom.clone());
-    assert_eq!(restyled.values[p].get(Prop::COLOR), Some("#008080ff"));
+    assert_eq!(
+        restyled.values[p].get(Prop::COLOR),
+        Some("rgb(0, 128, 128)")
+    );
 }
 
 #[test]
@@ -1845,7 +1862,7 @@ fn keyframes_interpolate_filters_keywords_shapes_and_steps() {
             Some("550"),
             Some("2.5px"),
             Some("2px"),
-            Some("inset(5px 10px 5px 10px)"),
+            Some("inset( 5px 10px 5px 10px round 0px 0px 0px 0px / 0px 0px 0px 0px)"),
             Some("-2")
         ]
     );
@@ -1869,4 +1886,60 @@ fn keyframes_interpolate_filters_keywords_shapes_and_steps() {
         [0.5, 1., 1.6].map(opacity),
         ["0", "0.5", "1"].map(|v| Some(v.into()))
     );
+}
+
+#[test]
+fn shapes_interpolate_like_chrome() {
+    let units = crate::css::value::units::Lengths::new(16., 800., 600.);
+    let at = |from: &str, to: &str| {
+        let lerp = lerp("clip-path", from, to)?;
+        let mut out = String::new();
+        lerp.write(0.3, &mut out);
+        Some(
+            crate::css::value::shape::Shaped::parse(&out)
+                .unwrap_or_else(|| panic!("{out}"))
+                .text(Some(&units)),
+        )
+    };
+    for (from, to, expected) in [
+        (
+            "xywh(0 0 10px 10px)",
+            "xywh(10px 10% 20px 20px round 5px)",
+            "inset(3% calc(100% - 16px) calc(97% - 13px) 3px round 1.5px)",
+        ),
+        (
+            "circle(10px)",
+            "circle(20% at 10px 10px)",
+            "circle(calc(6% + 7px) at calc(35% + 3px) calc(35% + 3px))",
+        ),
+        (
+            "path('M0 0L10 10')",
+            "shape(from 10px 10px, line to 100% 50%)",
+            "shape(from 3px 3px, line to calc(30% + 7px) calc(15% + 7px))",
+        ),
+        (
+            "path('M0 0h10a5 5 0 0 1 10 10Z')",
+            "path('M10 10H20a15 15 0 0 1 5 5Z')",
+            "path(\"M 3 3 H 13 A 8 8 0 0 1 21.5 11.5 Z\")",
+        ),
+        (
+            "shape(from 0 0, arc to 1px 1px of 5px 5px small cw)",
+            "shape(from 0 0, arc to 1px 1px of 5px 5px large ccw rotate 90deg)",
+            "shape(from 0px 0px, arc to 1px 1px of 5px 5px cw large rotate 27deg)",
+        ),
+    ] {
+        assert_eq!(at(from, to).as_deref(), Some(expected));
+    }
+    for (from, to) in [
+        ("none", "circle(1px)"),
+        ("circle(closest-side)", "circle(1px)"),
+        ("circle(1px) content-box", "circle(2px)"),
+        ("polygon(0 0)", "polygon(evenodd, 1px 1px)"),
+        (
+            "shape(from 0 0, line by 1px 1px)",
+            "shape(from 0 0, line to 1px 1px)",
+        ),
+    ] {
+        assert_eq!(at(from, to), None, "{from} {to}");
+    }
 }

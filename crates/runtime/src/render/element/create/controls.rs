@@ -1,10 +1,12 @@
 use super::super::Build;
 use super::super::kept::{Query, hashed};
 use super::super::margin::overscroll;
+use super::super::query::LOOK;
 use super::cx::Cx;
 use crate::css;
 use crate::css::properties::Prop;
 use crate::render::layout::size::{field_line, file_size, layout_ceil};
+use crate::render::layout::temporal::{icon, parts, temporal};
 use crate::style::{self};
 use renderer::{Color, SharedString, px, relative};
 use std::rc::Rc;
@@ -160,16 +162,32 @@ pub(super) fn controls(
                 .baseline(renderer::Baseline::Bottom),
         );
     }
-    let mut field_layer = None;
+    let (mut field_layer, mut picker) = (None, None);
     if editable {
-        if style.get(Prop::FIELD_SIZING) == Some("content") {
+        // A date or time input shows its fields until it has the focus. Then its value edits as text.
+        let fields = temporal(node);
+        if fields || style.get(Prop::FIELD_SIZING) == Some("content") {
             reader.log(Query::Value(id as u32), 0, hashed(&node.value));
         }
         let text = node.shown_text(
             node.current_value()
                 .map_or_else(|| doc.text(id), str::to_owned),
         );
-        let placeholder = node.attrs.get("placeholder").cloned().unwrap_or_default();
+        let editing = node.state & crate::css::selector::FOCUS != 0;
+        if fields {
+            reader.log(Query::Look(id as u32), 0, hashed(node.state & LOOK));
+        }
+        let placeholder = match input.filter(|_| fields) {
+            Some(kind) => match kind.to_ascii_lowercase().as_str() {
+                "date" => "yyyy-mm-dd",
+                "time" => "hh:mm",
+                "month" => "yyyy-mm",
+                "week" => "yyyy-Www",
+                _ => "yyyy-mm-ddThh:mm",
+            }
+            .to_owned(),
+            None => node.attrs.get("placeholder").cloned().unwrap_or_default(),
+        };
         let font_size = units.font.em;
         let text_color = style
             .get(Prop::COLOR)
@@ -187,7 +205,14 @@ pub(super) fn controls(
             .and_then(|pseudo| pseudo.get(Prop::OPACITY)?.parse::<f32>().ok())
             .map_or(1., |opacity| opacity.clamp(0., 1.));
         let single_line = node.tag != "textarea";
-        let padding = units.edges(style, css::properties::PADDING, containing[0]);
+        let mut padding = units.edges(style, css::properties::PADDING, containing[0]);
+        // The native look has a border of 1px.
+        if fields
+            && crate::render::paint::control::kind(&node.tag, input, false, style)
+                .is_some_and(|(_, boxed, _)| boxed)
+        {
+            padding = padding.map(|side| side + 1.);
+        }
         let empty = text.is_empty();
         let face = match pseudo {
             Some(pseudo) if empty => style::font(pseudo),
@@ -217,12 +242,18 @@ pub(super) fn controls(
             font_size: None,
             inset: Default::default(),
             nowrap: false,
+            preserve: true,
+            hyphenation: None,
+            rtl,
+            plaintext: style.get(Prop::UNICODE_BIDI) == Some("plaintext"),
+            embedding: None,
+            clear: 0,
             tab_size: 8.,
             stroke: None,
         };
         if !single_line && style.get(Prop::FIELD_SIZING) == Some("content") {
             // The full width of the content box, so the text wraps as in the field.
-            let mut sizer = renderer::text(shown.clone(), Some(vec![run.clone()]))
+            let mut sizer = renderer::text(shown.clone(), Some(Rc::new([run.clone()])))
                 .w(relative(1.))
                 .min_h(px(field_line_height))
                 .flex_shrink_0();
@@ -264,7 +295,63 @@ pub(super) fn controls(
         el = el.cursor(renderer::Cursor::Text);
         // Added after the background layers, which are absolute too and would paint over the text.
         field_layer = Some(if single_line {
-            let line = renderer::node().flex_shrink_0().child(field);
+            let mut line = renderer::node().flex_shrink_0();
+            let mut room = 0.;
+            if fields {
+                let ([width, _], size, inset) = icon(node, units.font.em);
+                room = width;
+                let dark = cx.dark();
+                let look = crate::render::paint::control::Look {
+                    control: match input.is_some_and(|kind| kind.eq_ignore_ascii_case("time")) {
+                        true => crate::render::paint::control::Control::Time,
+                        false => crate::render::paint::control::Control::Date,
+                    },
+                    ink: if dark { 0xffffff } else { 0 },
+                    ..Default::default()
+                };
+                if !node.attrs.contains_key("disabled") && !node.attrs.contains_key("readonly") {
+                    picker = Some(
+                        renderer::node()
+                            .absolute()
+                            .top(px(padding[0]))
+                            .right(px(padding[1]))
+                            .bottom(px(padding[2]))
+                            .w(px(size + 2. * inset))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                renderer::node()
+                                    .relative()
+                                    .flex_shrink_0()
+                                    .size(px(size))
+                                    .child(crate::render::paint::control::layer(
+                                        id,
+                                        look,
+                                        view.clone(),
+                                    )),
+                            ),
+                    );
+                }
+            }
+            line = match fields && !editing {
+                true => line
+                    .flex()
+                    .flex_row()
+                    .children(parts(node).into_iter().map(|part| {
+                        let side = if part.field { 1. } else { 0. };
+                        let run = renderer::TextRun {
+                            len: part.text.len(),
+                            color: text_color,
+                            ..field.run.clone()
+                        };
+                        renderer::text(part.text, Some([run].into()))
+                            .flex_shrink_0()
+                            .pl(px(side))
+                            .pr(px(side))
+                    })),
+                false => line.child(field),
+            };
             // A right-to-left row starts at the right, so text that overflows goes to the left and scrolls from there.
             let line = match (line_justify, rtl) {
                 (Some(renderer::AlignContent::Center), _) => line.ml_auto().mr_auto(),
@@ -274,7 +361,7 @@ pub(super) fn controls(
             };
             let mut clip = clip
                 .top(px(padding[0]))
-                .right(px(padding[1]))
+                .right(px(padding[1] + room))
                 .bottom(px(padding[2]))
                 .left(px(padding[3]))
                 .overflow_hidden()
@@ -282,10 +369,20 @@ pub(super) fn controls(
                 .flex_row()
                 .items_center()
                 .whitespace_nowrap();
-            if rtl {
+            if rtl && !fields {
                 clip.style().flex_direction = renderer::FlexDirection::RowReverse;
             }
-            clip.child(line)
+            let field = clip.child(line);
+            match picker {
+                Some(picker) => renderer::node()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .child(field)
+                    .child(picker),
+                None => field,
+            }
         } else {
             if rtl && line_justify == Some(renderer::AlignContent::End) {
                 clip.style().flow |= renderer::Flow::RTL_BLOCK;

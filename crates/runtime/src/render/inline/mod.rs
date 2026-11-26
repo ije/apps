@@ -16,7 +16,7 @@ pub(crate) struct InlineText {
     /// Out-of-flow boxes in the paragraph that its element builds beside it: nodes inside its inline boxes and
     /// nodes at their static place, or `::before` (1) and `::after` (2) of its inline boxes.
     pub lifted: Vec<(usize, u8)>,
-    pub runs: Vec<renderer::TextRun>,
+    pub runs: Rc<[renderer::TextRun]>,
     pub ranges: Vec<(usize, std::ops::Range<usize>)>,
     pub boxes: Vec<InlineBox>,
     /// The ranges of inline boxes with an outline.
@@ -54,6 +54,9 @@ impl InlineText {
                     && self.runs.iter().any(|run| {
                         let part = self.text.get(start..start + run.len).unwrap_or("");
                         start += run.len;
+                        if system.segmented(&run.font) {
+                            return true;
+                        }
                         let face = system.face(&run.font);
                         let ascii = system.ascii_glyphs(face);
                         part.chars().any(|c| match c.is_ascii() {
@@ -96,7 +99,8 @@ pub(crate) struct Mark {
     /// The box was a block, so its place is at the start of its line, or of the next line after `opened` edges or text.
     pub block: bool,
     pub opened: bool,
-    /// The edges of inline boxes between the mark and the next character.
+    /// The edges of inline boxes between the last character and the mark, and between it and the next one.
+    pub lead: f32,
     pub trail: f32,
 }
 
@@ -104,6 +108,8 @@ pub(crate) struct Mark {
 pub(crate) struct InlineBox {
     pub index: usize,
     pub fill: renderer::Color,
+    pub rtl: bool,
+    pub margins: [f32; 2],
     pub edges: [f32; 4],
     pub borders: [f32; 4],
     pub border: renderer::Color,
@@ -135,6 +141,43 @@ pub(crate) fn static_place(style: &Style) -> bool {
     matches!(style.get(Prop::POSITION), Some("absolute" | "fixed")) && !placed_out_of_flow(style)
 }
 
+/// The content of a `::before` or `::after` that takes part in layout. Like Chrome, a plain inline one with an empty
+/// string makes no line and leaves the boxes beside it as they are.
+pub(crate) fn drawn<'a>(pseudo: &'a Style, parent: &Style) -> Option<&'a str> {
+    let content = pseudo.get(Prop::CONTENT)?;
+    if matches!(content, "none" | "normal") || pseudo.get(Prop::DISPLAY) == Some("none") {
+        return None;
+    }
+    let same = |prop: Prop| {
+        pseudo
+            .get(prop)
+            .is_none_or(|value| parent.get(prop) == Some(value))
+    };
+    let unset = |prop: Prop, initial: &str| pseudo.get(prop).is_none_or(|value| value == initial);
+    let hollow = matches!(content, "\"\"" | "''")
+        && unset(Prop::DISPLAY, "inline")
+        && unset(Prop::FLOAT, "none")
+        && unset(Prop::VERTICAL_ALIGN, "baseline")
+        && unset(Prop::BOX_SHADOW, "none")
+        && pseudo
+            .get(Prop::OUTLINE_STYLE)
+            .is_none_or(|value| value == "none")
+        && pseudo
+            .get(Prop::POSITION)
+            .is_none_or(|value| !matches!(value, "absolute" | "fixed"))
+        && [Prop::FONT_FAMILY, Prop::FONT_SIZE, Prop::LINE_HEIGHT]
+            .into_iter()
+            .all(same)
+        && [PADDING, MARGIN]
+            .iter()
+            .flatten()
+            .all(|&prop| unset(prop, "0") || unset(prop, "0px"))
+        && BORDERS.iter().all(|[width, kind, _]| {
+            unset(*kind, "none") || matches!(pseudo.get(*width), Some("0" | "0px"))
+        });
+    (!hollow).then_some(content)
+}
+
 /// Whether the `::before` and `::after` of the inline box `id` that draw are all out of flow and placed on both axes,
 /// so the box stays a part of the text. Adds them to `lifted`.
 pub(crate) fn lifts_pseudos(
@@ -145,12 +188,7 @@ pub(crate) fn lifts_pseudos(
     let Some(pseudos) = styles.generated(id) else {
         return true;
     };
-    let drawn = |pseudo: &Style| {
-        pseudo
-            .get(Prop::CONTENT)
-            .is_some_and(|value| !matches!(value, "none" | "normal"))
-            && pseudo.get(Prop::DISPLAY) != Some("none")
-    };
+    let drawn = |pseudo: &Style| drawn(pseudo, &styles.values[id]).is_some();
     if !pseudos
         .iter()
         .all(|pseudo| !drawn(pseudo) || placed_out_of_flow(pseudo))
@@ -163,6 +201,13 @@ pub(crate) fn lifts_pseudos(
             .map(|at| (id, at as u8 + 1)),
     );
     true
+}
+
+/// Whether `id` has a `::before` or `::after` that takes part in layout.
+fn generates(styles: &ComputedStyles, id: usize) -> bool {
+    styles.generated(id).is_some_and(|pseudos| {
+        (pseudos.iter()).any(|pseudo| drawn(pseudo, &styles.values[id]).is_some())
+    })
 }
 
 /// Whether the `::after` of `id` is out of flow at its static place in the last line.
@@ -221,6 +266,7 @@ pub(crate) fn layered_after(
                 .is_some_and(|value| value != "normal")
             || [
                 Prop::TRANSFORM,
+                Prop::OFFSET_PATH,
                 Prop::TRANSLATE,
                 Prop::ROTATE,
                 Prop::SCALE,
@@ -265,7 +311,7 @@ pub(crate) fn makes_no_line(doc: &Document, styles: &ComputedStyles, id: usize) 
     style
         .get(Prop::DISPLAY)
         .is_none_or(|value| value == "inline")
-        && styles.generated(id).is_none()
+        && !generates(styles, id)
         && [PADDING, MARGIN].into_iter().all(|edges| {
             let [_, right, _, left] = units.edges(style, edges, 0.);
             right == 0. && left == 0.
@@ -437,11 +483,7 @@ pub(crate) fn pseudo_blocks(styles: &ComputedStyles, id: usize) -> Option<[bool;
     let mut blocks = [false; 2];
     for (block, pseudo) in blocks.iter_mut().zip(pseudos.iter()) {
         let display = pseudo.get(Prop::DISPLAY).unwrap_or("inline");
-        if pseudo
-            .get(Prop::CONTENT)
-            .is_none_or(|value| matches!(value, "none" | "normal"))
-            || display == "none"
-        {
+        if drawn(pseudo, &styles.values[id]).is_none() {
             continue;
         }
         if display.starts_with("inline")
@@ -625,8 +667,20 @@ pub(crate) fn splits(style: &Rc<Style>, parent: &Rc<Style>) -> bool {
                         | Prop::TRANSITION_BEHAVIOR
                         | Prop::WILL_CHANGE
                         | Prop::FONT_FEATURE_SETTINGS
+                        | Prop::TEXT_DECORATION_SKIP_INK
+                        | Prop::HYPHENS
+                        | Prop::UNICODE_BIDI
+                        | Prop::DIRECTION
+                        | Prop::HYPHENATE_CHARACTER
                         | Prop::FONT_VARIANT_NUMERIC
                         | Prop::FONT_VARIANT_LIGATURES
+                        | Prop::FONT_VARIANT_CAPS
+                        | Prop::FONT_VARIANT_ALTERNATES
+                        | Prop::FONT_VARIANT_EAST_ASIAN
+                        | Prop::FONT_VARIANT_POSITION
+                        | Prop::FONT_SIZE_ADJUST
+                        | Prop::FONT_STRETCH
+                        | Prop::TEXT_UNDERLINE_POSITION
                         | Prop::FONT_KERNING
                         | Prop::FONT_SYNTHESIS
                         | Prop::FONT_OPTICAL_SIZING
@@ -779,6 +833,54 @@ pub(crate) const CUT_LAST: u8 = 2;
 pub(crate) const CUT_BEFORE: u8 = 4;
 pub(crate) const CUT_AFTER: u8 = 8;
 // Events of a run: a spliced inline box opens without its children, and closes.
+/// What the boxes around a node do to the order of their text.
+fn embedding(
+    doc: &Document,
+    styles: &ComputedStyles,
+    node: usize,
+) -> Option<Rc<renderer::Embedding>> {
+    let mut marks: Vec<(usize, char)> = Vec::new();
+    let ups = std::iter::successors(doc.nodes[node].parent, |&up| doc.nodes[up].parent);
+    for up in ups {
+        let style = &styles.values[up];
+        let inline = style
+            .get(Prop::DISPLAY)
+            .is_none_or(|value| matches!(value, "inline" | "contents"));
+        if let Some(value) = style.get(Prop::UNICODE_BIDI) {
+            let rtl = style.get(Prop::DIRECTION) == Some("rtl");
+            let pick = |ltr, other| if rtl { other } else { ltr };
+            let dir = doc.nodes[up].attrs.get("dir");
+            let auto = value == "isolate"
+                && match dir {
+                    Some(dir) => dir.eq_ignore_ascii_case("auto"),
+                    None => doc.nodes[up].tag == "bdi",
+                };
+            // From the innermost mark to the outermost.
+            if value.ends_with("override") {
+                marks.push((up, pick('\u{202d}', '\u{202e}')));
+            }
+            match value {
+                _ if !inline => {}
+                "plaintext" => marks.push((up, '\u{2068}')),
+                _ if auto => marks.push((up, '\u{2068}')),
+                "embed" => marks.push((up, pick('\u{202a}', '\u{202b}'))),
+                "isolate" | "isolate-override" => marks.push((up, pick('\u{2066}', '\u{2067}'))),
+                _ => {}
+            }
+        }
+        if !inline {
+            break;
+        }
+    }
+    marks.reverse();
+    (!marks.is_empty()).then(|| {
+        Rc::new(renderer::Embedding {
+            marks,
+            boxes: Vec::new(),
+        })
+    })
+}
+
 pub(crate) const OPEN: usize = usize::MAX;
 pub(crate) const CLOSE: usize = usize::MAX - 1;
 
@@ -799,9 +901,7 @@ pub(crate) fn inline_text(
     let pseudo_line = || {
         styles.generated(id).is_some_and(|pseudos| {
             pseudos.iter().any(|pseudo| {
-                pseudo
-                    .get(Prop::CONTENT)
-                    .is_some_and(|value| !matches!(value, "none" | "normal"))
+                drawn(pseudo, parent).is_some()
                     && pseudo
                         .get(Prop::DISPLAY)
                         .is_none_or(|value| value.starts_with("inline"))
@@ -861,6 +961,7 @@ pub(crate) fn inline_text(
             at,
             block,
             opened,
+            lead: 0.,
             trail: 0.,
         };
         (trailed, runs.len(), trail)
@@ -876,9 +977,7 @@ pub(crate) fn inline_text(
     let mut lifted: Vec<(usize, u8)> = Vec::new();
     let parts: [Option<(String, bool)>; 2] = [0, 1].map(|index| {
         let pseudo = &styles.generated(id).filter(|_| atomic_allowed)?[index];
-        let content = pseudo
-            .get(Prop::CONTENT)
-            .filter(|value| !matches!(*value, "none" | "normal"))?;
+        let content = drawn(pseudo, parent)?;
         let display = pseudo.get(Prop::DISPLAY).unwrap_or("inline");
         if !display.starts_with("inline")
             || pseudo.get(Prop::FLOAT).is_some_and(|value| value != "none")
@@ -909,6 +1008,7 @@ pub(crate) fn inline_text(
                 Prop::BACKGROUND_IMAGE,
                 Prop::BOX_SHADOW,
                 Prop::TRANSFORM,
+                Prop::OFFSET_PATH,
                 Prop::TRANSLATE,
                 Prop::ROTATE,
                 Prop::SCALE,
@@ -1055,9 +1155,11 @@ pub(crate) fn inline_text(
             let empty = range.start == range.end;
             if let Ok(at) = boxes.binary_search_by_key(&index, |inline| inline.index) {
                 let inline = &boxes[at];
-                let right = inline.edges[1];
+                // The end of a right-to-left box is at its left.
+                let end = if inline.rtl { 3 } else { 1 };
+                let right = inline.edges[end];
                 let margin = if last {
-                    styles.lengths[child].edges(&styles.values[child], MARGIN, 0.)[1]
+                    styles.lengths[child].edges(&styles.values[child], MARGIN, 0.)[end]
                 } else {
                     0.
                 };
@@ -1151,7 +1253,16 @@ pub(crate) fn inline_text(
                 }
                 ranges.push((child, text.len()..text.len()));
                 text.push('\n');
-                runs.push(text_run(style, &styles.lengths[child], 1));
+                let mut run = text_run(style, &styles.lengths[child], 1);
+                if let Some(clear) = style.get(Prop::CLEAR).filter(|clear| *clear != "none") {
+                    let rtl = style.get(Prop::DIRECTION) == Some("rtl");
+                    run.clear = match (clear, rtl) {
+                        ("left", _) | ("inline-start", false) | ("inline-end", true) => 1,
+                        ("both", _) => 3,
+                        _ => 2,
+                    };
+                }
+                runs.push(run);
                 line_heights.push((text.len(), line_height(style)));
                 space = true;
                 continue 'nodes;
@@ -1218,7 +1329,7 @@ pub(crate) fn inline_text(
                 // The pseudo-elements of a spliced box are blocks beside the text, and the text draws the rest of
                 // its style.
                 || part.is_none()
-                    && (styles.generated(child).is_some()
+                    && (generates(styles, child)
                         && !(markers && lifts_pseudos(styles, child, &mut lifted))
                         || styles.extras(child).animations.is_some()
                         || splits(style, parent))
@@ -1274,13 +1385,17 @@ pub(crate) fn inline_text(
                             .get(Prop::BOX_SHADOW)
                             .is_some_and(|value| value != "none")
                 {
-                    opening += margin[3];
+                    let rtl = style.get(Prop::DIRECTION) == Some("rtl");
+                    let start = if rtl { 1 } else { 3 };
+                    opening += margin[start];
                     leads.push((opening, None));
-                    opening += edges[3];
+                    opening += edges[start];
                     let faded = fade(child);
                     boxes.push(InlineBox {
                         index,
                         fill: fill.fade(faded),
+                        rtl,
+                        margins: [margin[3], margin[1]],
                         edges,
                         borders,
                         border: BORDERS
@@ -1348,9 +1463,6 @@ pub(crate) fn inline_text(
             break_spaces |= mode == "break-spaces";
             let preserve = matches!(mode, "pre" | "pre-wrap" | "break-spaces");
             let transform = style.get(Prop::TEXT_TRANSFORM).unwrap_or("");
-            // Like Chromium, small caps are capitals at 70% of the size, where the letter was lowercase.
-            let caps = style.get(Prop::FONT_VARIANT) == Some("small-caps");
-            let mut lowered: Vec<std::ops::Range<usize>> = Vec::new();
             let mut last = text.chars().rev();
             let (mut prev, mut before) = (last.next().unwrap_or(' '), last.next().unwrap_or(' '));
             text.reserve(node_text.len());
@@ -1395,16 +1507,6 @@ pub(crate) fn inline_text(
                     case(c, transform, starts_word(before, prev, c))
                 };
                 (before, prev) = (prev, c);
-                let c = match c.to_uppercase().next() {
-                    Some(upper) if caps && c.is_lowercase() && upper.len_utf8() == c.len_utf8() => {
-                        match lowered.last_mut() {
-                            Some(last) if last.end == text.len() => last.end += c.len_utf8(),
-                            _ => lowered.push(text.len()..text.len() + c.len_utf8()),
-                        }
-                        upper
-                    }
-                    _ => c,
-                };
                 text.push(c);
                 space = c == '\n';
             }
@@ -1433,35 +1535,40 @@ pub(crate) fn inline_text(
                     run.font_size = Some(renderer::px(size));
                 }
                 run.nowrap = mode == "nowrap";
+                // Like Chrome, text that breaks at each letter shows no hyphens.
+                if style.get(Prop::HYPHENS) == Some("auto")
+                    && style.get(Prop::WORD_BREAK) != Some("break-all")
+                {
+                    let node = if child < doc.nodes.len() { child } else { id };
+                    let language = std::iter::successors(Some(node), |&up| doc.nodes[up].parent)
+                        .find_map(|up| doc.nodes[up].attrs.get("lang"));
+                    run.hyphenation =
+                        crate::style::hyphenation(style, language.map(|value| &**value));
+                }
+                run.embedding = embedding(
+                    doc,
+                    styles,
+                    if child < doc.nodes.len() { child } else { id },
+                );
                 run.inset[0] = renderer::px(opening);
                 for (inline, (mark, _)) in boxes[led..].iter_mut().zip(&leads[led..]) {
                     inline.lead = opening - mark;
                 }
                 led = boxes.len();
                 opening = 0.;
-                let mut from = start;
-                for range in lowered.iter().chain([&(text.len()..text.len())]) {
-                    for (end, small) in [(range.start, false), (range.end, true)] {
-                        if end > from {
-                            let mut piece = run.clone();
-                            piece.len = end - from;
-                            if small {
-                                piece.font_size = Some(renderer::px(size * 0.7));
-                            }
-                            if from > start {
-                                piece.inset[0] = renderer::px(0.);
-                            }
-                            runs.push(piece);
-                            line_heights.push((end, line_height(style)));
-                            from = end;
-                        }
-                    }
-                }
+                runs.push(run);
+                line_heights.push((text.len(), line_height(style)));
             }
         }
     }
     if markers && run.is_empty() && (cuts.is_empty() || ends[1]) && static_after(styles, id) {
         marks.push(mark(atom_key(id, 2), false, text.len(), &runs, opening));
+    }
+    let rtl = parent.get(Prop::DIRECTION) == Some("rtl");
+    let plaintext = crate::style::plaintext(doc, styles, id);
+    for run in &mut runs {
+        run.rtl = rtl;
+        run.plaintext = plaintext;
     }
     if text.contains('\r') {
         return None;
@@ -1516,6 +1623,7 @@ pub(crate) fn inline_text(
             let edges = before.map_or(0., |run| f32::from(run.inset[1]))
                 + runs.get(next).map_or(0., |run| f32::from(run.inset[0]));
             Mark {
+                lead: trail,
                 trail: edges - trail,
                 ..mark
             }
@@ -1530,6 +1638,32 @@ pub(crate) fn inline_text(
                 .get(*run)
                 .map_or(0., |run| f32::from(run.inset[1]) - at)
                 + runs.get(run + 1).map_or(0., |run| f32::from(run.inset[0]));
+        }
+    }
+    if !boxes.is_empty()
+        && (rtl
+            || boxes.iter().any(|inline| inline.rtl)
+            || runs.iter().any(|run| run.embedding.is_some())
+            || renderer::reorders(&text))
+    {
+        let mut start = 0;
+        for run in &mut runs {
+            let end = start + run.len;
+            let around = boxes.iter().filter_map(|inline| {
+                let (_, range) = &ranges[inline.index];
+                (range.start < end && start < range.end).then(|| renderer::InlineEdges {
+                    id: inline.index,
+                    rtl: inline.rtl,
+                    ends: [start <= range.start, range.end <= end],
+                    margins: inline.margins.map(renderer::px),
+                    edges: [inline.edges[3], inline.edges[1]].map(renderer::px),
+                })
+            });
+            let around: Vec<_> = around.collect();
+            if !around.is_empty() {
+                Rc::make_mut(run.embedding.get_or_insert_default()).boxes = around;
+            }
+            start = end;
         }
     }
     let pseudo_run = |style: &Style| {
@@ -1619,7 +1753,7 @@ pub(crate) fn inline_text(
         key: run.first().copied().unwrap_or(id),
         fallback: Default::default(),
         text: text.into(),
-        runs,
+        runs: runs.into(),
         ranges,
         boxes,
         outlines,

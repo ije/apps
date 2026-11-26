@@ -3,9 +3,10 @@ pub(crate) mod parser;
 
 // The last field is the position of the declaration in its block, which breaks ties between properties.
 use crate::css::{
-    properties::Prop, properties::Style, selector::Selector, selector::SelectorList,
-    value::grammar::fold, value::grammar::supports, value::shorthand::BORDER_IMAGE,
-    value::shorthand::BORDER_IMAGE_INITIAL, value::shorthand::expand,
+    properties::Prop, properties::Style, selector::Selector, selector::SelectorList, value::anchor,
+    value::grammar::computed, value::grammar::fold, value::grammar::supports,
+    value::shorthand::BORDER_IMAGE, value::shorthand::BORDER_IMAGE_INITIAL,
+    value::shorthand::expand,
 };
 use std::rc::Rc;
 pub(crate) type Declared = (Prop, Rc<str>, bool, u16);
@@ -29,15 +30,16 @@ pub(crate) enum Rule {
     Layer(Vec<String>, Vec<Rule>),
     Supports(String, bool, Vec<Rule>),
     Declarations(Declarations),
-    Theme(bool, Vec<Rule>),
+    Theme(String, Vec<Rule>),
     Variant(String, String),
     Utility(String, String),
     FontFace(Declarations),
-    Tailwind(Option<bool>),
+    Tailwind(String),
     Keyframes(String, Vec<(f32, Declarations)>),
     Container(Option<String>, bool, MediaQuery, Vec<Rule>),
     Property(String, String, bool, Option<String>),
     Starting(Vec<Rule>),
+    PositionTry(String, Declarations),
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -80,6 +82,7 @@ pub(crate) fn declare(source: &str) -> Vec<[String; 3]> {
                     | "grid-template"
                     | "grid"
                     | "mask"
+                    | "offset"
                     | "-webkit-mask"
             )
             || !expand(&name, value, &mut expanded)
@@ -138,7 +141,11 @@ impl Rule {
 
     pub(crate) fn plain(&self) -> bool {
         match self {
-            Self::Layer(..) | Self::Keyframes(..) | Self::Property(..) | Self::Theme(..) => false,
+            Self::Layer(..)
+            | Self::Keyframes(..)
+            | Self::Property(..)
+            | Self::Theme(..)
+            | Self::PositionTry(..) => false,
             Self::Style(_, children)
             | Self::Media(_, children)
             | Self::Supports(_, _, children)
@@ -177,12 +184,14 @@ impl Rule {
                 query.source(),
                 children.iter().map(Self::source).collect::<String>()
             ),
-            Self::Theme(inline, children) => format!(
-                "@theme{}{{{}}}",
-                if *inline { " inline" } else { "" },
+            Self::Theme(options, children) => format!(
+                "@theme {options}{{{}}}",
                 children.iter().map(Self::source).collect::<String>()
             ),
             Self::Utility(name, body) => format!("@utility {name}{{{body}}}"),
+            Self::PositionTry(name, values) => {
+                format!("@position-try {name}{{{}}}", values.source())
+            }
             Self::FontFace(values) => format!("@font-face{{{}}}", values.source()),
             Self::Variant(name, body) if body.starts_with('{') => format!("@variant {name}{body}"),
             Self::Variant(name, body) if body.contains("@slot") => {
@@ -196,9 +205,7 @@ impl Rule {
                     .as_ref()
                     .map_or(String::new(), |value| format!("initial-value:{value}"))
             ),
-            Self::Tailwind(Some(true)) => "@import 'tailwindcss';".into(),
-            Self::Tailwind(Some(false)) => "@import 'tailwindcss/utilities';".into(),
-            Self::Tailwind(None) => "@reference 'tailwindcss';".into(),
+            Self::Tailwind(text) => format!("@{text};"),
             Self::Keyframes(name, frames) => format!(
                 "@keyframes {name}{{{}}}",
                 frames
@@ -226,6 +233,17 @@ impl Rule {
             ),
         }
     }
+}
+
+/// An `@font-face` rule.
+#[derive(Clone, Default, PartialEq)]
+pub(crate) struct FontFace {
+    pub(crate) family: String,
+    pub(crate) src: String,
+    pub(crate) range: Option<String>,
+    pub(crate) weight: Option<String>,
+    pub(crate) style: Option<String>,
+    pub(crate) stretch: Option<String>,
 }
 
 pub(crate) fn declarations(source: &str) -> Style {
@@ -279,6 +297,18 @@ impl Declarations {
         result
     }
 
+    /// Keeps what an `@position-try` rule takes.
+    pub(crate) fn position_try(mut values: Self) -> Self {
+        values.0.retain(|declaration| match declaration {
+            Declaration::Property(name, value) => {
+                !value.ends_with("!important")
+                    && Prop::find(name).is_some_and(|prop| anchor::DESCRIPTORS.contains(prop))
+            }
+            Declaration::Apply(_) => false,
+        });
+        values
+    }
+
     pub(crate) fn source(&self) -> String {
         self.0
             .iter()
@@ -291,6 +321,18 @@ impl Declarations {
 }
 
 impl Rule {
+    /// The syntax, the inheritance and the computed initial value of an `@property` rule.
+    pub(crate) fn property(&self) -> Option<(Rc<str>, bool, Option<Rc<str>>)> {
+        let Self::Property(_, syntax, inherits, initial) = self else {
+            return None;
+        };
+        let initial = initial.as_deref().map(|value| match syntax.trim() {
+            "*" => value.into(),
+            _ => computed(syntax, value, None).0.into(),
+        });
+        Some((syntax.as_str().into(), *inherits, initial))
+    }
+
     pub(crate) fn cssom(&self) -> serde_json::Value {
         use serde_json::json;
         let declarations = |values: &Declarations| {
@@ -359,13 +401,17 @@ impl Rule {
                     .map(|(at, values)| json!([format!("{}%", at * 100.), declarations(values)]))
                     .collect::<Vec<_>>()
             ]),
+            Self::PositionTry(name, values) => {
+                json!(["position-try", name, declarations(values)])
+            }
             Self::FontFace(values) => json!(["font-face", declarations(values)]),
             Self::Property(name, syntax, inherits, initial) => {
                 json!(["property", name, syntax, inherits, initial])
             }
-            Self::Tailwind(Some(true)) => json!(["import", "tailwindcss"]),
-            Self::Tailwind(Some(false)) => json!(["import", "tailwindcss/utilities"]),
-            Self::Tailwind(None) => json!(["other", "@reference 'tailwindcss';"]),
+            Self::Tailwind(text) if text.starts_with("import") => {
+                json!(["import", text.split('"').nth(1)])
+            }
+            Self::Tailwind(_) => json!(["other", self.source()]),
             Self::Declarations(_) | Self::Theme(..) | Self::Variant(..) | Self::Utility(..) => {
                 json!(["other", self.source()])
             }
@@ -391,14 +437,7 @@ impl Stylesheet {
         let [rule] = self.0.as_slice() else {
             return None;
         };
-        let Rule::Property(_, syntax, inherits, initial) = &**rule else {
-            return None;
-        };
-        Some((
-            syntax.as_str().into(),
-            *inherits,
-            initial.as_deref().map(Rc::from),
-        ))
+        rule.property()
     }
 
     pub(crate) fn edit(
@@ -420,7 +459,7 @@ impl Stylesheet {
         edit_rules(rules, last, edit, parent, |rule| rule)
     }
 
-    pub(crate) fn font_faces(&self) -> Vec<(String, String, Option<String>)> {
+    pub(crate) fn font_faces(&self) -> Vec<FontFace> {
         let mut faces = Vec::new();
         let mut pending: Vec<&Rule> = self.0.iter().rev().map(|rule| &**rule).collect();
         while let Some(rule) = pending.pop() {
@@ -439,11 +478,18 @@ impl Stylesheet {
             else {
                 continue;
             };
-            faces.push((
-                family.trim_matches(['\'', '"']).to_owned(),
-                src.to_owned(),
-                values.get(Prop::new("unicode-range")).map(str::to_owned),
-            ));
+            let descriptor = |prop| values.get(prop).map(str::to_owned);
+            faces.push(FontFace {
+                family: family.trim_matches(['\'', '"']).to_owned(),
+                src: src.to_owned(),
+                // Declarations keep `U+0400-04FF` as tokens joined by `/**/`.
+                range: values
+                    .get(Prop::new("unicode-range"))
+                    .map(|range| range.replace("/**/", "")),
+                weight: descriptor(Prop::FONT_WEIGHT),
+                style: descriptor(Prop::FONT_STYLE),
+                stretch: descriptor(Prop::FONT_STRETCH),
+            });
         }
         faces
     }
@@ -539,6 +585,9 @@ fn edit_rules<R: std::borrow::Borrow<Rule> + From<Rule>>(
         }
         (Edit::Declarations(text), Rule::FontFace(values)) => {
             *values = Declarations::descriptors(text)
+        }
+        (Edit::Declarations(text), Rule::PositionTry(_, values)) => {
+            *values = Declarations::position_try(Declarations::parse(text));
         }
         (Edit::Selector(text), Rule::Style(selectors, children)) => {
             let parsed = Selector::parse(text, parent.as_ref());

@@ -168,6 +168,15 @@ impl NodePass<'_> {
                     }
                 }
             }
+            // Hints are below all layers of the author.
+            if !revert && origin == HINT {
+                let hint = CascadeRank::new(HINT, false, 0, [0; 3], 0);
+                for (_, candidate) in key.hints.iter().filter(|(name, _)| *name == prop) {
+                    if best.as_ref().is_none_or(|(old, _)| hint >= *old) {
+                        best = Some((hint, candidate));
+                    }
+                }
+            }
             *value = best.map_or_else(|| "unset".into(), |(_, value)| value.clone());
         }
         if cascade

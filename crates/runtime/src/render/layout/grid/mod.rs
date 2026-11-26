@@ -18,6 +18,8 @@ pub(crate) struct Grid {
     // The height of the content when it is not the sum of the rows: flexible rows that sum to less than `1fr`
     // size again in the height that they first gave the grid.
     pub height: Option<f32>,
+    // The heights of the captions above and below the border box of a table.
+    pub captions: [f32; 2],
 }
 
 impl Grid {

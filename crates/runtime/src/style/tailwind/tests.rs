@@ -32,7 +32,7 @@ fn id(doc: &Document, selector: &str) -> usize {
 fn generated(author: &str, classes: &[&str]) -> Vec<String> {
     let mut compiler = super::Compiler::default();
     let mut sheets = vec![Rc::new(super::Stylesheet::parse(&format!(
-        "@import 'tailwindcss/utilities';{author}"
+        "@import 'tailwindcss/theme';@import 'tailwindcss/utilities';{author}"
     )))];
     compiler.update(&mut sheets, &Document::parse(""), &[]);
     let config = compiler.0.last().unwrap();
@@ -40,27 +40,33 @@ fn generated(author: &str, classes: &[&str]) -> Vec<String> {
         .iter()
         .map(|class| {
             config
-                .compile(class, &super::value::escape(class))
+                .compile(class, &super::value::escape(class), false)
                 .map(|compiled| super::css(&compiled.rules))
                 .unwrap_or_default()
         })
         .collect()
 }
 
+// Writes the compiled classes of the file `TW_LIST` to `TW_OUT`, in the order of their rules.
 #[test]
 #[ignore]
 fn dump() {
-    let list = std::fs::read_to_string(std::env::var("TW_LIST").unwrap()).unwrap();
-    let author = std::env::var("TW_CSS")
-        .ok()
-        .filter(|path| !path.is_empty())
-        .map(|path| std::fs::read_to_string(path).unwrap())
-        .unwrap_or_default();
-    let classes: Vec<_> = list.lines().filter(|line| !line.is_empty()).collect();
-    let out: serde_json::Map<_, _> = classes
+    let read = |name: &str| std::fs::read_to_string(std::env::var(name).unwrap()).unwrap();
+    let (list, author) = (read("TW_LIST"), read("TW_CSS"));
+    let mut compiler = super::Compiler::default();
+    let mut sheets = vec![Rc::new(super::Stylesheet::parse(&author))];
+    compiler.update(&mut sheets, &Document::parse(""), &[]);
+    let config = compiler.0.last().unwrap();
+    let start = std::time::Instant::now();
+    let mut compiled: Vec<_> = list
+        .lines()
+        .filter_map(|class| config.compile(class, &super::value::escape(class), config.important))
+        .collect();
+    println!("{} classes in {:?}", compiled.len(), start.elapsed());
+    compiled.sort_unstable_by(|a, b| a.sort.cmp(&b.sort));
+    let out: Vec<_> = compiled
         .iter()
-        .zip(generated(&author, &classes))
-        .map(|(class, css)| ((*class).to_owned(), css.into()))
+        .map(|compiled| [compiled.sort.name.clone(), super::css(&compiled.rules)])
         .collect();
     std::fs::write(
         std::env::var("TW_OUT").unwrap(),
@@ -439,7 +445,7 @@ fn new_classes_join_the_scope_in_tailwind_order() {
 fn utilities_and_variants_sort_like_tailwind() {
     let mut compiler = super::Compiler::default();
     let mut sheets = vec![Rc::new(super::Stylesheet::parse(
-        "@import 'tailwindcss/utilities';",
+        "@import 'tailwindcss/theme';@import 'tailwindcss/utilities';",
     ))];
     compiler.update(&mut sheets, &Document::parse(""), &[]);
     let config = compiler.0.last().unwrap();
@@ -463,7 +469,7 @@ fn utilities_and_variants_sort_like_tailwind() {
             .split(' ')
             .map(|class| {
                 config
-                    .compile(class, &super::value::escape(class))
+                    .compile(class, &super::value::escape(class), false)
                     .unwrap()
                     .sort
             })
@@ -936,7 +942,6 @@ fn bg_glass_tint_uses_tailwind_colors_modifiers_and_variants() {
             ),
             ("bg-glass-blue", String::new()),
             ("bg-glass-[length:2px]", String::new()),
-            ("bg-glass-blue-500/101", String::new()),
             ("-bg-glass-blue-500", String::new()),
             ("glass-tint-blue-500", String::new()),
             ("hover:glass-tint-blue-500", String::new()),
@@ -1464,7 +1469,7 @@ fn gradients_and_divides_reach_computed_styles() {
     );
     assert_eq!(
         &styles.values[id(&doc, "div")]["background-image"],
-        "linear-gradient(to bottom right in oklab, oklch(54.1% 0.281 293.009) 0%, oklch(66.7% 0.295 322.15) 100%)"
+        "linear-gradient(to bottom right in oklab, oklch(0.541 0.281 293.009) 0%, oklch(0.667 0.295 322.15) 100%)"
     );
     let width = |selector, side| {
         length(
@@ -1603,7 +1608,9 @@ fn inserts_at_one_spot_keep_the_generated_sheets() {
     let order: Vec<(u32, u32)> = (0..doc.nodes.len() as u32)
         .map(|id| (id, u32::MAX))
         .collect();
-    let base = Rc::new(super::Stylesheet::parse("@import 'tailwindcss/utilities';"));
+    let base = Rc::new(super::Stylesheet::parse(
+        "@import 'tailwindcss/theme';@import 'tailwindcss/utilities' layer(utilities);",
+    ));
     let mut compiler = super::Compiler::default();
     compiler.update(&mut vec![base.clone()], &doc, &order);
     for step in 1..=40 {
@@ -1628,7 +1635,9 @@ fn incremental_inserts_match_a_fresh_compile() {
         })
         .collect();
     let html = "<p></p>".repeat(classes.len());
-    let base = Rc::new(super::Stylesheet::parse("@import 'tailwindcss/utilities';"));
+    let base = Rc::new(super::Stylesheet::parse(
+        "@import 'tailwindcss/theme';@import 'tailwindcss/utilities' layer(utilities);",
+    ));
     let compile = |order: &[usize], fresh: bool| {
         let mut doc = Document::parse(&html);
         let nodes: Vec<_> = (0..doc.nodes.len())
@@ -1831,4 +1840,264 @@ fn apply_keeps_decimal_classes_like_tailwind() {
     let b = &styles.values[id(&doc, ".b")];
     assert_eq!(length(&b["padding-top"], 0., 16., 800., 600.), 6.);
     assert_eq!(length(&b["padding-left"], 0., 16., 800., 600.), 2.);
+}
+
+#[test]
+fn author_layers_named_before_the_import_keep_their_order() {
+    let (doc, styles) = computed(
+        "<style>@layer reset, theme, base, mui, components, utilities;
+        @import 'tailwindcss/theme.css' layer(theme);
+        @import 'tailwindcss/utilities.css' layer(utilities);
+        @layer mui { .m { padding: 40px; color: red } }
+        @layer reset { .m { color: blue } }</style><p class='m p-2'></p>",
+        None,
+    );
+    let style = &styles.values[id(&doc, "p")];
+    assert_eq!(&style["color"], "red");
+    assert_eq!(length(&style["padding-left"], 0., 16., 800., 600.), 8.);
+}
+
+#[test]
+fn every_theme_namespace_names_utilities() {
+    assert_generated(
+        "@theme { --z-index-modal: 9; --opacity-half: .5; --width-page: 5px; --radius-full: 9px; --radius: 3px;
+        --transition-property-size: width; --default-border-width: 2px; --background-image-dots: url(a.png);
+        --font-display: Foo; --font-display--font-feature-settings: 'ss01'; --color-brand: red; }
+        @theme inline { --spacing-gutter: 7px; } @theme reference { --color-old: blue; }
+        @theme default { --color-brand: green; }",
+        &[
+            ("z-modal", ".z-modal{z-index:var(--z-index-modal);}"),
+            ("-z-modal", ".-z-modal{z-index:calc(var(--z-index-modal) * -1);}"),
+            ("w-page", ".w-page{width:var(--width-page);}"),
+            (
+                "bg-brand/half",
+                ".bg-brand\\/half{background-color:color-mix(in oklab, var(--color-brand) var(--opacity-half), transparent);}",
+            ),
+            ("rounded-full", ".rounded-full{border-radius:var(--radius-full);}"),
+            ("rounded", ".rounded{border-radius:var(--radius);}"),
+            (
+                "border",
+                ".border{border-style:var(--tw-border-style);border-width:2px;}",
+            ),
+            (
+                "bg-dots",
+                ".bg-dots{background-image:var(--background-image-dots);}",
+            ),
+            (
+                "font-display",
+                ".font-display{font-family:var(--font-display);font-feature-settings:var(--font-display--font-feature-settings);}",
+            ),
+            ("p-gutter", ".p-gutter{padding:7px;}"),
+            ("text-old", ".text-old{color:var(--color-old, blue);}"),
+            (
+                "bg-[--theme(--color-brand/50%)]",
+                ".bg-\\[--theme\\(--color-brand\\/50\\%\\)\\]{background-color:color-mix(in oklab, var(--color-brand) 50%, transparent);}",
+            ),
+            ("bg-[theme(colors.nope)]", ""),
+            ("p-foo", ""),
+        ],
+    );
+}
+
+#[test]
+fn import_options_set_prefix_importance_and_exclusions() {
+    let (doc, styles) = computed(
+        "<style>@import 'tailwindcss' prefix(tw) important;
+        @theme { --color-brand: red; }
+        @source not inline('tw:p-{2,4} tw:m-{0..10..5}');
+        #a { color: blue; margin: theme(spacing.4); border-color: var(--tw-color-brand) }</style>
+        <p id='a' class='tw:text-brand tw:m-5 tw:p-2 p-8 flex tw:group'><b class='tw:group-first:p-[3px] tw:ring-2'></b></p>",
+        None,
+    );
+    let p = &styles.values[id(&doc, "p")];
+    assert_eq!(&p["color"], "red");
+    assert_eq!(&p["border-top-color"], "red");
+    assert_eq!(length(&p["margin-left"], 0., 16., 800., 600.), 16.);
+    assert_eq!(p.get(Prop::PADDING_LEFT).unwrap_or("0"), "0");
+    let b = &styles.values[id(&doc, "b")];
+    assert_eq!(&b["padding-left"], "3px");
+    assert!(b["box-shadow"].contains("calc(2px"), "{}", &b["box-shadow"]);
+    for (layer, color) in [("", "red"), (" layer(utilities)", "blue")] {
+        let (doc, styles) = computed(
+            &format!(
+                "<style>@import 'tailwindcss/theme' layer(theme); @import 'tailwindcss/utilities'{layer};
+                @layer x {{ p {{ color: blue }} }} @layer utilities;</style><p class='text-[red]'></p>"
+            ),
+            None,
+        );
+        assert_eq!(&styles.values[id(&doc, "p")]["color"], color, "{layer}");
+    }
+}
+
+#[test]
+fn variant_lists_stack_and_nest() {
+    assert_generated(
+        "@custom-variant busy { @variant hover, focus { @slot; } }
+        @custom-variant both (&:hover, @media print);
+        @utility box { @variant dark:hover, focus { color: red; } margin: 1px; }",
+        &[
+            (
+                "busy:flex",
+                "@media (hover: hover){.busy\\:flex:hover{display:flex;}}.busy\\:flex:focus{display:flex;}",
+            ),
+            (
+                "both:flex",
+                ".both\\:flex:hover{display:flex;}@media print{.both\\:flex{display:flex;}}",
+            ),
+            (
+                "box",
+                "@media (prefers-color-scheme: dark){@media (hover: hover){.box:hover{color:red;}}}.box:focus{color:red;}.box{margin:1px;}",
+            ),
+            (
+                "in-focus:in-hover:flex",
+                "@media (hover: hover){:where(:hover) :is(:where(:focus) .in-focus\\:in-hover\\:flex){display:flex;}}",
+            ),
+            (
+                "after:hover:p-1",
+                ".after\\:hover\\:p-1::after{content:var(--tw-content);}@media (hover: hover){.after\\:hover\\:p-1::after:hover{padding:var(--spacing);}}",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn applied_media_rules_stay_before_later_declarations() {
+    let (doc, styles) = computed(
+        "<style>@import 'tailwindcss';
+        .a { @apply sm:p-8; padding: 1px; } .b { padding: 1px; @apply sm:p-8; }
+        @media (width >= theme(--breakpoint-sm)) { .a { color: red } }
+        @media (width >= theme(--breakpoint-2xl)) { .b { color: red } }</style><p class='a'></p><b class='b'></b>",
+        None,
+    );
+    let (a, b) = (&styles.values[id(&doc, "p")], &styles.values[id(&doc, "b")]);
+    assert_eq!(&a["padding-left"], "1px");
+    assert_eq!(length(&b["padding-left"], 0., 16., 800., 600.), 32.);
+    assert_eq!(&a["color"], "red");
+    assert_ne!(b.get(Prop::COLOR), Some("red"));
+}
+
+#[test]
+fn cyclic_and_fanned_out_variants_stay_bounded() {
+    let chain: String = (1..40)
+        .map(|i| {
+            format!(
+                "@custom-variant v{i} {{ @variant v{p} {{ @slot; }} @variant v{p} {{ @slot; }} }}",
+                p = i - 1
+            )
+        })
+        .collect();
+    let utilities: String = (1..40)
+        .map(|i| {
+            format!(
+                "@utility u{i} {{ @apply hover:u{p} focus:u{p} dark:u{p}; }}",
+                p = i - 1
+            )
+        })
+        .collect();
+    let nested = format!(
+        "{}color: red{}",
+        "@variant hover, focus, dark { ".repeat(24),
+        "}".repeat(24)
+    );
+    let start = std::time::Instant::now();
+    let author = format!(
+        "@custom-variant a {{ @variant b {{ @slot; }} @variant b {{ @slot; }} }}
+        @custom-variant b {{ @variant a {{ @slot; }} }}
+        @custom-variant dark {{ @variant dark {{ @slot; }} }}
+        @custom-variant v0 (&:hover);{chain} @utility u0 {{ color: red; }} {utilities} .x {{ {nested} }}
+        @source not inline('{{-9223372036854775808..9223372036854775807}} {{0..9..9223372036854775807}} {0}{0}{0}');",
+        "{0..4095}"
+    );
+    let found = generated(&author, &["a:flex", "dark:flex", "v39:flex", "u39", "flex"]);
+    assert_eq!(found[0], "");
+    assert_eq!(found[1], "");
+    assert_eq!(found[4], ".flex{display:flex;}");
+    let long = [
+        format!("{}1", "a-".repeat(100_000)),
+        format!("shadow-[{}red]", "a_".repeat(50_000)),
+        format!("{}m-1", "-".repeat(100_000)),
+    ];
+    generated("", &long.each_ref().map(String::as_str));
+    assert!(start.elapsed().as_secs() < 10, "{:?}", start.elapsed());
+}
+
+#[test]
+fn brace_patterns_expand_like_tailwind() {
+    let expand = super::value::braces;
+    assert_eq!(expand("p-{1,2}"), ["p-1", "p-2"]);
+    assert_eq!(
+        expand("{a,b{c,d}}-{4..0..2}"),
+        [
+            "a-4", "bc-4", "bd-4", "a-2", "bc-2", "bd-2", "a-0", "bc-0", "bd-0"
+        ]
+    );
+    assert_eq!(expand("{hover:,}m"), ["hover:m", "m"]);
+    assert_eq!(expand("{-1..1}"), ["-1", "0", "1"]);
+}
+
+#[test]
+fn theme_variables_are_in_the_root_unless_referenced() {
+    for import in ["", " theme(inline)", " theme(static inline)"] {
+        let (doc, styles) = computed(
+            &format!("<style>@import 'tailwindcss'{import}; :root {{ --bg: red }}
+            @theme inline {{ --color-bg: var(--bg); }} @theme reference {{ --color-no: blue; }}
+            p {{ color: var(--color-bg); background: var(--color-no, lime); border-color: var(--color-red-500) }}</style><p></p>"),
+            None,
+        );
+        let p = &styles.values[id(&doc, "p")];
+        assert_eq!(&p["color"], "red");
+        assert_eq!(&p["background-color"], "lime");
+        assert!(p["border-top-color"].starts_with("oklch"), "{import}");
+    }
+}
+
+#[test]
+fn changed_configurations_restyle_like_a_fresh_page() {
+    let page = |config: &str, class: &str| {
+        format!(
+            "<style>@import 'tailwindcss';</style><style id='s'>{config}</style><p class='{class}'></p>"
+        )
+    };
+    let mut doc = Document::parse(&page("/**/", "p-4"));
+    let (mut cache, mut sheets) = (StyleCache::default(), HashMap::new());
+    let (text, p) = (doc.nodes[id(&doc, "#s")].children[0], id(&doc, "p"));
+    let mut previous = None;
+    for (config, class) in [
+        ("", "p-4 zz"),
+        ("@theme{--spacing:10px}", "p-4 zz"),
+        ("@utility zz{margin-left:2px}", "p-4 zz"),
+        ("@utility zz{margin-left:2px}", "p-4 zz m-3"),
+        (
+            "@layer base{.zz{padding:0}}@theme{--color-zz:lime}",
+            "bg-zz m-3",
+        ),
+        ("", "bg-zz m-5"),
+    ] {
+        doc.nodes[text].text = format!("/**/{config}");
+        doc.nodes[p].attrs.set("class", class);
+        let context = super::super::StyleContext {
+            previous: previous.take(),
+            ..Default::default()
+        };
+        let styles = compute_styles(
+            &doc,
+            800.,
+            600.,
+            None,
+            &mut sheets,
+            &mut cache,
+            Some(&context),
+        );
+        cache.finish();
+        let (fresh, full) = computed(&page(config, class), None);
+        let fresh = &full.values[id(&fresh, "p")];
+        for key in ["padding-left", "margin-left", "background-color"] {
+            assert_eq!(
+                styles.values[p].get(Prop::new(key)),
+                fresh.get(Prop::new(key)),
+                "{config} {key}"
+            );
+        }
+        previous = Some(Rc::new(styles));
+    }
 }

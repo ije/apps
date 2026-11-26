@@ -21,7 +21,7 @@ mod ua;
 mod used;
 mod vars;
 pub(crate) use cascade::computed::*;
-pub(crate) use cascade::{Shadows, StyleCache, StyleContext, compute_styles};
+pub(crate) use cascade::{Shadows, Slots, StyleCache, StyleContext, compute_styles, span};
 pub(crate) use chunked::Chunked;
 pub(crate) use fonts::{FONT_NAMES, font_lists, font_names};
 pub(crate) use page::{Page, ShadowWalk, Styles};
@@ -29,9 +29,9 @@ pub(crate) use ua::{SVG, presentation};
 
 pub(crate) use animation::{Frame, Motion};
 pub(crate) use text::{
-    LineHeight, case, case_ignorable, cursor, font, line_height, pseudo_content, push_full,
-    restyle, selection_colors, spacing, starts_word, styled_run, text_run, text_transform,
-    word_break,
+    LineHeight, case, case_ignorable, cursor, font, hyphenation, line_height, plaintext,
+    pseudo_content, push_full, restyle, row_aligns, selection_colors, spacing, starts_word,
+    stretch, styled_run, text_run, text_transform, word_break,
 };
 pub(crate) use used::{dark, drawable_canvas};
 

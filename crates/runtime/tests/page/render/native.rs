@@ -323,6 +323,9 @@ fn selection_modify_moves_by_words_sentences_and_layout_lines_like_chrome() {
             ['editable edges', 'div#2:5,div#0:0,div#2:5,div#0:0,div#0:6'],
             ['editable wraps', 'pf#2:5,pf#2:15,pf#2:18,pf#2:5,pf#2:5 > pf#2:14'],
             ['spaces', 'pe#0:3,pe#0:4,pe#0:5,pe#0:6,pe#0:7,pe#0:10'],
+            ['right to left', 'pg#0:3,pg#0:2,pg#0:3'],
+            ['right to left rects', '1,true'],
+            ['auto directions', 'ltr,rtl,rtl,ltr,rtl,ltr'],
         ]) await expect(name, `results[${{JSON.stringify(name)}}]`, value);
         "#
         ),
@@ -332,7 +335,7 @@ fn selection_modify_moves_by_words_sentences_and_layout_lines_like_chrome() {
              <p id=pa>Hello world. This is a test! Another sentence here.</p><p id=pb>one <b>two <i>three</i></b> four<span>five</span> six</p>\
              <div id=pc class=w>aaaa bbbb cccc dddd eeee ffff gggg</div>\
              <div id=pd contenteditable><div>first line</div><div>second <b>bold</b> line</div><div><br></div><div>fourth</div></div>\
-             <p id=pe>  lots   of   spaces  </p><div id=pf class=w contenteditable>xx <b>yy zz</b> ww vvvv uuuu tttt</div>\
+             <p id=pe>  lots   of   spaces  </p><p id=pg dir=rtl>abc אבג</p><input id=pi dir=auto><p id=pj dir=auto>12</p><p id=ph class=w dir=rtl>some text that wraps</p><div id=pf class=w contenteditable>xx <b>yy zz</b> ww vvvv uuuu tttt</div>\
              <script>globalThis.results = {}; const s = getSelection(), $ = id => document.getElementById(id);\
              const at = (node, offset) => (node.nodeType === 3 ? (node.parentNode.id || node.parentNode.localName) + '#' + [...node.parentNode.childNodes].indexOf(node) : node.id || node.localName) + ':' + offset;\
              const t = (el, ...path) => path.reduce((node, i) => node.childNodes[i], el);\
@@ -350,7 +353,15 @@ fn selection_modify_moves_by_words_sentences_and_layout_lines_like_chrome() {
              run('editable lines', t($('pd'), 0, 0), 3, ['move forward line', 'move forward line', 'move forward line', 'move forward line', 'move backward line', 'move backward line'], $('pd'));\
              run('editable edges', t($('pd'), 1, 1, 0), 2, ['move forward lineboundary', 'move backward lineboundary', 'move forward paragraphboundary', 'move backward documentboundary', 'move forward documentboundary'], $('pd'));\
              run('editable wraps', t($('pf'), 0), 1, ['move forward line', 'move forward line', 'move forward line', 'move backward line', 'extend forward lineboundary'], $('pf'));\
-             run('spaces', t($('pe'), 0), 0, many('move forward character', 6)); });</script>",
+             run('spaces', t($('pe'), 0), 0, many('move forward character', 6));\
+             run('right to left', t($('pg'), 0), 2, ['move left character', 'move right character', 'move left character']);\
+             const auto = [], see = el => auto.push(getComputedStyle(el).direction), field = $('pi');\
+             field.value = '12'; see(field); field.value = '12ש'; see(field); field.setRangeText('3', 0, 1); see(field);\
+             field.focus(); field.select(); document.execCommand('insertText', false, 'a'); see(field);\
+             $('pj').firstChild.data = '12ש'; see($('pj')); $('pj').firstChild.data = '12a'; see($('pj'));\
+             results['auto directions'] = auto.join();\
+             const r = document.createRange(), row = (r.selectNodeContents($('ph')), r.getClientRects());\
+             results['right to left rects'] = [+(row.length > 1), row[0].width > 60].join(); });</script>",
         )],
     );
 }

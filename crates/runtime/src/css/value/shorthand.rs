@@ -1,3 +1,4 @@
+use crate::css::value::font::{VARIANT, variants};
 use crate::css::{value::tokens::components, value::units::Kind, value::units::Lengths};
 
 pub(crate) const BORDER_IMAGE: [&str; 5] = [
@@ -78,7 +79,8 @@ pub(crate) fn border_image(value: &str) -> Option<[String; 5]> {
                 || lower.starts_with("url(")
                 || lower.contains("gradient(")
                 || lower.starts_with("image-set(")
-                || lower.starts_with("-webkit-image-set("))
+                || lower.starts_with("-webkit-image-set(")
+                || lower.starts_with("image("))
         {
             parts[0] = Some(token.into());
             index += 1;
@@ -136,14 +138,60 @@ pub(crate) fn border_image(value: &str) -> Option<[String; 5]> {
     }))
 }
 
+// The position, path, distance, rotation and anchor of an `offset` value.
+fn offset(value: &str) -> Option<[String; 5]> {
+    let valid = |name: &str, value: &str| super::grammar::supports(name, value) == Some(true);
+    let halves = components(value, '/');
+    let (main, anchor) = match halves[..] {
+        [main] => (main, "auto"),
+        [main, anchor] => (main, anchor),
+        _ => return None,
+    };
+    let parts = components(main, ' ');
+    let path = |part: &&str| {
+        part.eq_ignore_ascii_case("none")
+            || super::shape::BOXES
+                .iter()
+                .any(|name| part.eq_ignore_ascii_case(name))
+            || part.contains('(') && valid("offset-path", part)
+    };
+    let start = parts.iter().position(path).unwrap_or(parts.len());
+    let count = parts[start..]
+        .iter()
+        .take(2)
+        .take_while(|part| path(part))
+        .count();
+    let (position, rest) = (parts[..start].join(" "), &parts[start + count..]);
+    let path = parts[start..start + count].join(" ");
+    let length = |part: &&str| valid("offset-distance", part);
+    let distance = rest.iter().position(length);
+    let mut turn = rest.to_vec();
+    if let Some(at) = distance {
+        turn.remove(at);
+    }
+    let out = [
+        (position, "normal", "offset-position"),
+        (path, "none", "offset-path"),
+        (
+            distance.map_or(String::new(), |at| rest[at].to_owned()),
+            "0px",
+            "offset-distance",
+        ),
+        (turn.join(" "), "auto", "offset-rotate"),
+        (anchor.to_owned(), "auto", "offset-anchor"),
+    ]
+    .map(|(value, initial, name)| match value.is_empty() {
+        true => Some(initial.to_owned()),
+        false => valid(name, &value).then_some(value),
+    });
+    let [Some(a), Some(b), Some(c), Some(d), Some(e)] = out else {
+        return None;
+    };
+    (!parts.is_empty()).then_some([a, b, c, d, e])
+}
+
 pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) -> bool {
     let alias = match key {
-        "inline-size" => "width",
-        "block-size" => "height",
-        "min-inline-size" => "min-width",
-        "max-inline-size" => "max-width",
-        "min-block-size" => "min-height",
-        "max-block-size" => "max-height",
         "overflow-inline" => "overflow-x",
         "overflow-block" => "overflow-y",
         "overscroll-behavior-inline" => "overscroll-behavior-x",
@@ -151,12 +199,26 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
         "word-wrap" => "overflow-wrap",
         "grid-row-gap" => "row-gap",
         "-webkit-background-clip" => "background-clip",
+        "-webkit-mask-clip" => "mask-clip",
+        "-webkit-mask-composite" => "mask-composite",
         "grid-column-gap" => "column-gap",
         "contain-intrinsic-inline-size" => "contain-intrinsic-width",
         "contain-intrinsic-block-size" => "contain-intrinsic-height",
         _ => "",
     };
     if !alias.is_empty() {
+        // `-webkit-mask-clip` has names of its own.
+        let value = match alias {
+            "mask-clip" => &*components(value, ',')
+                .into_iter()
+                .map(|name| match name {
+                    "border" | "padding" | "content" => format!("{name}-box"),
+                    name => name.to_owned(),
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => value,
+        };
         out.push((alias.into(), value.into()));
         return true;
     }
@@ -170,6 +232,66 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
         let (width, height) = split.map_or((value, value), |at| value.split_at(at));
         out.push(("contain-intrinsic-width".into(), width.trim().into()));
         out.push(("contain-intrinsic-height".into(), height.trim().into()));
+        return true;
+    }
+    if key == "offset" {
+        const NAMES: [&str; 5] = [
+            "offset-position",
+            "offset-path",
+            "offset-distance",
+            "offset-rotate",
+            "offset-anchor",
+        ];
+        let wide = matches!(
+            value,
+            "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+        );
+        let Some(parts) = (if wide {
+            Some([value; 5].map(String::from))
+        } else {
+            offset(value)
+        }) else {
+            return true;
+        };
+        out.extend(NAMES.map(String::from).into_iter().zip(parts));
+        return true;
+    }
+    if let Some(suffix) = key.strip_prefix("place-") {
+        // An alignment can be two words, like `safe end` or `last baseline`.
+        let whole = |at: usize| {
+            let word = value[..at].rsplit(' ').next().unwrap_or("");
+            !["safe", "unsafe", "first", "last", "legacy"]
+                .iter()
+                .any(|first| word.eq_ignore_ascii_case(first))
+        };
+        let split = value
+            .match_indices(' ')
+            .map(|(at, _)| at)
+            .find(|&at| whole(at));
+        let (align, justify) = match split {
+            Some(at) => value.split_at(at),
+            // A baseline is no `justify-content`.
+            None if suffix == "content" && value.to_ascii_lowercase().ends_with("baseline") => {
+                (value, "start")
+            }
+            None => (value, value),
+        };
+        out.push((format!("align-{suffix}"), align.into()));
+        out.push((format!("justify-{suffix}"), justify.trim().into()));
+        return true;
+    }
+    if key == "position-try" {
+        let (order, fallbacks) = match value {
+            "inherit" | "initial" | "unset" | "revert" | "revert-layer" => {
+                (value.to_owned(), value.to_owned())
+            }
+            _ => match crate::css::value::anchor::position_try(value) {
+                Some(parts) => parts,
+                None => return true,
+            },
+        };
+        out.push(("position-try-order".into(), order));
+        out.push(("position-try-fallbacks".into(), fallbacks));
         return true;
     }
     if key == "border-image" {
@@ -221,39 +343,22 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
             property,
             "margin" | "padding" | "inset" | "border" | "scroll-margin" | "scroll-padding"
         )
-        && let Some((side, rest)) = rest
+        && let Some((_, rest)) = rest
             .split_once('-')
             .map_or(Some((rest, "")), Some)
             .filter(|(side, _)| matches!(*side, "start" | "end"))
     {
-        if key.contains("-inline-") {
-            if property == "border" && rest.is_empty() {
-                let mut parts = Vec::new();
-                expand("border-top", value, &mut parts);
-                out.extend(
-                    parts
-                        .into_iter()
-                        .map(|(name, value)| (name.replacen("border-top", key, 1), value)),
-                );
-                return true;
-            }
-            out.push((key.into(), value.into()));
+        if property == "border" && rest.is_empty() {
+            let mut parts = Vec::new();
+            expand("border-top", value, &mut parts);
+            out.extend(
+                parts
+                    .into_iter()
+                    .map(|(name, value)| (name.replacen("border-top", key, 1), value)),
+            );
             return true;
         }
-        let side = match (key.contains("-inline-"), side) {
-            (true, "start") => "left",
-            (true, _) => "right",
-            (false, "start") => "top",
-            _ => "bottom",
-        };
-        let physical = match (property, rest) {
-            ("inset", _) => side.to_owned(),
-            (_, "") => format!("{property}-{side}"),
-            _ => format!("{property}-{side}-{rest}"),
-        };
-        if !expand(&physical, value, out) {
-            out.push((physical, value.into()));
-        }
+        out.push((key.into(), value.into()));
         return true;
     }
     const SIDES: [&str; 4] = ["top", "right", "bottom", "left"];
@@ -320,13 +425,11 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
             let sides = if key.contains("-inline") {
                 ["inline-start", "inline-end"]
             } else {
-                ["top", "bottom"]
+                ["block-start", "block-end"]
             };
             (
                 sides
                     .map(|side| match property {
-                        "inset" if side.starts_with("inline") => format!("inset-{side}"),
-                        "inset" => side.to_owned(),
                         "border" => format!("border-{side}{rest}"),
                         _ => format!("{property}-{side}"),
                     })
@@ -338,7 +441,7 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
         | "border-block" | "outline" | "column-rule" => {
             let sides: &[&str] = match key {
                 "border-inline" => &["inline-start", "inline-end"],
-                "border-block" => &["top", "bottom"],
+                "border-block" => &["block-start", "block-end"],
                 "outline" | "column-rule" => &[""],
                 _ => &[&key[7..]],
             };
@@ -372,7 +475,7 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
         "font" => (
             [
                 "font-style",
-                "font-variant",
+                "font-variant-caps",
                 "font-weight",
                 "font-stretch",
                 "font-size",
@@ -380,6 +483,9 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                 "font-family",
                 "font-variant-ligatures",
                 "font-variant-numeric",
+                "font-variant-alternates",
+                "font-variant-east-asian",
+                "font-variant-position",
                 "font-kerning",
                 "font-size-adjust",
                 "font-optical-sizing",
@@ -390,6 +496,7 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
             .into(),
             5,
         ),
+        "font-variant" => (VARIANT.map(String::from).into(), 15),
         "flex" => (
             ["flex-grow", "flex-shrink", "flex-basis"]
                 .map(String::from)
@@ -397,13 +504,6 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
             6,
         ),
         "flex-flow" => (["flex-direction", "flex-wrap"].map(String::from).into(), 7),
-        "place-items" | "place-content" | "place-self" => {
-            let suffix = &key[6..];
-            (
-                [format!("align-{suffix}"), format!("justify-{suffix}")].into(),
-                2,
-            )
-        }
         "gap" | "grid-gap" => (["row-gap", "column-gap"].map(String::from).into(), 2),
         "overflow" => (["overflow-x", "overflow-y"].map(String::from).into(), 2),
         "overscroll-behavior" => (
@@ -463,9 +563,19 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
         }
         // `mask` stays as well, because SVG reads it.
         "mask" | "-webkit-mask" => (
-            ["", "-image", "-position", "-size", "-repeat"]
-                .map(|part| format!("{key}{part}"))
-                .into(),
+            [
+                "",
+                "-image",
+                "-position",
+                "-size",
+                "-repeat",
+                "-clip",
+                "-origin",
+                "-composite",
+                "-mode",
+            ]
+            .map(|part| format!("{key}{part}"))
+            .into(),
             4,
         ),
         "-webkit-text-stroke" => (
@@ -569,9 +679,11 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
         }
         4 => {
             let layers = components(value, ',');
-            let mut result = vec![Vec::new(); 8];
+            let masks = key != "background";
+            let mut result = vec![Vec::new(); if masks { 9 } else { 8 }];
             let mut color = "transparent".to_owned();
             for (index, layer) in layers.iter().enumerate() {
+                let (mut composite, mut mode) = ("add", "match-source");
                 let (mut image, mut position, mut size, mut repeat, mut boxes, mut attachment) = (
                     "none".to_owned(),
                     Vec::new(),
@@ -603,6 +715,8 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                         || part.contains("gradient(")
                         || part.starts_with("image-set(")
                         || part.starts_with("-webkit-image-set(")
+                        || part.starts_with("-webkit-cross-fade(")
+                        || part.starts_with("image(")
                         || part == "none"
                     {
                         image = part.into();
@@ -611,10 +725,21 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                         "repeat" | "repeat-x" | "repeat-y" | "no-repeat" | "space" | "round"
                     ) {
                         repeat.push(part);
-                    } else if matches!(part, "border-box" | "padding-box" | "content-box" | "text")
+                    } else if matches!(part, "border-box" | "padding-box" | "content-box")
+                        || match masks {
+                            true => {
+                                matches!(part, "fill-box" | "stroke-box" | "view-box" | "no-clip")
+                            }
+                            false => part == "text",
+                        }
                     {
                         boxes.push(part);
-                    } else if matches!(part, "scroll" | "fixed" | "local") {
+                    } else if masks && matches!(part, "add" | "subtract" | "intersect" | "exclude")
+                    {
+                        composite = part;
+                    } else if masks && matches!(part, "alpha" | "luminance" | "match-source") {
+                        mode = part;
+                    } else if !masks && matches!(part, "scroll" | "fixed" | "local") {
                         attachment = part;
                     } else if after_slash
                         && (length(part) || matches!(part, "auto" | "cover" | "contain"))
@@ -624,7 +749,8 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                         || matches!(part, "left" | "right" | "top" | "bottom" | "center")
                     {
                         position.push(part.into());
-                    } else if index + 1 == layers.len()
+                    } else if !masks
+                        && index + 1 == layers.len()
                         && match part.split_once('(') {
                             Some((name, _)) => matches!(
                                 name.to_ascii_lowercase().as_str(),
@@ -639,6 +765,7 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                                     | "oklch"
                                     | "color"
                                     | "color-mix"
+                                    | "contrast-color"
                                     | "light-dark"
                                     | "var"
                                     | "env"
@@ -671,6 +798,13 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                     "repeat",
                 ));
                 let (origin, clip) = match boxes.as_slice() {
+                    [] | ["no-clip"] | [_, _, ..] if masks => match boxes[..] {
+                        [] => ("border-box", "border-box"),
+                        ["no-clip"] => ("border-box", "no-clip"),
+                        ["no-clip", origin] => (origin, "no-clip"),
+                        [origin, clip] => (origin, clip),
+                        _ => return true,
+                    },
                     [] => ("padding-box", "border-box"),
                     ["text"] => ("padding-box", "text"),
                     [one] => (*one, *one),
@@ -678,7 +812,12 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                 };
                 result[5].push(clip.into());
                 result[6].push(origin.into());
-                result[7].push(attachment.into());
+                if masks {
+                    result[7].push(composite.into());
+                    result[8].push(mode.into());
+                } else {
+                    result[7].push(attachment.into());
+                }
             }
             result[0].push(color);
             let result = result.into_iter().map(|values| values.join(", "));
@@ -784,7 +923,8 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
             };
             values.extend(
                 [
-                    "normal", "normal", "auto", "none", "auto", "normal", "normal",
+                    "normal", "normal", "normal", "normal", "normal", "auto", "none", "auto",
+                    "normal", "normal",
                 ]
                 .map(String::from),
             );
@@ -844,6 +984,10 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
             };
             values
         }
+        15 => match variants(&value.to_ascii_lowercase()) {
+            Some(values) => values.into(),
+            None => return true,
+        },
         9 => {
             let mut values = vec!["disc".to_owned(), "outside".to_owned(), "none".to_owned()];
             let (mut none, mut typed) = (false, false);

@@ -88,6 +88,9 @@ impl Tree {
                     _ => None,
                 }
             });
+        // A copy that reads a tile of a replaced image is rejected in `replay`.
+        #[cfg(debug_assertions)]
+        let copy = copy.filter(|(chunk, _)| !window.reads_removed(&chunk.span));
         // Debug builds paint the box to check the copy, unless the boxes inside have old places.
         let lagged = self.slots[index as usize].lag != Point::default();
         if (cfg!(not(debug_assertions)) || lagged)
@@ -378,7 +381,11 @@ impl Tree {
                         for child in 0..self.slots[index as usize].children.len() {
                             let child = index_of(self.slots[index as usize].children[child]);
                             let slot = &self.slots[child as usize];
-                            if slot.style.flow & Flow::FLOAT != 0 && slot.style.z_index.is_none() {
+                            // Text runs into the box of a float with a shape, and paints over it.
+                            if slot.style.flow & Flow::FLOAT != 0
+                                && slot.style.z_index.is_none()
+                                && slot.style.outside.is_none()
+                            {
                                 self.deferred.push(child);
                             } else {
                                 self.paint_node(child, false, window);

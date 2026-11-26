@@ -638,7 +638,7 @@ impl Motion {
         visit.dedup();
         self.seen = styles.values.clone();
         for id in visit {
-            let new = &styles.values[id];
+            let new = styles.unanchored(id);
             if Rc::ptr_eq(&self.previous[id], new) {
                 continue;
             }
@@ -656,7 +656,7 @@ impl Motion {
             std::iter::successors(doc.nodes[id].parent, |&parent| doc.nodes[parent].parent).count()
         });
         for id in exits.into_iter().chain(changed) {
-            let new = &styles.values[id];
+            let new = styles.unanchored(id);
             let old = std::mem::replace(&mut self.previous[id], new.clone());
             // A container query pass recomputes styles inside one frame, so it must not start transitions.
             if repass {

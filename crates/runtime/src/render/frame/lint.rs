@@ -76,10 +76,6 @@ pub(super) fn lint(
                     Prop::LINE_HEIGHT | Prop::VERTICAL_ALIGN if !pseudo.is_empty() => {
                         "line height and baseline can't change inside a line of text"
                     }
-                    Prop::TRANSFORM_STYLE if value == "preserve-3d" => {
-                        "3D children are flattened into the parent's plane"
-                    }
-                    Prop::CLIP_PATH if value.contains("shape(") => "shape() is not supported",
                     Prop::FILTER if value.contains("url(") && !value.contains("url(#") => {
                         "only filters defined in the page are supported"
                     }

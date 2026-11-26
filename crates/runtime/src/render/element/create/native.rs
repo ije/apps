@@ -4,6 +4,7 @@ use super::super::query::LOOK;
 use super::cx::{Cx, Frame};
 use crate::css;
 use crate::css::properties::Prop;
+use crate::render::layout::size::{list_rows, option_row, widest_option};
 use renderer::{Color, Rect, point, px, size};
 
 /// Reads the look of a native form control, and gives its box the padding and borders of that look.
@@ -33,18 +34,7 @@ pub(super) fn native_control(
         pixel_ratio,
         ..
     } = *reader;
-    let list = (node.tag == "select")
-        .then(|| {
-            match node
-                .attrs
-                .get("size")
-                .and_then(|size| size.trim().parse::<usize>().ok())
-            {
-                Some(rows) if rows > 1 => Some(rows),
-                _ => node.attrs.contains_key("multiple").then_some(4),
-            }
-        })
-        .flatten();
+    let list = list_rows(node);
     let native = crate::render::paint::control::kind(&node.tag, input, list.is_some(), style).map(
         |(control, boxed, plain)| {
             let number = |name: &str| {
@@ -205,14 +195,7 @@ pub(super) fn native_control(
         if let Some(rows) = list
             && style.get(Prop::HEIGHT).is_none_or(|value| value == "auto")
         {
-            // Options have `line-height: normal` and `min-height: 1.2em`.
-            let normal = text
-                .line_metrics(text.face(&parsed.face), px(units.font.em * pixel_ratio))
-                .map(f32::from)
-                .iter()
-                .sum::<f32>()
-                / pixel_ratio;
-            let row = (normal.max(1.2 * units.font.em) * 64.).round() / 64. + 1.;
+            let row = option_row(&parsed.face, units.font.em, text, pixel_ratio);
             el = el.h(px(rows as f32 * row
                 + padding[0]
                 + padding[2]
@@ -220,43 +203,10 @@ pub(super) fn native_control(
                 + borders[2]));
         }
         if look.control == crate::render::paint::control::Control::Menu {
-            padding[1] += 16.;
+            padding[1] += 12.;
             padding[3] += 4.;
             if style.get(Prop::WIDTH).is_none_or(|value| value == "auto") {
-                let (font, size) = (parsed.face.clone(), px(units.font.em));
-                let mut widest = 0f32;
-                let mut stack = node.children.clone();
-                while let Some(child) = stack.pop() {
-                    match doc.nodes[child].tag.as_str() {
-                        "optgroup" => stack.extend(&doc.nodes[child].children),
-                        "option" => {
-                            let label = doc
-                                .text(child)
-                                .split_ascii_whitespace()
-                                .collect::<Vec<_>>()
-                                .join(" ");
-                            let run = renderer::TextRun {
-                                len: label.len(),
-                                font: font.clone(),
-                                color: renderer::Color::BLACK,
-                                background_color: None,
-                                underline: None,
-                                strikethrough: None,
-                                overline: None,
-                                letter_spacing: px(0.),
-                                word_spacing: px(0.),
-                                font_size: None,
-                                inset: Default::default(),
-                                nowrap: false,
-                                tab_size: 8.,
-                                stroke: None,
-                            };
-                            widest = widest
-                                .max(f32::from(text.shape_line(&label, size, &run).line.width));
-                        }
-                        _ => {}
-                    }
-                }
+                let widest = widest_option(doc, id, &parsed.face, units.font.em, text);
                 el = el.min_w(px((widest * pixel_ratio).ceil() / pixel_ratio
                     + padding[1]
                     + padding[3]

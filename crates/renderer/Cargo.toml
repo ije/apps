@@ -11,6 +11,7 @@ etagere.workspace = true
 raw-window-handle.workspace = true
 rustc-hash.workspace = true
 taffy = { workspace = true, features = ["std", "flexbox", "grid", "block_layout", "calc"] }
+unicode-bidi = { version = "0.3.18", default-features = false, features = ["hardcoded-data", "std"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc.workspace = true
@@ -27,6 +28,7 @@ objc2-core-foundation = { workspace = true, features = [
     "CFCGTypes",
     "CFData",
     "CFDictionary",
+    "CFLocale",
     "CFNumber",
     "CFPreferences",
     "CFString",

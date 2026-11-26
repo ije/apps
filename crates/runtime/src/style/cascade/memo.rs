@@ -139,6 +139,8 @@ pub(crate) struct CachedStyle {
     pub(crate) extras: Option<Rc<Extras>>,
     pub(crate) viewport: bool,
     pub(crate) keyword: bool,
+    // Anchors place boxes with it.
+    pub(crate) positions: bool,
 }
 
 pub(crate) struct Share {

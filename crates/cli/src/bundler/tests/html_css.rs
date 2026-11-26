@@ -259,13 +259,80 @@ fn tailwind_parts_keep_their_imports() {
     .unwrap();
     let source = Rc::<Shared>::default().html(&path).unwrap();
     let css = linked_css(&source);
-    assert!(css.contains("@import \"tailwindcss/theme.css\";"));
-    assert!(css.contains("@import \"tailwindcss/utilities\";"));
+    assert!(css.contains("@import \"tailwindcss/theme.css\" layer(theme);"));
+    assert!(css.contains("@import \"tailwindcss/utilities\" layer(utilities);"));
     let style = apps_runtime::style::styles(&apps_runtime::bundle::page(&source), 800., 600.)
         .pop()
         .unwrap();
     assert_eq!(style["display"], "flex");
     assert_eq!(style["list-style-type"], "disc");
+}
+
+#[test]
+fn tailwind_import_options_reach_imported_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = |name: &str, text: &str| fs::write(dir.path().join(name), text).unwrap();
+    write(
+        "app.css",
+        "@import 'tailwindcss'; @theme { --color-brand: #010203; } .card { --at: '@theme' }",
+    );
+    write(
+        "style.css",
+        "@import './app.css' layer(app) prefix(tw) important theme(static) source('./x');",
+    );
+    let path = dir.path().join("index.html");
+    write(
+        "index.html",
+        "<link rel='stylesheet' href='./style.css'><p class='tw:bg-brand flex'></p>",
+    );
+    let source = Rc::<Shared>::default().html(&path).unwrap();
+    let css = linked_css(&source);
+    assert!(css.contains("@import \"tailwindcss\" prefix(tw) important theme(static) layer(app);"));
+    assert!(css.contains("@theme prefix(tw)  static  {"), "{css}");
+    assert!(css.contains("--at: '@theme'"));
+    let style = apps_runtime::style::styles(&apps_runtime::bundle::page(&source), 800., 600.)
+        .pop()
+        .unwrap();
+    assert_eq!(style["background-color"], "#010203");
+    assert_eq!(style["display"], "block");
+}
+
+#[test]
+fn referenced_tailwind_files_give_no_rules() {
+    for option in ["reference", "theme(reference)"] {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, text: &str| fs::write(dir.path().join(name), text).unwrap();
+        write(
+            "app.css",
+            "/* ; */ @import 'tailwindcss'; @theme { --color-brand: #010203; --x: ';}'; }
+            @layer base { @theme { --color-old: #040506; } p { margin: 9px } }
+            @utility box { color: #070809; &:hover { color: red } } p { padding: 9px }
+            @custom-variant on (&.on); @custom-variant off { &:not(.on) { @slot; } }",
+        );
+        write(
+            "style.css",
+            &format!(
+                "@import 'tailwindcss'; @import './app.css' {option}; @theme {{ --color-new: red; }}"
+            ),
+        );
+        let path = dir.path().join("index.html");
+        write(
+            "index.html",
+            "<link rel='stylesheet' href='./style.css'><p class='box on on:bg-brand off:hidden border-old p-2'></p>",
+        );
+        let source = Rc::<Shared>::default().html(&path).unwrap();
+        let css = linked_css(&source);
+        assert!(!css.contains("9px"), "{css}");
+        let style = apps_runtime::style::styles(&apps_runtime::bundle::page(&source), 800., 600.)
+            .pop()
+            .unwrap();
+        assert_eq!(style["background-color"], "#010203");
+        assert_eq!(style["border-top-color"], "#040506");
+        assert_eq!(style["color"], "#070809");
+        assert_eq!(style["display"], "block");
+        let px = |key: &str| apps_runtime::css::value::length(&style[key], 0., 16., 800., 600.);
+        assert_eq!(px("padding-left"), 8.);
+    }
 }
 
 #[test]
@@ -679,7 +746,7 @@ fn css_urls_skip_comments_and_strings_and_asset_names_are_stable() {
         Path::new("../packages/a/index.js")
     );
     let css = urls(
-        "/* url( */ .a{background:URL( '../img/a.png' )} .b::after{content:'url('} .c{background:url(../img/b.png)}",
+        "/* url( */ .a{background:URL( '../img/a.png' )} .b::after{content:'url('} .c{background:url(../img/b.png)} .d{background:image-set(url(../img/a.png) 1x, '../img/b.png' type('image/png') 2x);content:'../img/a.png'}",
         &root.join("web"),
         &Shared {
             root: root.clone(),
@@ -689,7 +756,7 @@ fn css_urls_skip_comments_and_strings_and_asset_names_are_stable() {
     assert_eq!(
         css,
         format!(
-            "/* url( */ .a{{background:URL(\"apps:///{a}\")}} .b::after{{content:'url('}} .c{{background:url(\"apps:///{b}\")}}"
+            "/* url( */ .a{{background:URL(\"apps:///{a}\")}} .b::after{{content:'url('}} .c{{background:url(\"apps:///{b}\")}} .d{{background:image-set(url(\"apps:///{a}\") 1x, url(\"apps:///{b}\") type('image/png') 2x);content:'../img/a.png'}}"
         )
     );
     fs::write(root.join("web/index.html"), r#"<img srcset="../img/a.png 1x,../img/b.png, data:image/png;base64,AA== 3x"><picture><source srcset=" ../img/b.png 2x"></picture>"#).unwrap();

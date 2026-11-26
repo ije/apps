@@ -1,7 +1,7 @@
 use crate::css::{properties::Prop, sheet::Stylesheet};
 use std::rc::Rc;
 pub(crate) const UA: &str = "
-html,body,address,blockquote,center,dialog,div,figure,figcaption,footer,form,header,hr,legend,main,p,pre,search,article,aside,h1,h2,h3,h4,h5,h6,hgroup,nav,section,dd,dl,dt,menu,ol,ul,details,summary,fieldset,optgroup,option{display:block}
+html,body,address,blockquote,center,dialog,div,figure,figcaption,footer,form,header,hr,legend,main,p,pre,search,article,aside,h1,h2,h3,h4,h5,h6,hgroup,nav,section,dd,dl,dt,menu,dir,ol,ul,details,summary,fieldset,optgroup,option{display:block}
 li{display:list-item}
 img,svg,canvas,video,audio,iframe,embed,object,input,button,select,textarea,progress,meter{display:inline-block}
 input:not([type=hidden i],[type=image i],[type=file i]),button,select,textarea,meter,progress{appearance:auto}
@@ -14,18 +14,24 @@ audio{width:300px;height:54px}
 video{object-fit:contain}
 terminal{display:inline-block;width:80ch;height:24lh;overflow:hidden;font:13px ui-monospace,Menlo,Consolas,monospace;cursor:text;user-select:none}
 slot{display:contents}
+[dir]{unicode-bidi:isolate}
+bdi,output{unicode-bidi:isolate}
+bdo,bdo[dir]{unicode-bidi:isolate-override}
 [dir=rtl i]{direction:rtl}
-[dir=ltr i]{direction:ltr}
+[dir=ltr i],[dir=auto i]{direction:ltr}
+bdi{direction:ltr}
+[dir=auto i]:dir(rtl),bdi:dir(rtl){direction:rtl}
+textarea[dir=auto i],pre[dir=auto i]{unicode-bidi:plaintext}
 body{margin:8px}
-p,dl,ul,ol,menu,pre{margin:1em 0}
+p,dl,ul,ol,menu,dir,pre{margin:1em 0}
 blockquote,figure{margin:1em 40px}
 ul ul,ul ol,ol ul,ol ol{margin:0}
-ul,ol,menu{padding-left:40px}
-ul,menu{list-style-type:disc}
+ul,ol,menu,dir{padding-inline-start:40px}
+ul,menu,dir{list-style-type:disc}
 ol{list-style-type:decimal}
 ul ul,ol ul{list-style-type:circle}
 ul ul ul,ol ul ul,ul ol ul,ol ol ul{list-style-type:square}
-dd{margin-left:40px}
+dd{margin-inline-start:40px}
 h1{font-size:2em;margin:.67em 0;font-weight:bold}
 h2{font-size:1.5em;margin:.83em 0;font-weight:bold}
 h3{font-size:1.17em;margin:1em 0;font-weight:bold}
@@ -46,8 +52,7 @@ s,strike,del{text-decoration:line-through}
 abbr[title]{text-decoration:underline dotted}
 mark{background-color:#ff0;color:#000}
 a[href]{color:LinkText;text-decoration:underline;cursor:pointer}
-center,caption{text-align:center}
-th{text-align:-internal-center}
+center,caption{text-align:-webkit-center}
 hr{margin:.5em auto;border:1px inset;color:gray;overflow:hidden}
 table{display:table;box-sizing:border-box;border-spacing:2px;text-indent:0}
 thead{display:table-header-group}
@@ -56,20 +61,10 @@ tfoot{display:table-footer-group}
 tr{display:table-row}
 td,th{display:table-cell}
 caption{display:table-caption}
-td[colspan='2'],th[colspan='2']{grid-column:span 2}
-td[rowspan='2'],th[rowspan='2']{grid-row:span 2}
-td[colspan='3'],th[colspan='3']{grid-column:span 3}
-td[rowspan='3'],th[rowspan='3']{grid-row:span 3}
-td[colspan='4'],th[colspan='4']{grid-column:span 4}
-td[rowspan='4'],th[rowspan='4']{grid-row:span 4}
-td[colspan='5'],th[colspan='5']{grid-column:span 5}
-td[rowspan='5'],th[rowspan='5']{grid-row:span 5}
-td[colspan='6'],th[colspan='6']{grid-column:span 6}
-td[rowspan='6'],th[rowspan='6']{grid-row:span 6}
-table[border]{border:1px outset}
-table[border]:not([border='0']) td,table[border]:not([border='0']) th{border:1px inset}
 td,th{padding:1px}
-thead,tbody,tfoot,tr{vertical-align:middle}
+thead,tbody,tfoot,table>tr{vertical-align:middle}
+tr{vertical-align:inherit}
+thead,tbody,tfoot,tr{border-color:inherit}
 td,th{vertical-align:inherit}
 fieldset{margin:0 2px;padding:.35em .75em .625em;border:2px groove light-dark(#efefef,#6b6b6b)}
 legend{padding:0 2px}
@@ -90,6 +85,7 @@ input[type=range i]{margin:2px;padding:0;border:0;background-color:transparent;c
 input[type=color i]{width:50px;height:27px;border:1px solid light-dark(#000,#fff);background-color:light-dark(#efefef,#6b6b6b);box-sizing:border-box}
 input[type=file i]{padding:0;border:0;background-color:transparent}
 input[type=file i]::file-selector-button{margin:0 4px 0 0;padding:2px 7px;border:1px solid light-dark(#767676,#858585);border-radius:2px;background-color:light-dark(#efefef,#6b6b6b)}
+input:is([type=date i],[type=time i],[type=datetime-local i],[type=month i],[type=week i]){padding:0;padding-inline-start:1px;font-family:monospace}
 input[type=search i]{box-sizing:border-box}
 summary{list-style-position:inside}
 button:disabled,input[type=button i]:disabled,input[type=submit i]:disabled,input[type=reset i]:disabled{color:light-dark(rgba(16,16,16,.3),rgba(255,255,255,.3));background-color:light-dark(rgba(239,239,239,.3),rgba(19,1,1,.3));border-color:light-dark(rgba(118,118,118,.3),rgba(195,195,195,.3))}

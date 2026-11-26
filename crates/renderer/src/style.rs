@@ -4,6 +4,7 @@ use crate::{
     point, px, size,
     text::TextOverrides,
 };
+use std::rc::Rc;
 
 // The shader reads the style as its position in this list.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -169,7 +170,7 @@ keywords! {
     Overscroll { Auto, Contain, None }
     FlexDirection { Row, RowReverse, Column, ColumnReverse }
     FlexWrap { NoWrap, Wrap, WrapReverse }
-    AlignItems { FlexStart, FlexEnd, Center, Baseline, LastBaseline, Stretch }
+    AlignItems { FlexStart, FlexEnd, Center, SafeFlexEnd, SafeCenter, Baseline, LastBaseline, Stretch }
     AlignContent { Start, End, FlexStart, FlexEnd, Center, Stretch, SpaceBetween, SpaceEvenly, SpaceAround }
     ObjectFit { Fill, Contain, Cover, ScaleDown, None }
     // `FirstOnly` takes the first baseline and gives none for the last. `Middle` puts it at half the border box height.
@@ -216,6 +217,13 @@ pub struct BoxShadow {
     pub inset: bool,
 }
 
+/// `overflow-clip-margin`: the distances from the padding box out to its box, and how far it reaches past that box.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClipMargin {
+    pub sides: Edges<Pixels>,
+    pub reach: Pixels,
+}
+
 macro_rules! style {
     ($($(#[$doc:meta])* $field:ident: $kind:ty = $initial:expr,)*) => {
         #[derive(Clone, Debug, PartialEq)]
@@ -237,6 +245,8 @@ style! {
     display: Display = Display::Block,
     visibility: Visibility = Visibility::Visible,
     overflow: Point<Overflow> = Point::new(Overflow::Visible, Overflow::Visible),
+    /// How far a box with [`Overflow::Clip`] on both axes paints past its padding box.
+    clip_margin: Option<Box<ClipMargin>> = None,
     restrict_scroll_to_axis: bool = false,
     overscroll: Point<Overscroll> = Point::new(Overscroll::Auto, Overscroll::Auto),
     position: Position = Position::Relative,
@@ -286,12 +296,18 @@ style! {
     placed: u8 = 0,
     mark: Option<Mark> = None,
     follow: Option<Follow> = None,
+    /// An out-of-flow box with an anchor, and the axes it aligns on.
+    anchored: Option<Box<[Option<Aligned>; 2]>> = None,
     /// A column set: its first child is the flow of content, as wide as one column.
     columns: Option<Box<Columns>> = None,
     /// [`Break`] bits of a box in a column flow.
     breaks: u8 = 0,
     /// [`Flow`] bits of a box in a block formatting context with floats.
     flow: u8 = 0,
+    /// The shape that lines run around instead of the margin box of a float.
+    outside: Option<Rc<Outside>> = None,
+    /// Sizes that are functions of the content sizes.
+    sizing: Option<Rc<Sizing>> = None,
     /// [`ScrollAnchor`] bits.
     scroll_anchor: u8 = 0,
     /// The bounds that [`Length::Bound`] lengths of this style index.
@@ -320,6 +336,62 @@ pub struct Follow {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Align {
+    Start,
+    Center,
+    End,
+    /// The center is at this place.
+    At(f32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AlignOverflow {
+    /// It moves into its room, or else into the containing block.
+    Shift,
+    Safe,
+    Unsafe,
+}
+
+/// How an out-of-flow box with an anchor aligns on an axis between two places of its containing block, in pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Aligned {
+    pub room: [f32; 2],
+    pub align: Align,
+    pub overflow: AlignOverflow,
+    pub rtl: bool,
+    /// Where the containing block ends that a box too big for its room stays in, at least. Infinite when it scrolls
+    /// to the box.
+    pub limit: f32,
+}
+
+impl Aligned {
+    /// The place of a margin box of `size` in a containing block of `extent`.
+    pub fn place(&self, size: f32, extent: f32) -> f32 {
+        let [from, to] = self.room;
+        let at = match self.align {
+            Align::Start => from,
+            Align::Center => (from + to - size) / 2.,
+            Align::End => to - size,
+            Align::At(center) => center - size / 2.,
+        };
+        let within = |at: f32, [from, to]: [f32; 2]| match self.rtl {
+            true => at.max(from).min(to - size),
+            false => at.min(to - size).max(from),
+        };
+        match self.overflow {
+            AlignOverflow::Unsafe => at,
+            AlignOverflow::Safe if self.rtl => at.min(to - size),
+            AlignOverflow::Safe => at.max(from),
+            AlignOverflow::Shift if size <= to - from => within(at, self.room),
+            AlignOverflow::Shift if self.rtl && self.limit == f32::INFINITY => {
+                at.min(to.max(extent) - size)
+            }
+            AlignOverflow::Shift => within(at, [from.min(0.), to.max(extent).max(self.limit)]),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Columns {
     pub count: u16,
     pub gap: Pixels,
@@ -338,6 +410,125 @@ impl Break {
     pub const AVOID_INSIDE: u8 = 16;
     /// Replaced content and controls, which columns never break.
     pub const WHOLE: u8 = 32;
+}
+
+/// The content size that a [`Sizing`] width reads.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ContentWidth {
+    Min,
+    Max,
+    Fit,
+}
+
+type SizeOf = Box<dyn Fn(f32) -> f32>;
+
+/// Sizes of a border box from its content sizes, in CSS pixels. The layout uses them where the box has no other size.
+pub struct Sizing {
+    /// Tells functions apart.
+    pub key: u64,
+    pub width: Option<(ContentWidth, SizeOf)>,
+    pub height: Option<SizeOf>,
+    /// Percent heights inside resolve against the height.
+    /// The aspect ratio, whose height is the least content height.
+    pub ratio: Option<f32>,
+    pub definite: bool,
+}
+
+impl std::fmt::Debug for Sizing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.key.fmt(f)
+    }
+}
+
+impl PartialEq for Sizing {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+/// The `shape-outside` of a float.
+pub struct Outside {
+    /// Tells shapes apart.
+    pub key: u64,
+    /// The outline of the shape for a margin box of this size, from its top left corner.
+    #[allow(clippy::type_complexity)]
+    pub points: Box<dyn Fn([f32; 2]) -> Vec<[f32; 2]>>,
+    pub margin: f32,
+    /// The last rows, as each paragraph beside the float asks for them.
+    #[allow(clippy::type_complexity)]
+    pub rows: std::cell::RefCell<([f32; 4], Rc<[[f32; 3]]>)>,
+}
+
+impl std::fmt::Debug for Outside {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.key.fmt(f)
+    }
+}
+
+impl PartialEq for Outside {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Outside {
+    /// The rows of the shape in a margin box: their top, their bottom, and how far the shape reaches from the left.
+    pub(crate) fn rows(&self, size: [f32; 2], right: bool, step: f32) -> Rc<[[f32; 3]]> {
+        let key = [size[0], size[1], f32::from(u8::from(right)), step];
+        if self.rows.borrow().0 == key {
+            return self.rows.borrow().1.clone();
+        }
+        let points = (self.points)(size);
+        let better = |a: f32, b: f32| if right { a.min(b) } else { a.max(b) };
+        let none = if right {
+            f32::INFINITY
+        } else {
+            f32::NEG_INFINITY
+        };
+        // The outermost x of the shape between two heights.
+        let reach = |top: f32, bottom: f32| {
+            let mut found = none;
+            for (at, &[x0, y0]) in points.iter().enumerate() {
+                let [x1, y1] = points[(at + 1) % points.len()];
+                let (low, high) = (y0.min(y1).max(top), y0.max(y1).min(bottom));
+                if low > high {
+                    continue;
+                }
+                for y in [low, high] {
+                    let share = if y1 == y0 { 0. } else { (y - y0) / (y1 - y0) };
+                    found = better(found, x0 + (x1 - x0) * share);
+                }
+                if y0 == y1 {
+                    found = better(found, x1);
+                }
+            }
+            found
+        };
+        let mut rows: Vec<[f32; 3]> = Vec::new();
+        let count = (size[1] / step).ceil().clamp(0., 4096.) as usize;
+        for row in 0..count {
+            let (top, bottom) = (row as f32 * step, ((row + 1) as f32 * step).min(size[1]));
+            let mut x = none;
+            let steps = if self.margin > 0. { 8 } else { 0 };
+            for at in -steps..=steps {
+                let by = self.margin * at as f32 / 8.;
+                let across = (self.margin * self.margin - by * by).max(0.).sqrt();
+                let side = reach(top + by, bottom + by);
+                x = better(x, if right { side - across } else { side + across });
+            }
+            if x == none {
+                continue;
+            }
+            let x = x.clamp(0., size[0]);
+            match rows.last_mut() {
+                Some(last) if last[1] == top && last[2] == x => last[1] = bottom,
+                _ => rows.push([top, bottom, x]),
+            }
+        }
+        let rows: Rc<[_]> = rows.into();
+        *self.rows.borrow_mut() = (key, rows.clone());
+        rows
+    }
 }
 
 pub struct Flow;
@@ -414,6 +605,8 @@ impl Style {
             AlignItems::FlexStart => t::AlignItems::FLEX_START,
             AlignItems::FlexEnd => t::AlignItems::FLEX_END,
             AlignItems::Center => t::AlignItems::CENTER,
+            AlignItems::SafeFlexEnd => t::AlignItems::SAFE_FLEX_END,
+            AlignItems::SafeCenter => t::AlignItems::SAFE_CENTER,
             AlignItems::Baseline | AlignItems::LastBaseline => t::AlignItems::BASELINE,
             AlignItems::Stretch => t::AlignItems::STRETCH,
         };
@@ -540,6 +733,11 @@ impl Style {
         }
     }
 
+    pub(crate) fn clips_past_padding(&self) -> Option<&ClipMargin> {
+        (self.clip_margin.as_deref())
+            .filter(|_| self.overflow == Point::new(Overflow::Clip, Overflow::Clip))
+    }
+
     /// A visible axis stays open, and a visible border is outside the clip.
     pub fn overflow_mask(&self, bounds: Rect) -> Option<Clip<Pixels>> {
         const FAR: Pixels = px(1e7);
@@ -548,11 +746,20 @@ impl Style {
             return None;
         }
         // Like Chrome, the clip is the padding box, also with transparent or multicolored borders.
-        let border = self.border_widths;
+        let mut border = self.border_widths;
+        let margin = self.clips_past_padding();
+        if let Some(margin) = margin {
+            border.top -= margin.sides.top;
+            border.right -= margin.sides.right;
+            border.bottom -= margin.sides.bottom;
+            border.left -= margin.sides.left;
+        }
         let inner = Rect::between(
             bounds.origin + point(border.left, border.top),
             bounds.bottom_right() - point(border.right, border.bottom),
         );
+        let reach = margin.map_or(Pixels::ZERO, |margin| margin.reach);
+        let inner = inner.inset(-reach);
         let (start, end) = (inner.origin, inner.bottom_right());
         let open = |clip: bool, edge: Pixels, far: Pixels| if clip { edge } else { far };
         let clip = Rect::between(
@@ -563,7 +770,24 @@ impl Style {
         if radii.is_zero() {
             return Some(Clip::from(clip));
         }
-        let inset = radii.inset(border.top, border.right, border.bottom, border.left);
+        let corners =
+            |[top_left, top_right, bottom_right, bottom_left]: [Pixels; 4]| crate::Corners {
+                top_left,
+                top_right,
+                bottom_right,
+                bottom_left,
+            };
+        let mut inset = radii.inset(border.top, border.right, border.bottom, border.left);
+        if !reach.is_zero() {
+            // Like Chrome, small radii grow less, and square corners stay square.
+            let grown = |radius: Pixels| match radius.0 / reach.0 {
+                _ if radius.is_zero() => radius,
+                ratio if (0. ..1.).contains(&ratio) => radius + reach * (1. + (ratio - 1.).powi(3)),
+                _ => (radius + reach).max(Pixels::ZERO),
+            };
+            inset.x = corners(inset.x.to_array().map(grown));
+            inset.y = corners(inset.y.to_array().map(grown));
+        }
         // A bevel or concave inner curve is the outer one moved in, which a curve of the padding box can't
         // match. When every curved corner is such a one and both axes clip, the curves come from the border box
         // and the clip bounds cut the padding box.
@@ -598,13 +822,6 @@ impl Style {
                     )
                 };
             }
-            let corners =
-                |[top_left, top_right, bottom_right, bottom_left]: [Pixels; 4]| crate::Corners {
-                    top_left,
-                    top_right,
-                    bottom_right,
-                    bottom_left,
-                };
             return Some(Clip {
                 bounds: clip,
                 rounded: bounds,
@@ -747,4 +964,23 @@ mod tests {
             place(ObjectFit::Contain, big)
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn shapes_give_their_rows_and_reach() {
+    let shape = |margin| Outside {
+        key: 0,
+        points: Box::new(|[width, height]| vec![[0., 0.], [width, 0.], [0., height]]),
+        margin,
+        rows: Default::default(),
+    };
+    let rows = shape(0.).rows([4., 4.], false, 1.);
+    assert_eq!(
+        *rows,
+        [[0., 1., 4.], [1., 2., 3.], [2., 3., 2.], [3., 4., 1.]]
+    );
+    assert_eq!(*shape(0.).rows([4., 4.], true, 2.), [[0., 4., 0.]]);
+    let rows = shape(1.).rows([4., 4.], false, 2.);
+    assert!(rows[1][2] > 2. && rows[1][2] < 4.);
 }

@@ -1,4 +1,5 @@
 mod diff;
+mod space;
 mod span;
 
 use crate::{
@@ -719,6 +720,24 @@ impl Scene {
         self.layers.push(layer);
     }
 
+    // Ends a layer. A hidden plane of a 3D rendering context doesn't draw.
+    pub(crate) fn end_plane(&mut self, hidden: bool) {
+        match hidden {
+            true => drop(self.active.pop()),
+            false => self.pop_effect(),
+        }
+    }
+
+    pub(crate) fn next_layer(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub(crate) fn nested_len(&self) -> usize {
+        self.layers[self.active.last().copied().unwrap_or(0)]
+            .nested
+            .len()
+    }
+
     pub(crate) fn pop_effect(&mut self) {
         let Some(index) = self.active.pop() else {
             return;
@@ -865,6 +884,17 @@ pub enum BlendMode {
     PlusLighter = 16,
 }
 
+/// How a layer with a transform takes part in a 3D rendering context.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Space {
+    // The layer is a plane of the context around it, and its transform goes to the space of that context.
+    pub joins: bool,
+    // Layers inside can join the context of this layer.
+    pub preserves: bool,
+    // The plane shows its hidden back, so only the planes inside draw.
+    pub hidden: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct PaintEffect {
     pub transform: Option<[f32; 16]>,
@@ -878,6 +908,9 @@ pub struct PaintEffect {
     pub backdrop: Option<Backdrop>,
     pub glass: Option<Glass>,
     pub key: Option<u64>,
+    pub space: Space,
+    // The box of a plane of a 3D rendering context.
+    pub plane: Rect<Pixels>,
     // Shows the content only through the text that `Window::with_text_clip` captures around it.
     pub text_mask: bool,
 }
@@ -896,6 +929,8 @@ impl Default for PaintEffect {
             backdrop: None,
             glass: None,
             key: None,
+            space: Space::default(),
+            plane: Rect::default(),
             text_mask: false,
         }
     }

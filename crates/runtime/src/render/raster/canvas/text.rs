@@ -43,7 +43,7 @@ pub fn font(value: &str) -> Option<String> {
             out.push(' ');
         }
     }
-    if get("font-variant")? == "small-caps" {
+    if get("font-variant-caps")? == "small-caps" {
         out.push_str("small-caps ");
     }
     crate::css::value::tokens::write_number(f64::from(size), &mut out);
@@ -120,6 +120,12 @@ pub fn line(
         font_size: None,
         inset: Default::default(),
         nowrap: false,
+        preserve: true,
+        hyphenation: None,
+        rtl: false,
+        plaintext: false,
+        embedding: None,
+        clear: 0,
         tab_size: 8.,
         stroke: None,
     };

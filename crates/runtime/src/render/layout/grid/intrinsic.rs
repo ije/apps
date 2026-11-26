@@ -16,6 +16,130 @@ pub(super) fn leaf_ceil(width: f32, pixel_ratio: f32) -> f32 {
     }
 }
 
+/// The content size that a keyword or `calc-size()` gives, from the min-content and max-content sizes, the space of
+/// `stretch` and the size of `auto`. `sides` are the padding and borders that `box-sizing: border-box` counts.
+pub(crate) fn keyword_content(
+    value: &str,
+    units: &css::value::units::Lengths,
+    [min, max]: [f32; 2],
+    space: Option<f32>,
+    auto: f32,
+    base: f32,
+    sides: f32,
+) -> Option<f32> {
+    Some(
+        match value {
+            "min-content" => min,
+            "max-content" | "content" => max,
+            "fit-content" => space.map_or(auto, |space| max.min(min.max(space))),
+            "stretch" | "-webkit-fill-available" => space?,
+            "auto" => auto,
+            "any" => 0.,
+            _ => match css::value::calc_size(value) {
+                Some((basis, size)) => {
+                    let basis =
+                        keyword_content(basis, units, [min, max], space, auto, base, sides)?;
+                    let basis = format!("({}px)", basis + sides);
+                    let size = css::value::with_size(size, &basis);
+                    units.resolve(&format!("calc({size})"), base)? - sides
+                }
+                None => units.resolve(value, base)? - sides,
+            },
+        }
+        .max(0.),
+    )
+}
+
+// Sets the sizes, minimums and maximums of an axis that are keywords. The automatic minimum is 0.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn keyword_sizes(
+    style: &css::properties::Style,
+    units: &css::value::units::Lengths,
+    props: [Prop; 3],
+    sizes: &mut [Option<f32>; 3],
+    ends: [f32; 2],
+    space: Option<f32>,
+    auto: f32,
+    base: f32,
+    sides: f32,
+) {
+    for (slot, prop) in sizes.iter_mut().zip(props) {
+        if let Some(value) = style.get(prop).filter(|value| keyword(value)) {
+            let least = prop == props[1] && value != "fit-content";
+            let auto = if least { 0. } else { auto };
+            *slot = keyword_content(value, units, ends, space, auto, base, sides);
+        }
+    }
+}
+
+fn keyword(value: &str) -> bool {
+    matches!(
+        value,
+        "min-content" | "max-content" | "fit-content" | "stretch" | "-webkit-fill-available"
+    ) || value.starts_with("calc-size(")
+}
+
+// The place of the content sizes of a box that has keyword sizes in `Measurements::sizes`.
+const RAW: Option<u32> = Some(u32::MAX);
+
+/// The border box size that a keyword or `calc-size()` value of a size property gives. `space` is the size of the
+/// containing block, and `fills` says that an `auto` width fills it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn keyword_size(
+    doc: &Document,
+    id: usize,
+    styles: &ComputedStyles,
+    prop: Prop,
+    space: [f32; 2],
+    fills: bool,
+    text: &renderer::TextSystem,
+    measured: &mut Measurements,
+) -> Option<f32> {
+    let (style, units) = (&styles.values[id], &styles.lengths[id]);
+    let value = style.get(prop).filter(|value| keyword(value))?;
+    let axis = usize::from(matches!(
+        prop,
+        Prop::HEIGHT | Prop::MIN_HEIGHT | Prop::MAX_HEIGHT
+    ));
+    let [margin, padding] = [css::properties::MARGIN, css::properties::PADDING]
+        .map(|sides| units.edges(style, sides, space[0]));
+    let border = units.borders(style, space[0]);
+    let [start, end] = [[3, 1], [0, 2]][axis];
+    let inner = padding[start] + padding[end] + border[start] + border[end];
+    let outer = inner + margin[start] + margin[end];
+    let width = (axis == 1).then_some(space[0]);
+    // Keyword sizes change the result, so the content sizes are apart.
+    intrinsic(doc, id, styles, width, None, text, measured);
+    let key = match axis {
+        0 => (id, RAW, None, true),
+        _ => (id, width.map(f32::to_bits), RAW, true),
+    };
+    let [min, max, ..] = measured.sizes.get(&key).copied()?;
+    let room = (space[axis] - outer).max(0.);
+    let auto = match (axis, fills) {
+        // The automatic minimum is 0, also for flex items, whose own one layout adds.
+        _ if matches!(prop, Prop::MIN_WIDTH | Prop::MIN_HEIGHT) => 0.,
+        (0, true) => room,
+        (0, false) => max.min(min.max(room)),
+        _ => max,
+    };
+    let sides = match style.get(Prop::BOX_SIZING) {
+        Some("border-box") => inner,
+        _ => 0.,
+    };
+    keyword_content(
+        value,
+        units,
+        [min, max],
+        Some(room),
+        auto,
+        space[axis],
+        sides,
+    )
+    .map(|size| size + inner)
+}
+
 pub(crate) fn intrinsic(
     doc: &Document,
     id: usize,
@@ -42,6 +166,62 @@ pub(crate) fn intrinsic(
     if let Some(value) = measured.sizes.get(&(key.0, key.1, key.2, false)) {
         return *value;
     }
+    if super::super::size::turned(doc, styles, id).is_some() {
+        let units = &styles.lengths[id];
+        let base = width.unwrap_or(0.);
+        let margin = units.edges(&styles.values[id], css::properties::MARGIN, base);
+        let [across, along] = [margin[1] + margin[3], margin[0] + margin[2]];
+        let [widest, _] = frame_size(doc, id, styles, None, text, measured);
+        let inline = widest.min(units.viewport[1]);
+        let [_, block] = frame_size(doc, id, styles, Some(inline), text, measured);
+        let result = [
+            block + across,
+            block + across,
+            block + across,
+            inline + along,
+        ];
+        measured.sizes.insert((key.0, key.1, key.2, false), result);
+        let own = |value: f32| [value.max(0.), value.min(0.)];
+        measured
+            .margins
+            .insert(key, [own(margin[0]), own(margin[2])]);
+        return result;
+    }
+    measure(doc, id, styles, width, height, text, measured, key)
+}
+
+// Marks the measures of a turned box in the frame of its layout, apart from those on the page.
+const FRAME: u32 = u32::MAX - 1;
+
+/// The width of the lines of a turned box and its height across them, as border box sizes: the widest without an
+/// `inline` size, and for that size.
+pub(crate) fn frame_size(
+    doc: &Document,
+    id: usize,
+    styles: &ComputedStyles,
+    inline: Option<f32>,
+    text: &renderer::TextSystem,
+    measured: &mut Measurements,
+) -> [f32; 2] {
+    let key = (id, inline.map(f32::to_bits), Some(FRAME));
+    let [_, widest, _, height] = match measured.sizes.get(&(key.0, key.1, key.2, false)) {
+        Some(value) => *value,
+        None => measure(doc, id, styles, inline, None, text, measured, key),
+    };
+    [widest, height]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn measure(
+    doc: &Document,
+    id: usize,
+    styles: &ComputedStyles,
+    width: Option<f32>,
+    height: Option<f32>,
+    text: &renderer::TextSystem,
+    measured: &mut Measurements,
+    key: (usize, Option<u32>, Option<u32>),
+) -> [f32; 4] {
     // Clear before this measure, so the lead that it records stays with its size.
     if measured.sizes.len() > 65536 {
         measured.retain(|_| false);
@@ -59,18 +239,31 @@ pub(crate) fn intrinsic(
         return [0.; 4];
     }
     let base = width.unwrap_or(0.);
+    let turn = match key.2 == Some(FRAME) {
+        true => super::super::size::turned(doc, styles, id),
+        false => None,
+    };
     let edges = || {
-        [
+        let edges = [
             units.edges(style, css::properties::PADDING, base),
             units.edges(style, css::properties::MARGIN, base),
             units.borders(style, base),
-        ]
+        ];
+        match turn {
+            // The margins of a turned box stay on the page.
+            Some(clockwise) => {
+                let [padding, _, border] = edges;
+                let sides = |sides| super::super::size::turn_sides(sides, clockwise);
+                [sides(padding), [0.; 4], sides(border)]
+            }
+            None => edges,
+        }
     };
     let [padding, margin, border] = match &mut measured.edges {
-        Some(memo) => *memo
+        Some(memo) if turn.is_none() => *memo
             .entry((std::rc::Rc::as_ptr(style), base.to_bits()))
             .or_insert_with(edges),
-        None => edges(),
+        _ => edges(),
     };
     let inner = [
         padding[1] + padding[3] + border[1] + border[3],
@@ -90,25 +283,69 @@ pub(crate) fn intrinsic(
         && style.get(Prop::DISPLAY).is_none_or(|v| {
             v == "inline" || v == "inline-block" && styles.flags[id] & style::AGENT_DISPLAY != 0
         });
+    let keywords = std::cell::Cell::new([false; 2]);
     let sizes = |props: [Prop; 3], base: Option<f32>| {
-        let axis = usize::from(props[0] == Prop::HEIGHT);
+        let axis = usize::from((props[0] == Prop::HEIGHT) != turn.is_some());
         props.map(|prop| {
-            style
+            let value = style
                 .get(prop)
                 .filter(|_| !(sizeless && matches!(prop, Prop::WIDTH | Prop::HEIGHT)))
+                .filter(|v| !matches!(*v, "auto" | "none"))?;
+            if keyword(value) {
+                if turn.is_some() {
+                    return None;
+                }
+                let mut axes = keywords.get();
+                axes[axis] = true;
+                keywords.set(axes);
+                return None;
+            }
+            Some(value)
                 .filter(|v| base.is_some() || !v.contains('%'))
                 .and_then(|v| units.resolve(v, base.unwrap_or(0.)))
                 .map(|v| (v - if border_box { inner[axis] } else { 0. }).max(0.))
         })
     };
+    let sides = |axis: usize| if border_box { inner[axis] } else { 0. };
     let clamp = |value: f32, [_, min, max]: [Option<f32>; 3]| {
         value
             .min(max.unwrap_or(f32::INFINITY))
             .max(min.unwrap_or(0.))
     };
-    let horizontal = [Prop::WIDTH, Prop::MIN_WIDTH, Prop::MAX_WIDTH];
-    let fixed = sizes(horizontal, None);
-    let used = sizes(horizontal, width);
+    let mut horizontal = [Prop::WIDTH, Prop::MIN_WIDTH, Prop::MAX_WIDTH];
+    let mut upright = [Prop::HEIGHT, Prop::MIN_HEIGHT, Prop::MAX_HEIGHT];
+    if turn.is_some() {
+        std::mem::swap(&mut horizontal, &mut upright);
+    }
+    let mut fixed = sizes(horizontal, None);
+    let mut used = sizes(horizontal, width);
+    // Content-sized widths measure the content without a width first.
+    if let Some(width) = width.filter(|_| keywords.get()[0]) {
+        intrinsic(doc, id, styles, None, None, text, measured);
+        let raw = measured.sizes.get(&(id, RAW, None, true)).copied();
+        let [min, max, ..] = raw.unwrap_or_default();
+        let room = (width - outer[0]).max(0.);
+        let shrinks = display.starts_with("inline")
+            || style.get(Prop::FLOAT).is_some_and(|value| value != "none")
+            || (node.parent)
+                .and_then(|parent| styles.values[parent].get(Prop::DISPLAY))
+                .is_some_and(|display| display.ends_with("flex"));
+        let auto = match shrinks {
+            true => max.min(min.max(room)),
+            false => room,
+        };
+        keyword_sizes(
+            style,
+            units,
+            horizontal,
+            &mut used,
+            [min, max],
+            Some(room),
+            auto,
+            width,
+            sides(0),
+        );
+    }
     // A table cell is as wide as its columns.
     let cell = style::role(styles, id) == style::CELL;
     let available = used[0]
@@ -116,20 +353,7 @@ pub(crate) fn intrinsic(
         .or(width.map(|width| width - outer[0]))
         .or(fixed[0])
         .map(|width| clamp(width, used).max(0.));
-    // Content-sized widths measure the content without a width first.
-    let available = match (style.get(Prop::WIDTH), width) {
-        (Some(value @ ("min-content" | "max-content" | "fit-content")), Some(width)) => {
-            let [min, max, ..] = intrinsic(doc, id, styles, None, None, text, measured);
-            let size = match value {
-                "min-content" => min,
-                "max-content" => max,
-                _ => max.min(width.max(min)),
-            };
-            Some(clamp((size - outer[0]).max(0.), used))
-        }
-        _ => available,
-    };
-    let vertical = sizes([Prop::HEIGHT, Prop::MIN_HEIGHT, Prop::MAX_HEIGHT], height);
+    let mut vertical = sizes(upright, height);
     let floated = |child: usize| {
         !matches!(display, "flex" | "inline-flex" | "grid" | "inline-grid")
             && styles.values[child]
@@ -322,7 +546,7 @@ pub(crate) fn intrinsic(
             let percent = available.is_some()
                 && styles.values[atom.node]
                     .get(Prop::WIDTH)
-                    .is_some_and(|v| v.contains('%'));
+                    .is_some_and(|v| v.contains('%') || v == "stretch");
             runs[atom.run].inset[1] = renderer::px(if percent { used } else { max });
             // Like Chrome, a replaced box sits on the baseline, and other boxes on their last line.
             let baseline = if super::super::size::natural_size(
@@ -366,6 +590,8 @@ pub(crate) fn intrinsic(
             word_break,
             renderer::WordBreak::Anywhere | renderer::WordBreak::BreakAll
         );
+        let indent =
+            crate::render::element::query::row_indents(style, units, available.unwrap_or(0.));
         let shape = |runs: &[renderer::TextRun]| {
             text.shape_text(
                 &source,
@@ -379,6 +605,7 @@ pub(crate) fn intrinsic(
                         .and_then(|value| value.parse::<usize>().ok())
                         .map(|lines| lines.max(1)),
                     word_break,
+                    indent,
                     ..Default::default()
                 },
             )
@@ -434,12 +661,13 @@ pub(crate) fn intrinsic(
             }
         }
         let mut line_start = 0;
-        for line in &lines {
+        for (index, line) in lines.iter().enumerate() {
+            let first = f32::from(indent.of(index)[0]);
             let width = f32::from(line.line.width);
-            content[1] = content[1].max(width);
+            content[1] = content[1].max(width + first);
             content[2] += line.rows() as f32 * units.font.lh;
             let mut glyphs = line.line.glyphs.iter().peekable();
-            let (mut start, mut previous, mut hyphen) = (0., ' ', false);
+            let (mut start, mut previous, mut hyphen) = (-first, ' ', false);
             while let Some(glyph) = glyphs.next() {
                 let character = line
                     .text
@@ -457,10 +685,16 @@ pub(crate) fn intrinsic(
                                 && previous.is_alphanumeric())
                         || hyphen && character.is_alphabetic()
                     {
-                        start = x - opening
-                            .iter()
-                            .find(|(at, _)| *at == line_start + glyph.index as usize)
-                            .map_or(0., |(_, inset)| *inset);
+                        start = x
+                            - if glyph.index == 0 { first } else { 0. }
+                            - opening
+                                .iter()
+                                .find(|(at, _)| *at == line_start + glyph.index as usize)
+                                .map_or(0., |(_, inset)| *inset);
+                    }
+                    if let Some(hyphen) = line.hyphen_before(glyph.index as usize) {
+                        content[0] = content[0].max(x + f32::from(hyphen.line.width) - start);
+                        start = x;
                     }
                     let end = glyphs.peek().map_or(width, |next| f32::from(next.x));
                     content[0] = content[0].max(end - start);
@@ -487,21 +721,27 @@ pub(crate) fn intrinsic(
     {
         let mut extent = |width: Option<f32>, height: Option<f32>| {
             let key = (id, width.map(f32::to_bits), height.map(f32::to_bits), true);
-            if let Some(&[columns, rows, ..]) = measured.sizes.get(&key) {
-                return [columns, rows];
+            if let Some(&[columns, rows, captions, _]) = measured.sizes.get(&key) {
+                return [columns, rows, captions];
             }
             let grid = layout(doc, id, styles, width, height, None, None, text, measured);
             let [columns, rows] = [0, 1].map(|axis| grid.extent(axis));
-            measured.sizes.insert(key, [columns, rows, 0., 0.]);
-            [columns, rows]
+            let captions = grid.captions[0] + grid.captions[1];
+            measured.sizes.insert(key, [columns, rows, captions, 0.]);
+            [columns, rows, captions]
         };
-        let [min, _] = extent(Some(0.), None);
-        let [max, natural] = extent(None, None);
+        let [min, ..] = extent(Some(0.), None);
+        let [max, natural, captions] = extent(None, None);
         content = [min, max, natural];
         if available.is_some() || vertical[0].is_some() {
             let fit = style.get(Prop::WIDTH) == Some("fit-content");
             let width = available.map(|width| if fit { width.min(max).max(min) } else { width });
             content[2] = extent(width, vertical[0])[1];
+        }
+        // The height of a table leaves out its captions.
+        if captions > 0. {
+            let captions = extent(available, vertical[0])[2];
+            vertical = vertical.map(|height| height.map(|height| height + captions));
         }
     } else {
         // The content of spliced inline boxes is in the flow of the box.
@@ -585,7 +825,7 @@ pub(crate) fn intrinsic(
                 }
                 let own = &styles.values[child];
                 let lengths = &styles.lengths[child];
-                let [min, _, auto, _] = intrinsic(doc, child, styles, None, None, text, measured);
+                let [min, max, auto, _] = intrinsic(doc, child, styles, None, None, text, measured);
                 let frame = frame(own, lengths, space);
                 let sides = frame[1] + frame[3];
                 // A length sizes the border box with `box-sizing: border-box`, which keeps only the margins outside.
@@ -597,11 +837,16 @@ pub(crate) fn intrinsic(
                         v + sides
                     }
                 };
-                let basis = own
-                    .get(Prop::FLEX_BASIS)
-                    .filter(|v| !matches!(*v, "auto" | "content"))
-                    .and_then(|v| lengths.resolve(v, space))
-                    .map_or(auto, outer);
+                let basis = match own.get(Prop::FLEX_BASIS) {
+                    Some("min-content") => min,
+                    Some("max-content" | "fit-content") => max,
+                    Some("content") => max,
+                    value => value
+                        .filter(|v| *v != "auto")
+                        .or(own.get(Prop::WIDTH).filter(|v| v.contains('%')))
+                        .and_then(|v| lengths.resolve(v, space))
+                        .map_or(auto, outer),
+                };
                 let lower = if own
                     .get(Prop::OVERFLOW_X)
                     .is_some_and(|v| !matches!(v, "visible" | "clip"))
@@ -693,8 +938,8 @@ pub(crate) fn intrinsic(
         let (mut resolved, mut starts) = (resolved.into_iter(), starts.into_iter());
         // `line` is the width, the tallest piece, and how far raised pieces reach above and below the strut.
         let (mut line, mut run) = ([0f32; 4], 0f32);
-        // How far the baseline-aligned items of a flex line reach above and below their shared baseline.
-        let mut aligned = [0f32; 2];
+        // How far the items of a flex line that align on their first or last baselines reach above and below it.
+        let mut aligned = [[0f32; 2]; 2];
         // Margins that adjoin the top edge, those after the last box placed, and whether a box was placed.
         let (mut top, mut pending, mut placed) = ([0f32; 2], [0f32; 2], false);
         let join = |a: [f32; 2], b: [f32; 2]| [a[0].max(b[0]), a[1].min(b[1])];
@@ -708,6 +953,19 @@ pub(crate) fn intrinsic(
             })
         };
         let mut first = true;
+        // Like Chrome, an inside marker before a block is in a line of its own.
+        if super::super::size::inside_marker(styles, id)
+            && (kids.iter().enumerate())
+                .find(|&(at, &child)| !skipped(at, child))
+                .is_some_and(|(_, &child)| {
+                    !doc.nodes[child].tag.starts_with('#')
+                        && doc.nodes[child].tag != "br"
+                        && (styles.values[child].get(Prop::DISPLAY))
+                            .is_some_and(|value| !value.starts_with("inline"))
+                })
+        {
+            (content[2], placed) = (units.font.lh, true);
+        }
         // A collapsed space between inline boxes, which hangs at the end of a line.
         let (mut spaced, mut space) = (false, None);
         for (at, &child) in kids.iter().enumerate() {
@@ -763,7 +1021,7 @@ pub(crate) fn intrinsic(
                 Some(available)
                     if styles.values[child]
                         .get(Prop::WIDTH)
-                        .is_some_and(|v| v.contains('%'))
+                        .is_some_and(|v| v.contains('%') || v == "stretch")
                         || fills(
                             doc,
                             styles,
@@ -826,7 +1084,7 @@ pub(crate) fn intrinsic(
                         .is_some_and(|available| line[0] + gaps[0] + spacing + width > available)
             }) {
                 content[2] += total(line, strut) + gaps[1];
-                (line, aligned, strut) = ([0.; 4], [0.; 2], false);
+                (line, aligned, strut) = ([0.; 4], [[0.; 2]; 2], false);
             }
             line[0] += if line[0] > 0. { gaps[0] + spacing } else { 0. } + width;
             // Like a line box, a raised or lowered inline box grows the line by what it reaches past the strut.
@@ -884,13 +1142,11 @@ pub(crate) fn intrinsic(
                     // Like layout, items aligned on their baselines can make the line taller than each item.
                     if flex
                         && row
-                        && styles.values[child]
+                        && let Some(align) = styles.values[child]
                             .get(Prop::ALIGN_SELF)
                             .filter(|value| *value != "auto")
                             .or(style.get(Prop::ALIGN_ITEMS))
-                            .is_some_and(|value| {
-                                value.ends_with("baseline") && !value.starts_with("last")
-                            })
+                            .filter(|value| value.ends_with("baseline"))
                     {
                         let [above, _, below, _] = child_units.edges(
                             child_style,
@@ -898,11 +1154,13 @@ pub(crate) fn intrinsic(
                             available.unwrap_or(0.),
                         );
                         // An item without a baseline sits on its bottom border edge.
+                        let last = usize::from(align.starts_with("last"));
                         let above = above
-                            + first_baseline(doc, child, styles, at, text, measured)
+                            + baseline(doc, child, styles, at, last == 1, text, measured)
                                 .unwrap_or(height - above - below);
-                        aligned = [aligned[0].max(above), aligned[1].max(height - above)];
-                        line[1] = line[1].max(aligned[0] + aligned[1]);
+                        let group = &mut aligned[last];
+                        *group = [group[0].max(above), group[1].max(height - above)];
+                        line[1] = line[1].max(group[0] + group[1]);
                     }
                     // A replaced box on the baseline of the strut keeps the strut below it in the line.
                     if inline_level
@@ -947,9 +1205,8 @@ pub(crate) fn intrinsic(
             }
         }
         content[1] = content[1].max(run);
-        // Like Chrome, an empty item keeps the line of its outside marker.
+        // Like Chrome, an empty item keeps the line of its marker.
         let height = if display == "list-item"
-            && style.get(Prop::LIST_STYLE_POSITION) != Some("inside")
             && style.get(Prop::LIST_STYLE_TYPE) != Some("none")
             && node.children.iter().all(|&child| {
                 doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim_ascii().is_empty()
@@ -989,6 +1246,12 @@ pub(crate) fn intrinsic(
                 .is_some_and(|v| v != "visible");
         let own = |value: f32| [value.max(0.), value.min(0.)];
         let mut sets = [own(margin[0]), own(margin[2])];
+        if !flex && crate::render::trims(style, 0) {
+            top = [0.; 2];
+        }
+        if !flex && crate::render::trims(style, 2) {
+            pending = [0.; 2];
+        }
         if !placed {
             pending = top;
             top = [0.; 2];
@@ -1080,25 +1343,54 @@ pub(crate) fn intrinsic(
         }
     }
     if node.tag == "select"
-        && !node.attrs.contains_key("multiple")
-        && node
-            .attrs
-            .get("size")
-            .is_none_or(|size| size.trim().parse::<u32>().is_ok_and(|size| size <= 1))
         && ![Prop::APPEARANCE, Prop::WEBKIT_APPEARANCE]
             .into_iter()
             .any(|prop| style.get(prop) == Some("none"))
     {
-        let face = text.face(&style::font(style));
-        let [ascent, descent, _] = text
-            .line_metrics(face, renderer::px(units.font.em * measured.pixel_ratio))
-            .map(f32::from);
-        content[2] = (ascent + descent) / measured.pixel_ratio + 2.;
+        let (face, em, ratio) = (style::font(style), units.font.em, measured.pixel_ratio);
+        if let Some(rows) = super::super::size::list_rows(node) {
+            content[2] = rows as f32 * super::super::size::option_row(&face, em, text, ratio);
+        } else {
+            let [ascent, descent, _] = text
+                .line_metrics(text.face(&face), renderer::px(em * ratio))
+                .map(f32::from);
+            content[2] = (ascent + descent) / ratio + 2.;
+            let widest = super::super::size::widest_option(doc, id, &face, em, text);
+            // The look takes 4px before the label and 12px after it.
+            let width = (widest * ratio).ceil() / ratio + 16.;
+            content[0] = width;
+            content[1] = width;
+        }
     }
-    let [min, max] = [content[0], content[1]].map(|value| clamp(fixed[0].unwrap_or(value), fixed));
+    let mut bounds = [fixed; 2];
+    if keywords.get()[0] {
+        if width.is_none() {
+            measured
+                .sizes
+                .insert((id, RAW, None, true), [content[0], content[1], 0., 0.]);
+        }
+        for (end, bounds) in bounds.iter_mut().enumerate() {
+            let ends = [content[0], content[1]];
+            // Without a space, `fit-content` is the content size.
+            keyword_sizes(
+                style,
+                units,
+                horizontal,
+                bounds,
+                ends,
+                None,
+                content[end],
+                0.,
+                sides(0),
+            );
+        }
+        fixed = bounds[1];
+    }
+    let [min, max] = [0, 1].map(|end| clamp(bounds[end][0].unwrap_or(content[end]), bounds[end]));
     let min = if cell {
         // Like Chrome, the width of a table cell raises its max-content width, not its min-content width.
-        content[0].max(fixed[1].unwrap_or(0.)).min(min.max(max))
+        let most = fixed[2].map_or(f32::INFINITY, |most| most.max(min));
+        content[0].max(fixed[1].unwrap_or(0.)).min(most)
     } else if matches!(
         node.tag.as_str(),
         "img" | "video" | "canvas" | "iframe" | "svg" | "embed" | "object" | "input" | "textarea"
@@ -1134,17 +1426,32 @@ pub(crate) fn intrinsic(
                 height.max(content[2])
             }
         });
+    if keywords.get()[1] {
+        let size = ratio.unwrap_or(content[2]);
+        measured
+            .sizes
+            .insert((id, key.1, RAW, true), [size, size, 0., 0.]);
+        let props = [Prop::HEIGHT, Prop::MIN_HEIGHT, Prop::MAX_HEIGHT];
+        let room = height.map(|height| (height - outer[1]).max(0.));
+        let base = height.unwrap_or(0.);
+        keyword_sizes(
+            style,
+            units,
+            props,
+            &mut vertical,
+            [size; 2],
+            room,
+            size,
+            base,
+            sides(1),
+        );
+    }
     let own = |value: f32| [value.max(0.), value.min(0.)];
-    let sets = collapsed.unwrap_or([own(margin[0]), own(margin[2])]);
-    let result = [
+    let mut sets = collapsed.unwrap_or([own(margin[0]), own(margin[2])]);
+    let mut result = [
         min + outer[0],
         max + outer[0],
-        match style.get(Prop::WIDTH) {
-            Some("fit-content") => available.map_or(max, |width| max.min(min.max(width))),
-            Some("max-content") => max,
-            Some("min-content") => min,
-            _ => available.unwrap_or(max),
-        } + outer[0],
+        available.unwrap_or(max) + outer[0],
         clamp(vertical[0].or(ratio).unwrap_or(content[2]), vertical)
             + inner[1]
             + sets
@@ -1152,9 +1459,95 @@ pub(crate) fn intrinsic(
                 .map(|[positive, negative]| positive + negative)
                 .sum::<f32>(),
     ];
+    // A max-width below the max-content width wraps the content.
+    if width.is_none()
+        && turn.is_none()
+        && bounds[1][0].is_none()
+        && max < content[1]
+        && natural.is_none()
+        && !matches!(node.tag.as_str(), "svg" | "input" | "select" | "textarea")
+    {
+        // The measure of the wrapped content reads the content sizes.
+        measured.sizes.insert((key.0, key.1, key.2, false), result);
+        result[3] = intrinsic(
+            doc,
+            id,
+            styles,
+            Some(max + outer[0]),
+            height,
+            text,
+            measured,
+        )[3];
+        let at = (id, Some((max + outer[0]).to_bits()), key.2);
+        sets = measured.margins.get(&at).copied().unwrap_or(sets);
+        if let Some(&lead) = measured.leads.get(&at) {
+            measured.leads.insert(key, lead);
+        }
+    }
     measured.sizes.insert((key.0, key.1, key.2, false), result);
     measured.margins.insert(key, sets);
     result
+}
+
+/// The first or last baseline of a box from the top of its border box.
+pub(super) fn baseline(
+    doc: &Document,
+    id: usize,
+    styles: &ComputedStyles,
+    width: Option<f32>,
+    last: bool,
+    text: &renderer::TextSystem,
+    measured: &mut Measurements,
+) -> Option<f32> {
+    let (node, style, units) = (&doc.nodes[id], &styles.values[id], &styles.lengths[id]);
+    let display = style.get(Prop::DISPLAY).unwrap_or("");
+    let flex = display.ends_with("flex")
+        && style
+            .get(Prop::FLEX_DIRECTION)
+            .is_none_or(|value| !value.starts_with("column"));
+    if !last
+        || flex
+        || display.ends_with("grid")
+        || matches!(node.tag.as_str(), "input" | "select" | "textarea")
+    {
+        return first_baseline(doc, id, styles, width, text, measured);
+    }
+    let first = first_baseline(doc, id, styles, width, text, measured)?;
+    let [.., used, height] = intrinsic(doc, id, styles, width, None, text, measured);
+    let base = width.unwrap_or(0.);
+    let [margin, padding] = [css::properties::MARGIN, css::properties::PADDING]
+        .map(|sides| units.edges(style, sides, base));
+    let border = units.borders(style, base);
+    let bottom = height - margin[0] - margin[2] - padding[2] - border[2];
+    if node.tag.starts_with('#') || measured.texts.get(&id).is_some_and(Option::is_some) {
+        let strut = f32::from(text.baseline(
+            text.face(&style::font(style)),
+            renderer::px(units.font.em),
+            renderer::px(units.font.lh),
+            measured.pixel_ratio,
+        ));
+        return Some(bottom - units.font.lh + strut);
+    }
+    let sides = [margin, padding, border];
+    let inner = used - sides.iter().map(|side| side[1] + side[3]).sum::<f32>();
+    let mut at = bottom;
+    for &child in node.children.iter().rev() {
+        let own = &styles.values[child];
+        if doc.nodes[child].tag == "#comment"
+            || doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim_ascii().is_empty()
+            || own.get(Prop::DISPLAY) == Some("none")
+            || (own.get(Prop::POSITION)).is_some_and(|v| matches!(v, "absolute" | "fixed"))
+        {
+            continue;
+        }
+        let outer = intrinsic(doc, child, styles, Some(inner), None, text, measured)[3];
+        if let Some(found) = baseline(doc, child, styles, Some(inner), true, text, measured) {
+            let above = (styles.lengths[child]).edges(own, css::properties::MARGIN, inner)[0];
+            return Some(at - outer + above + found);
+        }
+        at -= outer;
+    }
+    Some(first)
 }
 
 /// The first baseline of a box from the top of its border box, as layout places it: the first line of its text, or
@@ -1192,6 +1585,9 @@ pub(super) fn first_baseline(
     // A control centers its line of text.
     if matches!(node.tag.as_str(), "input" | "select" | "textarea") {
         let inner = height - margin[0] - margin[2] - top - padding[2] - border[2];
+        if node.tag == "textarea" {
+            return Some(top + strut(measured));
+        }
         return Some(top + (inner - units.font.lh) / 2. + strut(measured));
     }
     if matches!(node.tag.as_str(), "progress" | "meter") {
@@ -1362,13 +1758,10 @@ pub(super) fn pseudo_size(
 ) -> Option<[f32; 4]> {
     let style = &styles.values[id];
     let pseudo = &styles.generated(id)?[index];
-    let value = pseudo
-        .get(Prop::CONTENT)
-        .filter(|value| !matches!(*value, "none" | "normal"))?;
-    if pseudo.get(Prop::DISPLAY) == Some("none")
-        || pseudo
-            .get(Prop::POSITION)
-            .is_some_and(|value| matches!(value, "absolute" | "fixed"))
+    let value = crate::render::inline::drawn(pseudo, style)?;
+    if pseudo
+        .get(Prop::POSITION)
+        .is_some_and(|value| matches!(value, "absolute" | "fixed"))
     {
         return None;
     }
@@ -1425,7 +1818,11 @@ pub(super) fn pseudo_size(
         (Some(fixed), _) => [fixed + sides(0)[0]; 2],
         (None, None) => [sides(0)[1]; 2],
         (None, Some(lines)) => [
-            f32::from(renderer::widest_piece(lines, renderer::px(0.))),
+            f32::from(renderer::widest_piece(
+                lines,
+                renderer::px(0.),
+                Default::default(),
+            )),
             lines
                 .iter()
                 .map(|line| f32::from(line.line.width))

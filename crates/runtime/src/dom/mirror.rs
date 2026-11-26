@@ -74,6 +74,14 @@ impl LayoutMirror {
         self.slot(self.capacity).wrapping_add(self.capacity / 4)
     }
 
+    // Counts the rectangles that layouts changed.
+    pub(crate) fn changed(&self) -> f32 {
+        match self.memory {
+            Some(_) => unsafe { *self.changes() },
+            None => 0.,
+        }
+    }
+
     // Counts the style changes, which can change a content box without a new border box.
     fn restyles(&self) -> *mut f32 {
         self.changes().wrapping_add(1)

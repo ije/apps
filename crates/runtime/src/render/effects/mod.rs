@@ -1,6 +1,7 @@
 pub(crate) mod clip;
 pub(crate) mod filter;
 pub(crate) mod gradient;
+pub(crate) mod offset;
 pub(crate) mod transform;
 
 use crate::css;
@@ -69,6 +70,8 @@ pub(crate) struct Establishes {
     pub(crate) fixed: bool,
     pub(crate) layer: bool,
     pub(crate) transformed: bool,
+    // The used `transform-style` is `preserve-3d`.
+    pub(crate) preserves: bool,
 }
 
 // Share this decision across build, cull and cache keys. Callers add flex/grid z-index and opacity layers.
@@ -85,7 +88,7 @@ pub(crate) fn establishes(style: &Style) -> Establishes {
         return Establishes::default();
     }
     let position = style.get(Prop::POSITION).unwrap_or("static");
-    let transformed = set(&[Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE]);
+    let transformed = set(&TRANSFORM_PROPS);
     let layer = set(&[
         Prop::FILTER,
         Prop::WEBKIT_FILTER,
@@ -108,6 +111,19 @@ pub(crate) fn establishes(style: &Style) -> Establishes {
     }) || style
         .get(Prop::CONTENT_VISIBILITY)
         .is_some_and(|value| value != "visible");
+    let mut preserves = style.get(Prop::TRANSFORM_STYLE) == Some("preserve-3d")
+        && !layer
+        && opacity(style) >= 1.
+        && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+            .into_iter()
+            .all(|prop| style.get(prop).is_none_or(|value| value == "visible"))
+        && style.get(Prop::CONTAIN).is_none_or(|value| {
+            (value.split(' ')).all(|kind| !matches!(kind, "paint" | "strict" | "content"))
+        })
+        && style
+            .get(Prop::CONTENT_VISIBILITY)
+            .is_none_or(|value| value == "visible")
+        && style.get(Prop::CLIP).is_none_or(|value| value == "auto");
     let (mut wills, mut will_stack, mut will_position) = (false, false, false);
     for name in style
         .get(Prop::WILL_CHANGE)
@@ -125,6 +141,7 @@ pub(crate) fn establishes(style: &Style) -> Establishes {
             "rotate",
             "scale",
             "perspective",
+            "offset-path",
             "filter",
             "-webkit-filter",
             "backdrop-filter",
@@ -136,6 +153,21 @@ pub(crate) fn establishes(style: &Style) -> Establishes {
         will_position |= is(&["position"]);
         will_stack |= is(&[
             "opacity",
+            "clip-path",
+            "-webkit-clip-path",
+            "mask",
+            "mask-image",
+            "-webkit-mask",
+            "-webkit-mask-image",
+            "mix-blend-mode",
+            "isolation",
+        ]);
+        preserves &= !is(&[
+            "opacity",
+            "filter",
+            "-webkit-filter",
+            "backdrop-filter",
+            "-webkit-backdrop-filter",
             "clip-path",
             "-webkit-clip-path",
             "mask",
@@ -157,6 +189,7 @@ pub(crate) fn establishes(style: &Style) -> Establishes {
             Prop::WEBKIT_BACKDROP_FILTER,
         ])
         || style.get(Prop::TRANSFORM_STYLE) == Some("preserve-3d");
+    preserves &= !set(&[Prop::MASK, Prop::WEBKIT_MASK]);
     Establishes {
         stacking: fixed
             || layer
@@ -173,6 +206,7 @@ pub(crate) fn establishes(style: &Style) -> Establishes {
         fixed,
         layer,
         transformed,
+        preserves,
     }
 }
 
@@ -186,8 +220,13 @@ pub(crate) fn border_style(kind: &str) -> renderer::BorderStyle {
     }
 }
 
-pub(crate) const TRANSFORM_PROPS: [Prop; 4] =
-    [Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE];
+pub(crate) const TRANSFORM_PROPS: [Prop; 5] = [
+    Prop::TRANSFORM,
+    Prop::TRANSLATE,
+    Prop::ROTATE,
+    Prop::SCALE,
+    Prop::OFFSET_PATH,
+];
 
 // Must list every property that `effects::opacity` and `crate::css::value::transform::transform` read.
 pub(crate) const COMPOSITED_PROPS: [Prop; 6] = [
@@ -295,6 +334,22 @@ mod tests {
             of(&[("display", "contents"), ("transform", "scale(2)")]),
             Establishes::default()
         );
+        let preserves = |pair| of(&[("transform-style", "preserve-3d"), pair]).preserves;
+        assert!(preserves(("contain", "layout")) && preserves(("will-change", "transform")));
+        for pair in [
+            ("transform-style", "flat"),
+            ("opacity", "0.9"),
+            ("overflow-x", "clip"),
+            ("filter", "blur(0)"),
+            ("clip-path", "inset(0)"),
+            ("mask-image", "linear-gradient(red,blue)"),
+            ("mix-blend-mode", "multiply"),
+            ("isolation", "isolate"),
+            ("contain", "layout paint"),
+            ("will-change", "opacity"),
+        ] {
+            assert!(!preserves(pair), "{pair:?}");
+        }
         assert!(of(&[("-webkit-filter", "blur(1px)")]).layer && !of(&[("mask", "url(#m)")]).layer);
     }
 }

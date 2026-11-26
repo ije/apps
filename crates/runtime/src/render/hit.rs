@@ -6,6 +6,28 @@ use crate::dom::{LEAVING, TOP_LAYER};
 use crate::style;
 use serde_json::{Value, json};
 
+// Whether a convex shape holds a point.
+fn in_shape(
+    shape: &[renderer::Point<renderer::Pixels>],
+    at: renderer::Point<renderer::Pixels>,
+) -> bool {
+    // Twice the area of the triangle of a side and a point, with the sign of the whole shape.
+    let cross = |a: usize, b: usize, c: renderer::Point<renderer::Pixels>| {
+        let (ab, ac) = (shape[b] - shape[a], c - shape[a]);
+        f64::from(ab.x.0) * f64::from(ac.y.0) - f64::from(ab.y.0) * f64::from(ac.x.0)
+    };
+    let turn: f64 = (2..shape.len())
+        .map(|last| cross(0, last - 1, shape[last]))
+        .sum();
+    turn.abs() > 1e-3
+        && (0..shape.len())
+            .all(|side| cross(side, (side + 1) % shape.len(), at) * turn.signum() >= 0.)
+}
+
+// An ancestor, the clip in it, the blocks it makes, whether the point is in its border, and its matrix with 1 when
+// that is 2D.
+type Around = (usize, [f32; 4], u8, bool, Option<[f32; 5]>);
+
 pub(crate) fn hit_test(
     doc: &Document,
     state: &PageState,
@@ -62,23 +84,15 @@ pub(crate) fn hit_test(
         .collect();
     // The last field is 1 in the drawable content of a canvas, which takes no pointer, and 2 in an element
     // that the canvas drew.
-    // The rounded corners of the nearest clipping box, as in the renderer.
-    type Round = Option<(renderer::Rect<renderer::Pixels>, renderer::Radii)>;
-    let mut pending = vec![(
-        0,
-        screen,
-        false,
-        0,
-        0u8,
-        None::<(renderer::Rect<renderer::Pixels>, renderer::Radii)>,
-    )];
-    pending.extend(top.iter().map(|&id| (id, screen, false, 0, 0, None)));
+    let mut pending = vec![(0, screen, false, 0, 0u8, false)];
+    pending.extend(top.iter().map(|&id| (id, screen, false, 0, 0, false)));
     let mut hits = Vec::new();
     // The ancestors of the current node with the clips inside them and, once read, the containing blocks they
-    // make: 1 when read, 2 for absolute and 4 for fixed boxes.
-    let mut path: Vec<(usize, [f32; 4], u8, Round)> = Vec::new();
+    // make: 1 when read, 2 for absolute and 4 for fixed boxes. The last field is the matrix from the box to the
+    // window, once read.
+    let mut path: Vec<Around> = Vec::new();
     let inside = |clip: [f32; 4]| x >= clip[0] && x < clip[2] && y >= clip[1] && y < clip[3];
-    while let Some((id, mut clip, hit, depth, mut drawn, mut round)) = pending.pop() {
+    while let Some((id, mut clip, hit, depth, mut drawn, mut ring)) = pending.pop() {
         if hit {
             hits.push(id);
             continue;
@@ -91,6 +105,11 @@ pub(crate) fn hit_test(
                 .info
                 .get(id)
                 .is_some_and(|info| info.flags & crate::render::layout::cull::UNCULLABLE == 0)
+        {
+            continue;
+        }
+        if !state.layout.anchors.boxes.is_empty()
+            && (state.layout.anchors.boxes.get(&id)).is_some_and(|found| found.hidden.get())
         {
             continue;
         }
@@ -139,23 +158,27 @@ pub(crate) fn hit_test(
         }
         // An out-of-flow box gets only the clip of its containing block, as the renderer draws it. That clip
         // holds the clip of each box between, so a box without a clip keeps it.
-        if clip != screen
+        if (clip != screen || ring)
             && let Some(escape) = style
                 .get(Prop::POSITION)
                 .filter(|&value| matches!(value, "absolute" | "fixed"))
         {
             let bit = if escape == "fixed" { 4 } else { 2 };
-            (clip, round) = path
+            (clip, ring) = path
                 .iter_mut()
                 .rev()
-                .find_map(|(id, clip, made, round)| {
+                .find_map(|(id, clip, made, ring, _)| {
                     if *made == 0 {
                         let block = crate::render::effects::establishes(&computed.values[*id]);
                         *made = 1 | (u8::from(block.absolute) * 2) | (u8::from(block.fixed) * 4);
                     }
-                    (*made & bit != 0).then_some((*clip, *round))
+                    (*made & bit != 0).then_some((*clip, *ring))
                 })
-                .unwrap_or((screen, None));
+                .unwrap_or((screen, false));
+        }
+        // In the border of such a box, its boxes with layers of their own miss the pointer.
+        if ring && layered(doc, computed, id, style, up(id)) {
+            clip = [f32::INFINITY; 4];
         }
         let canvas = style::drawable_canvas(node, style);
         if inside(clip)
@@ -165,12 +188,65 @@ pub(crate) fn hit_test(
             let rect =
                 renderer::Rect::new(renderer::point(renderer::px(left), renderer::px(top)), size);
             let at = renderer::point(renderer::px(x), renderer::px(y));
-            let corners = match node.tag.starts_with('#') {
-                true => renderer::Radii::default(),
-                false => crate::render::effects::clip::radii(style, &computed.lengths[id], || {
-                    [width, height]
+            let contained = style.get(Prop::CONTAIN).is_some_and(|value| {
+                ["paint", "strict", "content"]
+                    .iter()
+                    .any(|kind| value.contains(kind))
+            }) && !matches!(
+                style.get(Prop::DISPLAY).unwrap_or("inline"),
+                "inline" | "contents"
+            ) || style
+                .get(Prop::CONTENT_VISIBILITY)
+                .is_some_and(|value| value != "visible")
+                && (state.layout.cull.info.get(id))
+                    .is_some_and(|info| info.flags & crate::render::layout::cull::SKIPS != 0);
+            let axes = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y].map(|prop| {
+                canvas
+                    || contained
+                    || drawn != 1
+                        && style.get(prop).is_some_and(|value| {
+                            matches!(value, "hidden" | "clip" | "auto" | "scroll")
+                        })
+            });
+            let clips = canvas
+                || drawn != 1
+                    && axes.contains(&true)
+                    && !super::viewport_overflow(doc, computed, id);
+            let out = x < left || x >= left + width || y < top || y >= top + height;
+            let margin = clips && style.contains(Prop::OVERFLOW_CLIP_MARGIN);
+            let rounded = !node.tag.starts_with('#')
+                && (clips || !out)
+                && crate::render::effects::clip::RADII
+                    .iter()
+                    .any(|&prop| style.contains(prop));
+            // A point outside the bounds is outside a clip on both axes.
+            let far = clips && out && axes == [true; 2] && !margin;
+            path.push((id, clip, 0, ring, None));
+            // The size of a transformed box and the point in it.
+            let local = (!far
+                && (clips || rounded)
+                && state.geometry.mirror.is_transformed(id)
+                && !node.tag.starts_with('#'))
+            .then(|| local_point(&mut path, computed, state, [x, y]))
+            .flatten();
+            path.pop();
+            let point = at;
+            let (rect, at) = match local {
+                Some((size, [x, y])) => (
+                    renderer::Rect::new(
+                        Default::default(),
+                        renderer::size(renderer::px(size[0]), renderer::px(size[1])),
+                    ),
+                    renderer::point(renderer::px(x), renderer::px(y)),
+                ),
+                None => (rect, at),
+            };
+            let corners = match rounded && !far {
+                false => renderer::Radii::default(),
+                true => crate::render::effects::clip::radii(style, &computed.lengths[id], || {
+                    [rect.size.width, rect.size.height].map(f32::from)
                 })
-                .resolve(size),
+                .resolve(rect.size),
             };
             let selectable = !style
                 .get(Prop::POINTER_EVENTS)
@@ -189,8 +265,22 @@ pub(crate) fn hit_test(
                     && y >= top
                     && y < top + height
             };
-            if (caret || !node.tag.starts_with('#'))
+            // A node without a shape of its own is hidden with the box around it.
+            let shapes = &state.geometry.shapes;
+            let shape_of = |id: usize| {
+                (shapes.get(&id))
+                    .filter(|_| computed.values[id].get(Prop::DISPLAY) != Some("contents"))
+            };
+            let shape = shape_of(id).filter(|_| !shapes.is_empty());
+            let shown = shapes.is_empty()
+                || shape.is_some()
+                || (path.iter().rev())
+                    .find_map(|(id, ..)| shape_of(*id))
+                    .is_none_or(|shape| !shape.is_empty());
+            if shown
+                && (caret || !node.tag.starts_with('#'))
                 && match state.geometry.fragments.is_empty() {
+                    _ if shape.is_some() => shape.is_some_and(|shape| in_shape(shape, point)),
                     true => within([left, top, width, height]),
                     false => state
                         .geometry.fragments
@@ -200,30 +290,81 @@ pub(crate) fn hit_test(
                         }),
                 }
                 // Like Chrome, a point outside the rounded corners misses the box and what it clips.
-                && (node.tag.starts_with('#') || corners.contains(rect, at))
-                && round.is_none_or(|(rect, corners)| corners.contains(rect, at))
+                && (node.tag.starts_with('#')
+                    || shape.is_some_and(|shape| shape.len() != 4)
+                    || corners.contains(rect, at))
                 && selectable
                 && drawn != 1
             {
-                pending.push((id, clip, true, depth, drawn, None));
+                pending.push((id, clip, true, depth, drawn, false));
             }
             // A canvas shows its drawable content only inside its box.
             if canvas {
                 drawn = 1;
             }
-            for (axis, prop) in [(0, Prop::OVERFLOW_X), (1, Prop::OVERFLOW_Y)] {
-                if canvas
-                    || drawn != 1
-                        && style.get(prop).is_some_and(|value| {
-                            matches!(value, "hidden" | "clip" | "auto" | "scroll")
-                        })
-                        && !super::viewport_overflow(doc, computed, id)
+            let nowhere = [
+                f32::INFINITY,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+            ];
+            if far {
+                clip = nowhere;
+            }
+            let (size, [x, y]) = local.unwrap_or(([width, height], [x - left, y - top]));
+            // Most points are farther from the edges than all of the borders and paddings.
+            let deep = || {
+                state.layout.content_size(id).is_some_and(|inner| {
+                    let room = [size[0] - inner[0], size[1] - inner[1]];
+                    (room[0]..=size[0] - room[0]).contains(&x)
+                        && (room[1]..=size[1] - room[1]).contains(&y)
+                })
+            };
+            if clips && !far && (rounded || margin || !deep()) {
+                let units = &computed.lengths[id];
+                let borders = units.borders(style, size[0]);
+                let mut edges = borders;
+                let clipped = margin
+                    && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y].iter().all(|&prop| {
+                        matches!(style.get(prop), Some("clip"))
+                            || contained && matches!(style.get(prop), None | Some("visible"))
+                    });
+                if let Some(value) = style.get(Prop::OVERFLOW_CLIP_MARGIN).filter(|_| clipped)
+                    && let Some(renderer::ClipMargin { sides, reach }) =
+                        crate::render::effects::clip::margin(value, style, units, size[0])
                 {
-                    clip[axis] = clip[axis].max([left, top][axis]);
-                    clip[axis + 2] = clip[axis + 2].min([left + width, top + height][axis]);
-                    if !corners.is_zero() {
-                        round = Some((rect, corners));
+                    let sides = [sides.top, sides.right, sides.bottom, sides.left];
+                    edges =
+                        std::array::from_fn(|side| borders[side] - f32::from(sides[side] + reach));
+                }
+                // Like Chrome, a box with a layer of its own lets the pointer in to its border box, and corners turn
+                // the clip margin off.
+                let past = |edges: [f32; 4], axes: [bool; 2]| {
+                    axes[0] && !(edges[3]..size[0] - edges[1]).contains(&x)
+                        || axes[1] && !(edges[0]..size[1] - edges[2]).contains(&y)
+                };
+                let shut = if !corners.is_zero() {
+                    let edges: [f32; 4] =
+                        std::array::from_fn(|side| edges[side].max(borders[side]));
+                    let at = renderer::point(renderer::px(x), renderer::px(y));
+                    let inner = renderer::Rect::between(
+                        renderer::point(renderer::px(edges[3]), renderer::px(edges[0])),
+                        renderer::point(
+                            renderer::px(size[0] - edges[1]),
+                            renderer::px(size[1] - edges[2]),
+                        ),
+                    );
+                    let [top, right, bottom, left] = edges.map(renderer::px);
+                    past(edges, [true; 2])
+                        || !corners.inset(top, right, bottom, left).contains(inner, at)
+                } else {
+                    past(edges, axes) && {
+                        ring = layered(doc, computed, id, style, up(id));
+                        !ring || past(edges.map(|side| side.min(0.)), axes)
                     }
+                };
+                if shut {
+                    clip = nowhere;
                 }
             }
         }
@@ -233,13 +374,13 @@ pub(crate) fn hit_test(
         {
             continue;
         }
-        path.push((id, clip, 0, round));
+        path.push((id, clip, 0, ring, None));
         pending.extend(
             computed
                 .flat_children(doc, id)
                 .iter()
                 .filter(|child| !top.contains(child))
-                .map(|&child| (child, clip, false, depth + 1, drawn, round)),
+                .map(|&child| (child, clip, false, depth + 1, drawn, ring)),
         );
     }
     hits.sort_by_cached_key(|&id| {
@@ -357,4 +498,99 @@ pub(crate) fn hit_test(
         );
     }
     if first { Value::Null } else { json!(hits) }
+}
+
+// Whether Chrome gives the box a paint layer of its own.
+fn layered(
+    doc: &Document,
+    computed: &crate::style::ComputedStyles,
+    id: usize,
+    style: &css::properties::Style,
+    parent: Option<usize>,
+) -> bool {
+    let made = crate::render::effects::establishes(style);
+    made.stacking
+        || made.absolute
+        || matches!(
+            doc.nodes[id].tag.as_str(),
+            "iframe" | "svg" | "input" | "textarea" | "video" | "canvas" | "embed" | "object"
+        )
+        || style
+            .get(Prop::Z_INDEX)
+            .is_some_and(|value| value.parse::<i32>().is_ok())
+            && parent
+                .and_then(|parent| computed.values.get(parent)?.get(Prop::DISPLAY))
+                .is_some_and(|display| display.ends_with("flex") || display.ends_with("grid"))
+}
+
+// The size of the last box of a path without its transforms, and the point in its space. The center of a box stays
+// the center of its bounds.
+fn local_point(
+    path: &mut [Around],
+    computed: &crate::style::ComputedStyles,
+    state: &super::PageState,
+    point: [f32; 2],
+) -> Option<([f32; 2], [f32; 2])> {
+    let size = |node: usize| {
+        let (style, units) = (computed.values.get(node)?, computed.lengths.get(node)?);
+        let inner = state.layout.content_size(node)?;
+        let sides = crate::render::effects::clip::insets(Some("content-box"), style, units, inner);
+        Some([
+            inner[0] + sides[1] + sides[3],
+            inner[1] + sides[0] + sides[2],
+        ])
+    };
+    // Each box resolves its transform once in a hit test: the boxes in it take its matrix.
+    let known = path.iter().rposition(|entry| entry.4.is_some());
+    let mut m = known
+        .and_then(|at| path[at].4)
+        .unwrap_or([1., 0., 0., 1., 1.]);
+    for entry in &mut path[known.map_or(0, |at| at + 1)..] {
+        let node = entry.0;
+        let style = (state.styles.animating.get(&node)).or(computed.values.get(node))?;
+        if super::effects::TRANSFORM_PROPS
+            .iter()
+            .any(|&prop| style.get(prop).is_some_and(|value| value != "none"))
+            && let Some(size) = size(node)
+        {
+            let [w, h] = size.map(renderer::px);
+            let bounds = renderer::Rect::new(Default::default(), renderer::size(w, h));
+            if let Some(t) =
+                css::value::transform::transform(style, &computed.lengths[node], bounds, None)
+            {
+                let flat = [t[2], t[3], t[6], t[7], t[8], t[9], t[11]] == [0.; 7];
+                m = [
+                    m[0] * t[0] + m[2] * t[1],
+                    m[1] * t[0] + m[3] * t[1],
+                    m[0] * t[4] + m[2] * t[5],
+                    m[1] * t[4] + m[3] * t[5],
+                    if flat { m[4] } else { 0. },
+                ];
+            }
+        }
+        entry.4 = Some(m);
+    }
+    let id = path.last()?.0;
+    let &[left, top, width, height] = state.geometry.mirror.get(&id)?;
+    let det = m[0] * m[3] - m[1] * m[2];
+    // The bounds of a box give its size, unless its turn is near 45 degrees or in 3D.
+    let [a, b, c, d, flat] = m.map(f32::abs);
+    let share = a * d - b * c;
+    let size = match flat != 0. && share.abs() > 0.2 {
+        true => [
+            (width * d - height * c) / share,
+            (height * a - width * b) / share,
+        ],
+        false => size(id)?,
+    };
+    let [x, y] = [point[0] - left - width / 2., point[1] - top - height / 2.];
+    (det.abs() > 1e-6).then(|| {
+        (
+            size,
+            [
+                size[0] / 2. + (x * m[3] - y * m[2]) / det,
+                size[1] / 2. + (y * m[0] - x * m[1]) / det,
+            ],
+        )
+    })
 }

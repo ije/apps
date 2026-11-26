@@ -121,6 +121,12 @@ impl Walk {
         Some(&self.since(serial)?[*moved..])
     }
 
+    // The nodes of `since` that moved, joined or left.
+    pub(crate) fn moved_since(&self, serial: u64) -> Option<&[u32]> {
+        let (_, _, moved) = self.delta.as_ref()?;
+        Some(&self.since(serial)?[..*moved])
+    }
+
     // Each node with its parent, in the composed order.
     pub(crate) fn order(&self) -> &[(u32, u32)] {
         &self.nodes

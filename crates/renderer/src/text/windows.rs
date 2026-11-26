@@ -126,24 +126,35 @@ fn is_color_glyph(factory: &IDWriteFactory5, face: &IDWriteFontFace3, glyph: Gly
     .is_ok()
 }
 
-fn typo_metrics(face: &IDWriteFontFace3) -> Option<[f32; 2]> {
-    let tag = u32::from_le_bytes(*b"OS/2");
+fn table<R>(face: &IDWriteFontFace3, tag: &[u8; 4], read: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    let tag = u32::from_le_bytes(*tag);
     let (mut data, mut len, mut context, mut exists) =
         (ptr::null_mut(), 0u32, ptr::null_mut(), BOOL(0));
-    // SAFETY: the table stays readable until it is released, and only its first 72 bytes are read.
+    // SAFETY: the table stays readable until it is released.
     unsafe {
         face.TryGetFontTable(tag, &mut data, &mut len, &mut context, &mut exists)
             .ok()?;
         if !exists.as_bool() {
             return None;
         }
-        let read = (len >= 72 && !data.is_null()).then(|| {
-            let table = slice::from_raw_parts(data.cast::<u8>(), 72);
-            [68, 70].map(|at| f32::from(i16::from_be_bytes([table[at], table[at + 1]])))
-        });
+        let found =
+            (!data.is_null()).then(|| read(slice::from_raw_parts(data.cast::<u8>(), len as usize)));
         face.ReleaseFontTable(context);
-        read.filter(|[ascent, descent]| *ascent > 0. && *descent < 0.)
+        found
     }
+}
+
+fn typo_metrics(face: &IDWriteFontFace3) -> Option<[f32; 2]> {
+    let value = |bytes: &[u8], at: usize| {
+        Some(f32::from(i16::from_be_bytes(
+            *bytes.get(at..)?.first_chunk()?,
+        )))
+    };
+    table(face, b"OS/2", |bytes| {
+        Some([value(bytes, 68)?, value(bytes, 70)?])
+    })
+    .flatten()
+    .filter(|[ascent, descent]| *ascent > 0. && *descent < 0.)
 }
 
 impl Library {
@@ -259,6 +270,9 @@ impl Library {
             family => family,
         });
         let weight = DWRITE_FONT_WEIGHT((font.weight.round() as i32).clamp(1, 999));
+        const STRETCHES: [f32; 9] = [0.5, 0.625, 0.75, 0.875, 1., 1.125, 1.25, 1.5, 2.];
+        let stretch = STRETCHES.iter().rposition(|&value| value <= font.stretch);
+        let stretch = DWRITE_FONT_STRETCH(stretch.unwrap_or(0) as i32 + 1);
         // In the order of `FontStyle`.
         let styles = [
             DWRITE_FONT_STYLE_NORMAL,
@@ -289,9 +303,7 @@ impl Library {
                         .filter(|()| found.as_bool())
                         .and_then(|()| collection.GetFontFamily(index).ok())
                         .and_then(|members| {
-                            members
-                                .GetFirstMatchingFont(weight, DWRITE_FONT_STRETCH_NORMAL, style)
-                                .ok()
+                            members.GetFirstMatchingFont(weight, stretch, style).ok()
                         })
                         .and_then(|matched| matched.CreateFontFace().ok())
                         .and_then(|face| face.cast::<IDWriteFontFace3>().ok())
@@ -311,7 +323,7 @@ impl Library {
                     true => None,
                     false => Some((font.features.clone(), self.typography(&font.features).ok()?)),
                 };
-                let matching = Some((weight, style, DWRITE_FONT_STRETCH_NORMAL));
+                let matching = Some((weight, style, stretch));
                 let face = self.describe(face, family, collection, matching, features);
                 return Some(self.register(face));
             }
@@ -858,6 +870,11 @@ impl TextSystem {
         }
     }
 
+    pub fn substitutions(&self, font: FontId) -> (Vec<u8>, Vec<[u8; 4]>) {
+        let found = table(&self.0.borrow().face(font).face, b"GSUB", <[u8]>::to_vec);
+        (found.unwrap_or_default(), Vec::new())
+    }
+
     pub fn glyph(&self, font: FontId, ch: char) -> Option<GlyphId> {
         let mut glyph = 0;
         // SAFETY: one code point in, one glyph out.
@@ -916,6 +933,37 @@ impl TextSystem {
             line.glyphs.extend(glyphs);
         }
         line
+    }
+
+    /// Measured in the pixels of the glyph at 4 times its size.
+    pub fn intercept(
+        &self,
+        font: FontId,
+        glyph: GlyphId,
+        size: f32,
+        top: f32,
+        bottom: f32,
+    ) -> Option<[f32; 2]> {
+        let raster = GlyphRaster {
+            font,
+            glyph,
+            size: px(size),
+            scale: 4.,
+            subpixel: 0,
+            emoji: false,
+            dilation: 0,
+            stroke: 0.,
+        };
+        let bounds = self.raster_bounds(&raster).ok()?;
+        let (canvas, pixels) = self.rasterize(&raster, bounds).ok()?;
+        let row =
+            |y: f32| ((y * 4.).round() as i32 - bounds.origin.y).clamp(0, canvas.height) as usize;
+        let width = canvas.width as usize;
+        let rows = pixels.get(row(top) * width..row(bottom) * width)?;
+        let inked = |x: usize| rows.chunks_exact(width).any(|row| row[x] > 127);
+        let left = (0..width).find(|&x| inked(x))?;
+        let right = (0..width).rfind(|&x| inked(x))? + 1;
+        Some([left, right].map(|x| (x as i32 + bounds.origin.x) as f32 / 4.))
     }
 
     pub fn raster_bounds(&self, glyph: &GlyphRaster) -> Result<Rect<i32>> {
@@ -985,6 +1033,10 @@ impl TextSystem {
     }
 
     // DirectWrite shares its font cache across the process, so there is nothing to load ahead.
+    pub fn hyphenate(&self, _: &str, _: &str) -> Vec<usize> {
+        Vec::new()
+    }
+
     pub fn warm(_: Vec<Vec<String>>) {}
 }
 

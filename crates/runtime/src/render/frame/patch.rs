@@ -29,6 +29,7 @@ pub(super) fn patch(build: &Build, window: &mut Window) {
             ancestors: patch.ancestors,
             flex_parent: patch.flex_parent,
             columned: patch.columned,
+            space: patch.space,
             perspective: patch.perspective,
             zone: None,
             #[cfg(debug_assertions)]
@@ -109,6 +110,7 @@ pub(super) fn patch(build: &Build, window: &mut Window) {
             ancestors: patch.ancestors.clone(),
             flex_parent: patch.flex_parent,
             columned: patch.columned,
+            space: patch.space,
             perspective: patch.perspective,
             zone: None,
             #[cfg(debug_assertions)]

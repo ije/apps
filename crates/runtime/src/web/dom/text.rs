@@ -603,6 +603,44 @@ pub(super) fn selection(
     Ok(Value::Null)
 }
 
+// The custom highlights in order, when that changed, and the new parts of the ranges that changed.
+pub(super) fn highlights(args: &Value, doc: &mut Document, state: &mut PageState) -> Result<Value> {
+    let interaction = &mut state.interaction;
+    for update in args[1].as_array().context("Expected ranges")? {
+        let [id, range] = [0, 1].map(|at| update[at].as_u64().unwrap_or(0) as u32);
+        let highlight = interaction.highlighted.entry(id).or_default();
+        for node in highlight.ranges.remove(&range).into_iter().flatten() {
+            if let Some(parts) = highlight.nodes.get_mut(&node) {
+                parts.retain(|part| part.0 != range);
+                if parts.is_empty() {
+                    highlight.nodes.remove(&node);
+                }
+            }
+        }
+        for part in update[2].as_array().into_iter().flatten() {
+            let [node, start, end] = [0, 1, 2].map(|at| part[at].as_u64().unwrap_or(0) as usize);
+            ensure!(node < doc.nodes.len(), "Invalid highlight node");
+            let parts = highlight.nodes.entry(node).or_default();
+            parts.push((range, [start, end]));
+            highlight.ranges.entry(range).or_default().push(node);
+        }
+    }
+    if let Some(order) = args[0].as_array() {
+        interaction.highlights = order
+            .iter()
+            .map(|entry| {
+                let id = entry[1].as_u64().unwrap_or(0) as u32;
+                (entry[0].as_str().unwrap_or_default().into(), id)
+            })
+            .collect();
+        let live = &interaction.highlights;
+        (interaction.highlighted).retain(|id, _| live.iter().any(|(_, other)| other == id));
+    }
+    interaction.highlight_changes += 1;
+    state.dirty = true;
+    Ok(Value::Null)
+}
+
 pub(super) fn user_select(
     op: &str,
     id: usize,

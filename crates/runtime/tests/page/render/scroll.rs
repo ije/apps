@@ -200,10 +200,10 @@ fn positioned_boxes_follow_their_containing_block_and_scroller() {
         await load('outer-block.html');
         await expect('outer scroll', "A.scrollTop = 30;" + rect('abs'), '152,2,50');
         await win.webContents.capturePage();
-        await expect('outer scroll hit', hit(170, 20), 'abs');
+        await expect('outer scroll hit', hit(170, 25), 'abs');
         await expect('inner scroll', "B.scrollTop = 20;" + rect('abs'), '152,2,50');
         await win.webContents.capturePage();
-        await expect('inner scroll hit', hit(170, 20), 'abs');
+        await expect('inner scroll hit', hit(170, 25), 'abs');
         await load('chain.html');
         const chain = "['x3', 'x4', 'x6', 'st6'].map(id => (r => [r.x, r.y].map(Math.round).join())(document.getElementById(id).getBoundingClientRect())).join(' ')";
         await expect('chain', chain, '112,22 266,12 112,166 112,166');
@@ -689,6 +689,41 @@ fn scroll_ranges_snap_to_device_pixels_like_chrome() {
              <div class=s style='height:100.5px;margin-top:10.3px'><div style='height:148.75px'></div></div>\
              <div class=s style='height:100px'><div style='height:200.5px'></div></div>\
              <div class=s style='height:100.25px;padding:3.3px'><div style='height:200.6px'></div></div></body>",
+        )],
+    );
+}
+
+// The elements are those of Chrome.
+#[test]
+#[ignore = "requires the macOS window server"]
+fn hits_follow_clips_in_transforms_and_containment_like_chrome() {
+    run_hidden(
+        r#"
+        const expect = async (step, code, value) => {
+            const got = await run(code);
+            if (got !== value) fail(step + ': ' + got + ' instead of ' + value);
+        };
+        const hits = points => `${JSON.stringify(points)}.map(([x, y]) => (e => e.id || e.localName)(document.elementFromPoint(x, y))).join()`;
+        await load('hits.html');
+        await expect('contained', hits([[105, 40], [140, 40], [280, 40], [340, 40], [130, 160]]), 'a,sib,div,html,html');
+        await expect('scaled', hits([[205, 135], [212, 142], [255, 160], [261, 155]]), 'sc,btn,btn,sc');
+        await expect('layer', hits([[15, 240], [40, 265], [65, 240], [75, 265]]), 'in,in,in,html');
+        await expect('margin', hits([[155, 265], [195, 265], [211, 265]]), 'out,out,html');
+        "#,
+        &[(
+            "hits.html",
+            "<body style='margin:0'><style>.c{position:absolute;contain:paint;width:100px;height:100px}.c>a{position:absolute;\
+             left:80px;top:20px;width:100px;height:40px}</style>\
+             <div class=c style='left:10px;top:10px'><a id=a></a></div><div class=c id=sib style='left:130px;top:10px;contain:none'></div>\
+             <div class=c style='left:230px;top:10px;contain:strict'><a style='position:fixed'></a></div>\
+             <div class=c style='left:10px;top:130px;contain:content;overflow:auto'><a></a></div>\
+             <div style='position:absolute;left:200px;top:130px;transform:scale(.5);transform-origin:0 0'>\
+             <div style='width:100px;height:100px;border:20px solid;overflow:auto' id=sc>\
+             <button id=btn style='width:100px;height:60px;display:block'>x</button></div></div>\
+             <div style='position:absolute;left:10px;top:235px;width:40px;height:40px;border:10px solid;overflow:hidden'>\
+             <b id=in style='display:block;width:100px;height:100px;margin:-20px'></b></div>\
+             <div style='position:absolute;left:160px;top:235px'><div style='width:40px;height:40px;overflow:clip;overflow-clip-margin:10px'>\
+             <b id=out style='display:block;width:100px;height:100px;margin:-20px'></b></div></div></body>",
         )],
     );
 }

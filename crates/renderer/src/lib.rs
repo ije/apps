@@ -23,7 +23,7 @@ pub use control::*;
 pub use geometry::*;
 pub use gpu::Snapshot;
 pub(crate) use gpu::scene::Scene;
-pub use gpu::scene::{Backdrop, BlendMode, ColorMatrix, Glass, PaintEffect};
+pub use gpu::scene::{Backdrop, BlendMode, ColorMatrix, Glass, PaintEffect, Space};
 pub use gpu::scene::{Planes, RenderImage, Surface};
 pub use input::*;
 #[cfg(target_os = "linux")]
@@ -35,9 +35,11 @@ pub use platform::{
 };
 pub use style::*;
 pub use text::{
-    Decoration, DecorationStyle, Font, FontId, FontStyle, FontWeight, Glyph, GlyphId, Line,
-    Paragraph, SUBPIXEL_STEPS, SharedString, TextAlign, TextLine, TextOverrides, TextRun,
-    TextStyle, TextSystem, TextWrap, WhiteSpace, WordBreak, Wrapping, warm, widest_piece,
+    AdjustMetric, Caps, Decoration, DecorationStyle, Embedding, FaceRules, Font, FontId, FontStyle,
+    FontWeight, Glyph, GlyphId, Hyphen, Hyphenation, Indent, InlineEdges, Line, Paragraph, Part,
+    SOFT_HYPHEN, SUBPIXEL_STEPS, SharedString, SizeAdjust, TextAlign, TextLine, TextOverrides,
+    TextRun, TextStyle, TextSystem, TextWrap, WhiteSpace, WordBreak, Wrapping, reorders,
+    right_to_left, warm, widest_piece,
 };
 
 /// True when images can be surfaces.

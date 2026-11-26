@@ -75,18 +75,9 @@ pub(super) fn pseudo_elements(
         }
         let pseudo_only = pseudo.is_some();
         let pseudo = style_of;
-        let Some(content) = pseudo
-            .get(Prop::CONTENT)
-            .filter(|v| !matches!(*v, "none" | "normal"))
-        else {
+        let Some(content) = crate::render::inline::drawn(pseudo, style) else {
             continue;
         };
-        if pseudo
-            .get(Prop::DISPLAY)
-            .is_some_and(|value| value == "none")
-        {
-            continue;
-        }
         // The text holds an inline pseudo-element: plain text as runs, a box as an atom.
         let held = cx.inline_text().or_else(|| cx.edge_text(index));
         let merged = !editable
@@ -115,8 +106,13 @@ pub(super) fn pseudo_elements(
         if face.style != renderer::FontStyle::Normal {
             decoration.text_style().set_font_style(face.style);
         }
-        if face.synthesis != [true; 2] {
+        if face.synthesis != [true; 3] {
             decoration.text_style().set_font_synthesis(face.synthesis);
+        }
+        if face.size_adjust.is_some() {
+            decoration
+                .text_style()
+                .set_font_size_adjust(face.size_adjust);
         }
         match own {
             "flex" | "inline-flex" => {

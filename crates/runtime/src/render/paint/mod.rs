@@ -677,6 +677,9 @@ impl Hooks for PseudoBlock {
     }
 }
 
+// The distance and the origin of the perspective of a parent, its node and its borders.
+pub(crate) type Perspective = ((f32, String), usize, [f32; 4]);
+
 pub(crate) struct DomBox {
     // The axes without insets of an out-of-flow box.
     pub(crate) unplaced: [bool; 2],
@@ -696,7 +699,8 @@ pub(crate) struct DomBox {
     pub(crate) effects: Option<f32>,
     pub(crate) composited: bool,
     pub(crate) transformed: bool,
-    pub(crate) perspective: Option<Box<((f32, String), usize)>>,
+    pub(crate) perspective: Option<Box<Perspective>>,
+    pub(crate) space: renderer::Space,
     pub(crate) units: css::value::units::Lengths,
     pub(crate) revision: u64,
     pub(crate) sides: [f32; 2],
@@ -713,6 +717,9 @@ pub(crate) struct DomBox {
     pub(crate) reached_at: Cell<(Rect<Pixels>, u32)>,
     pub(crate) offset: Cell<Point<Pixels>>,
     pub(crate) frame: bool,
+    // Scrolls move or hide the box with its anchor.
+    pub(crate) anchored: bool,
+    pub(crate) hidden: Cell<bool>,
     pub(crate) text_clip: bool,
     // A drawable element of a canvas, which paints into a snapshot for `drawElementImage()`.
     pub(crate) drawn: bool,
@@ -769,6 +776,7 @@ impl DomBox {
         &self,
         dom: &mut crate::render::PageState,
         window_bounds: Rect<Pixels>,
+        shape: Option<Box<[Point<Pixels>]>>,
         size: Size<Pixels>,
         parts: &[Rect<Pixels>],
     ) {
@@ -799,10 +807,16 @@ impl DomBox {
                 || scaled(window_bounds.size.height, size.height)
                 || !self.drawn
                     && (self.transformed
-                        || [Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE, Prop::TRANSFORM]
+                        || super::effects::TRANSFORM_PROPS
                             .into_iter()
                             .any(|prop| self.style.get(prop).is_some_and(|value| value != "none"))),
         );
+        let shapes = &mut dom.geometry.shapes;
+        if let Some(shape) = shape {
+            shapes.insert(self.id, shape);
+        } else if !shapes.is_empty() {
+            shapes.remove(&self.id);
+        }
         // Like Chrome, a box that columns split reports the union of its parts.
         if let Some(union) = parts.iter().copied().reduce(|all, part| all.union(part)) {
             let rect = |part: Rect<Pixels>| {
@@ -916,6 +930,7 @@ impl DomBox {
                     found.push((*node, all, parts));
                 }
                 for ((node, all, parts), (_, pieces)) in found.into_iter().zip(boxes) {
+                    dom.geometry.shapes.remove(&node);
                     if let Some(all) = all {
                         dom.geometry.mirror.insert(node, all);
                     }
@@ -1027,11 +1042,16 @@ impl Hooks for DomBox {
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let parts: Vec<_> = cx.fragments().collect();
         let (exact, baselines, unscrolled) = (cx.exact, cx.baselines, cx.unscroll);
+        let anchored = cx.style.anchored.as_deref();
         let window = &mut *cx.window;
         let mut bounds = exact;
         let mut offset = point(px(0.), px(0.));
         unscroll(&mut offset, self.unplaced, unscrolled);
         bounds.origin += offset;
+        let inset = match anchored {
+            Some(axes) => self.aligned(axes, bounds.size, window),
+            None => self.inset,
+        };
         if let Some(sticky) = &self.sticky {
             let Sticky {
                 scroll,
@@ -1091,7 +1111,7 @@ impl Hooks for DomBox {
                 container,
                 viewport: self.units.viewport,
                 sized: self.sized,
-                inset: self.inset,
+                inset,
                 margin: self.margin,
                 rtl: self.rtl,
             }
@@ -1124,7 +1144,7 @@ impl Hooks for DomBox {
                 } else {
                     [viewport.height, bounds.top(), bounds.size.height]
                 };
-                let at = match (self.inset[start], self.inset[end]) {
+                let at = match (inset[start], inset[end]) {
                     (Some(first), Some(last)) if auto(start) || auto(end) => {
                         let free = extent - px(first + last) - size - margin(start) - margin(end);
                         px(first)
@@ -1149,23 +1169,62 @@ impl Hooks for DomBox {
             }
             bounds.origin = exact.origin + offset;
         }
+        if self.style.get(Prop::POSITION) == Some("fixed") {
+            // The clip of a hidden box doesn't reach the fixed boxes in it.
+            let store = self.view.store.borrow();
+            self.hidden
+                .set(store.pages.get(&self.view.id).is_some_and(|page| {
+                    crate::render::Anchored::hidden_around(&page.state, &page.doc, self.id)
+                }));
+        }
+        if anchored.is_some() {
+            let store = self.view.store.borrow();
+            if let Some(dom) = store.page_state(self.view.id)
+                && let Some(found) = dom.layout.anchors.boxes.get(&self.id)
+            {
+                let (by, hidden) = found.prepaint(dom, !self.view.reflowing.get());
+                let by = by.map(px);
+                offset += point(by[0], by[1]);
+                bounds.origin += point(by[0], by[1]);
+                let fixed = self.style.get(Prop::POSITION) == Some("fixed");
+                self.hidden.set(hidden || fixed && self.hidden.get());
+            }
+        }
         self.block(bounds, point(px(0.), px(0.)));
-        let perspective = self
-            .perspective
-            .as_deref()
-            .and_then(|((distance, origin), parent)| {
+        let perspective = self.perspective.as_deref().and_then(
+            |((distance, origin), parent, [top, right, bottom, left])| {
+                // The place of the parent before its own transform.
                 let view = &*self.view;
                 let store = view.store.borrow();
-                let [x, y, width, height] =
-                    *store.page_state(view.id)?.geometry.mirror.get(parent)?;
-                let [ox, oy, _] =
-                    crate::css::value::transform::origin(origin, &self.units, [width, height]);
-                Some((*distance, [x + ox, y + oy]))
-            });
+                let padding = store.page_state(view.id)?.layout.blocks.get(parent)?;
+                let [x, y] = [padding.origin.x, padding.origin.y].map(f32::from);
+                let [width, height] = [padding.size.width, padding.size.height].map(f32::from);
+                let size = [width + left + right, height + top + bottom];
+                let [ox, oy, _] = crate::css::value::transform::origin(origin, &self.units, size);
+                Some((*distance, [x - left + ox, y - top + oy]))
+            },
+        );
+        let offset_style = (super::effects::offset::reads_page(&self.style) && !self.boxless)
+            .then(|| {
+                let view = &*self.view;
+                let mut store = view.store.borrow_mut();
+                let (doc, state, _) = store.page_parts(view.id);
+                let (style, units) = (&self.style, &self.units);
+                super::effects::offset::placed(
+                    self.id, style, units, bounds, doc?, state, &self.ids, window,
+                )
+            })
+            .flatten();
+        if let Some(style) = &offset_style {
+            let origin = Rect::new(renderer::Point::default(), bounds.size);
+            let local = crate::css::value::transform::transform(style, &self.units, origin, None);
+            let size = [f32::from(bounds.size.width), f32::from(bounds.size.height)];
+            self.local.set(Some(Box::new((size, local))));
+        }
         // A canvas draws a drawable element as it is before its transform.
         let mut matrix = match perspective {
             Some(_) => crate::css::value::transform::transform(
-                &self.style,
+                offset_style.as_ref().unwrap_or(&self.style),
                 &self.units,
                 bounds,
                 perspective,
@@ -1185,7 +1244,12 @@ impl Hooks for DomBox {
                 .borrow_mut()
                 .insert(self.id, (bounds, perspective));
         }
+        let space = self.space.joins || self.space.preserves;
+        if space {
+            matrix.get_or_insert(crate::css::value::transform::IDENTITY);
+        }
         if !self.transformed
+            && !space
             && let Some([x, y]) = matrix
                 .as_ref()
                 .and_then(super::effects::transform::translation)
@@ -1208,6 +1272,7 @@ impl Hooks for DomBox {
         }
         let mut prepaint = |window: &mut Window| {
             let window_bounds = window.transformed_bounds(bounds);
+            let shape = window.hit_shape(bounds);
             // The parts move with the box's offsets and transform.
             let parts: Vec<_> = parts
                 .iter()
@@ -1231,7 +1296,7 @@ impl Hooks for DomBox {
                 {
                     window.redraw();
                 }
-                self.mirror(dom, window_bounds, bounds.size, &parts);
+                self.mirror(dom, window_bounds, shape, bounds.size, &parts);
                 let width = f32::from(bounds.size.width);
                 let [top, right, bottom, left] = self.margin;
                 let cell = self
@@ -1302,7 +1367,11 @@ impl Hooks for DomBox {
             if moved && let Some(frame) = view.frames.borrow().get(&self.id) {
                 let _ = frame.browser.set_bounds(frame.bounds);
             }
-            window.scope(renderer::Scope::Offset(offset), |window| inner(window));
+            // The boxes in it that paint in another stacking context are hidden too.
+            let clip = (self.hidden.get()).then(|| Rect::default().into());
+            window.scope(renderer::Scope::Clip(clip), |window| {
+                window.scope(renderer::Scope::Offset(offset), |window| inner(window))
+            });
             self.reached(window_bounds, flags);
             self.unions();
         };
@@ -1325,11 +1394,12 @@ impl Hooks for DomBox {
                 });
                 window.with_hits_at(drawn, &mut prepaint)
             }
-            Some(matrix) => window.with_keyed_hit_transform(
-                matrix,
-                self.transformed.then_some(self.id as u64),
-                &mut prepaint,
-            ),
+            Some(matrix) if self.transformed => {
+                window.with_keyed_hit_transform(matrix, Some(self.id as u64), &mut prepaint)
+            }
+            Some(matrix) => {
+                window.with_space_hits(matrix, self.space, self.backface_hidden(), &mut prepaint)
+            }
             None => prepaint(window),
         }
         self.placed.set((bounds, matrix));
@@ -1341,6 +1411,9 @@ impl Hooks for DomBox {
         !self.drawn
             && !self.composited
             && !self.frame
+            && !self.space.joins
+            && !self.space.preserves
+            && !super::effects::offset::reads_page(&self.style)
             && [
                 Prop::FILTER,
                 Prop::WEBKIT_FILTER,
@@ -1359,11 +1432,15 @@ impl Hooks for DomBox {
         self.drawn
             || self.sticky.is_some()
             || self.fixed
+            || self.anchored
             || self.container.is_some()
             || self.sized.is_some()
             || self.perspective.is_some()
             || self.transformed
             || self.frame
+            || self.space.joins
+            || self.space.preserves
+            || super::effects::offset::reads_page(&self.style)
     }
 
     fn skippable(&self) -> bool {
@@ -1410,6 +1487,9 @@ impl Hooks for DomBox {
                 parts
                     .iter_mut()
                     .for_each(|part| (part[0], part[1]) = (part[0] + x, part[1] + y));
+            }
+            if let Some(shape) = dom.geometry.shapes.get_mut(&id) {
+                shape.iter_mut().for_each(|corner| *corner += by);
             }
             if let Some(pieces) = dom.geometry.pieces.get_mut(&id) {
                 pieces
@@ -1496,6 +1576,7 @@ impl Hooks for DomBox {
         }
         let mut kept = |window: &mut Window| {
             let window_bounds = window.transformed_bounds(bounds);
+            let shape = window.hit_shape(bounds);
             let parts: Vec<_> = parts
                 .iter()
                 .map(|part| window.transformed_bounds(*part + offset))
@@ -1505,7 +1586,7 @@ impl Hooks for DomBox {
                 let mut store = view.store.borrow_mut();
                 let dom = store.state(view.id);
                 if moved {
-                    self.mirror(dom, window_bounds, bounds.size, &parts);
+                    self.mirror(dom, window_bounds, shape, bounds.size, &parts);
                 }
                 dom.layout
                     .cull
@@ -1523,12 +1604,18 @@ impl Hooks for DomBox {
             }
         };
         match matrix {
-            Some(matrix) => cx.window.with_keyed_hit_transform(matrix, None, &mut kept),
+            Some(matrix) => {
+                let hides_back = self.backface_hidden();
+                (cx.window).with_space_hits(matrix, self.space, hides_back, &mut kept)
+            }
             None => kept(cx.window),
         }
     }
 
     fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        if self.hidden.get() {
+            return;
+        }
         if !self.drawn {
             return self.draw(cx.window, inner);
         }
@@ -1544,27 +1631,81 @@ impl Hooks for DomBox {
 }
 
 impl DomBox {
+    fn backface_hidden(&self) -> bool {
+        self.style.get(Prop::BACKFACE_VISIBILITY) == Some("hidden")
+    }
+
+    // The insets of a box that an anchor aligns, from its place in its containing block.
+    fn aligned(
+        &self,
+        axes: &[Option<renderer::Aligned>; 2],
+        size: Size<Pixels>,
+        window: &Window,
+    ) -> [Option<f32>; 4] {
+        let mut inset = self.inset;
+        let extent = {
+            let store = self.view.store.borrow();
+            let dom = store.page_state(self.view.id);
+            let block = dom.and_then(|dom| dom.layout.blocks.get(&self.container?));
+            let viewport = window.viewport_size();
+            block.map_or([viewport.width.0, viewport.height.0], |block| {
+                [block.size.width.0, block.size.height.0]
+            })
+        };
+        for (axis, aligned) in axes.iter().enumerate() {
+            let Some(aligned) = aligned else { continue };
+            let [start, end] = [[3, 1], [0, 2]][axis];
+            let size = [size.width.0, size.height.0][axis] + self.margin[start] + self.margin[end];
+            inset[start] = Some(aligned.place(size, extent[axis]));
+            inset[end] = None;
+        }
+        inset
+    }
+
     fn draw(&self, window: &mut Window, inner: &mut dyn FnMut(&mut Window)) {
         let (bounds, matrix) = self.placed.get();
         self::native::paint(&self.view, self.id, bounds, &self.style, window);
-        window.mark(self.view.id << 32 | self.id as u64);
-        let inner = &mut |window: &mut Window| match self.text_clip {
-            true => window.with_text_clip(|window| inner(window)),
-            false => inner(window),
+        // The mark of a plane goes into its layer, so it sorts with the plane.
+        let mark = self.view.id << 32 | self.id as u64;
+        let space = self.space.joins || self.space.preserves;
+        if !space {
+            window.mark(mark);
+        }
+        let inner = &mut |window: &mut Window| {
+            if space {
+                window.mark(mark);
+            }
+            match self.text_clip {
+                true => window.with_text_clip(|window| inner(window)),
+                false => inner(window),
+            }
         };
         if matrix.is_none() && self.effects.is_none() {
             return inner(window);
         }
-        if let Some(matrix) = &matrix
-            && self
-                .style
-                .get(Prop::BACKFACE_VISIBILITY)
-                .is_some_and(|value| value == "hidden")
-            && super::effects::transform::backface(matrix, bounds)
-        {
+        // The matrix of a box in a 3D rendering context goes to the plane of the context.
+        let (matrix, joins) = match window.space().filter(|_| self.space.joins) {
+            Some(space) => (
+                matrix.map(|matrix| crate::css::value::transform::multiply(space, &matrix)),
+                true,
+            ),
+            None => (matrix, false),
+        };
+        let hidden = self.backface_hidden() && matrix.as_ref().is_some_and(renderer::faces_away);
+        let nothing = !self.composited && matrix.as_ref().is_some_and(renderer::singular);
+        if nothing || hidden && !self.space.preserves {
             return;
         }
         let (clip, mut layers) = self.effects(bounds, matrix, window);
+        // Filters nest inside the layer with the transform, which is the last one.
+        if let Some(outer) = layers.last_mut().filter(|_| space) {
+            outer.space = renderer::Space {
+                joins,
+                hidden,
+                ..self.space
+            };
+            outer.plane = bounds;
+        }
         let mut paint = |window: &mut Window| match &clip {
             Some(clip) => window.with_group_clip(*clip, |window| inner(window)),
             None => inner(window),
@@ -1599,8 +1740,16 @@ impl DomBox {
         let mut clip = None;
         let mut shapes = None;
         match value(&[Prop::CLIP_PATH, Prop::WEBKIT_CLIP_PATH])
-            .and_then(|value| effects::clip::clip(value, &units, size, doc, &self.ids))
+            .and_then(|value| effects::clip::clip(value, style, &units, size, doc, &self.ids))
         {
+            // A filter draws before the clip, so its layer takes a mask.
+            Some(Clip::Rounded([x, y, w, h], radii)) if !layers.is_empty() => {
+                let outline = css::value::shape::rounded([x, y, w, h], radii.map(|r| [r; 2]));
+                shapes = Some((
+                    format!("<path d=\"{}\"/>", css::value::shape::svg(&outline)),
+                    Some([x, y, x + w, y + h]),
+                ));
+            }
             Some(Clip::Rounded(rect, radii)) => {
                 clip = Some(renderer::Clip::rounded(
                     Rect::new(
@@ -1610,7 +1759,7 @@ impl DomBox {
                     effects::clip::corners(radii),
                 ))
             }
-            Some(Clip::Shape(shape)) => shapes = Some(shape),
+            Some(Clip::Shape(shape, reach)) => shapes = Some((shape, reach)),
             None => {}
         }
         let mask = mask::mask(
@@ -1620,7 +1769,7 @@ impl DomBox {
             (self.id, 0),
             style,
             units,
-            shapes.as_deref(),
+            shapes,
             bounds,
             window,
         );

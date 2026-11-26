@@ -319,7 +319,7 @@ fn child_lists_inline_shorthands_and_serialization_stay_current() {
         kids[0].className = 'x'; p.setAttribute('data-x', '1');
         check('lists survive attribute writes', () => kids === p.children && nodes === p.childNodes);
         for (const kid of p.children) kid.remove();
-        check('lists are static and renew after a change', () => kids.length === 4 && nodes.length === 8 && p.children.length === 0 && p.childNodes.length === 4);
+        check('lists are live', () => kids.length === 2 && nodes.length === 6 && kids === p.children && nodes === p.childNodes && kids[1] === nodes[4]);
         const q = document.createElement('div'); q.innerHTML = '<i></i>'; q.childNodes; p.append(q.firstChild);
         check('moves renew both lists', () => q.childNodes.length === 0 && p.lastChild.localName === 'i');
         p.innerHTML = '<a></a><b></b>'; check('innerHTML renews lists', () => p.children.length === 2 && p.firstChild.localName === 'a');
@@ -331,9 +331,9 @@ fn child_lists_inline_shorthands_and_serialization_stay_current() {
         d.style.font = 'bold 12px / 1.5 serif'; check('font reads back', () => d.style.font === 'bold 12px / 1.5 serif' && d.style.removeProperty('font') === 'bold 12px / 1.5 serif' && d.style.length === 0);
         d.style.border = 'solid'; check('border omits default parts', () => d.style.border === 'solid');
         d.removeAttribute('style'); d.style.marginBlock = '1px';
-        check('logical shorthands read back without folding physical sides', () => d.style.marginBlock === '1px' && css() === 'margin-top: 1px; margin-bottom: 1px;');
+        check('logical shorthands read back without folding physical sides', () => d.style.marginBlock === '1px' && css() === 'margin-block: 1px;');
         d.removeAttribute('style'); d.style.borderInline = '1px solid red'; d.style.inlineSize = '5px';
-        check('logical border and alias', () => d.style.borderInline === '1px solid red' && d.style.inlineSize === '5px' && css() === 'border-inline: 1px solid red; width: 5px;');
+        check('logical border and alias', () => d.style.borderInline === '1px solid red' && d.style.inlineSize === '5px' && css() === 'border-inline: 1px solid red; inline-size: 5px;');
         d.removeAttribute('style'); d.style.background = 'url(a.png) no-repeat 1px 2px / 3px, blue';
         check('background layers', () => d.style.background === 'url("a.png") 1px 2px / 3px no-repeat, blue');
         const svg = document.createElement('div'); svg.innerHTML = '<svg><style>a&lt;b</style></svg><style>a<b</style>';
@@ -771,4 +771,117 @@ fn same_text_writes_large_fragments_and_id_queries() {
         fails.join('\n') || 'ok'
     "#, "test").unwrap();
     assert_eq!(result, "ok");
+}
+
+#[test]
+fn live_collections_form_controls_and_custom_states() {
+    checked_page(
+        "<html><body><form id=f><input name=user id=u><input name=r type=radio value=1><input name=r type=radio value=2 checked><select name=s required><option value=''>a</select><x-f name=x></x-f></form><input form=f name=out><div id=d><p class='a b'></p>text</div></body></html>",
+        r#"
+        const $ = id => document.getElementById(id), [f, d, u] = [$('f'), $('d'), $('u')], make = tag => document.createElement(tag);
+        const tags = d.getElementsByTagName('i'), classes = d.getElementsByClassName('a'), kids = d.children, nodes = d.childNodes;
+        d.append(make('i')); d.insertBefore(make('b'), d.firstChild);
+        check('insert', () => tags.length === 1 && tags === d.getElementsByTagName('i') && [...kids].map(kid => kid.localName).join() === 'b,p,i' && nodes[2].data === 'text');
+        d.lastChild.className = 'a'; check('class', () => classes.length === 2 && classes[1] === tags[0]);
+        d.replaceChildren('x', make('u')); check('replace', () => !tags.length && !classes.length && kids.length === 1 && nodes.length === 2);
+        d.innerHTML = '<i></i><i></i>y'; check('html', () => tags.length === 2 && kids[1] === tags[1] && nodes[2].data === 'y' && Array.from(tags).length === 2 && '1' in tags && !('2' in tags));
+        const fragment = document.createDocumentFragment(), held = fragment.childNodes; fragment.append(make('s'), 'z'); d.append(fragment);
+        check('fragment', () => !held.length && kids[2].localName === 's' && nodes.length === 5);
+        const elements = f.elements;
+        check('elements', () => elements === f.elements && elements.user === u && elements.u === u && elements.r.value === '2' && elements.out.form === f && f.length === elements.length);
+        const late = make('input'); late.name = 'title'; f.append(late);
+        check('late', () => elements.title === late && Object.hasOwn(elements, 'title') && !Object.hasOwn(elements, 'nope')); late.remove(); check('gone', () => elements.title === undefined);
+        const named = make('form'); named.name = 'find'; named.id = 'ff'; document.body.append(named);
+        check('form names', () => document.forms.namedItem('ff') === named && document.forms.find === named && document.forms.namedItem('find') === named); named.remove();
+        check('radio list', () => { const radios = elements.r; radios.value = '1'; return radios.value === '1' && radios.length === 2; });
+        const items = d.getElementsByTagName('i'), marked = d.getElementsByClassName('m');
+        check('loops', () => { for (let i = 0; i < items.length; i++) { items[i].id = 'i' + i; items[i].classList.add('m'); items[i].append(make('b')); } return items.length === 2 && marked.length === 2; });
+        check('nested', () => { const box = make('div'); box.append(make('i')); const deep = box.getElementsByTagName('i'); d.append(box); const before = items.length; box.firstChild.remove(); return before === 3 && items.length === 2 && !deep.length; });
+        check('required select', () => f.matches(':invalid') && elements.s.matches(':invalid'));
+        elements.s.innerHTML = '<option>b'; check('new options', () => !f.matches(':invalid'));
+        elements.s.firstChild.firstChild.data = ''; check('option text', () => elements.s.matches(':invalid'));
+        elements.s.append(new Option('c', 'c')); elements.s.value = 'c';
+        const log = [];
+        customElements.define('x-f', class extends HTMLElement {
+            static formAssociated = true;
+            constructor() { super(); this.i = this.attachInternals(); }
+            formAssociatedCallback(form) { log.push(form ? 'in' : 'out'); }
+            formDisabledCallback(off) { log.push(off); }
+            formResetCallback() { log.push('reset'); }
+        });
+        const x = f.querySelector('x-f');
+        x.i.setValidity({ customError: true }, 'm'); check('custom invalid', () => f.matches(':invalid') && x.matches(':invalid') && elements.x === x);
+        x.i.setValidity({}); x.i.states.add('on'); check('states', () => x.matches(':state(on)') && !f.matches(':invalid'));
+        x.setAttribute('disabled', ''); check('disabled', () => x.matches(':disabled'));
+        f.reset(); x.remove(); check('callbacks', () => log.join() === 'in,true,reset,out');
+        f.addEventListener('submit', event => event.preventDefault()); u.required = true; check('user', () => !u.matches(':user-invalid'));
+        f.requestSubmit(); check('submitted', () => u.matches(':user-invalid')); f.reset(); check('reset', () => !u.matches(':user-invalid'));
+        "#,
+    );
+}
+
+#[test]
+fn xml_documents_attribute_nodes_and_highlights() {
+    checked_page(
+        "<html><body><div id=d a=1>some text</div></body></html>",
+        r#"
+        const parse = (source, type = 'text/xml') => new DOMParser().parseFromString(source, type), write = node => new XMLSerializer().serializeToString(node), d = document.getElementById('d');
+        const source = '<?xml version="1.0"?><!DOCTYPE N><?p q?><N xmlns:x="u" A="&lt;"><x:I x:k="1"/>a&amp;b<![CDATA[<c>]]><b_d/></N>';
+        const doc = parse(source), root = doc.documentElement, item = root.firstChild;
+        check('names', () => doc instanceof XMLDocument && root.tagName === 'N' && item.prefix === 'x' && item.localName === 'I' && item.namespaceURI === 'u' && item.getAttributeNS('u', 'k') === '1' && root.getAttribute('A') === '<');
+        check('nodes', () => [...root.childNodes].map(node => node.nodeType).join() === '1,3,4,1' && doc.childNodes[1].nodeType === 7);
+        check('write', () => write(doc) === source && write(parse('<a xmlns="u"><b xmlns=""/></a>')) === '<a xmlns="u"><b xmlns=""/></a>');
+        for (const bad of ['', 'x', '<!DOCTYPE a><!DOCTYPE a><a/>', '<a xmlns:p="u" xmlns:q="u" p:b="1" q:b="2"/>', '<a xmlns:p=""/>', '<a:b:c/>', '<constructor:a/>', '<a>&constructor;</a>', '<a>\u0001</a>', '<a>'.repeat(6000), '<!DOCTYPE a [<!ENTITY e "' + 'x'.repeat(1000) + '">]><a>' + '&e;'.repeat(11000) + '</a>', '<a>', '<a></b>', '<a b=c/>', '<a b="1" b="2"/>', '<a>&nope;</a>', '<x:a/>', '<a/><b/>']) check('bad ' + bad, () => parse(bad).querySelector('parsererror'));
+        check('svg', () => parse('<svg xmlns="http://www.w3.org/2000/svg"><linearGradient/></svg>', 'image/svg+xml').documentElement.firstChild instanceof SVGElement);
+        check('xhtml', () => parse('<html xmlns="http://www.w3.org/1999/xhtml"><body><p/></body></html>', 'application/xhtml+xml').body.firstChild instanceof HTMLParagraphElement);
+        check('namespaces', () => { const node = document.createElementNS('u', 'a'); node.setAttributeNS('v', 'q:z', '1'); return node.getAttributeNS('v', 'z') === '1' && node.getAttributeNode('q:z').namespaceURI === 'v' && write(node) === '<a xmlns="u" xmlns:q="v" q:z="1"/>' && item.lookupPrefix('u') === 'x' && doc.cloneNode(true).documentElement.tagName === 'N'; });
+        const attr = d.getAttributeNode('a');
+        check('attr', () => attr instanceof Node && attr.ownerElement === d && attr.parentNode === null && !attr.childNodes.length && attr.textContent === '1' && attr.getRootNode() === attr);
+        check('attr child', () => { try { d.append(attr); } catch (error) { return error.name === 'HierarchyRequestError'; } });
+        check('attr gone', () => { d.setAttribute('b', '2'); const gone = d.getAttributeNode('b'); d.removeAttribute('b'); return gone.ownerElement === null && gone.value === '2' && d.getAttributeNode('b') === null; });
+        const range = new Range(); range.setStart(d.firstChild, 0); range.setEnd(d.firstChild, 4);
+        const highlight = new Highlight(range); CSS.highlights.set('x', highlight);
+        check('highlight', () => highlight.size === 1 && highlight.add(range) === highlight && CSS.highlights.get('x') === highlight);
+        document.head.innerHTML = '<style>:root{--c:red}::highlight(x){color:var(--c)}div::highlight(x){background-color:blue}@media print{div::highlight(x){color:green}}</style>';
+        check('style', () => { const style = getComputedStyle(d, '::highlight(x)'); return style.color === 'rgb(255, 0, 0)' && style.backgroundColor === 'rgb(0, 0, 255)'; });
+        check('supports', () => CSS.supports('selector(::highlight(a))') && !CSS.supports('selector(::highlight())') && CSS.supports('at-rule(@scope)') && !CSS.supports('at-rule(@nope)'));
+        "#,
+    );
+}
+
+#[test]
+fn form_states_restyle_with_the_order_of_the_tree() {
+    checked_page(
+        "<html><head><style>:default{left:1px}form:invalid{left:2px}:indeterminate{left:3px}</style></head><body><form id=f><button id=a type=button></button><input id=b type=submit></form><button id=x form=f></button><form id=p></form><form id=q></form><input id=o required form=w><form id=g><input type=radio name=r id=r1><input type=radio name=r id=r2></form><input type=radio name=r id=r3 form=g></body></html>",
+        r#"
+        const $ = id => document.getElementById(id), [f, a, b, x, p, q, g, r1, r2, r3] = ['f', 'a', 'b', 'x', 'p', 'q', 'g', 'r1', 'r2', 'r3'].map($);
+        const all = [f, a, b, x, p, q, g, r1, r2, r3], is = (node, value) => getComputedStyle(node).left === value;
+        const right = () => all.every(node => !node.isConnected || is(node, node.matches(':default') ? '1px' : node.matches('form:invalid') ? '2px' : node.matches(':indeterminate') ? '3px' : 'auto'));
+        const step = (name, change, expected) => check(name, () => { change(); return right() && expected(); });
+        step('start', () => {}, () => is(b, '1px') && is(x, 'auto') && is(r3, '3px'));
+        step('before', () => f.before(x), () => is(x, '1px') && is(b, 'auto'));
+        step('after', () => f.after(x), () => is(b, '1px') && is(x, 'auto'));
+        step('into', () => { const box = document.createElement('div'); f.before(box); box.append(x); }, () => is(x, '1px'));
+        step('removed', () => x.parentNode.remove(), () => is(b, '1px'));
+        step('type', () => { a.type = 'submit'; }, () => is(a, '1px') && is(b, 'auto'));
+        step('same id', () => { p.id = q.id = 'w'; }, () => is(p, '2px') && is(q, 'auto'));
+        step('swap', () => q.after(p), () => is(q, '2px') && is(p, 'auto'));
+        step('swap back', () => p.after(q), () => is(p, '2px') && is(q, 'auto'));
+        step('other id', () => { p.id = 'v'; }, () => is(q, '2px') && is(p, 'auto'));
+        step('first gone', () => { p.id = 'w'; p.remove(); }, () => is(q, '2px'));
+        step('checked', () => { r3.checked = true; }, () => is(r1, 'auto') && is(r2, 'auto'));
+        step('out of group', () => r3.removeAttribute('form'), () => is(r1, '3px') && is(r3, 'auto'));
+        step('in group', () => r3.setAttribute('form', 'g'), () => is(r1, 'auto'));
+        step('new form id', () => { g.id = 'h'; }, () => is(r1, '3px'));
+        step('wrapped', () => { const inner = document.createElement('div'); g.append(inner); inner.append(r3); r3.removeAttribute('form'); }, () => is(r1, 'auto'));
+        step('moved out', () => document.body.append(r3.parentNode), () => is(r1, '3px'));
+        step('left', () => { r1.checked = true; r1.remove(); }, () => is(r2, '3px'));
+        step('back', () => g.append(r1), () => is(r2, 'auto'));
+        const box = document.createElement('div'); document.body.append(box);
+        step('template', () => { r1.checked = false; p.id = q.id = g.id = 't'; box.innerHTML = '<template><input form=t required><form id=t></form><input type=radio name=r checked form=t></template>'; q.id = 'other'; g.id = 'h'; g.before(p); r2.name = r1.name = 'r'; }, () => is(p, 'auto') && is(r2, '3px'));
+        step('shared id', () => { box.innerHTML = '<template><form id=u></form></template>'; p.id = 'u'; box.append(Object.assign(document.createElement('input'), { required: true })); box.lastChild.setAttribute('form', 'u'); }, () => is(p, '2px'));
+        step('read', () => box.firstChild.content, () => is(p, '2px'));
+        step('into template', () => box.firstChild.append(box.lastChild), () => is(p, 'auto'));
+        "#,
+    );
 }

@@ -207,3 +207,125 @@ fn tables_have_border_box_sizing_like_chrome() {
         Some("border-box")
     );
 }
+
+#[test]
+fn html_attributes_give_presentational_hints() {
+    let doc = Document::parse(
+        "<ol type=a><li id=a><li id=b type=I></ol><ul type=SQUARE><li id=c></ul><table id=t align=right rules=all border=3 bordercolor=abc><tr valign=top><td id=d nowrap width=40 bgcolor=ff0000><td id=e colspan=3 rowspan=0></table><h2 id=h align=center></h2><div id=f align=right><table id=g></table></div><hr id=i size=8 color=red width=50%>",
+    );
+    let computed = styles(&doc, 800., 600.);
+    let get = |id: &str, name: &str| {
+        (computed[element(&doc, id)].get(name)).map_or("", |value| value.as_str())
+    };
+    for (id, kind) in [
+        ("#a", "lower-alpha"),
+        ("#b", "upper-roman"),
+        ("#c", "square"),
+    ] {
+        assert_eq!(get(id, "list-style-type"), kind);
+    }
+    assert_eq!(get("#t", "float"), "right");
+    assert_eq!(get("#t", "border-collapse"), "collapse");
+    assert_eq!(get("#d", "white-space"), "nowrap");
+    assert_eq!(get("#d", "width"), "40px");
+    assert_eq!(get("#d", "vertical-align"), "top");
+    assert_eq!(get("#d", "background-color"), "#ff0000");
+    assert_eq!(get("#e", "grid-column-start"), "span 3");
+    assert_eq!(get("#e", "grid-row-start"), "span 4095");
+    assert_eq!(get("#h", "text-align"), "center");
+    assert_eq!(get("#f", "text-align"), "-webkit-right");
+    // Tables don't inherit the alignments that also place blocks.
+    assert_eq!(get("#g", "text-align"), "start");
+    assert_eq!(get("#i", "height"), "6px");
+    assert_eq!(get("#i", "border-top-style"), "solid");
+}
+
+#[test]
+fn collapsed_borders_follow_row_spans_hidden_borders_and_columns() {
+    let doc = Document::parse(
+        "<style>table{border-collapse:collapse}</style><table><colgroup><col><col style='border:4px solid blue'></colgroup><tr><td id=a rowspan=2 style='border:2px solid red'><td id=b style='border:1px solid'><tr><td id=c style='border:1px dashed green'></table><table><tr><td id=d style='border:2px hidden'><td id=e style='border:5px solid'></table>",
+    );
+    let computed = styles(&doc, 800., 600.);
+    let get = |id: &str, name: &str| computed[element(&doc, id)][name].as_str();
+    // The second row starts in the second column.
+    assert_eq!(get("#c", "border-left-width"), "4px");
+    assert_eq!(get("#a", "border-right-width"), "4px");
+    assert_eq!(get("#a", "border-right-color"), "blue");
+    assert_eq!(get("#b", "border-bottom-style"), "solid");
+    assert_eq!(get("#c", "border-top-style"), "solid");
+    assert_eq!(get("#a", "border-bottom-width"), "2px");
+    assert_eq!(get("#e", "border-left-style"), "none");
+    assert_eq!(get("#e", "border-right-width"), "5px");
+}
+
+#[test]
+fn logical_properties_turn_with_the_lines_of_a_box() {
+    let doc = Document::parse(
+        "<style>div{padding-inline:1px 2px;padding-block:3px 4px;inline-size:50px}</style><div id=a></div><div id=b style='writing-mode:vertical-rl'></div><div id=c style='writing-mode:sideways-lr'></div><div id=d dir=rtl></div>",
+    );
+    let computed = styles(&doc, 800., 600.);
+    let padding = |id: &str| {
+        ["top", "right", "bottom", "left"]
+            .map(|side| computed[element(&doc, id)][&format!("padding-{side}")].clone())
+            .join(" ")
+    };
+    assert_eq!(padding("#a"), "3px 2px 4px 1px");
+    assert_eq!(padding("#b"), "1px 3px 2px 4px");
+    assert_eq!(padding("#c"), "2px 4px 1px 3px");
+    assert_eq!(padding("#d"), "3px 1px 4px 2px");
+    assert_eq!(computed[element(&doc, "#a")]["width"], "50px");
+    assert_eq!(computed[element(&doc, "#b")]["height"], "50px");
+}
+
+#[test]
+fn hints_stay_under_the_layers_of_the_author() {
+    let doc = Document::parse(
+        "<table id=a bordercolor=red></table><table id=b border=-3><tr><td id=c bgcolor=red style='all:revert-layer'></table><table id=d border=5 style='border-top-width:revert'></table><img id=e border>",
+    );
+    let computed = styles(&doc, 800., 600.);
+    let get = |id: &str, name: &str| {
+        (computed[element(&doc, id)].get(name)).map_or("", |value| value.as_str())
+    };
+    assert_eq!(get("#a", "border-top-style"), "");
+    assert_eq!(get("#b", "border-top-width"), "1px");
+    assert_eq!(get("#c", "background-color"), "red");
+    assert_eq!(get("#c", "border-top-style"), "inset");
+    assert_ne!(get("#d", "border-top-width"), "5px");
+    assert_eq!(get("#d", "border-left-width"), "5px");
+    assert_eq!(get("#e", "border-top-width"), "0px");
+}
+
+#[test]
+fn spans_past_the_table_make_no_columns() {
+    let mut rows = String::new();
+    for _ in 0..300 {
+        rows.push_str("<tr><td colspan=1000 rowspan=300 style='border:1px solid'>");
+    }
+    let doc = Document::parse(&format!(
+        "<table style='border-collapse:collapse'><col style='border-right:4px solid'><tr><td id=a style='border:1px solid'><td id=b style='border:1px solid'><tr><td id=c colspan=100 style='border:1px solid'></table><table style='border-collapse:collapse'>{rows}</table><table dir=rtl style='border-collapse:collapse'><tr><td id=d style='border-left:6px solid'><td id=e></table>"
+    ));
+    let start = std::time::Instant::now();
+    let computed = styles(&doc, 800., 600.);
+    assert!(start.elapsed().as_secs() < 5);
+    let get = |id: &str, name: &str| computed[element(&doc, id)][name].as_str();
+    assert_eq!(get("#a", "border-right-width"), "4px");
+    assert_eq!(get("#b", "border-left-width"), "4px");
+    assert_eq!(get("#c", "border-right-width"), "1px");
+    assert_eq!(get("#c", "border-top-width"), "1px");
+    // The second cell of a right-to-left row is at the left of the first.
+    assert_eq!(get("#e", "border-right-width"), "6px");
+}
+
+#[test]
+fn cells_take_the_first_free_columns() {
+    let mut slots = crate::style::Slots::default();
+    assert_eq!(slots.place(0, 1, 2), 0);
+    assert_eq!(slots.place(0, 1, 1), 1);
+    assert_eq!(slots.place(0, 1, 3), 2);
+    assert_eq!(slots.place(1, 3, 1), 1);
+    assert_eq!(slots.place(2, 1, 1), 0);
+    assert_eq!(slots.place(2, 1, 1), 1);
+    assert_eq!(slots.place(2, 1, 1), 3);
+    let real = slots.merge(0);
+    assert_eq!([0, 2, 3, 4, 1000].map(real), [0, 2, 3, 4, 4]);
+}

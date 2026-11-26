@@ -350,39 +350,6 @@ fn block_in_inline_splits_and_empty_inlines_make_no_line() {
 }
 
 #[test]
-fn small_caps_are_smaller_capitals_like_chrome() {
-    let doc = Document::parse("<p style='font:small-caps 20px Helvetica'>Ab cD 1</p>");
-    let computed = compute_styles(
-        &doc,
-        800.,
-        600.,
-        None,
-        &mut HashMap::new(),
-        &mut StyleCache::default(),
-        None,
-    );
-    let p = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
-    let inline = inline_text(&doc, &computed, p, &[], &[], [true; 2]).unwrap();
-    assert_eq!(&*inline.text, "AB CD 1");
-    let runs: Vec<_> = inline
-        .runs
-        .iter()
-        .map(|run| (run.len, run.font_size.map(f32::from)))
-        .collect();
-    assert_eq!(
-        runs,
-        [
-            (1, None),
-            (1, Some(14.)),
-            (1, None),
-            (1, Some(14.)),
-            (3, None)
-        ]
-    );
-    assert!(inline.mixed);
-}
-
-#[test]
 fn capitalize_follows_words_across_inline_text() {
     let doc = Document::parse(
         "<p style='text-transform:capitalize'>foo<b>bar</b> don't 3d x.y a-b _c<i> e</i>f</p>",

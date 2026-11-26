@@ -1,8 +1,12 @@
 use crate::{
     App, Backdrop, BorderStyle, BoxShadow, Child, Clip, Color, Cursor, Edges, Event, Key,
     Modifiers, NodeKey, PaintEffect, Pixels, Point, Radii, Rect, RenderImage, ScrollRef, Size,
-    Snapshot, Tree, Utf16Selection, WheelPhase, WindowChange, WindowControl, WindowId, WindowState,
-    geometry::{Plane, compose, invert, plane_of, project, snap, snap_width},
+    Snapshot, Space, Tree, Utf16Selection, WheelPhase, WindowChange, WindowControl, WindowId,
+    WindowState,
+    geometry::{
+        Plane, before_viewer, compose, faces_away, invert, multiply, plane_of, project, singular,
+        snap, snap_width,
+    },
     gpu::atlas::TileKey,
     gpu::scene::{self, BackdropState, EffectState, Scene},
     platform, point, px, size,
@@ -21,6 +25,8 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+
+const REBARS: u8 = 4;
 
 pub(crate) mod node;
 mod paint;
@@ -113,6 +119,8 @@ fn device_matrix(mut matrix: [f32; 16], scale: f32) -> [f32; 16] {
 struct HitTransform {
     key: Option<u64>,
     outer: Option<Rc<HitTransform>>,
+    // In a plane of a 3D rendering context.
+    deep: bool,
     local: Cell<Plane>,
     to_window: Cell<Plane>,
     from_window: Cell<Plane>,
@@ -146,6 +154,7 @@ impl HitTransform {
         };
         let shifted = Rc::new(HitTransform {
             key: self.key,
+            deep: self.deep,
             outer: (self.outer.as_ref()).map(|outer| outer.shifted(by, moved)),
             local: Cell::new(turn(self.local.get())),
             to_window: Cell::new(to_window),
@@ -206,6 +215,25 @@ impl HitTransform {
     }
 }
 
+// A 3D rendering context in prepaint: its matrix, and the transform and the areas around it.
+struct HitSpace {
+    matrix: [f32; 16],
+    base: Option<Rc<HitTransform>>,
+    area: (Rect, Rect),
+}
+
+// The layer and the box of a plane, and where its paint records start.
+type PlaneStart = (usize, Rect<f32>, [u32; 4]);
+
+// A 3D rendering context in paint: its matrix, the layer of its open plane, and the layer depth there.
+struct PlaneSpace {
+    matrix: [f32; 16],
+    plane: EffectState,
+    bounds: Rect<f32>,
+    depth: usize,
+    hidden: bool,
+}
+
 #[derive(Clone)]
 struct Placed {
     region: Region,
@@ -222,7 +250,11 @@ impl Placed {
         let local = match &self.transform {
             None => Some(at),
             Some(transform) if transform.area.intersect(transform.view).contains(at) => {
-                project(&transform.from_window.get(), at)
+                // Points behind the viewer miss.
+                let m = transform.from_window.get();
+                (m[2] * at.x.0 + m[5] * at.y.0 + m[8] > 0.)
+                    .then(|| project(&m, at))
+                    .flatten()
             }
             Some(_) => None,
         };
@@ -262,6 +294,8 @@ struct Input {
     drag_areas: Vec<u64>,
     // The tokens of `Window::mark` in paint order.
     marks: Vec<u64>,
+    // For each 3D rendering context, inner ones first, the cursors and the marks of its planes from back to front.
+    sorted: Vec<Vec<[[u32; 2]; 2]>>,
     // The paint pass that made the paint records, and the prepaint pass that made the regions.
     pass: Option<u32>,
     prepass: Option<u32>,
@@ -339,8 +373,26 @@ impl Input {
         self.cursors.clear();
         self.drag_areas.clear();
         self.marks.clear();
+        self.sorted.clear();
         self.pass = None;
         self.prepass = None;
+    }
+
+    // A list of paint records with the planes of 3D rendering contexts from back to front.
+    fn by_depth<'a, T: Copy>(&self, list: &'a [T], which: usize) -> Cow<'a, [T]> {
+        let mut list = Cow::Borrowed(list);
+        for planes in &self.sorted {
+            let ranges = planes.iter().map(|plane| plane[which]);
+            let Some(start) = ranges.clone().map(|[start, _]| start as usize).min() else {
+                continue;
+            };
+            let sorted: Vec<T> = ranges
+                .flat_map(|[start, end]| &list[start as usize..end as usize])
+                .copied()
+                .collect();
+            list.to_mut()[start..start + sorted.len()].copy_from_slice(&sorted);
+        }
+        list
     }
 
     fn lens(&self) -> [u32; 4] {
@@ -489,6 +541,11 @@ pub struct Window {
     offsets: Vec<Point<Pixels>>,
     font_smoothing: bool,
     hit_transform: Option<Rc<HitTransform>>,
+    hit_space: Option<Rc<HitSpace>>,
+    // The 3D rendering context that paint is in, and the planes of the open contexts: their layers, their boxes and
+    // where their paint records start.
+    space: Option<Box<PlaneSpace>>,
+    planes: Vec<Vec<PlaneStart>>,
     // The transforms and the clip of each `with_hit_base` around the current box.
     hit_bases: Vec<(Option<Rc<HitTransform>>, Rect)>,
     // The digest and the size of each snapshot layer of the last frame.
@@ -517,8 +574,10 @@ pub struct Window {
     // `rebar`: the bars of this pass are not the ones it was built with. `rebars`: the extra passes for bars.
     rebar: bool,
     rebars: u8,
+    // `rebars` can come to this in a frame.
+    most_rebars: u8,
     // The marks that texts placed in this prepaint.
-    marks: Vec<(u64, Point<Pixels>)>,
+    marks: Vec<(u64, Point<Pixels>, Option<bool>)>,
     restart: bool,
     restarts: u8,
     rebuild: bool,
@@ -547,6 +606,7 @@ impl Window {
         text_system: Rc<TextSystem>,
     ) -> Self {
         let (scale_factor, viewport_size) = (platform.scale_factor(), platform.content_size());
+        text_system.scale.set(scale_factor);
         let atlas = platform.atlas().clone();
         Self {
             id,
@@ -579,6 +639,9 @@ impl Window {
             offsets: Vec::new(),
             font_smoothing: true,
             hit_transform: None,
+            hit_space: None,
+            space: None,
+            planes: Vec::new(),
             hit_bases: Vec::new(),
             shots: FxHashMap::default(),
             opacity: 1.,
@@ -601,6 +664,7 @@ impl Window {
             settling: false,
             rebar: false,
             rebars: 0,
+            most_rebars: REBARS,
             marks: Vec::new(),
             restart: false,
             restarts: 0,
@@ -674,12 +738,20 @@ impl Window {
         self.rebar = self.drawing;
     }
 
-    /// A text put the mark `key` in a line, `by` from where layout placed it.
-    pub fn place_mark(&mut self, key: u64, by: Point<Pixels>) {
-        self.marks.push((key, by));
+    /// The boxes with anchors moved, and take more passes than scroll bars until they settle: the boxes they are
+    /// anchored to can move, and they try positions.
+    pub fn reanchor(&mut self) {
+        self.rebar();
+        self.most_rebars = 64;
     }
 
-    pub(crate) fn take_marks(&mut self) -> Vec<(u64, Point<Pixels>)> {
+    /// A text put the mark `key` in a line, `by` from where layout placed it. Text of a direction
+    /// has the box at that side of the mark.
+    pub fn place_mark(&mut self, key: u64, by: Point<Pixels>, rtl: Option<bool>) {
+        self.marks.push((key, by, rtl));
+    }
+
+    pub(crate) fn take_marks(&mut self) -> Vec<(u64, Point<Pixels>, Option<bool>)> {
         mem::take(&mut self.marks)
     }
 
@@ -930,6 +1002,7 @@ impl Window {
         self.native = (size, scale_factor);
         self.viewport_size = size / self.zoom;
         self.scale_factor = scale_factor * self.zoom;
+        self.text_system.scale.set(self.scale_factor);
         self.dirty = false;
         self.refresh();
     }
@@ -1120,7 +1193,7 @@ impl Window {
                     self.hovered = self.pending.probe(self.pointer, &mut self.under);
                     let restarting = self.restart && self.restarts < 4;
                     let again = self.again || self.restart;
-                    let rebar = self.rebar && self.rebars < 4;
+                    let rebar = self.rebar && self.rebars < self.most_rebars;
                     if !restarting && (!again || self.settling && !rebar) {
                         tree.paint(root, self);
                     }
@@ -1135,7 +1208,7 @@ impl Window {
                 continue;
             }
             let again = mem::take(&mut self.again) || restart;
-            let rebar = mem::take(&mut self.rebar) && self.rebars < 4;
+            let rebar = mem::take(&mut self.rebar) && self.rebars < self.most_rebars;
             if again && (rebar || !self.settling) {
                 self.rebars += u8::from(rebar);
                 self.settling = true;
@@ -1143,6 +1216,7 @@ impl Window {
             }
             self.settling = false;
             self.rebars = 0;
+            self.most_rebars = REBARS;
             self.restarts = 0;
             if again {
                 self.refresh();
@@ -1249,7 +1323,7 @@ impl Window {
             let states = mem::take(&mut self.next_states);
             self.states.extend(states);
             again = mem::take(&mut self.again);
-            let rebar = mem::take(&mut self.rebar) && self.rebars < 4;
+            let rebar = mem::take(&mut self.rebar) && self.rebars < self.most_rebars;
             if !again || self.settling && !rebar {
                 break;
             }
@@ -1259,6 +1333,7 @@ impl Window {
         self.drawing = false;
         self.settling = false;
         self.rebars = 0;
+        self.most_rebars = REBARS;
         if again {
             self.refresh();
         }
@@ -1269,7 +1344,7 @@ impl Window {
         let hovered = &self.under[..self.hovered];
         let cursor = self
             .live
-            .cursors
+            .by_depth(&self.live.cursors, 0)
             .iter()
             .rev()
             .find_map(|(key, cursor)| hovered.contains(key).then_some(*cursor))
@@ -1505,8 +1580,8 @@ impl Window {
     }
 
     /// The tokens of `mark` in the last frame.
-    pub fn marks(&self) -> &[u64] {
-        &self.live.marks
+    pub fn marks(&self) -> Cow<'_, [u64]> {
+        self.live.by_depth(&self.live.marks, 1)
     }
 
     /// The content that paint draws now reads state outside the tree, so it can't be copied into later frames.
@@ -1735,6 +1810,7 @@ impl Window {
         let placed = match placed {
             Some((local, to_window, from_window)) => HitTransform {
                 key: None,
+                deep: base.as_ref().is_some_and(|base| base.deep),
                 id: HitTransform::id(
                     None,
                     &to_window,
@@ -1754,6 +1830,7 @@ impl Window {
             // An empty area takes no pointer.
             None => HitTransform {
                 key: None,
+                deep: false,
                 id: HitTransform::id(None, &[0.; 9], Rect::default(), Rect::default()),
                 area: Rect::default(),
                 view: Rect::default(),
@@ -1817,16 +1894,14 @@ impl Window {
         let Some(from_window) = invert(&to_window) else {
             return f(self);
         };
-        let (area, view) = match &outer {
-            Some(outer) => (outer.area, outer.view),
-            None => (self.content_mask().bounds, self.viewport_bounds()),
-        };
+        let (area, view) = self.hit_area(&outer);
         // Composited animations change a keyed transform in place.
         if key.is_some() {
             self.transforms = self.transforms.wrapping_add(1);
         }
         self.hit_transform = Some(Rc::new(HitTransform {
             key,
+            deep: outer.as_ref().is_some_and(|outer| outer.deep),
             outer,
             local: Cell::new(local),
             to_window: Cell::new(to_window),
@@ -1843,6 +1918,97 @@ impl Window {
             .take()
             .and_then(|inner| inner.outer.clone());
         result
+    }
+
+    fn hit_area(&self, outer: &Option<Rc<HitTransform>>) -> (Rect, Rect) {
+        match outer {
+            Some(outer) => (outer.area, outer.view),
+            None => (self.content_mask().bounds, self.viewport_bounds()),
+        }
+    }
+
+    /// Like `with_keyed_hit_transform` without a key, also for a box in a 3D rendering context. A box that hides
+    /// its back takes no pointer when it faces away.
+    pub fn with_space_hits<R>(
+        &mut self,
+        m: [f32; 16],
+        space: Space,
+        hides_back: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let around = self.hit_space.take();
+        let (m, base, (mut area, view)) = match around.as_ref().filter(|_| space.joins) {
+            Some(space) => (multiply(&space.matrix, &m), space.base.clone(), space.area),
+            None => {
+                let base = self.hit_transform.clone();
+                let area = self.hit_area(&base);
+                (m, base, area)
+            }
+        };
+        if space.preserves {
+            self.hit_space = Some(Rc::new(HitSpace {
+                matrix: m,
+                base: base.clone(),
+                area: (area, view),
+            }));
+        }
+        let local = plane_of(&m);
+        let to_window =
+            (base.as_ref()).map_or(local, |base| compose(&base.to_window.get(), &local));
+        let hidden = hides_back && faces_away(&m) || singular(&m);
+        if hidden {
+            area = Rect::default();
+        }
+        let placed = HitTransform {
+            key: None,
+            deep: space.joins
+                || space.preserves
+                || hidden
+                || (to_window[2], to_window[5], to_window[8]) != (0., 0., 1.)
+                || base.as_ref().is_some_and(|base| base.deep),
+            outer: base,
+            local: Cell::new(local),
+            to_window: Cell::new(to_window),
+            // A plane on its edge takes no pointer.
+            from_window: Cell::new(invert(&to_window).unwrap_or_default()),
+            area,
+            view,
+            id: HitTransform::id(None, &to_window, area, view),
+        };
+        let outer = self.hit_transform.replace(Rc::new(placed));
+        self.push_content_mask(unbounded_mask());
+        let result = f(self);
+        self.content_masks.pop();
+        self.hit_transform = outer;
+        self.hit_space = around;
+        result
+    }
+
+    /// The corners in the window of the part of a box before the viewer, for boxes in 3D. None when it takes no
+    /// pointer.
+    pub fn hit_shape(&self, bounds: Rect) -> Option<Box<[Point<Pixels>]>> {
+        let transform = (self.hit_transform.as_ref()).filter(|transform| transform.deep)?;
+        let to_window = transform.to_window.get();
+        if transform.area.is_empty() || invert(&to_window).is_none() {
+            return Some(Box::default());
+        }
+        let m = to_window.map(f64::from);
+        let corners = [
+            bounds.origin,
+            bounds.top_right(),
+            bounds.bottom_right(),
+            bounds.bottom_left(),
+        ]
+        .map(|at| {
+            let [x, y] = [at.x.0, at.y.0].map(f64::from);
+            [0, 1, 2].map(|row| m[row] * x + m[3 + row] * y + m[6 + row])
+        });
+        let shape = before_viewer(&corners).into_iter();
+        Some(
+            shape
+                .map(|[x, y, _]| point(px(x as f32), px(y as f32)))
+                .collect(),
+        )
     }
 }
 
@@ -1889,6 +2055,7 @@ mod tests {
             .map_or(local, |outer| compose(&outer.to_window.get(), &local));
         Rc::new(HitTransform {
             key: Some(7),
+            deep: false,
             outer,
             local: Cell::new(local),
             to_window: Cell::new(to_window),

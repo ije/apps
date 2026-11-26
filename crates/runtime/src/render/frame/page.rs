@@ -1,6 +1,5 @@
 use super::super::element::{self, Build, element};
-use super::Cx;
-use super::snap;
+use super::{Cx, anchor, snap};
 use crate::css;
 use crate::css::properties::{Prop, Style};
 use crate::dom::Document;
@@ -166,7 +165,7 @@ pub(super) fn node(
     mut pointer_events: renderer::Node,
     root: renderer::Child,
     overlay: Vec<renderer::Child>,
-    autos: bool,
+    [autos, anchored]: [bool; 2],
     started: std::time::Instant,
 ) -> renderer::Child {
     let id = view.id;
@@ -195,6 +194,35 @@ pub(super) fn node(
         renderer::Length::Calc(1., renderer::px(-viewport.space[1])),
         renderer::Length::Calc(1., renderer::px(-viewport.space[0])),
     );
+    // Refresh the layout mirror after prepaint: scroll ranges change after the initial sync_scroll. Boxes with anchors
+    // read it after the top layer.
+    let (data, space) = (view.clone(), viewport.space);
+    let mut mirror = Some(
+        renderer::canvas(
+            move |_, window| {
+                if let Ok(mut store) = data.store.try_borrow_mut()
+                    && let Some(page) = store.pages.get_mut(&data.id)
+                {
+                    let dom = &mut page.state;
+                    dom.geometry.prepainted(dom.pixel_ratio);
+                    dom.geometry.page_bars = space;
+                    if snap::update(&page.doc, dom) {
+                        window.redraw();
+                    }
+                    dom.geometry.sync_scroll();
+                    let size = window.viewport_size();
+                    let passes = [!window.redrawing(), !data.reflowing.get()];
+                    if anchored
+                        && anchor::update(&page.doc, dom, [size.width.0, size.height.0], passes)
+                    {
+                        window.reanchor();
+                    }
+                }
+            },
+            |_, _, _| (),
+        )
+        .absolute(),
+    );
     let page = page
         .pr(renderer::px(viewport.space[1]))
         .pb(renderer::px(viewport.space[0]))
@@ -216,28 +244,7 @@ pub(super) fn node(
         })
         .child(pointer_events)
         .child(root)
-        .child({
-            // Refresh the layout mirror after prepaint: scroll ranges change after the initial
-            // sync_scroll.
-            let (data, space) = (view.clone(), viewport.space);
-            renderer::canvas(
-                move |_, window| {
-                    if let Ok(mut store) = data.store.try_borrow_mut()
-                        && let Some(page) = store.pages.get_mut(&data.id)
-                    {
-                        let dom = &mut page.state;
-                        dom.geometry.prepainted(dom.pixel_ratio);
-                        dom.geometry.page_bars = space;
-                        if snap::update(&page.doc, dom) {
-                            window.redraw();
-                        }
-                        dom.geometry.sync_scroll();
-                    }
-                },
-                |_, _, _| (),
-            )
-            .absolute()
-        })
+        .children(mirror.take_if(|_| !anchored))
         .children(autos.then(|| spacer::autos(view.clone())))
         .children(viewport.bar.map(|look| scrollbar::Scrollbar {
             id: 0,
@@ -286,12 +293,12 @@ pub(super) fn node(
             )
             .absolute()
         }));
-    if overlay.is_empty() {
+    if overlay.is_empty() && !anchored {
         page.into()
     } else {
         let mut window = renderer::node().size_full();
         window.style().bars = bars;
-        window.child(page).children(overlay).into()
+        window.child(page).children(overlay).children(mirror).into()
     }
 }
 

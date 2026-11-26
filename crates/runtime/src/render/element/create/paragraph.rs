@@ -144,6 +144,12 @@ pub(super) fn paragraph(
     if data.greedy && hit.is_none() {
         el.text_style().set_text_wrap(renderer::TextWrap::Wrap);
     }
+    let (justify, last) = crate::style::row_aligns(style, rtl);
+    let plaintext = last.is_none()
+        && style
+            .get(Prop::TEXT_ALIGN)
+            .is_none_or(|value| value == "start")
+        && crate::style::plaintext(doc, styles, id);
     let mut paragraph = renderer::Node::from(InlineText {
         data: data.clone(),
         mixed: data.mixed(build.text),
@@ -153,14 +159,10 @@ pub(super) fn paragraph(
         shaped: Default::default(),
         prepainted: Default::default(),
         rtl,
-        justify: style
-            .get(Prop::TEXT_ALIGN)
-            .is_some_and(|value| value == "justify")
-            .then(|| {
-                style
-                    .get(Prop::TEXT_ALIGN_LAST)
-                    .is_some_and(|value| value == "justify")
-            }),
+        plaintext,
+        justify,
+        last,
+        reversed: style.get(Prop::WRITING_MODE) == Some("vertical-lr"),
     });
     let alone = el.kids().is_empty()
         && placed.is_empty()
@@ -188,6 +190,9 @@ pub(super) fn paragraph(
         paragraph = paragraph.id(("text", data.key));
     }
     paragraph.style().flow = renderer::Flow::BLOCK;
+    if last.is_some() || justify[1] || plaintext {
+        paragraph.style().flex_grow = 1.;
+    }
     // Text straight in a multi-column box breaks between its rows.
     let multicol = (flow && data.atoms.is_empty())
         .then(|| {
@@ -258,7 +263,7 @@ pub(super) fn beside(
     cx: &Cx<'_>,
     fr: &Frame,
     data: &crate::render::inline::InlineText,
-    marks: &Rc<[std::cell::Cell<renderer::Point<renderer::Pixels>>]>,
+    marks: &Rc<[std::cell::Cell<crate::render::paint::text::MarkPlace>]>,
     padding: [f32; 4],
 ) -> Vec<renderer::Child> {
     let Cx {

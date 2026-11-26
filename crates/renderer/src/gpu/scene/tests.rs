@@ -675,3 +675,57 @@ fn patches_before_a_paint_damage_only_what_the_diff_finds() {
         assert!(shown || !scene.damage.rects.is_empty());
     }
 }
+
+#[test]
+fn planes_sort_by_depth_and_split_where_they_meet() {
+    let mask = Clip::from(bounds([0., 0., 800., 600.]));
+    let turned = |angle: f32, z: f32| {
+        // A turn about the vertical line at x 50.
+        let (s, c) = angle.to_radians().sin_cos();
+        let mut m = crate::geometry::IDENTITY;
+        (m[0], m[2], m[8], m[10]) = (c, -s, s, c);
+        (m[12], m[14]) = (50. - 50. * c, 50. * s + z);
+        m
+    };
+    let draw = |planes: &[[f32; 16]]| {
+        let mut scene = Scene::default();
+        for &transform in planes {
+            scene.push_effect(
+                EffectState {
+                    transform: Some(transform),
+                    ..effect(mask)
+                },
+                None,
+            );
+            scene.push(Instance::new(BOX, bounds([0., 0., 100., 100.]), mask));
+            scene.pop_effect();
+        }
+        let order = scene.sort_planes(0, std::iter::empty());
+        (scene, order)
+    };
+    assert_eq!(
+        draw(&[turned(0., 5.), turned(0., -5.), turned(0., 0.)]).1,
+        [2, 3, 1]
+    );
+    // Planes at the same depth keep their order, and one on its edge draws nothing.
+    assert_eq!(
+        draw(&[turned(0., 0.), turned(0., 0.), turned(90., 0.)]).1,
+        [1, 2]
+    );
+    // A context with many planes sorts them by their centers.
+    let many: Vec<_> = (0..600).map(|at| turned(0., -(at as f32))).collect();
+    assert!(draw(&many).1.is_sorted_by(|a, b| a > b));
+    let (scene, order) = draw(&[turned(45., 0.), turned(-45., 0.)]);
+    assert_eq!(order.len(), 3);
+    assert_eq!(scene.layers[0].nested.len(), 3);
+    assert!(order[0] == order[2] && order[0] != order[1]);
+    let clips: Vec<_> = (scene.layers.iter().skip(1))
+        .filter_map(|layer| layer.effect.as_ref()?.clip)
+        .map(|(clip, _)| [clip.left(), clip.right()])
+        .collect();
+    assert_eq!(clips.len(), 2);
+    assert!(
+        clips.contains(&[-4., 50.5]) && clips.contains(&[49.5, 104.]),
+        "{clips:?}"
+    );
+}

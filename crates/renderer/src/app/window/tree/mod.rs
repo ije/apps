@@ -100,6 +100,8 @@ struct Slot {
     held: bool,
     // The floats that the box placed in the context of its parent when no other float reached it, from its origin.
     spill: Option<Box<Spill>>,
+    // The content height of a box with floats, and what it depends on, for one layout.
+    natural: Option<Box<(Vec<f32>, f32)>>,
     // The prepaint pass that kept the box and all boxes in it where they were, and the first pass of the run
     // of such passes.
     calm: u32,
@@ -130,6 +132,8 @@ struct Slot {
     unscroll: Point<Pixels>,
     // Where the text of a mark in a line puts it, from its layout.
     shift: Point<f32>,
+    // The direction of the text around that mark, when it is mixed.
+    turned: Option<bool>,
     // No hit transform is in it, so its regions move with a scroll as they are.
     flat: bool,
     // How far scrolls moved the box without a prepaint of the boxes in it, since one last went through them.
@@ -229,6 +233,7 @@ impl Slot {
             inputs: None,
             held: false,
             spill: None,
+            natural: None,
             calm: 0,
             since: 0,
             chunk: None,
@@ -244,6 +249,7 @@ impl Slot {
             cut: 0,
             unscroll: Point::default(),
             shift: Point::default(),
+            turned: None,
             flat: false,
             lag: Point::default(),
             ahead: Point::default(),
@@ -281,7 +287,7 @@ impl Slot {
         self.layout = Layout::new();
         self.baselines = Baselines::NONE;
         self.room = None;
-        (self.unscroll, self.shift) = Default::default();
+        (self.unscroll, self.shift, self.turned) = Default::default();
         self.origin = Point::default();
         (self.bounds, self.painted, self.exact) = Default::default();
         self.far = [None; 2];
@@ -743,7 +749,10 @@ impl Tree {
                     || slot.style.inline != styled.inline
                     || slot.style.block != styled.block
                     || slot.style.flow != styled.flow
-                    || slot.style.follow != styled.follow);
+                    || slot.style.outside != styled.outside
+                    || slot.style.sizing != styled.sizing
+                    || slot.style.follow != styled.follow
+                    || slot.style.anchored != styled.anchored);
         let relaid = outer || !same_measure || relisted;
         if !same_measure {
             match measurement {
@@ -759,7 +768,10 @@ impl Tree {
             }
         }
         slot.kind = kind;
-        if styled.escape & Escape::PLACED != 0 && styled.placed != 0 || styled.follow.is_some() {
+        if styled.escape & Escape::PLACED != 0 && styled.placed != 0
+            || styled.follow.is_some()
+            || styled.anchored.is_some()
+        {
             self.escaping.insert(index);
         }
         if let Some(mark) = styled.mark {
@@ -767,7 +779,7 @@ impl Tree {
         }
         // A slot can become a mark outside a line, or the mark of another box.
         if slot.style.mark != styled.mark {
-            slot.shift = Point::default();
+            (slot.shift, slot.turned) = Default::default();
         }
         // Whether scroll containers take the absolute boxes in this box reads these styles.
         let scoped = kept.is_some()
@@ -1246,7 +1258,7 @@ struct LayoutTree<'a> {
     scale: f32,
     exact: bool,
     // The margin boxes `[left, top, right, bottom, right side]` of the floats in the formatting context, from the
-    // border box of its root.
+    // border box of its root. A float with a shape adds twice its place in `slots`, from 1, to its side.
     floats: Vec<[f32; 5]>,
     // The lowest top and bottom of all floats of the context, also the ones that ended above the current box.
     ceiling: f32,
@@ -1256,6 +1268,10 @@ struct LayoutTree<'a> {
     // The next box that `compute` lays out is beside floats: it skips the cache, and `stack` places it in the
     // formatting context of its parent.
     active: bool,
+    // The next box that `compute` lays out takes its content sizes, not those of its `Sizing`.
+    natural: bool,
+    // The boxes that keep their natural height for this layout.
+    naturals: Vec<u32>,
     joined: bool,
     // Line boxes that keep their line in this Taffy pass: the box, its overflow and its style with that much less
     // right margin.
@@ -1437,12 +1453,160 @@ fn place_region(window: &mut Window, style: &Style, first: Rect, old: Option<&Re
 }
 
 impl LayoutTree<'_> {
+    fn forget(&mut self) {
+        for index in mem::take(&mut self.naturals) {
+            self.slots[index as usize].natural = None;
+        }
+    }
+
+    /// Lays out a box with sizes that are functions of its content sizes: first without them, then with the sizes.
+    fn sized(
+        &mut self,
+        node: NodeId,
+        mut inputs: LayoutInput,
+        block: Option<&mut BlockContext<'_>>,
+    ) -> LayoutOutput {
+        use taffy::{MaybeMath, MaybeResolve};
+        let index = usize::from(node);
+        let sizing = self.slots[index].style.sizing.clone().unwrap();
+        let (active, scale, ratio) = (self.active, self.scale, sizing.ratio);
+        // Boxes with floats measure to another height than they lay out, and floats reach the boxes after them.
+        let floating = active || self.slots[index].floats;
+        let outer = active.then(|| (self.floats.clone(), self.origin, self.ceiling, self.reach));
+        let calc = |value, basis| crate::style::resolve_calc(value, basis);
+        let style = self.slots[index].taffy();
+        let [min, max] = [style.min_size, style.max_size]
+            .map(|size| size.maybe_resolve(inputs.parent_size, calc));
+        // The content sizes of a box are without its own limits.
+        let natural = |tree: &mut Self, inputs: LayoutInput| {
+            let vertical = inputs.axis != taffy::RequestedAxis::Horizontal;
+            // Nested boxes with floats would lay out twice at each level.
+            let mut key = Vec::new();
+            if floating && vertical {
+                let space = match inputs.available_space.width {
+                    taffy::AvailableSpace::Definite(width) => width,
+                    taffy::AvailableSpace::MinContent => -1.,
+                    taffy::AvailableSpace::MaxContent => -2.,
+                };
+                key.extend([
+                    inputs.known_dimensions.width.unwrap_or(-1.),
+                    inputs.parent_size.width.unwrap_or(-1.),
+                    space,
+                ]);
+                if let Some((floats, [x, y], ceiling, reach)) = &outer {
+                    key.extend([(ceiling - y).max(0.), (reach - y).max(0.)]);
+                    for f in floats.iter().filter(|float| float[3] > *y) {
+                        key.extend([f[0] - x, f[1] - y, f[2] - x, f[3] - y, f[4]]);
+                    }
+                }
+                if let Some(found) = tree.slots[index].natural.as_deref()
+                    && found.0 == key
+                {
+                    return found.1;
+                }
+            }
+            tree.natural = true;
+            tree.active = active;
+            let output = tree.compute(
+                node,
+                LayoutInput {
+                    sizing_mode: taffy::SizingMode::ContentSize,
+                    run_mode: match floating && vertical {
+                        true => RunMode::PerformLayout,
+                        false => RunMode::ComputeSize,
+                    },
+                    ..inputs
+                },
+                None,
+            );
+            if let Some((floats, origin, ceiling, reach)) = &outer {
+                tree.floats.clone_from(floats);
+                (tree.origin, tree.ceiling, tree.reach) = (*origin, *ceiling, *reach);
+            }
+            if !vertical {
+                return output.size.width;
+            }
+            let height = output
+                .size
+                .height
+                .max(ratio.map_or(0., |ratio| output.size.width / ratio));
+            if floating {
+                tree.naturals.push(index as u32);
+                tree.slots[index].natural = Some(Box::new((key, height)));
+            }
+            height
+        };
+        let mut parent_size = inputs.parent_size;
+        parent_size.height = None;
+        if let Some((content, size)) = &sizing.width
+            && inputs.known_dimensions.width.is_none()
+        {
+            let mut available = inputs.available_space;
+            match content {
+                crate::ContentWidth::Min => available.width = taffy::AvailableSpace::MinContent,
+                crate::ContentWidth::Max => available.width = taffy::AvailableSpace::MaxContent,
+                crate::ContentWidth::Fit => {}
+            }
+            let found = natural(
+                self,
+                LayoutInput {
+                    axis: taffy::RequestedAxis::Horizontal,
+                    available_space: available,
+                    run_mode: RunMode::ComputeSize,
+                    ..inputs
+                },
+            );
+            let width = (size(found / scale) * scale).maybe_clamp(min.width, max.width);
+            inputs.known_dimensions.width = Some(width);
+            inputs.known_dimensions_are_definite.width = true;
+        }
+        if let Some(size) = &sizing.height
+            && inputs.known_dimensions.height.is_none()
+            && (inputs.run_mode == RunMode::PerformLayout
+                || inputs.axis != taffy::RequestedAxis::Horizontal)
+        {
+            let found = natural(
+                self,
+                LayoutInput {
+                    axis: taffy::RequestedAxis::Both,
+                    parent_size,
+                    available_space: taffy::Size {
+                        height: taffy::AvailableSpace::MaxContent,
+                        ..inputs.available_space
+                    },
+                    ..inputs
+                },
+            );
+            // Like Chrome, in 64ths of a pixel, so the rounding errors of floats don't add up.
+            let height = (size(found / scale) * 64.).round() / 64. * scale;
+            let height = height.maybe_clamp(min.height, max.height);
+            inputs.known_dimensions.height = Some(height);
+            inputs.known_dimensions_are_definite.height = sizing.definite;
+        }
+        if let (false, RunMode::ComputeSize, Some(width), Some(height)) = (
+            active,
+            inputs.run_mode,
+            inputs.known_dimensions.width,
+            inputs.known_dimensions.height,
+        ) {
+            return LayoutOutput::from_outer_size(taffy::Size { width, height });
+        }
+        (self.natural, self.active) = (true, active);
+        self.compute(node, inputs, block)
+    }
+
     fn compute(
         &mut self,
         node: NodeId,
         mut inputs: LayoutInput,
         block: Option<&mut BlockContext<'_>>,
     ) -> LayoutOutput {
+        if self.slots[usize::from(node)].style.sizing.is_some()
+            && !mem::take(&mut self.natural)
+            && inputs.run_mode != RunMode::PerformHiddenLayout
+        {
+            return self.sized(node, inputs, block);
+        }
         let joined = mem::take(&mut self.active);
         if inputs.run_mode == RunMode::PerformHiddenLayout {
             return taffy::compute_hidden_layout(self, node);
@@ -1527,6 +1691,7 @@ impl LayoutTree<'_> {
             && style.position != taffy::Position::Absolute
             && slot.parent != NONE
             && self.slots[slot.parent as usize].style.block
+            && !(slot.style.sizing.as_ref()).is_some_and(|sizing| sizing.definite)
         {
             inputs.known_dimensions_are_definite.height = false;
         }
@@ -1755,7 +1920,20 @@ impl LayoutPartialTree for LayoutTree<'_> {
     }
 
     fn compute_child_layout(&mut self, node: NodeId, inputs: LayoutInput) -> LayoutOutput {
-        self.compute(node, inputs, None)
+        let mut output = self.compute(node, inputs, None);
+        let slot = &self.slots[usize::from(node)];
+        if slot.style.align_self == Some(AlignItems::LastBaseline) && slot.parent != NONE {
+            let parent = self.slots[slot.parent as usize].taffy();
+            if parent.display == taffy::Display::Flex
+                && matches!(
+                    parent.flex_direction,
+                    FlexDirection::Row | FlexDirection::RowReverse
+                )
+            {
+                output.baselines.first = output.baselines.last;
+            }
+        }
+        output
     }
 }
 

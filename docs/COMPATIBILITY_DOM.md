@@ -4,12 +4,11 @@ Pages get the standard DOM API (nodes, elements, events, ranges, selection, obse
 
 | Feature | Support |
 |---|---|
-| `NodeList`, `HTMLCollection` | Static arrays with `item()`. They don't update when the tree changes |
-| `CDATASection`, `ProcessingInstruction` | Not supported. `Attr` is not a `Node` |
+| `NodeList`, `HTMLCollection` | Live, as in browsers, but they are real arrays or proxies of arrays, so they also have array methods. The elements of `children` are not its properties by `id` and `name`: use `children.namedItem()`. `attributes` is a static list |
+| XML documents | The elements of an XML document match CSS selectors without case and with their prefix. `innerHTML` of an XML element parses as HTML when it is set. Copies of CDATA sections and processing instructions inside a copied node are text and comments. Entities of a DTD give text: their markup and the default attributes of a DTD are ignored, and external and XHTML entities are errors |
 | Named access | Elements are not globals by their `id`, so `window.foo` for `<div id="foo">` is `undefined`. Use `document.getElementById()`. Forms don't have their controls as properties, so `form.username` is `undefined`. Use `form.elements.username` |
-| `DOMParser`, XPath, XSLT | `DOMParser` parses `text/html` and `image/svg+xml`. SVG goes through the HTML parser: `documentElement` is the `<svg>`, which stays inside a `<body>`, and errors make no `<parsererror>`. XPath and XSLT are not supported |
-| `*AttributeNS()` | The namespace is ignored |
-| Element names | `createElement()` and `createElementNS()` take only names of ASCII letters, digits and `-` that start with a letter. Others, like `a_b` or `x:y`, throw an `InvalidCharacterError` |
+| XPath, XSLT | Not supported |
+| `*AttributeNS()` | On HTML elements the namespace is ignored |
 | `<template>` | Parsed children move into `content` when `content` is first read |
 | `eval()`, `new Function()` | Throw an `EvalError` in pages and page workers, as do the constructors of async and generator functions. The `jsExecute` feature allows them, and page workers from `data:` and `blob:` URLs |
 | `ShadowRealm` | Needs the `jsExecute` feature. A realm has only the JavaScript built-ins. `importValue()` loads `data:` and `blob:` URLs, and `http` and `https` URLs with `httpImport`, but not the modules of the app. Wrapped functions don't keep `name` and `length` |
@@ -31,9 +30,9 @@ Pages get the standard DOM API (nodes, elements, events, ranges, selection, obse
 | Long scripts | A page script that runs for more than 10 seconds without returning is stopped, so one page cannot freeze the app |
 | Origin private file system | `navigator.storage.getDirectory()` keeps files in memory, so they are lost when the page reloads or the app quits |
 | Forms | A submit that is not canceled sends nothing and does not navigate, so handle `submit` and call `preventDefault()`. `method="dialog"` closes its dialog |
-| `attachInternals()` | Has `setFormValue()`, `setValidity()`, `validity`, `checkValidity()`, `form`, `labels` and `states`. `:state()`, the `formResetCallback` and `formDisabledCallback` reactions and ARIA properties of the internals have no effect |
-| Form pseudo-classes | `:valid` and `:invalid` match `input`, `select`, `textarea` and submit buttons, not `form` and `fieldset`. A `<select>` checks its validity again when its selection or attributes change, not when options are added or removed. `:user-valid`, `:user-invalid` and `:autofill` never match, and `:indeterminate` doesn't match radio buttons. `:default` finds the default button of the ancestor `<form>` only, not of a `form` attribute |
-| Date and time inputs | Show and edit the value as plain text, like `2026-10-31`, with no picker, and are as wide as a text field |
+| `attachInternals()` | ARIA properties of the internals have no effect, and `formStateRestoreCallback` is not called. `formAssociatedCallback` and `formDisabledCallback` run for changes in the document, not in detached trees, and not when a form that a `form` attribute names joins or leaves the document |
+| Form pseudo-classes | `:autofill` never matches. An edit with `execCommand()` counts as an edit by the user for `:user-valid` and `:user-invalid` |
+| Date and time inputs | Look and size like in Chrome, but a focused one edits its value as plain text, like `2026-10-31`, and there is no picker. On Windows and Linux the fields have US order in `en_US`, else day, month, year, and English names. The fields have no pseudo-elements to style |
 | Styled ranges and progress bars | With `appearance: none`, `::-webkit-slider-runnable-track`, `::-webkit-slider-thumb`, `::-webkit-progress-bar` and `::-webkit-progress-value` draw with their size, `margin-top`, background color, one border and radius. Their background images, shadows and `:hover` and `:active` styles are not drawn. A `<meter>` with `appearance: none` draws nothing. The thumb of a default range keeps its color while the pointer is on it, where Chrome makes it lighter or darker |
 | `<input type=file>` | `click()` opens the system panel only while the page handles user input, on macOS. Files over 64 MB are left out, and `accept` filters only by `.ext` and `image/*`. `webUtils.getPathForFile()` doesn't know picked files. `::file-selector-button` sets the padding, margin, borders, colors and radius of the button. An `<input type=image>` shows no `alt` text |
 | `alert()`, `confirm()`, `prompt()` | On macOS they show a message box of the app and wait for the answer, in pages, preload scripts and the main process. On Windows and Linux, and in pages of an app with a Rust main, they show nothing and return `undefined`, `false` and `null`. Workers and headless scripts don't have them |
@@ -41,7 +40,7 @@ Pages get the standard DOM API (nodes, elements, events, ranges, selection, obse
 | `XMLHttpRequest` | Runs on `fetch`. Synchronous requests throw `InvalidAccessError`, upload `progress` fires only at the end, and response headers are not filtered by CORS |
 | Clipboard API | `navigator.clipboard` reads and writes text only, while a page script runs from the app's event loop. `write()` needs a `text/plain` item and ignores its other types, so images are rejected |
 | File drags | Files dragged from other apps fire `dragenter`, `dragover`, `dragleave` and `drop`. As in browsers, `drop` fires only if the last `dragover` was canceled and files can be read only in `drop`. The system cursor always shows a copy badge, and a file input doesn't take dropped files by default |
-| Hit testing | A rotated or skewed box takes pointer events in its bounding rectangle, and an SVG shape in its whole box. As in Chrome, a box with `border-radius` misses the pointer outside its corners, but each `corner-shape` counts as round there |
+| Hit testing | A rotated or skewed box takes pointer events in its bounding rectangle, unless it is in a 3D rendering context or drawn in perspective, and an SVG shape in its whole box. As in Chrome, a box with `border-radius` misses the pointer outside its corners, but each `corner-shape` counts as round there |
 | `navigator` | Has `userAgent`, `platform`, `language`, `languages`, `hardwareConcurrency`, `onLine`, `cookieEnabled`, `maxTouchPoints`, `clipboard`, `storage`, `gpu`, `sendBeacon` and the fixed legacy fields `vendor`, `appName`, `appCodeName`, `appVersion`, `product`, `webdriver` and `pdfViewerEnabled` |
 | `document.cookie` | Keeps cookies in memory for the page only. They are not saved and not sent with requests |
 | `requestIdleCallback()` | Runs its callback after a 1 ms timer |

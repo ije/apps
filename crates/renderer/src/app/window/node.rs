@@ -121,7 +121,7 @@ impl From<&str> for Child {
 pub(crate) enum Content {
     #[default]
     None,
-    Text(SharedString, Option<Vec<TextRun>>),
+    Text(SharedString, Option<Rc<[TextRun]>>),
     Measured(Box<dyn Measurement>),
     Layers(bool),
 }
@@ -439,6 +439,10 @@ impl Node {
         &self.children
     }
 
+    pub fn take_children(&mut self) -> Vec<Child> {
+        std::mem::take(&mut self.children)
+    }
+
     pub fn text_content(&self) -> Option<(&str, Option<&[TextRun]>)> {
         match &self.content {
             Content::Text(text, runs) => Some((text, runs.as_deref())),
@@ -543,7 +547,7 @@ pub fn layers(negative: bool) -> Node {
     node
 }
 
-pub fn text(text: impl Into<SharedString>, runs: Option<Vec<TextRun>>) -> Node {
+pub fn text(text: impl Into<SharedString>, runs: Option<Rc<[TextRun]>>) -> Node {
     let text = text.into();
     debug_assert!(
         runs.as_ref()

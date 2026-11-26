@@ -79,19 +79,6 @@ fn map(matrix: &Matrix, [x, y]: [f32; 2]) -> Option<[f32; 2]> {
     })
 }
 
-pub(crate) fn backface(matrix: &Matrix, bounds: Rect<Pixels>) -> bool {
-    let center = bounds.center();
-    let [cx, cy] = [f32::from(center.x), f32::from(center.y)];
-    let (Some(a), Some(b), Some(c)) = (
-        map(matrix, [cx, cy]),
-        map(matrix, [cx + 1., cy]),
-        map(matrix, [cx, cy + 1.]),
-    ) else {
-        return true;
-    };
-    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) < 0.
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::tests::{close, style};
@@ -175,8 +162,8 @@ mod tests {
             Some((300., [105., 60.])),
         )
         .unwrap();
-        assert!(backface(&flipped, bounds));
-        assert!(!backface(&quarter, bounds));
+        assert!(renderer::faces_away(&flipped));
+        assert!(!renderer::faces_away(&quarter));
         assert!(
             transform(
                 &style(&[("transform", "rotate3d(0, 0, 0, 45deg)")]),

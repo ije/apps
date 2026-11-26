@@ -2,9 +2,8 @@ use super::*;
 use crate::css::{
     properties::MARGIN, properties::PADDING, properties::Registry, sheet::Edit, sheet::MediaQuery,
     sheet::declarations, sheet::declare, sheet::parser::supports_condition, value::Filter,
-    value::clip_path, value::counter::counter_text, value::grammar::supports,
-    value::grammar::syntax_matches, value::length, value::resolved::resolved,
-    value::specified::specified,
+    value::counter::counter_text, value::grammar::supports, value::grammar::syntax_matches,
+    value::length, value::resolved::resolved, value::specified::specified,
 };
 use crate::style::cascade::rank::CascadeRank;
 use crate::style::cascade::scope::{PSEUDO, SELECTOR};

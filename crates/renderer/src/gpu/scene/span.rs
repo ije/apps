@@ -218,7 +218,7 @@ impl Scene {
     }
 
     // Whether the span of `last` reads an atlas tile that was removed since that paint.
-    fn reads_removed(&self, span: &Span) -> bool {
+    pub(crate) fn reads_removed(&self, span: &Span) -> bool {
         if self.removed.is_empty() {
             return false;
         }

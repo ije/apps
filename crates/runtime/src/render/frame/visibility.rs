@@ -176,6 +176,7 @@ fn visibility(
 }
 
 pub(super) fn drop_hidden_images(
+    doc: &Document,
     dom: &mut crate::render::PageState,
     visible: &[bool],
     styles: &style::ComputedStyles,
@@ -239,6 +240,10 @@ pub(super) fn drop_hidden_images(
         } else {
             visible.get(id) == Some(&true)
                 && match layer / 64 {
+                    // The root also paints the canvas background of the body.
+                    0 if doc.nodes[id].tag == "html" => {
+                        background::canvas_source(doc, styles).map(|source| &*styles.values[source])
+                    }
                     0 => styles.values.get(id).map(|style| &**style),
                     3 => styles.extras(id).backdrop.as_deref(),
                     slot => styles
@@ -419,7 +424,9 @@ pub(super) fn forget(
     flipped: bool,
     window: &mut renderer::Window,
 ) {
-    drop_hidden_images(dom, cx.visible, styles, |image| window.release_image(image));
+    drop_hidden_images(cx.doc, dom, cx.visible, styles, |image| {
+        window.release_image(image)
+    });
     cx.view
         .mask_sources
         .borrow_mut()
@@ -636,7 +643,9 @@ mod tests {
         let mut released = Vec::new();
         let mut visible = vec![false; doc.nodes.len()];
         (visible[0], visible[second]) = (true, true);
-        drop_hidden_images(&mut dom, &visible, &styles, |image| released.push(image.id));
+        drop_hidden_images(&doc, &mut dom, &visible, &styles, |image| {
+            released.push(image.id)
+        });
         assert_eq!(dom.media.canvases[&canvas].pixels.pixels()[0].red(), 255);
         assert_eq!(released.len(), 2);
         assert!(released.contains(&dom.media.canvases[&canvas].image.id));
@@ -646,7 +655,9 @@ mod tests {
         assert!(dom.rasters.bitmaps.contains_key("t"));
         released.clear();
         for _ in 0..2 {
-            drop_hidden_images(&mut dom, &[], &styles, |image| released.push(image.id));
+            drop_hidden_images(&doc, &mut dom, &[], &styles, |image| {
+                released.push(image.id)
+            });
         }
         assert!(
             dom.rasters.backgrounds.is_empty()
@@ -672,13 +683,32 @@ mod tests {
                 .insert((id, 0), (String::new(), Some(image)));
         }
         let mut released = Vec::new();
-        drop_hidden_images(&mut dom, &vec![true; doc.nodes.len()], &styles, |image| {
-            released.push(image.id)
-        });
+        drop_hidden_images(
+            &doc,
+            &mut dom,
+            &vec![true; doc.nodes.len()],
+            &styles,
+            |image| released.push(image.id),
+        );
         assert_eq!(released.len(), 1);
         assert!(
             dom.rasters.masks.contains_key(&(ids[0], 0))
                 && dom.rasters.masks.contains_key(&(ids[1], 0))
         );
+    }
+
+    #[test]
+    fn the_root_keeps_the_canvas_image_of_the_body() {
+        let mut doc = crate::dom::Document::parse(
+            "<style>body{background:linear-gradient(red,blue)}</style><body></body>",
+        );
+        let mut dom = crate::render::PageState::default();
+        let styles = dom.restyle(&mut doc, [800., 600.]);
+        let html = (doc.nodes.iter().position(|node| node.tag == "html")).unwrap();
+        let image = Arc::new(renderer::RenderImage::new(1, 1, vec![0; 4]));
+        (dom.rasters.backgrounds).insert((html, 0), (String::new(), image));
+        let visible = vec![true; doc.nodes.len()];
+        drop_hidden_images(&doc, &mut dom, &visible, &styles, |_| panic!("released"));
+        assert!(dom.rasters.backgrounds.contains_key(&(html, 0)));
     }
 }

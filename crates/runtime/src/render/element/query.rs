@@ -56,46 +56,61 @@ pub(super) fn row_fill(doc: &Document, styles: &ComputedStyles, id: usize) -> Op
             return Some(fill);
         }
     }
-    // Columns paint under the cells, after rows. Rows spanned from above are not counted.
-    let (table, row) = (table?, doc.nodes[id].parent?);
-    let span = |node: usize, name: &str| {
-        doc.nodes[node]
-            .attrs
-            .get(name)
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1)
-            .clamp(1, 1000)
-    };
-    let column: usize = doc.nodes[row]
-        .children
-        .iter()
-        .take_while(|&&cell| cell != id)
-        .filter(|&&cell| style::role(styles, cell) == style::CELL)
-        .map(|&cell| span(cell, "colspan"))
-        .sum();
-    let mut at = 0;
-    for &group in &doc.nodes[table].children {
-        if doc.nodes[group].tag != "colgroup" {
-            continue;
-        }
-        let start = at;
-        let mut found = None;
-        for &col in &doc.nodes[group].children {
-            if doc.nodes[col].tag == "col" {
-                if (at..at + span(col, "span")).contains(&column) {
-                    found = fill(col);
+    // Columns paint under the cells, after rows.
+    let table = table?;
+    let known = styles.columns.borrow().get(&table).cloned();
+    let filled = known.unwrap_or_else(|| {
+        // The columns of each `<col>` or group with a fill. Those of a `<col>` come before those of its group.
+        let mut cols = Vec::new();
+        let mut at = 0;
+        for &group in &doc.nodes[table].children {
+            if doc.nodes[group].tag != "colgroup" {
+                continue;
+            }
+            let start = at;
+            for &col in &doc.nodes[group].children {
+                if doc.nodes[col].tag == "col" {
+                    let end = at + style::span(&doc.nodes[col], "span");
+                    cols.push((col, at..end));
+                    at = end;
                 }
-                at += span(col, "span");
+            }
+            if at == start {
+                at += style::span(&doc.nodes[group], "span");
+            }
+            cols.push((group, start..at));
+        }
+        cols.retain(|(node, _)| fill(*node).is_some());
+        let mut filled = rustc_hash::FxHashMap::default();
+        if !cols.is_empty() {
+            // Rows have no box, so the cells of all rows are the children of their group here.
+            let (mut slots, mut index, mut row) = (style::Slots::default(), 0, None);
+            for group in std::iter::once(table).chain(doc.nodes[table].children.iter().copied()) {
+                for &child in &doc.nodes[group].children {
+                    if style::role(styles, child) != style::CELL {
+                        continue;
+                    }
+                    let next = doc.nodes[child].parent;
+                    if row.replace(next).is_some_and(|row| row != next) {
+                        index += 1;
+                    }
+                    let span = |name| style::span(&doc.nodes[child], name);
+                    let column = slots.place(index, span("colspan"), span("rowspan"));
+                    if let Some((col, _)) = cols.iter().find(|(_, range)| range.contains(&column)) {
+                        filled.insert(child, *col);
+                    }
+                }
+                // A cell ends with its row group.
+                slots = Default::default();
+                row = None;
+                index = 0;
             }
         }
-        if at == start {
-            at += span(group, "span");
-        }
-        if (start..at).contains(&column) {
-            return found.or_else(|| fill(group));
-        }
-    }
-    None
+        let filled = std::rc::Rc::new(filled);
+        (styles.columns.borrow_mut()).insert(table, filled.clone());
+        filled
+    });
+    filled.get(&id).copied().and_then(fill)
 }
 
 pub(super) fn collapses(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
@@ -118,7 +133,7 @@ pub(super) fn parent_font(
     })
 }
 
-pub(super) fn box_parent(doc: &Document, styles: &ComputedStyles, id: usize) -> Option<usize> {
+pub(crate) fn box_parent(doc: &Document, styles: &ComputedStyles, id: usize) -> Option<usize> {
     let mut parent = doc.nodes[id].parent;
     while let Some(ancestor) = parent
         && styles.values[ancestor]
@@ -185,7 +200,8 @@ pub(super) fn backdrop(doc: &Document, styles: &ComputedStyles, id: usize) -> Op
     })
 }
 
-pub(super) const LOOK: u16 = crate::css::selector::HOVER | crate::css::selector::ACTIVE;
+pub(super) const LOOK: u32 =
+    crate::css::selector::HOVER | crate::css::selector::ACTIVE | crate::css::selector::FOCUS;
 
 pub(super) fn boxless(doc: &Document, id: usize) -> Option<(usize, bool)> {
     std::iter::successors(doc.nodes[id].parent, |&parent| doc.nodes[parent].parent)
@@ -362,7 +378,7 @@ pub(super) fn static_mark(key: usize, drop: f32, inline: bool) -> renderer::Node
     mark
 }
 
-pub(super) fn positioner(
+pub(crate) fn positioner(
     position: &str,
     mut ancestors: impl Iterator<Item = usize>,
     mut made: impl FnMut(usize) -> super::super::effects::Establishes,
@@ -438,6 +454,26 @@ pub(super) fn passed(styles: &ComputedStyles, id: usize, query: Query, below: bo
     }
 }
 
+// The indents of the rows of a text in this width.
+pub(crate) fn row_indents(
+    style: &css::properties::Style,
+    units: &css::value::units::Lengths,
+    width: f32,
+) -> renderer::Indent {
+    let Some(value) = style.get(Prop::TEXT_INDENT) else {
+        return Default::default();
+    };
+    let has = |word| value.split(' ').any(|part| part == word);
+    let (indent, percent) = text_indent(style, units);
+    renderer::TextStyle {
+        text_indent: renderer::px(indent),
+        text_indent_percent: percent,
+        text_indent_rows: [has("hanging"), has("each-line")],
+        ..Default::default()
+    }
+    .indent(renderer::px(width))
+}
+
 // `text-indent` as pixels and a fraction of the width of the paragraph, which the renderer resolves at layout.
 pub(super) fn text_indent(
     style: &css::properties::Style,
@@ -446,6 +482,8 @@ pub(super) fn text_indent(
     let Some(value) = style.get(Prop::TEXT_INDENT) else {
         return (0., 0.);
     };
+    let value = value.split(" hanging").next().unwrap_or(value);
+    let value = value.split(" each-line").next().unwrap_or(value);
     let pixels = units.resolve(value, 0.).unwrap_or(0.);
     match value.contains('%') {
         true => (

@@ -5,6 +5,7 @@ impl LayoutTree<'_> {
         // Taffy resolves percent heights of row items against a known height even when it is not definite. Such a
         // height comes from the content and limits of the box, so laying out without it gives the same size.
         if !inputs.known_dimensions_are_definite.height
+            && self.slots[usize::from(node)].style.sizing.is_none()
             && self.slots[usize::from(node)].style.inline == Inline::None
             && matches!(
                 self.slots[usize::from(node)].taffy().flex_direction,
@@ -63,6 +64,15 @@ impl LayoutTree<'_> {
             )
         {
             self.group_baselines(index, inputs.parent_size.width, output.size.width);
+        }
+        if inputs.run_mode == RunMode::PerformLayout
+            && self.slots[index].style.inline == Inline::None
+            && matches!(
+                self.slots[index].taffy().flex_direction,
+                FlexDirection::Row | FlexDirection::RowReverse
+            )
+        {
+            self.row_baselines(index, inputs.parent_size.width, &mut output);
         }
         if inputs.run_mode != RunMode::PerformLayout
             || self.slots[index].style.inline != Inline::Lines
@@ -206,5 +216,198 @@ impl LayoutTree<'_> {
         self.slots[index].children = children;
         self.hung.truncate(start);
         output
+    }
+
+    /// Taffy puts the items that align on their baselines at the top of their line. Like Chrome, those that align on
+    /// their last baselines go to its end, and `wrap-reverse` swaps the start and the end.
+    fn row_baselines(
+        &mut self,
+        index: usize,
+        parent_width: Option<f32>,
+        output: &mut LayoutOutput,
+    ) {
+        let style = self.slots[index].taffy();
+        let reverse = style.flex_wrap == taffy::FlexWrap::WrapReverse;
+        let items = self.slots[index].style.align_items;
+        let kind = |slot: &Slot| {
+            let margin = slot.taffy().margin;
+            slot.style.align_self.or(items).filter(|align| {
+                matches!(align, AlignItems::Baseline | AlignItems::LastBaseline)
+                    && !margin.top.is_auto()
+                    && !margin.bottom.is_auto()
+            })
+        };
+        let flows = |slot: &Slot| {
+            slot.taffy().position != taffy::Position::Absolute
+                && slot.taffy().display != taffy::Display::None
+        };
+        let members: Vec<usize> = (self.slots[index].children.iter())
+            .map(|&child| usize::from(child))
+            .filter(|&child| flows(&self.slots[child]))
+            .collect();
+        if !(members.iter()).any(|&child| match kind(&self.slots[child]) {
+            Some(AlignItems::LastBaseline) => true,
+            align => reverse && align.is_some(),
+        }) {
+            return;
+        }
+        use taffy::ResolveOrZero;
+        let calc = |value, basis| crate::style::resolve_calc(value, basis);
+        let edges = style.padding.resolve_or_zero(parent_width, calc)
+            + style.border.resolve_or_zero(parent_width, calc);
+        let wraps = style.flex_wrap != taffy::FlexWrap::NoWrap;
+        let row = style.flex_direction == FlexDirection::Row;
+        let gap = style
+            .gap
+            .height
+            .resolve_or_zero(Some(output.size.height), calc);
+        let stretch = matches!(
+            style.align_content.keyword,
+            taffy::AlignContentKeyword::Normal | taffy::AlignContentKeyword::Stretch
+        );
+        let span = |slots: &[Slot], child: usize| {
+            let layout = &slots[child].layout;
+            [
+                layout.location.y - layout.margin.top,
+                layout.location.y + layout.size.height + layout.margin.bottom,
+            ]
+        };
+        // The lines from the top: their top, bottom and items.
+        let mut lines: Vec<(f32, f32, Vec<usize>)> = Vec::new();
+        let mut reached = f32::NEG_INFINITY;
+        for &child in &members {
+            let layout = &self.slots[child].layout;
+            let [start, end] = match row {
+                true => [layout.location.x, layout.location.x + layout.size.width],
+                false => [-layout.location.x - layout.size.width, -layout.location.x],
+            };
+            let [top, bottom] = span(self.slots, child);
+            match lines.last_mut() {
+                Some(line) if !wraps || start > reached - 0.5 => {
+                    (line.0, line.1) = (line.0.min(top), line.1.max(bottom));
+                    line.2.push(child);
+                }
+                _ => lines.push((top, bottom, vec![child])),
+            }
+            reached = end;
+        }
+        // `wrap-reverse` lines go up.
+        if lines.len() > 1 && lines[0].0 > lines[1].0 {
+            lines.reverse();
+        }
+        let count = lines.len();
+        for at in 0..count {
+            let next = lines.get(at + 1).map(|line| line.0 - gap);
+            if !wraps || stretch && at == 0 {
+                lines[at].0 = edges.top;
+            }
+            if !wraps || stretch {
+                lines[at].1 = next.unwrap_or(output.size.height - edges.bottom);
+            }
+        }
+        // Lines that stretch share the free space. Without it, a stretched item tells no size of its line.
+        let natural = |line: &[usize]| {
+            let mut tallest = 0f32;
+            let mut groups = [[0f32; 2]; 2];
+            for &child in line {
+                let slot = &self.slots[child];
+                let [top, bottom] = span(self.slots, child);
+                let last = match kind(slot) {
+                    Some(align) => align == AlignItems::LastBaseline,
+                    None => {
+                        if matches!(
+                            slot.style.align_self.or(items),
+                            None | Some(AlignItems::Stretch)
+                        ) && slot.taffy().size.height.is_auto()
+                        {
+                            return None;
+                        }
+                        tallest = tallest.max(bottom - top);
+                        continue;
+                    }
+                };
+                let base = match last {
+                    true => slot.baselines.last,
+                    false => slot.baselines.first,
+                };
+                let above = base.unwrap_or(slot.layout.size.height) + slot.layout.margin.top;
+                let group = &mut groups[usize::from(last)];
+                *group = [group[0].max(above), group[1].max(bottom - top - above)];
+            }
+            Some(
+                tallest
+                    .max(groups[0][0] + groups[0][1])
+                    .max(groups[1][0] + groups[1][1]),
+            )
+        };
+        let sizes: Option<Vec<f32>> = lines.iter().map(|(.., line)| natural(line)).collect();
+        if wraps && let Some(sizes) = sizes {
+            let inner = output.size.height - edges.top - edges.bottom;
+            let used = sizes.iter().sum::<f32>() + gap * (count - 1) as f32;
+            let extra = match stretch {
+                true => (inner - used).max(0.) / count as f32,
+                false => 0.,
+            };
+            let mut at = edges.top;
+            for (line, size) in lines.iter_mut().zip(sizes) {
+                if stretch {
+                    line.0 = at;
+                }
+                line.1 = line.0 + size + extra;
+                at = line.1 + gap;
+            }
+        }
+        for (top, bottom, line) in &lines {
+            for last in [false, true] {
+                let group = match last {
+                    true => AlignItems::LastBaseline,
+                    false => AlignItems::Baseline,
+                };
+                let base = |slot: &Slot| {
+                    let baselines = slot.baselines;
+                    let base = if last {
+                        baselines.last
+                    } else {
+                        baselines.first
+                    };
+                    base.unwrap_or(slot.layout.size.height)
+                };
+                let (mut above, mut below) = (0f32, 0f32);
+                for &child in line {
+                    let slot = &self.slots[child];
+                    if kind(slot) == Some(group) {
+                        let layout = &slot.layout;
+                        above = above.max(base(slot) + layout.margin.top);
+                        below = below.max(layout.size.height + layout.margin.bottom - base(slot));
+                    }
+                }
+                let shared = match last != reverse {
+                    true => bottom - below,
+                    false => top + above,
+                };
+                for &child in line {
+                    if kind(&self.slots[child]) == Some(group) {
+                        let base = base(&self.slots[child]);
+                        self.slots[child].layout.location.y = shared - base;
+                    }
+                }
+            }
+        }
+        let line = if reverse { lines.last() } else { lines.first() };
+        let first = line.and_then(|(.., line)| {
+            let aligned = [AlignItems::Baseline, AlignItems::LastBaseline]
+                .into_iter()
+                .find_map(|group| {
+                    let mut line = line.iter().copied();
+                    line.find(|&child| kind(&self.slots[child]) == Some(group))
+                });
+            let slot = &self.slots[aligned.or(line.first().copied())?];
+            let base = match kind(slot) {
+                Some(AlignItems::LastBaseline) => slot.baselines.last,
+                _ => slot.baselines.first,
+            };
+            Some(slot.layout.location.y + base?)
+        });
+        output.baselines.first = first.or(output.baselines.first);
     }
 }

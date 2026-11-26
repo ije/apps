@@ -84,9 +84,45 @@ pub(super) fn children(
     // Content-sized heights size a grid like `auto`.
     let auto_height = style
         .get(Prop::HEIGHT)
-        .is_none_or(|v| matches!(v, "auto" | "fit-content" | "max-content" | "min-content"));
+        .is_none_or(|v| v == "auto" || css::value::content_size(v));
+    let painted = el.kids().len();
     let (mut el, grid) = grid_container(cx, fr, el, items, &mut content, auto_height);
-    let mut children = if grid.is_some() {
+    // The border box of a table, which paints, has its captions outside.
+    if let Some([above, below]) = (grid.as_ref())
+        .map(|grid| grid.captions)
+        .filter(|captions| *captions != [0.; 2])
+    {
+        let mut kids = el.take_children();
+        let sizer = kids.split_off(painted);
+        let paints = kids.split_off(usize::from(cx.stacking).min(kids.len()));
+        let mut frame = renderer::node()
+            .absolute()
+            .top(px(above - fr.borders[0]))
+            .right(px(-fr.borders[1]))
+            .bottom(px(below - fr.borders[2]))
+            .left(px(-fr.borders[3]))
+            .children(paints);
+        let style = el.style();
+        let own = frame.style();
+        own.border_widths = style.border_widths;
+        own.background = style.background.take();
+        own.border_color = style.border_color.take();
+        own.border_style = style.border_style;
+        own.corner_radii = std::mem::take(&mut style.corner_radii);
+        own.box_shadow = std::mem::take(&mut style.box_shadow);
+        if style.overflow.x != renderer::Overflow::Visible {
+            own.escape = renderer::Escape::OUTLINE;
+        }
+        let fixed = (!auto_height && slot.is_none()).then_some(&mut style.size.height);
+        let limits = [&mut style.min_size.height, &mut style.max_size.height];
+        for height in fixed.into_iter().chain(limits) {
+            if let renderer::Length::Px(height) = height {
+                *height += px(above + below);
+            }
+        }
+        el = el.children(kids).child(frame).children(sizer);
+    }
+    let mut children = if grid.is_some() && !flat.is_empty() {
         node.children.clone()
     } else {
         flat.to_vec()
@@ -574,6 +610,12 @@ pub(super) fn children(
                     .map(|(atom, child)| cx.atom_slot(atom, child, content[0], &|| [0.; 3]))
                     .collect();
                 let marks: Rc<[_]> = data.marks.iter().map(|_| Default::default()).collect();
+                let (justify, last) = crate::style::row_aligns(style, rtl);
+                let plaintext = last.is_none()
+                    && style
+                        .get(Prop::TEXT_ALIGN)
+                        .is_none_or(|value| value == "start")
+                    && crate::style::plaintext(doc, styles, id);
                 let mut paragraph = renderer::Node::from(InlineText {
                     data: data.clone(),
                     mixed: data.mixed(build.text),
@@ -583,18 +625,17 @@ pub(super) fn children(
                     shaped: Default::default(),
                     prepainted: Default::default(),
                     rtl,
-                    justify: style
-                        .get(Prop::TEXT_ALIGN)
-                        .is_some_and(|value| value == "justify")
-                        .then(|| {
-                            style
-                                .get(Prop::TEXT_ALIGN_LAST)
-                                .is_some_and(|value| value == "justify")
-                        }),
+                    plaintext,
+                    justify,
+                    last,
+                    reversed: style.get(Prop::WRITING_MODE) == Some("vertical-lr"),
                 });
                 // Text keeps its box when runs come before it, so it can stay a scroll anchor.
                 paragraph = paragraph.id(("text", data.key));
                 paragraph.style().flow = renderer::Flow::BLOCK;
+                if last.is_some() || justify[1] || plaintext {
+                    paragraph.style().flex_grow = 1.;
+                }
                 if data.greedy {
                     paragraph
                         .text_style()

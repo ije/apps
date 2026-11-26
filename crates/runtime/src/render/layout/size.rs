@@ -205,6 +205,10 @@ pub(crate) fn field_size(
 ) -> [f32; 2] {
     let node = &doc.nodes[id];
     let textarea = node.tag == "textarea";
+    if super::temporal::temporal(node) {
+        let line = field_line(node, style, units, text, pixel_ratio);
+        return super::temporal::size(node, style, units, text, line);
+    }
     if style.get(Prop::FIELD_SIZING) == Some("content") {
         let value = node.shown_text(
             node.current_value()
@@ -313,6 +317,116 @@ pub(crate) fn field_size(
             field_line(node, style, units, text, pixel_ratio)
         },
     ]
+}
+
+fn angle(style: &css::properties::Style) -> i8 {
+    match style.get(Prop::WRITING_MODE) {
+        None | Some("horizontal-tb") => 0,
+        Some("sideways-lr") => -1,
+        _ => 1,
+    }
+}
+
+/// Whether the box lays out turned against its parent, and then whether clockwise: its writing mode is orthogonal to
+/// the one of its parent.
+pub(crate) fn turned(doc: &Document, styles: &style::ComputedStyles, id: usize) -> Option<bool> {
+    let style = &styles.values[id];
+    style.get(Prop::WRITING_MODE)?;
+    let parent = doc.nodes[id].parent?;
+    let turn = angle(style) - angle(&styles.values[parent]);
+    (turn.abs() == 1
+        && !doc.nodes[id].tag.starts_with('#')
+        && !matches!(
+            style.get(Prop::DISPLAY),
+            None | Some("inline" | "none" | "contents")
+        ))
+    .then_some(turn > 0)
+}
+
+/// The sides of a box, top, right, bottom and left, in the frame of its turned layout.
+pub(crate) fn turn_sides<T>([top, right, bottom, left]: [T; 4], clockwise: bool) -> [T; 4] {
+    match clockwise {
+        true => [right, bottom, left, top],
+        false => [left, top, right, bottom],
+    }
+}
+
+/// The rows of a `<select>` that shows a list.
+pub(crate) fn list_rows(node: &crate::dom::Node) -> Option<usize> {
+    if node.tag != "select" {
+        return None;
+    }
+    let size = node.attrs.get("size");
+    match size.and_then(|size| size.trim().parse::<usize>().ok()) {
+        Some(rows) if rows > 1 => Some(rows),
+        _ => node.attrs.contains_key("multiple").then_some(4),
+    }
+}
+
+/// The height of an option in a list, which has `line-height: normal` and `min-height: 1.2em`.
+pub(crate) fn option_row(
+    face: &renderer::Font,
+    em: f32,
+    text: &renderer::TextSystem,
+    pixel_ratio: f32,
+) -> f32 {
+    let normal = text
+        .line_metrics(text.face(face), px(em * pixel_ratio))
+        .map(f32::from)
+        .iter()
+        .sum::<f32>()
+        / pixel_ratio;
+    (normal.max(1.2 * em) * 64.).round() / 64. + 1.
+}
+
+/// The width of the widest option of a `<select>`.
+pub(crate) fn widest_option(
+    doc: &Document,
+    id: usize,
+    face: &renderer::Font,
+    em: f32,
+    text: &renderer::TextSystem,
+) -> f32 {
+    let mut widest = 0f32;
+    let mut stack = doc.nodes[id].children.clone();
+    while let Some(child) = stack.pop() {
+        match doc.nodes[child].tag.as_str() {
+            "optgroup" => stack.extend(&doc.nodes[child].children),
+            "option" => {
+                let label = doc
+                    .text(child)
+                    .split_ascii_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let run = renderer::TextRun {
+                    len: label.len(),
+                    font: face.clone(),
+                    color: renderer::Color::BLACK,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                    overline: None,
+                    letter_spacing: px(0.),
+                    word_spacing: px(0.),
+                    font_size: None,
+                    inset: Default::default(),
+                    nowrap: false,
+                    preserve: true,
+                    hyphenation: None,
+                    rtl: false,
+                    plaintext: false,
+                    embedding: None,
+                    clear: 0,
+                    tab_size: 8.,
+                    stroke: None,
+                };
+                let line = text.shape_line(&label, px(em), &run).line;
+                widest = widest.max(f32::from(line.width));
+            }
+            _ => {}
+        }
+    }
+    widest
 }
 
 /// The line height of a field. Like Chrome, a single-line field whose `line-height` is not above its font size, in
@@ -480,6 +594,16 @@ pub(crate) fn native_size(kind: ControlKind) -> [f32; 2] {
         ControlKind::Text | ControlKind::Search => [160., height],
         _ => [width, height],
     }
+}
+
+/// Whether a list item has its marker in its first line, without a `::before` there.
+pub(crate) fn inside_marker(styles: &style::ComputedStyles, id: usize) -> bool {
+    let style = &styles.values[id];
+    style.get(Prop::LIST_STYLE_POSITION) == Some("inside")
+        && style.get(Prop::DISPLAY) == Some("list-item")
+        && style.get(Prop::LIST_STYLE_TYPE) != Some("none")
+        && (styles.generated(id))
+            .is_none_or(|pseudos| crate::render::inline::drawn(&pseudos[0], style).is_none())
 }
 
 #[cfg(test)]

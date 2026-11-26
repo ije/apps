@@ -1,10 +1,11 @@
 use super::super::Build;
 use super::super::kept::{Query, hashed};
-use super::super::margin::{percent_bound, percent_calc, shrinks_around};
+use super::super::margin::{definite_height, percent_bound, percent_calc, shrinks_around};
 use super::super::query::{inset_axes, only_auto_ratio, text_indent};
 use super::cx::{Cx, Frame, percentage, viewport};
 use crate::css;
 use crate::css::properties::Prop;
+use crate::render::layout::grid::intrinsic;
 use crate::render::layout::size::{aspect_ratio, dimension, layout_ceil};
 use crate::style::{self};
 use renderer::{px, relative};
@@ -79,6 +80,24 @@ pub(super) fn props(
     {
         el = if rtl { el.text_right() } else { el.text_left() };
     }
+    let replaced = crate::render::layout::cull::replaced(&node.tag)
+        || matches!(
+            node.tag.as_str(),
+            "img" | "video" | "input" | "progress" | "meter"
+        );
+    // Layout gives the content heights of other boxes. The cells of a grid have the heights of their tracks.
+    let sizes_content = !replaced && slot.is_none() && fr.turn.is_none();
+    let mut content_sized = false;
+    // Layout reads the last baseline of an item that has the alignment itself.
+    if hit.is_none()
+        && flex_parent
+        && style
+            .get(Prop::ALIGN_SELF)
+            .is_none_or(|value| value == "auto")
+        && reader.parent(id, Prop::ALIGN_ITEMS) == Some("last baseline")
+    {
+        el.style().align_self = Some(renderer::AlignItems::LastBaseline);
+    }
     for (prop, value) in style.iter().filter(|_| hit.is_none()) {
         let value: &str = value;
         let vertical = matches!(
@@ -96,7 +115,8 @@ pub(super) fn props(
         let page_size = || match vertical && parent == Some(0) {
             true => Some(viewport()),
             false => (vertical && line_base == Some(true)
-                || slot.is_some() && !style::table_part(doc, styles, id))
+                || slot.is_some() && !style::table_part(doc, styles, id)
+                || vertical && value.contains('%') && limited_parent(cx))
             .then_some(containing),
         };
         match prop {
@@ -149,7 +169,7 @@ pub(super) fn props(
                     && value == "fit-content"
                 {
                     // The grid's measure child gives the content sizes, and these bounds clamp a stretched width.
-                    let [min, max, ..] = crate::render::layout::grid::intrinsic::intrinsic(
+                    let [min, max, ..] = intrinsic::intrinsic(
                         doc,
                         id,
                         styles,
@@ -171,30 +191,54 @@ pub(super) fn props(
                     }
                     renderer::Length::Auto
                 } else if matches!(value, "stretch" | "-webkit-fill-available") {
-                    relative(1.)
-                } else if matches!(value, "fit-content" | "max-content" | "min-content")
-                    && axis == 0
-                {
-                    let [min, max, ..] = crate::render::layout::grid::intrinsic::intrinsic(
-                        doc,
-                        id,
-                        styles,
-                        Some(containing[0]),
-                        None,
-                        text,
-                        &mut measured.borrow_mut(),
-                    );
-                    let size = match value {
-                        "min-content" => min,
-                        "max-content" => max,
-                        _ => {
-                            max.min(min.max(containing[0] - inset_x.iter().flatten().sum::<f32>()))
+                    if vertical && block_size.or_else(page_size).is_none() {
+                        let definite = definite_height(doc, styles, parent);
+                        reader.log(Query::Definite(id as u32), 0, hashed(definite));
+                        if !definite {
+                            continue;
                         }
-                    };
-                    let size = layout_ceil((size - margin[1] - margin[3]).max(0.), pixel_ratio);
-                    fr.intrinsic_width = Some(size);
-                    if value == "fit-content" && style.get(Prop::MAX_WIDTH).is_none() {
-                        el = el.max_w(renderer::Length::Calc(1., px(-margin[1] - margin[3])));
+                    }
+                    let [start, end] = if vertical { [0, 2] } else { [3, 1] };
+                    let mut sides = margin[start] + margin[end];
+                    if matches!(position, "absolute" | "fixed") {
+                        sides += [start, end]
+                            .iter()
+                            .filter_map(|&side| {
+                                let prop = [Prop::TOP, Prop::RIGHT, Prop::BOTTOM, Prop::LEFT][side];
+                                units.resolve(style.get(prop)?, base)
+                            })
+                            .sum::<f32>();
+                    }
+                    match block_size.or_else(page_size) {
+                        Some(_) => px((base - sides).max(0.)).into(),
+                        None => renderer::Length::Calc(1., px(-sides)),
+                    }
+                } else if sizes_content
+                    && (value.starts_with("calc-size(")
+                        && !matches!(prop, Prop::MIN_WIDTH | Prop::MAX_WIDTH)
+                        || vertical && css::value::content_size(value))
+                {
+                    content_sized = true;
+                    continue;
+                } else if let Some(size) = intrinsic::keyword_size(
+                    doc,
+                    id,
+                    styles,
+                    prop,
+                    [
+                        containing[0] - inset_x.iter().flatten().sum::<f32>(),
+                        containing[1],
+                    ],
+                    cx.fills(),
+                    text,
+                    &mut measured.borrow_mut(),
+                ) {
+                    let size = layout_ceil(size.max(0.), pixel_ratio);
+                    if prop == Prop::WIDTH {
+                        fr.intrinsic_width = Some(size);
+                        if value == "fit-content" && style.get(Prop::MAX_WIDTH).is_none() {
+                            el = el.max_w(renderer::Length::Calc(1., px(-margin[1] - margin[3])));
+                        }
                     }
                     px(size).into()
                 } else {
@@ -284,15 +328,46 @@ pub(super) fn props(
                     renderer::Length::Calc(percent.max(0.) / 100., px(extra[axis]))
                 } else if let Some(length) = units.resolve(value, base) {
                     px(length.max(0.) + extra[axis]).into()
+                } else if axis == 0 && !matches!(value, "auto" | "content") {
+                    let [min, max, ..] = intrinsic::intrinsic(
+                        doc,
+                        id,
+                        styles,
+                        None,
+                        None,
+                        text,
+                        &mut measured.borrow_mut(),
+                    );
+                    let sides = margin[1] + margin[3] + extra[0];
+                    let [min, max] = [min - sides, max - sides];
+                    intrinsic::keyword_content(
+                        value,
+                        &units,
+                        [min, max],
+                        Some(base - sides),
+                        max,
+                        base,
+                        0.,
+                    )
+                    .map_or(renderer::Length::Auto, |size| {
+                        px(layout_ceil(size + extra[0], pixel_ratio)).into()
+                    })
                 } else {
                     renderer::Length::Auto
                 };
             }
             Prop::ALIGN_ITEMS | Prop::ALIGN_SELF if flex_parent || flexbox => {
-                let align = match value {
+                let align = match value.strip_prefix("unsafe ").unwrap_or(value) {
                     "center" => renderer::AlignItems::Center,
                     "flex-start" | "start" | "self-start" => renderer::AlignItems::FlexStart,
                     "flex-end" | "end" | "self-end" => renderer::AlignItems::FlexEnd,
+                    "safe center" => renderer::AlignItems::SafeCenter,
+                    "safe flex-end" | "safe end" | "safe self-end" => {
+                        renderer::AlignItems::SafeFlexEnd
+                    }
+                    "safe flex-start" | "safe start" | "safe self-start" => {
+                        renderer::AlignItems::FlexStart
+                    }
                     "baseline" | "first baseline" => renderer::AlignItems::Baseline,
                     "last baseline" => renderer::AlignItems::LastBaseline,
                     "stretch" | "normal" => renderer::AlignItems::Stretch,
@@ -309,16 +384,18 @@ pub(super) fn props(
                     && !style
                         .get(Prop::FLEX_DIRECTION)
                         .is_some_and(|v| v.starts_with("column"));
-                let align = match value {
+                let safe = value.strip_prefix("safe ");
+                el.style().safe |= safe.is_some();
+                let align = match safe.or(value.strip_prefix("unsafe ")).unwrap_or(value) {
                     "center" => renderer::AlignContent::Center,
                     "flex-end" => renderer::AlignContent::FlexEnd,
                     // Taffy's Start/End ignore flex reversal. RTL rows use RowReverse. In columns, left/right
                     // behave as start.
-                    "start" | "end" | "left" | "right" => {
-                        if match value {
+                    side @ ("start" | "end" | "left" | "right") => {
+                        if match side {
                             "left" => false,
                             "right" => inline,
-                            _ => (value == "end") != (inline && rtl),
+                            _ => (side == "end") != (inline && rtl),
                         } {
                             renderer::AlignContent::End
                         } else {
@@ -356,11 +433,10 @@ pub(super) fn props(
                     && vertical
                     && slot.is_none()
                     && reader.parent(id, Prop::HEIGHT).is_none_or(|height| {
-                        matches!(
-                            height,
-                            "auto" | "fit-content" | "min-content" | "max-content"
-                        ) || height.contains('%')
-                            && parent.is_none_or(|parent| doc.nodes[parent].parent != Some(0))
+                        height == "auto"
+                            || css::value::content_size(height)
+                            || height.contains('%')
+                                && parent.is_none_or(|parent| doc.nodes[parent].parent != Some(0))
                     }));
                 let length: renderer::Length = if let Some(percent) = percentage(value) {
                     if !fraction {
@@ -433,6 +509,232 @@ pub(super) fn props(
             }
             _ => {}
         }
+    }
+    if content_sized {
+        el = content_sizes(cx, fr, el);
+    }
+    el
+}
+
+/// Whether the parent has a height with content limits. Like Chrome, percentages take the height without the limits.
+#[inline(never)]
+fn limited_parent(cx: &Cx<'_>) -> bool {
+    let reader = cx.reader;
+    let fixed = |height: &str| {
+        cx.parent.is_some_and(|parent| {
+            (reader.styles.lengths[parent].resolve(height, f32::NAN)).is_some_and(f32::is_finite)
+        })
+    };
+    reader.parent(cx.id, Prop::HEIGHT).is_some_and(fixed)
+        && [Prop::MIN_HEIGHT, Prop::MAX_HEIGHT]
+            .into_iter()
+            .any(|prop| {
+                reader.parent(cx.id, prop).is_some_and(|value| {
+                    css::value::content_size(value) || value.starts_with("calc-size(")
+                })
+            })
+}
+
+/// Gives layout the sizes that are functions of the content sizes.
+#[inline(never)]
+fn content_sizes(cx: &Cx<'_>, fr: &Frame, mut el: renderer::Node) -> renderer::Node {
+    let Cx {
+        reader,
+        id,
+        style,
+        units,
+        containing,
+        parent,
+        block_size,
+        editable,
+        display,
+        ..
+    } = *cx;
+    let Frame { margin, extra, .. } = *fr;
+    let sums = [margin[1] + margin[3], margin[0] + margin[2]];
+    // What the functions depend on, apart from the units.
+    let mut parts = [0f32; 12];
+    parts[..2].copy_from_slice(&extra);
+    parts[2..4].copy_from_slice(&sums);
+    parts[4] = containing[0];
+    let mut values = [None; 4];
+    let mut width = None;
+    let mut loose = false;
+    if let Some(value) = style
+        .get(Prop::WIDTH)
+        .filter(|value| value.starts_with("calc-size("))
+    {
+        let mut basis = value;
+        while let Some((inner, _)) = css::value::calc_size(basis) {
+            basis = inner;
+        }
+        let side = extra[0];
+        let fills = basis == "stretch" || basis == "auto" && cx.fills();
+        if fills || !css::value::content_size(value) {
+            // A linear function is a share of the containing block.
+            let room = format!("(100% - {}px)", sums[0] + side);
+            let share = (css::value::calc_size(value))
+                .filter(|(basis, _)| !basis.contains("calc") && block_size.is_none())
+                .map(|(_, size)| format!("calc({})", css::value::with_size(size, &room)))
+                .and_then(|size| percent_calc(&units, &size));
+            el = match share {
+                Some((share, offset)) => el.w(renderer::Length::Calc(share, px(offset + side))),
+                None => {
+                    let space = (containing[0] - sums[0] - side).max(0.);
+                    let ends = [0.; 2];
+                    let base = containing[0];
+                    let size = intrinsic::keyword_content(
+                        value,
+                        &units,
+                        ends,
+                        Some(space),
+                        space,
+                        base,
+                        0.,
+                    );
+                    el.w(px(size.map_or(0., |size| size + side)))
+                }
+            };
+        } else {
+            values[0] = Some(value);
+            let content = match basis {
+                "min-content" => renderer::ContentWidth::Min,
+                "max-content" => renderer::ContentWidth::Max,
+                _ => renderer::ContentWidth::Fit,
+            };
+            let (value, base) = (value.to_owned(), containing[0]);
+            let space = (base - sums[0] - side).max(0.);
+            let size: Box<dyn Fn(f32) -> f32> = Box::new(move |found| {
+                let found = (found - side).max(0.);
+                intrinsic::keyword_content(&value, &units, [found; 2], Some(space), found, base, 0.)
+                    .map_or(0., |size| size.max(0.) + side)
+            });
+            width = Some((content, size));
+            loose = cx.fills() || cx.stretches(0);
+        }
+    }
+    let table = style::table_box(style::role(reader.styles, id));
+    let [height, min, max] = [Prop::HEIGHT, Prop::MIN_HEIGHT, Prop::MAX_HEIGHT].map(|prop| {
+        style
+            .get(prop)
+            // Like Chrome, a table takes no calculation for its height.
+            .filter(|value| match value.starts_with("calc-size(") {
+                true => !table,
+                false => css::value::content_size(value),
+            })
+    });
+    let (mut definite, mut ratio) = (false, None);
+    let mut tall = None;
+    let grid = display.ends_with("grid");
+    if height.or(min).or(max).is_some() {
+        // A control can have a height of its own.
+        let fixed = match el.style().size.height {
+            renderer::Length::Px(fixed) => Some(f32::from(fixed)),
+            _ => None,
+        };
+        let side = extra[1];
+        // Content keywords alone don't depend on the containing block.
+        let calculates = [height, min, max]
+            .iter()
+            .flatten()
+            .any(|value| value.starts_with("calc-size("));
+        let space = block_size.map(|size| size[1]).or_else(|| {
+            let definite = definite_height(reader.doc, reader.styles, parent);
+            reader.log(Query::Definite(id as u32), 0, hashed(definite));
+            definite.then_some(containing[1])
+        });
+        let outer = space.filter(|_| calculates);
+        let space = outer.map(|space| (space - sums[1] - side).max(0.));
+        values[1..].copy_from_slice(&[height, min, max]);
+        let rows = match el.style().min_size.height {
+            renderer::Length::Px(rows) if editable => f32::from(rows),
+            _ => 0.,
+        };
+        let plain =
+            min.or(max).is_none() && height.is_some_and(|value| !value.starts_with("calc-size("));
+        let [height, min, max] = [height, min, max].map(|value| value.map(str::to_owned));
+        let own = height.is_some();
+        if own {
+            ratio = el.style().aspect_ratio.take().filter(|_| {
+                (height.as_deref().and_then(css::value::calc_size))
+                    .is_some_and(|(basis, _)| basis == "auto")
+            });
+        }
+        definite = space.is_some()
+            && (height.as_deref()).is_some_and(|value| !css::value::content_size(value));
+        let contained = !editable
+            && style.get(Prop::CONTAIN).is_some_and(|value| {
+                (value.split_ascii_whitespace()).any(|part| matches!(part, "size" | "strict"))
+            });
+        // A percentage of a height that is not definite is 0.
+        let base = outer.unwrap_or(0.);
+        parts[5] = base;
+        parts[6..].copy_from_slice(&[
+            fixed.unwrap_or(-1.),
+            space.unwrap_or(-1.),
+            rows,
+            ratio.unwrap_or(0.),
+            f32::from(u8::from(contained)),
+            f32::from(u8::from(definite)),
+        ]);
+        let size = move |found: f32| {
+            let found = match fixed.filter(|_| own) {
+                Some(fixed) => fixed,
+                None if contained => side,
+                None => found.max(rows),
+            };
+            let content = (found - side).max(0.);
+            let of = |value: &str, auto: f32| {
+                let stretch = space.unwrap_or(content);
+                intrinsic::keyword_content(
+                    value,
+                    &units,
+                    [content; 2],
+                    Some(stretch),
+                    auto,
+                    base,
+                    0.,
+                )
+                .map(|size| size.max(0.) + side)
+            };
+            let mut size = match &height {
+                Some(value) => of(value, content).unwrap_or(found),
+                None => fixed.unwrap_or(found),
+            };
+            if let Some(max) = max.as_deref().and_then(|max| of(max, 0.)) {
+                size = size.min(max);
+            }
+            if let Some(min) = min.as_deref().and_then(|min| of(min, 0.)) {
+                size = size.max(min);
+            }
+            size
+        };
+        match fixed {
+            Some(fixed) if own => el = el.h(px(size(fixed))),
+            Some(_) if grid => {}
+            // Content keywords alone are the height of the layout.
+            None if plain => loose |= cx.stretches(1),
+            // A share of the containing block has no content limits.
+            None if !own && el.style().size.height != renderer::Length::Auto => {}
+            _ => {
+                el.style().size.height = renderer::Length::Auto;
+                tall = Some(Box::new(size) as Box<dyn Fn(f32) -> f32>);
+                // Layout knows the content height, but it stretches a flex item of auto height.
+                loose |= cx.stretches(1);
+            }
+        }
+    }
+    if loose {
+        el.style().align_self = Some(renderer::AlignItems::FlexStart);
+    }
+    if width.is_some() || tall.is_some() {
+        el.style().sizing = Some(std::rc::Rc::new(renderer::Sizing {
+            key: hashed((parts.map(f32::to_bits), values, format!("{units:?}"))),
+            width,
+            height: tall,
+            ratio,
+            definite,
+        }));
     }
     el
 }
@@ -533,9 +835,9 @@ pub(super) fn natural_box(
         && reader
             .parent(id, Prop::FLEX_WRAP)
             .is_none_or(|value| value == "nowrap")
-        && reader
-            .parent(id, Prop::HEIGHT)
-            .is_some_and(|value| value != "auto" && !value.contains('%')))
+        && reader.parent(id, Prop::HEIGHT).is_some_and(|value| {
+            value != "auto" && !value.contains('%') && !css::value::content_size(value)
+        }))
     .then(|| (containing[1] - margin[0] - margin[2] - chrome[1]).max(0.));
     let sized = !set[0] && !stretch[0] && !(css && set[1]);
     let width = if set[0] {
@@ -739,12 +1041,19 @@ pub(super) fn new_box(cx: &Cx<'_>) -> renderer::Node {
         let (indent, percent) = text_indent(style, &units);
         text.set_text_indent(px(indent));
         text.set_text_indent_percent(percent);
+        if let Some(value) = style.get(Prop::TEXT_INDENT) {
+            let has = |word| value.split(' ').any(|part| part == word);
+            text.set_text_indent_rows([has("hanging"), has("each-line")]);
+        }
     }
     if face.style != renderer::FontStyle::Normal {
         el.text_style().set_font_style(face.style);
     }
-    if face.synthesis != [true; 2] {
+    if face.synthesis != [true; 3] {
         el.text_style().set_font_synthesis(face.synthesis);
+    }
+    if face.size_adjust.is_some() {
+        el.text_style().set_font_size_adjust(face.size_adjust);
     }
     el
 }

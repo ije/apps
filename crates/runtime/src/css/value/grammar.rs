@@ -1,7 +1,11 @@
 use crate::css::{
-    properties::Prop, value::color::color, value::corner_shape, value::easing::Easing,
+    properties::Prop, value::anchor, value::calc_size, value::color::color, value::corner_shape,
+    value::easing::Easing, value::font::ordered, value::resolved::percent_sum,
+    value::resolved::percent_text, value::shape, value::shape::BOXES, value::shape::Position,
+    value::shape::Shape, value::shape::Shaped, value::shape_outside,
     value::shorthand::BORDER_IMAGE, value::shorthand::BORDER_IMAGE_INITIAL,
-    value::tokens::components, value::tokens::number, value::units::Kind, value::units::Lengths,
+    value::shorthand::expand, value::tokens::components, value::tokens::number, value::units::Kind,
+    value::units::Lengths, value::with_size,
 };
 pub(super) fn grammar(name: &str) -> Option<&'static str> {
     match name {
@@ -51,6 +55,63 @@ pub(crate) fn supports(name: &str, value: &str) -> Option<bool> {
         return Some(false);
     }
     let lower = value.to_ascii_lowercase();
+    // What these take is checked by their parsers, unless it is a keyword or comes later.
+    let shaped = matches!(name, "clip-path" | "offset-path");
+    let own = shaped
+        || matches!(name, "mask" | "mask-repeat")
+        || name.starts_with("offset") && name != "offset-distance";
+    let ordered = ordered(name, value);
+    if (own || ordered.is_some())
+        && !["var(", "env(", "attr("]
+            .iter()
+            .any(|function| lower.contains(function))
+        && !matches!(
+            lower.as_str(),
+            "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+        )
+    {
+        if let Some(ordered) = ordered {
+            return Some(ordered.is_some() && grammar(name).is_some());
+        }
+        let parts = components(&lower, ' ');
+        return Some(match name {
+            _ if shaped && lower == "none" => true,
+            _ if shaped && lower.starts_with("url(") => {
+                parts.len() == 1
+                    || name == "offset-path" && parts.len() == 2 && BOXES.contains(&parts[1])
+            }
+            "clip-path" => Shaped::parse(value)
+                .is_some_and(|shaped| !matches!(shaped.shape, Some(Shape::Ray(_)))),
+            // Like Chrome, a path here takes no fill rule.
+            "offset-path" => Shaped::parse(value).is_some_and(|shaped| {
+                shaped.reference != Some("margin-box")
+                    && !(matches!(shaped.shape, Some(Shape::Path(..)))
+                        && ["evenodd", "nonzero"]
+                            .iter()
+                            .any(|rule| lower.contains(rule)))
+            }),
+            "offset-anchor" | "offset-position" => {
+                lower == "auto"
+                    || name == "offset-position" && lower == "normal"
+                    || Position::parse(&parts).is_some()
+            }
+            "offset-rotate" => shape::turn(&lower, &Lengths::new(16., 1., 1.)).is_some(),
+            "mask-repeat" => components(&lower, ',').into_iter().all(|layer| {
+                let parts = components(layer, ' ');
+                let both =
+                    |part: &&str| matches!(*part, "repeat" | "no-repeat" | "space" | "round");
+                match parts[..] {
+                    [one] => both(&one) || matches!(one, "repeat-x" | "repeat-y"),
+                    [_, _] => parts.iter().all(both),
+                    _ => false,
+                }
+            }),
+            _ => {
+                let mut parts = Vec::new();
+                expand(name, value, &mut parts) && !parts.is_empty()
+            }
+        });
+    }
     if let Some(index) = name
         .strip_prefix("border-image")
         .map(|longhand| {
@@ -109,6 +170,14 @@ pub(crate) fn supports(name: &str, value: &str) -> Option<bool> {
         }
         return Some(axes == 1 || axes == 2 && axis == "size");
     }
+    // The marks of the cascade are not for pages.
+    if name.starts_with("-internal-") {
+        return Some(false);
+    }
+    // The maximum sizes have no `auto`.
+    if name.starts_with("max-") && lower.contains("calc-size(auto") {
+        return Some(false);
+    }
     // An axis, and then how strict it is.
     if name == "scroll-snap-type"
         && let parts = components(&lower, ' ')
@@ -116,6 +185,43 @@ pub(crate) fn supports(name: &str, value: &str) -> Option<bool> {
             || parts.len() == 2 && !matches!(parts[1], "mandatory" | "proximity"))
     {
         return Some(false);
+    }
+    // Like Chrome, a box and a length with a unit, each once, and no math.
+    if name == "overflow-clip-margin"
+        && let parts = components(&lower, ' ')
+        && (parts
+            .iter()
+            .any(|part| part.contains(['(']) && !part.starts_with("var("))
+            || parts.iter().any(|part| part.parse::<f32>().is_ok())
+            || parts.len() == 2 && parts[0].ends_with("-box") == parts[1].ends_with("-box"))
+    {
+        return Some(false);
+    }
+    if matches!(
+        name,
+        "anchor-name"
+            | "anchor-scope"
+            | "position-anchor"
+            | "position-area"
+            | "position-try"
+            | "position-try-fallbacks"
+            | "position-try-order"
+            | "position-visibility"
+    ) {
+        return Some(
+            lower.contains("var(")
+                || matches!(
+                    lower.as_str(),
+                    "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+                )
+                || anchor::specified(name, value).is_some(),
+        );
+    }
+    if anchor::has_function(value) && !lower.contains("var(") {
+        return Some(anchor::canonical(name, value).is_some_and(|text| {
+            anchor::replace(&text, &mut |_| Some("1px".into()))
+                .is_some_and(|text| supports(name, &text) == Some(true))
+        }));
     }
     let grammar = grammar(name)?;
     // Like Chrome, a border, outline or column rule takes no negative width.
@@ -197,6 +303,8 @@ pub(crate) fn supports(name: &str, value: &str) -> Option<bool> {
     }
     Some(
         !value.is_empty()
+            // Only these draw it.
+            && (!lower.contains("cross-fade(") || matches!(name, "background" | "background-image"))
             // Like Chrome, only outlines take this color in author styles.
             && (name.starts_with("outline") || !lower.contains("-webkit-focus-ring-color"))
             && (lower.contains("var(")
@@ -210,6 +318,12 @@ pub(crate) fn supports(name: &str, value: &str) -> Option<bool> {
 
 // Readers parse `<integer>` and `<number>` values as plain numbers, so math in them folds when it is stored.
 pub(crate) fn fold(name: &str, value: &str) -> Option<String> {
+    if name.starts_with("position-") || name.starts_with("anchor-") {
+        return anchor::specified(name, value);
+    }
+    if let Some(ordered) = ordered(name, value) {
+        return ordered.filter(|_| !value.contains(['"', '\'']));
+    }
     if !value.ends_with(')') {
         return None;
     }
@@ -271,6 +385,8 @@ const INITIAL: &[(&str, &str)] = &[
     ("align-content", "normal"),
     ("align-items", "normal"),
     ("align-self", "auto"),
+    ("anchor-name", "none"),
+    ("anchor-scope", "none"),
     ("animation-delay", "0s"),
     ("animation-direction", "normal"),
     ("animation-duration", "0s"),
@@ -367,6 +483,12 @@ const INITIAL: &[(&str, &str)] = &[
     ("font-size-adjust", "none"),
     ("font-stretch", "100%"),
     ("font-style", "normal"),
+    ("font-variant-alternates", "normal"),
+    ("font-variant-caps", "normal"),
+    ("font-variant-east-asian", "normal"),
+    ("font-variant-ligatures", "normal"),
+    ("font-variant-numeric", "normal"),
+    ("font-variant-position", "normal"),
     ("font-weight", "400"),
     ("grid-auto-columns", "auto"),
     ("grid-auto-flow", "row"),
@@ -379,8 +501,10 @@ const INITIAL: &[(&str, &str)] = &[
     ("grid-template-columns", "none"),
     ("grid-template-rows", "none"),
     ("height", "auto"),
+    ("hyphenate-character", "auto"),
     ("hyphens", "manual"),
     ("image-rendering", "auto"),
+    ("interpolate-size", "numeric-only"),
     ("isolation", "auto"),
     ("justify-content", "normal"),
     ("justify-items", "normal"),
@@ -395,7 +519,16 @@ const INITIAL: &[(&str, &str)] = &[
     ("margin-left", "0px"),
     ("margin-right", "0px"),
     ("margin-top", "0px"),
+    ("margin-trim", "none"),
+    ("mask-clip", "border-box"),
+    ("mask-composite", "add"),
     ("mask-image", "none"),
+    ("mask-mode", "match-source"),
+    ("mask-origin", "border-box"),
+    ("mask-position", "0% 0%"),
+    ("mask-repeat", "repeat"),
+    ("mask-size", "auto"),
+    ("mask-type", "luminance"),
     ("max-height", "none"),
     ("max-width", "none"),
     ("min-height", "auto"),
@@ -403,12 +536,18 @@ const INITIAL: &[(&str, &str)] = &[
     ("mix-blend-mode", "normal"),
     ("object-fit", "fill"),
     ("object-position", "50% 50%"),
+    ("offset-anchor", "auto"),
+    ("offset-distance", "0px"),
+    ("offset-path", "none"),
+    ("offset-position", "normal"),
+    ("offset-rotate", "auto"),
     ("opacity", "1"),
     ("order", "0"),
     ("outline-color", "currentcolor"),
     ("outline-offset", "0px"),
     ("outline-style", "none"),
     ("outline-width", "3px"),
+    ("overflow-clip-margin", "0px"),
     ("overflow-wrap", "normal"),
     ("overflow-x", "visible"),
     ("overflow-y", "visible"),
@@ -423,6 +562,11 @@ const INITIAL: &[(&str, &str)] = &[
     ("perspective-origin", "50% 50%"),
     ("pointer-events", "auto"),
     ("position", "static"),
+    ("position-anchor", "normal"),
+    ("position-area", "none"),
+    ("position-try-fallbacks", "none"),
+    ("position-try-order", "normal"),
+    ("position-visibility", "anchor-visible"),
     ("quotes", "auto"),
     ("r", "0px"),
     ("resize", "none"),
@@ -447,6 +591,8 @@ const INITIAL: &[(&str, &str)] = &[
     ("scrollbar-color", "auto"),
     ("scrollbar-gutter", "auto"),
     ("scrollbar-width", "auto"),
+    ("shape-margin", "0px"),
+    ("shape-outside", "none"),
     ("stroke", "none"),
     ("stroke-dasharray", "none"),
     ("stroke-dashoffset", "0px"),
@@ -459,6 +605,7 @@ const INITIAL: &[(&str, &str)] = &[
     ("text-box-trim", "none"),
     ("text-decoration-color", "currentcolor"),
     ("text-decoration-line", "none"),
+    ("text-decoration-skip-ink", "auto"),
     ("text-decoration-style", "solid"),
     ("text-decoration-thickness", "auto"),
     ("text-indent", "0px"),
@@ -468,6 +615,7 @@ const INITIAL: &[(&str, &str)] = &[
     ("text-size-adjust", "auto"),
     ("text-transform", "none"),
     ("text-underline-offset", "auto"),
+    ("text-underline-position", "auto"),
     ("text-wrap", "wrap"),
     ("top", "auto"),
     ("touch-action", "auto"),
@@ -480,6 +628,7 @@ const INITIAL: &[(&str, &str)] = &[
     ("transition-property", "all"),
     ("transition-timing-function", "ease"),
     ("translate", "none"),
+    ("unicode-bidi", "normal"),
     ("unicode-bidi", "normal"),
     ("user-select", "auto"),
     ("vertical-align", "baseline"),
@@ -609,6 +758,10 @@ pub(crate) const SHORTHANDS: &[(&str, &[&str])] = &[
     ("place-items", &["align-items", "justify-items"]),
     ("place-self", &["align-self", "justify-self"]),
     (
+        "position-try",
+        &["position-try-order", "position-try-fallbacks"],
+    ),
+    (
         "border-top",
         &["border-top-width", "border-top-style", "border-top-color"],
     ),
@@ -684,7 +837,9 @@ pub(crate) fn syntax_matches(syntax: &str, value: &str) -> bool {
     alternatives.into_iter().any(|alternative| {
         if !alternative.starts_with(['<', '[', '*']) && !alternative.ends_with(['(', '+', '#', '}'])
         {
-            return value.trim().eq_ignore_ascii_case(alternative);
+            return (value.split_ascii_whitespace())
+                .map(str::to_ascii_lowercase)
+                .eq(alternative.split(' ').map(str::to_owned));
         }
         let mut range = 1..=usize::MAX;
         let (kinds, separator) = match alternative.strip_suffix(['+', '#']) {
@@ -761,7 +916,7 @@ pub(crate) fn syntax_matches(syntax: &str, value: &str) -> bool {
                     "<color>" => {
                         value.eq_ignore_ascii_case("currentcolor")
                             || color(value).is_some()
-                            || value.contains("(from ")
+                            || (value.contains("(from ") || value.contains("contrast-color("))
                                 && color(
                                     &value.to_ascii_lowercase().replace("currentcolor", "black"),
                                 )
@@ -769,6 +924,7 @@ pub(crate) fn syntax_matches(syntax: &str, value: &str) -> bool {
                             || ["light-dark(", "color-mix("]
                                 .iter()
                                 .any(|function| value.starts_with(function) && value.ends_with(')'))
+                            || value.starts_with("contrast-color(") && value.contains("light-dark(")
                     }
                     "<custom-ident>" => {
                         !value.is_empty()
@@ -777,22 +933,50 @@ pub(crate) fn syntax_matches(syntax: &str, value: &str) -> bool {
                                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
                     }
                     "<image>" | "<url>" => {
-                        [
-                            "url(",
-                            "image-set(",
-                            "-webkit-image-set(",
-                            "image(",
-                            "cross-fade(",
-                        ]
-                        .iter()
-                        .any(|function| value.starts_with(function))
-                            || value.contains("gradient(")
+                        if let Some(valid) = super::image::valid(value) {
+                            return valid;
+                        }
+                        value.starts_with("url(")
+                            || !value.starts_with("cross-fade(")
+                                && value.contains("gradient(")
                                 && value.split_once('(').is_some_and(|(_, inner)| {
                                     inner.trim_end_matches(')').trim() != ""
                                 })
                     }
-                    "<transform-function>" | "<transform-list>" => value.contains('('),
+                    "<transform-function>" | "<transform-list>" => {
+                        let parts = components(value, ' ');
+                        if kind == "<transform-list>" && value == "none" {
+                            return true;
+                        }
+                        (parts.len() == 1 || kind == "<transform-list>" && !parts.is_empty())
+                            && value.contains('(')
+                            && supports("transform", value) == Some(true)
+                    }
+                    "<resolution>" => super::image::resolution(value).is_some(),
                     "<string>" => value.starts_with(['"', '\'']),
+                    "<size>" => syntax_matches("min-content|max-content|fit-content|stretch|<calc-size>|-webkit-fill-available|-webkit-min-content|-webkit-max-content|-webkit-fit-content", value),
+                    "<calc-size>" => calc_size(value).is_some_and(|(basis, size)| {
+                        let sized = |part: &str| part.split(|c: char| !c.is_ascii_alphanumeric() && c != '-').any(|word| word.eq_ignore_ascii_case("size"));
+                        let size = with_size(size, "(1px)");
+                        ((basis.eq_ignore_ascii_case("any") && !sized(calc_size(value).map_or("", |(_, size)| size)))
+                            || syntax_matches("auto|<length-percentage>|min-content|max-content|fit-content|stretch|<calc-size>", basis))
+                            && syntax_matches("<length-percentage>", &format!("calc({size})"))
+                    }),
+                    // A place, which can have an overflow position before it.
+                    "<place>" | "<place-self>" | "<place-side>" | "<place-anchor>" => {
+                        let lower = value.to_ascii_lowercase();
+                        let mut words = lower.split_ascii_whitespace().peekable();
+                        words.next_if(|word| matches!(*word, "safe" | "unsafe"));
+                        let places: &[&str] = match kind {
+                            "<place>" => &["center", "start", "end", "flex-start", "flex-end"],
+                            "<place-self>" => &["self-start", "self-end"],
+                            "<place-side>" => &["left", "right"],
+                            _ => &["anchor-center"],
+                        };
+                        words.next().is_some_and(|word| places.contains(&word))
+                            && words.next().is_none()
+                    }
+                    "<shape-outside>" => shape_outside(value).is_some(),
                     "<easing-function>" => Easing::parse(value).is_some(),
                     "<corner-shape>" => corner_shape(value).is_some(),
                     "*" => !value.is_empty(),
@@ -815,42 +999,77 @@ pub(crate) fn syntax_matches(syntax: &str, value: &str) -> bool {
     })
 }
 
-// The computed value of a registered custom property. Relative lengths like `2em` and colors stay as written, and
-// false means that the value depends on the element.
-pub(crate) fn computed(syntax: &str, value: &str) -> (String, bool) {
-    let mut units = Lengths::new(f32::NAN, f32::NAN, f32::NAN);
-    units.root = units.font;
+// The type of a registered syntax that takes the value: the first that matches.
+pub(crate) fn matched<'a>(syntax: &'a str, value: &str) -> &'a str {
+    match syntax.contains('|') {
+        true => (syntax.split('|'))
+            .find(|kind| syntax_matches(kind, value))
+            .unwrap_or(syntax),
+        false => syntax,
+    }
+}
+
+// The computed value of a registered custom property, with the lengths of an element when they are known. Without
+// them, relative lengths like `2em` stay as written, and false means that the value depends on the element.
+pub(crate) fn computed(syntax: &str, value: &str, element: Option<&Lengths>) -> (String, bool) {
+    let syntax = matched(syntax, value);
+    let mut unknown = Lengths::new(f32::NAN, f32::NAN, f32::NAN);
+    unknown.root = unknown.font;
+    let units = element.unwrap_or(&unknown);
     let has = |kind: &str| syntax.contains(kind);
     let number = number;
     let mut independent = true;
     let (separator, joint) = if has("#") { (',', ", ") } else { (' ', " ") };
+    let mut one = |part: &str| match units.math(part, f32::NAN, &[]) {
+        Some((n, Kind::Length)) if has("<length") || has("<transform") => {
+            format!("{}px", number(n))
+        }
+        Some((n, Kind::Number)) if has("<number>") || has("<transform") => number(n),
+        Some((n, Kind::Number)) if has("<integer>") => number(n.round()),
+        Some((n, Kind::Number)) if n == 0. && has("<length") => "0px".into(),
+        Some((n, Kind::Angle)) if has("<angle>") || has("<transform") => {
+            format!("{}deg", number(n))
+        }
+        Some((n, Kind::Time)) if has("<time>") => format!("{}s", number(n)),
+        Some(_) => part.to_owned(),
+        None => match part.strip_suffix('%').and_then(|n| n.parse::<f64>().ok()) {
+            Some(percent) => format!("{}%", number(percent)),
+            None => match percent_sum(part, units) {
+                Some(sum) => percent_text(sum),
+                None => {
+                    independent &= units.math(part, 100., &[]).is_some()
+                        || Lengths::new(16., 100., 100.)
+                            .math(part, 100., &[])
+                            .is_none();
+                    part.to_owned()
+                }
+            },
+        },
+    };
     let parts: Vec<String> = components(value, separator)
         .into_iter()
         .map(|part| {
             let part = part.trim();
-            match units.math(part, f32::NAN, &[]) {
-                Some((n, Kind::Length)) if has("<length") => format!("{}px", number(n)),
-                Some((n, Kind::Number)) if has("<number>") => number(n),
-                Some((n, Kind::Number)) if has("<integer>") => number(n.round()),
-                Some((n, Kind::Number)) if n == 0. && has("<length") => "0px".into(),
-                Some((n, Kind::Angle)) if has("<angle>") => format!("{}deg", number(n)),
-                Some((n, Kind::Time)) if has("<time>") => format!("{}s", number(n)),
-                Some(_) => part.into(),
-                None => match (units.math(part, 0., &[]), units.math(part, 100., &[])) {
-                    (Some((0., Kind::Length)), Some((n, Kind::Length))) => {
-                        format!("{}%", number(n))
-                    }
-                    (Some((a, Kind::Length)), Some((b, Kind::Length))) => {
-                        format!("calc({}% + {}px)", number(b - a), number(a))
-                    }
-                    _ => {
-                        independent &= Lengths::new(16., 100., 100.)
-                            .math(part, 100., &[])
-                            .is_none();
-                        part.into()
-                    }
-                },
+            // System colors depend on the color scheme of the element.
+            if has("<color>")
+                && super::color::system(part, false).is_none()
+                && let Some(color) = super::color::serialize(part)
+            {
+                return color;
             }
+            if has("<resolution>")
+                && let Some(resolution) = super::image::resolution(part)
+            {
+                return format!("{}dppx", number(resolution));
+            }
+            if has("<transform")
+                && let Some((name, args)) =
+                    part.strip_suffix(')').and_then(|part| part.split_once('('))
+            {
+                let args: Vec<String> = components(args, ',').into_iter().map(&mut one).collect();
+                return format!("{name}({})", args.join(", "));
+            }
+            one(part)
         })
         .collect();
     (parts.join(joint), independent)

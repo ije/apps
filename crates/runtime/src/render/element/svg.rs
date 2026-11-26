@@ -343,6 +343,7 @@ pub(super) fn svg_layer(
                         ),
                         size(px(w * scale_x), px(h * scale_y)),
                     ));
+                    state.geometry.shapes.remove(&node);
                     state.geometry.mirror.insert(
                         node,
                         [

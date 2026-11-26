@@ -1,14 +1,16 @@
-use crate::css::value::grammar::grammar;
+use crate::css::value::grammar::{computed, grammar};
 use crate::css::value::specified::math_sum;
 use crate::css::{
     properties::BORDERS, properties::PADDING, properties::Prop, properties::Registry,
-    properties::Style, value::area_cells, value::corner_shape, value::grammar::SHORTHANDS,
-    value::grammar::initial, value::shorthand::BORDER_IMAGE, value::shorthand::expand,
-    value::specified::specified, value::tokens::components, value::tokens::number,
-    value::tokens::write_printed, value::units::Kind, value::units::Lengths,
+    properties::Style, value::area_cells, value::corner_shape, value::font::VARIANT,
+    value::font::serialize_variants, value::grammar::SHORTHANDS, value::grammar::initial,
+    value::shape::Position, value::shape::Shaped, value::shape::amount, value::shape::turn,
+    value::shorthand::BORDER_IMAGE, value::shorthand::expand, value::specified::specified,
+    value::tokens::components, value::tokens::number, value::tokens::write_printed,
+    value::units::Kind, value::units::Lengths,
 };
 use crate::css::{
-    properties::LOGICAL, value::color::serialize as serialize_color, value::specified::shortest,
+    value::anchor, value::color::serialize as serialize_color, value::specified::shortest,
 };
 use std::borrow::Cow;
 pub(crate) fn resolved(
@@ -25,11 +27,19 @@ pub(crate) fn resolved(
     if name.starts_with("--") {
         return Prop::find(name)
             .and_then(|prop| {
-                style
-                    .value(prop)
-                    .or_else(|| registry.get(&prop)?.2.as_ref())
+                let registered = registry.get(&prop);
+                let value = style.value(prop).or_else(|| registered?.2.as_ref())?;
+                Some(match registered.filter(|(syntax, ..)| &**syntax != "*") {
+                    Some((syntax, ..)) => computed(syntax, value, Some(units)).0,
+                    None => value.to_string(),
+                })
             })
-            .map_or_else(String::new, |value| value.to_string());
+            .unwrap_or_default();
+    }
+    if name == "position-area"
+        && let Some(area) = style.get(Prop::POSITION_AREA)
+    {
+        return anchor::computed_area(area);
     }
     let get = |name: &str| resolved(style, units, name, size, container, registry);
     // The item count comes from the longhand that defines it, because not every shorthand is stored.
@@ -56,7 +66,7 @@ pub(crate) fn resolved(
             let mut parts = Vec::new();
             for (longhand, initial) in [
                 ("font-style", "normal"),
-                ("font-variant", "normal"),
+                ("font-variant-caps", "normal"),
                 ("font-weight", "400"),
                 ("font-stretch", "100%"),
             ] {
@@ -114,6 +124,56 @@ pub(crate) fn resolved(
                         layer = format!("{} {layer}", get("background-color"));
                     }
                     layer
+                })
+                .collect();
+            return layers.join(", ");
+        }
+        "offset" => {
+            let [position, path, distance, rotate, anchor] = [
+                "offset-position",
+                "offset-path",
+                "offset-distance",
+                "offset-rotate",
+                "offset-anchor",
+            ]
+            .map(get);
+            let mut text = format!("{path} {distance} {rotate}");
+            if position != "normal" {
+                text = format!("{position} {text}");
+            }
+            if anchor != "auto" {
+                text = format!("{text} / {anchor}");
+            }
+            return text;
+        }
+        "mask" => {
+            let images = list("mask", "image", "image");
+            let layers: Vec<String> = (0..images.len())
+                .map(|index| {
+                    let pick = |key: &str| list("mask", key, "image").swap_remove(index);
+                    let (position, size) = (pick("position"), pick("size"));
+                    let (origin, clip) = (pick("origin"), pick("clip"));
+                    let mut parts = vec![images[index].clone()];
+                    if size != "auto" {
+                        parts.push(format!("{position} / {size}"));
+                    } else if position != "0% 0%" {
+                        parts.push(position);
+                    }
+                    parts.extend(Some(pick("repeat")).filter(|repeat| repeat != "repeat"));
+                    if origin == clip {
+                        parts.extend(Some(origin).filter(|origin| origin != "border-box"));
+                    } else {
+                        if clip != "no-clip" || origin != "border-box" {
+                            parts.push(origin);
+                        }
+                        parts.push(clip);
+                    }
+                    parts.extend(Some(pick("composite")).filter(|value| value != "add"));
+                    parts.extend(Some(pick("mode")).filter(|value| value != "match-source"));
+                    if parts.len() > 1 && parts[0] == "none" {
+                        parts.remove(0);
+                    }
+                    parts.join(" ")
                 })
                 .collect();
             return layers.join(", ");
@@ -215,6 +275,10 @@ pub(crate) fn resolved(
                 .map(get)
                 .join(" ");
         }
+        "font-variant" => {
+            let parts = VARIANT.map(get);
+            return serialize_variants(&parts.each_ref().map(String::as_str)).unwrap_or_default();
+        }
         "text-decoration" => {
             let mut parts = vec![get("text-decoration-line")];
             for (longhand, initial) in [
@@ -254,12 +318,7 @@ pub(crate) fn resolved(
             };
         }
         "border-block" | "border-inline" => {
-            let [start, end] = if name == "border-block" {
-                ["border-top", "border-bottom"]
-            } else {
-                ["border-left", "border-right"]
-            }
-            .map(get);
+            let [start, end] = ["start", "end"].map(|side| get(&format!("{name}-{side}")));
             return if start == end { start } else { String::new() };
         }
         "margin-block"
@@ -271,7 +330,13 @@ pub(crate) fn resolved(
         | "scroll-margin-block"
         | "scroll-margin-inline"
         | "scroll-padding-block"
-        | "scroll-padding-inline" => {
+        | "scroll-padding-inline"
+        | "border-block-width"
+        | "border-inline-width"
+        | "border-block-style"
+        | "border-inline-style"
+        | "border-block-color"
+        | "border-inline-color" => {
             let mut sides = Vec::new();
             expand(name, "0 1", &mut sides);
             let [start, end] = [0, sides.len().saturating_sub(1)].map(|index| {
@@ -377,6 +442,7 @@ pub(crate) fn resolved(
         return match values.as_slice() {
             [top, right, bottom, left] => shortest([top, right, bottom, left].map(String::as_str)),
             [a, b] if a == b => a.clone(),
+            [order, fallbacks] if name == "position-try" && order == "normal" => fallbacks.clone(),
             _ => values.join(" "),
         };
     }
@@ -696,6 +762,14 @@ pub(crate) fn resolved(
             let [width, height] = size.unwrap_or_default();
             let mut flat = style.clone();
             flat.insert(Prop::TRANSFORM_ORIGIN, "0 0");
+            for prop in [
+                Prop::TRANSLATE,
+                Prop::ROTATE,
+                Prop::SCALE,
+                Prop::OFFSET_PATH,
+            ] {
+                flat.remove(prop);
+            }
             let bounds = renderer::Rect::new(
                 renderer::point(renderer::px(0.), renderer::px(0.)),
                 renderer::size(renderer::px(width), renderer::px(height)),
@@ -855,47 +929,33 @@ pub(crate) fn resolved(
             })
             .collect::<Vec<_>>()
             .join(", "),
-        "clip-path" | "shape-outside" if value.starts_with("inset(") && value.ends_with(')') => {
-            let body = &value[6..value.len() - 1];
-            let (sides, round) = body
-                .split_once(" round ")
-                .map_or((body, None), |(sides, round)| (sides, Some(round.trim())));
-            let sides = match components(sides, ' ')[..] {
-                [a] => [a; 4],
-                [a, b] => [a, b, a, b],
-                [a, b, c] => [a, b, c, b],
-                [a, b, c, d] => [a, b, c, d],
-                _ => return value,
-            };
-            // Like Chrome, each side and radius is a computed length-percentage.
-            let computed = |part: &str| match part.contains('%') {
-                true => percents(part),
-                false => units
-                    .resolve(part, f32::NAN)
-                    .map_or_else(|| part.to_owned(), px),
-            };
-            let sides = sides.map(computed);
-            let round = round.map(|round| {
-                components(round, ' ')
-                    .into_iter()
-                    .map(|part| {
-                        if part == "/" {
-                            part.to_owned()
-                        } else {
-                            computed(part)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            });
-            let mut result = format!("inset({}", shortest(sides.each_ref().map(String::as_str)));
-            if let Some(round) = round {
-                result.push_str(" round ");
-                result.push_str(&round);
-            }
-            result.push(')');
-            result
+        "overflow-clip-margin" => {
+            let parts: Vec<String> = components(&value, ' ')
+                .into_iter()
+                .map(|part| match part.ends_with("-box") {
+                    true => part.to_owned(),
+                    false => amount(part, units),
+                })
+                .collect();
+            specified(name, &parts.join(" "))
         }
+        "mask-repeat" | "background-repeat" => specified(name, &value),
+        "offset-rotate" => match turn(&value, units) {
+            Some((auto, angle)) => {
+                format!("{}{}deg", if auto { "auto " } else { "" }, printed(angle))
+            }
+            None => value,
+        },
+        "offset-anchor" | "offset-position" => match Position::parse(&components(&value, ' ')) {
+            Some(position) => position.text(Some(units)),
+            None => value,
+        },
+        "clip-path" | "offset-path" => match Shaped::parse(&value) {
+            Some(shaped) => shaped.text(Some(units)),
+            None => specified(name, &value),
+        },
+        "shape-outside" => crate::css::value::outside_text(&value, Some(units))
+            .unwrap_or_else(|| specified(name, &value)),
         "transform-origin" | "perspective-origin" => {
             let [width, height] = size.unwrap_or_default();
             let mut parts = components(&value, ' ');
@@ -1131,6 +1191,7 @@ pub(crate) fn resolved(
                     | "column-width"
                     | "column-rule-width"
                     | "-webkit-text-stroke-width"
+                    | "offset-distance"
             ) =>
         {
             // Like Chrome, the offsets of a static box are not used values.
@@ -1293,17 +1354,16 @@ fn tracks(value: &str, units: &Lengths, out: &mut String) {
 
 // The physical property that a logical property name maps to, as the cascade maps it.
 pub(crate) fn physical_name<'a>(style: &Style, name: &'a str) -> Cow<'a, str> {
-    if let Some((_, ltr, rtl)) = LOGICAL.iter().find(|(logical, ..)| logical.name() == name) {
-        return Cow::Borrowed(
-            if style.get(Prop::DIRECTION) == Some("rtl") {
-                rtl
-            } else {
-                ltr
-            }
-            .name(),
-        );
+    if let Some(prop) = Prop::find(name).filter(|prop| prop.is_logical()) {
+        return Cow::Borrowed(crate::css::properties::physical(prop, style).name());
     }
     let mut out = Vec::new();
+    if matches!(
+        name,
+        "-webkit-mask-clip" | "-webkit-mask-composite" | "-webkit-background-clip"
+    ) {
+        return Cow::Borrowed(&name[8..]);
+    }
     if (name.contains("block") || name.contains("inline"))
         && expand(name, "0", &mut out)
         && let [(physical, _)] = &out[..]

@@ -7,7 +7,7 @@ use bbtree::unsync::BBTreeMap;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, path::Path};
 
-const HEADER: &[u8; 8] = b"APP\0\x02\0\0\0";
+const HEADER: &[u8; 8] = b"APP\0\x03\0\0\0";
 
 pub const LINK_SHEET: &str = "apps-sheet";
 

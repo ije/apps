@@ -227,6 +227,7 @@ fn picture_rects(name: &str, page: &str) -> (String, std::collections::HashMap<S
     (text, rects)
 }
 
+mod anchor;
 mod incremental;
 mod layout;
 mod media;

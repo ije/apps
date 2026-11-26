@@ -274,34 +274,54 @@ fn gradient_stops<S: AsRef<str>>(
 pub(crate) fn axis_mask(
     style: &css::properties::Style,
     units: &Lengths,
-    [width, height]: [f32; 2],
+    size: [f32; 2],
     raster: [u32; 2],
 ) -> Option<Option<Vec<u8>>> {
-    let get =
-        |[prop, webkit]: [Prop; 2]| style.get(prop).or_else(|| style.get(webkit)).unwrap_or("");
-    let plain = |value: &str, defaults: &[&str]| {
-        css::value::tokens::components(value, ',')
+    let plain = |prop: Prop, defaults: &[&str]| {
+        css::value::tokens::components(style.get(prop).unwrap_or(""), ',')
             .iter()
             .all(|part| {
                 let part = part.trim();
                 part.is_empty() || defaults.contains(&part)
             })
     };
-    if !plain(
-        get([Prop::MASK_SIZE, Prop::WEBKIT_MASK_SIZE]),
-        &["auto", "auto auto"],
-    ) || !plain(
-        get([Prop::MASK_POSITION, Prop::WEBKIT_MASK_POSITION]),
-        &["0% 0%", "0 0", "left top"],
-    ) {
+    if !plain(Prop::MASK_SIZE, &["auto", "auto auto"])
+        || !plain(
+            Prop::MASK_POSITION,
+            &["0% 0%", "0 0", "0px 0px", "left top"],
+        )
+        || !plain(Prop::MASK_MODE, &["alpha", "match-source"])
+    {
         return None;
     }
-    let images =
-        css::value::tokens::components(get([Prop::MASK_IMAGE, Prop::WEBKIT_MASK_IMAGE]), ',');
+    let images = css::value::tokens::components(style.get(Prop::MASK_IMAGE).unwrap_or(""), ',');
     let composites =
         css::value::tokens::components(style.get(Prop::MASK_COMPOSITE).unwrap_or(""), ',');
     let mut layers = Vec::with_capacity(images.len());
-    for image in &images {
+    for (index, image) in images.iter().enumerate() {
+        let (origin, outline) = super::super::paint::mask::layer_boxes(style, units, size, index);
+        if origin != [0., 0., size[0], size[1]] && !plain(Prop::MASK_REPEAT, &["repeat"]) {
+            return None;
+        }
+        // The coverage of the outline that clips the layer.
+        let cover = match super::super::paint::mask::whole(&outline, size) {
+            false => {
+                let mut mask = tiny_skia::Mask::new(raster[0], raster[1])?;
+                if let Some(path) = css::value::shape::path(&outline) {
+                    mask.fill_path(
+                        &path,
+                        tiny_skia::FillRule::Winding,
+                        true,
+                        tiny_skia::Transform::from_scale(
+                            raster[0] as f32 / size[0],
+                            raster[1] as f32 / size[1],
+                        ),
+                    );
+                }
+                Some(mask.take())
+            }
+            true => None,
+        };
         let mut axes = [
             vec![1f32; raster[0] as usize],
             vec![1f32; raster[1] as usize],
@@ -330,11 +350,15 @@ pub(crate) fn axis_mask(
             }
             _ => return None,
         };
-        let extent = [width, height][axis];
+        let extent = origin[2 + axis];
         let stops = gradient_stops(&parts, prelude, units, extent, false)?;
         let count = raster[axis] as usize;
         for (index, alpha) in axes[axis].iter_mut().enumerate() {
-            let at = (index as f32 + 0.5) * extent / count as f32;
+            let at = (index as f32 + 0.5) * size[axis] / count as f32;
+            let at = match extent == size[axis] {
+                true => at,
+                false => (at - origin[axis]).rem_euclid(extent),
+            };
             let at = if reversed { extent - at } else { at };
             let end = stops.partition_point(|(offset, _)| *offset <= at);
             *alpha *= match (
@@ -351,34 +375,41 @@ pub(crate) fn axis_mask(
                 (None, None) => 1.,
             };
         }
-        layers.push(axes);
+        layers.push((axes, cover));
     }
     // As in `mask_svg`, layers go from the bottom up, and each joins the layers below it by its `mask-composite`.
     let [width, height] = raster.map(|side| side as usize);
     let (last, above) = layers.split_last()?;
-    let ops: Vec<u8> = (0..above.len())
+    let ops = (0..above.len())
         .map(|index| {
             let composite = composites.get(index % composites.len().max(1));
-            match composite.map_or("", |value| value.trim()) {
-                "intersect" | "source-in" => 1,
+            Some(match composite.map_or("", |value| value.trim()) {
+                "intersect" | "source-in" | "destination-in" => 1,
                 "subtract" | "source-out" => 2,
                 "exclude" | "xor" => 3,
-                _ => 0,
-            }
+                "" | "add" | "source-over" | "destination-over" => 0,
+                _ => return None,
+            })
         })
-        .collect();
+        .collect::<Option<Vec<u8>>>()?;
     let mut alpha = Vec::with_capacity(width * height);
     for y in 0..height {
         for x in 0..width {
-            let mut below = last[0][x] * last[1][y];
-            for ([across, down], op) in above.iter().zip(&ops).rev() {
-                let layer = across[x] * down[y];
-                below = match op {
+            let value = |(axes, _): &([Vec<f32>; 2], Option<Vec<u8>>)| axes[0][x] * axes[1][y];
+            let covered = |(_, cover): &([Vec<f32>; 2], Option<Vec<u8>>)| {
+                (cover.as_ref()).map_or(1., |cover| f32::from(cover[y * width + x]) / 255.)
+            };
+            let mut below = value(last) * covered(last);
+            for (layer, op) in above.iter().zip(&ops).rev() {
+                let (cover, layer) = (covered(layer), value(layer));
+                let joined = match op {
                     1 => layer * below,
                     2 => layer * (1. - below),
                     3 => layer * (1. - below) + below * (1. - layer),
                     _ => layer + below * (1. - layer),
                 };
+                // Like Chrome, a layer changes only what its clip covers.
+                below += (joined - below) * cover;
             }
             alpha.push(below);
         }
@@ -910,13 +941,17 @@ fn gradient<'a>(
         for pair in offsets.windows(2) {
             let [(a, (ink_a, alpha_a)), (b, (ink_b, alpha_b))] = [pair[0], pair[1]];
             mixed.push(pair[0]);
-            if ink_a == ink_b || space.is_none() && alpha_a == alpha_b || a == b {
+            let space = space.as_deref();
+            // The longer way between two equal hues is all of them.
+            let longer = space.is_some_and(|space| space.contains("longer"));
+            if ink_a == ink_b && !longer || space.is_none() && alpha_a == alpha_b || a == b {
                 continue;
             }
-            let space = space.as_deref().unwrap_or("srgb");
+            let space = space.unwrap_or("srgb");
+            let count = if longer { 24 } else { 8 };
             let [a_css, b_css] = [css(ink_a, alpha_a), css(ink_b, alpha_b)];
-            for step in 1..8 {
-                let t = step as f32 / 8.;
+            for step in 1..count {
+                let t = step as f32 / count as f32;
                 let mix = format!(
                     "color-mix(in {space}, {a_css} {}%, {b_css})",
                     (1. - t) * 100.

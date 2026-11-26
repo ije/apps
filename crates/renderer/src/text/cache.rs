@@ -1,4 +1,4 @@
-use super::{FontId, Fonts, Line, Wrapping, breaks::breaks};
+use super::{FontId, Fonts, Line, SOFT_HYPHEN, Wrapping, breaks::breaks};
 use crate::{Pixels, px};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::{
@@ -36,6 +36,7 @@ struct Entry {
     text: Rc<str>,
     font_size: Pixels,
     spans: Box<[Span]>,
+    levels: Option<Box<[u8]>>,
     wrap: Option<Wrapping>,
     line: Rc<Line>,
     breaks: Rc<[u32]>,
@@ -70,15 +71,17 @@ impl Cache {
         text: &str,
         font_size: Pixels,
         spans: &[Span],
+        levels: Option<&[u8]>,
         wrap: Option<&Wrapping>,
     ) -> Found {
-        let hash = FxBuildHasher.hash_one((text, font_size, spans, wrap));
+        let hash = FxBuildHasher.hash_one((text, font_size, spans, levels, wrap));
         {
             let state = self.0.borrow();
             if let Some(entry) = state.entries.get(&hash)
                 && *entry.text == *text
                 && entry.font_size == font_size
                 && *entry.spans == *spans
+                && entry.levels.as_deref() == levels
                 && entry.wrap.as_ref() == wrap
             {
                 entry.used.set(state.frame);
@@ -87,7 +90,7 @@ impl Cache {
         }
         let (text, line, breaks) = match wrap {
             Some(wrap) => {
-                let (text, line, _) = self.get(fonts, text, font_size, spans, None);
+                let (text, line, _) = self.get(fonts, text, font_size, spans, levels, None);
                 let mut end = 0;
                 let nowrap: Vec<_> = spans
                     .iter()
@@ -101,7 +104,10 @@ impl Cache {
                 (text, line, breaks)
             }
             None => {
-                let mut line = fonts.shape(text, font_size, spans);
+                let mut line = match levels {
+                    Some(levels) => super::bidi::shape(fonts, text, font_size, spans, levels),
+                    None => fonts.shape(text, font_size, spans),
+                };
                 // Text with a font size of 0 takes no room, so its glyphs have no advance and no metrics.
                 if spans.iter().any(|span| span.size == px(0.)) {
                     let (mut end, mut zero) = (0, Vec::new());
@@ -148,6 +154,7 @@ impl Cache {
             text: text.clone(),
             font_size,
             spans: spans.into(),
+            levels: levels.map(Into::into),
             wrap: wrap.copied(),
             line: line.clone(),
             breaks: breaks.clone(),
@@ -177,27 +184,32 @@ fn space(line: &mut Line, text: &str, spans: &[Span]) {
     let after = |index: usize| {
         let span = &spans[span_at(index)];
         let space = matches!(text[index..].chars().next(), Some(' ' | '\u{a0}'));
+        // Like Chrome, a soft hyphen takes no letter spacing.
+        if text[index..].starts_with(SOFT_HYPHEN) {
+            return px(0.);
+        }
         span.letter_spacing + if space { span.word_spacing } else { px(0.) }
     };
     let mut shift = px(0.);
     let mut previous: Option<usize> = None;
     for glyph in &mut line.glyphs {
         let index = glyph.index as usize;
-        match previous {
-            None => shift += spans[span_at(index)].inset[0],
-            Some(last) if last != index => {
-                shift += after(last);
-                let (from, to) = (span_at(last), span_at(index));
-                if from != to {
-                    shift += spans[from].inset[1];
-                    shift += spans
-                        .get(from + 1..=to)
-                        .unwrap_or_default()
-                        .iter()
-                        .fold(px(0.), |sum, span| sum + span.inset[0]);
+        if previous != Some(index) {
+            match previous {
+                None => shift += spans[span_at(index)].inset[0],
+                Some(last) => {
+                    shift += after(last);
+                    let (from, to) = (span_at(last), span_at(index));
+                    if from != to {
+                        shift += spans[from].inset[1];
+                        shift += spans
+                            .get(from + 1..=to)
+                            .unwrap_or_default()
+                            .iter()
+                            .fold(px(0.), |sum, span| sum + span.inset[0]);
+                    }
                 }
             }
-            Some(_) => {}
         }
         previous = Some(index);
         glyph.x += shift;
@@ -266,14 +278,14 @@ mod tests {
             inset: [px(0.); 2],
             nowrap: false,
         }];
-        let (_, first, _) = cache.get(fonts, "hello", px(16.), &spans, None);
-        let (_, again, _) = cache.get(fonts, "hello", px(16.), &spans, None);
+        let (_, first, _) = cache.get(fonts, "hello", px(16.), &spans, None, None);
+        let (_, again, _) = cache.get(fonts, "hello", px(16.), &spans, None, None);
         assert!(Rc::ptr_eq(&first, &again));
         let wrap = Wrapping {
             width: Some(px(1.)),
             ..Default::default()
         };
-        cache.get(fonts, "hello", px(16.), &spans, Some(&wrap));
+        cache.get(fonts, "hello", px(16.), &spans, None, Some(&wrap));
         assert_eq!(cache.0.borrow().entries.len(), 2);
         for _ in 0..=KEEP_FRAMES {
             cache.end_frame();
@@ -291,7 +303,8 @@ mod tests {
         let again = window.shape_line("cached", px(16.), &run(0xff0000ff));
         assert!(Rc::ptr_eq(&first.line, &again.line));
         let bytes = std::fs::read("/System/Library/Fonts/Supplemental/Chalkduster.ttf").unwrap();
-        text.add_font(bytes, "Chalkduster").unwrap();
+        text.add_font(bytes, "Chalkduster", Default::default(), 0)
+            .unwrap();
         assert!(text.families().iter().any(|family| family == "Chalkduster"));
         let fresh = window.shape_line("cached", px(16.), &run(0));
         assert!(!Rc::ptr_eq(&first.line, &fresh.line));
@@ -336,7 +349,8 @@ mod tests {
             assert!((line.looks[0].len, line.looks[0].color) == look);
         }
         // Spans split where paint changes, even at an empty run, so no ligature forms across.
-        let spans = text.spans(runs.iter().map(|run| (run.len, run)), px(16.));
+        let pieces: Vec<_> = runs.iter().map(|run| (run.len, run)).collect();
+        let spans = text.spans(&pieces, px(16.));
         assert!(spans.len() == 3 && spans[0].len == 3 && spans[2].len == 9);
         let wrapped = text.shape_text(
             "one two three four",

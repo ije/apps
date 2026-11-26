@@ -1,5 +1,5 @@
 use crate::style::keyframes::interpolate::{
-    Lerp, PAINT, add, animatable, computed, interpolate, keeps_box_in_place, lerp,
+    Lerp, PAINT, add, animatable, computed, interpolate, keeps_box_in_place, lerp_of, sized,
 };
 use crate::style::used::resolve_keywords;
 use crate::style::vars::resolve_style;
@@ -196,6 +196,7 @@ pub(crate) fn tracks(
     merge: bool,
 ) -> Vec<(Prop, Vec<Keyframe>)> {
     let mut tracks: Vec<(Prop, Vec<Keyframe>)> = Vec::new();
+    let physical = |key| crate::css::properties::physical(key, style);
     for (offset, declarations, timing) in rules {
         let mut frame = style.clone();
         let mut custom = Vec::new();
@@ -208,7 +209,7 @@ pub(crate) fn tracks(
                         custom.push((key, value.clone()));
                         return None;
                     }
-                    Some((key, value.clone()))
+                    Some((physical(key), value.clone()))
                 }),
         );
         resolve_style(&mut frame, Some(style), None, &custom, registry, theme);
@@ -220,6 +221,7 @@ pub(crate) fn tracks(
             {
                 continue;
             }
+            let key = physical(key);
             let Some(value) = computed(&frame, key, registry) else {
                 continue;
             };
@@ -245,8 +247,12 @@ pub(crate) fn tracks(
         frames.sort_by(|a, b| a.at.total_cmp(&b.at));
         if !key.is_custom() || animatable(*key, registry) {
             for index in 1..frames.len() {
-                frames[index - 1].lerp =
-                    lerp(key.name(), &frames[index - 1].value, &frames[index].value);
+                frames[index - 1].lerp = lerp_of(
+                    *key,
+                    registry,
+                    &sized(style, *key, &frames[index - 1].value),
+                    &sized(style, *key, &frames[index].value),
+                );
             }
         }
     }
@@ -377,10 +383,11 @@ impl Animation {
                 } else {
                     (0..last.max(1))
                         .map(|index| {
-                            lerp(
-                                property.name(),
-                                &keys[index].1,
-                                &keys[(index + 1).min(last)].1,
+                            lerp_of(
+                                *property,
+                                registry,
+                                &sized(base, *property, &keys[index].1),
+                                &sized(base, *property, &keys[(index + 1).min(last)].1),
                             )
                         })
                         .collect()

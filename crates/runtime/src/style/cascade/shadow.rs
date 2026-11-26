@@ -70,6 +70,7 @@ pub(crate) const ELEMENT: usize = usize::MAX;
 pub(crate) const SLOTTED: usize = 12;
 pub(crate) const PART: usize = 13;
 pub(crate) const STARTING: usize = 14;
+pub(crate) const HIGHLIGHT: usize = 22;
 
 #[derive(Clone)]
 pub(crate) struct Passed {

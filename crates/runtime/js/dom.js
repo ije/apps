@@ -21,10 +21,12 @@
   // The parsed page has no layout yet, so the first geometry read must lay it out.
   // The layout count when the page last changed, or a script scrolled, since a layout. A layout after it, like the
   // one of a frame, has the change.
-  let stale = true, staleAt, scrolled = false, scrolledAt, laid = false, version = 0;
+  let stale = true, staleAt, scrolled = false, scrolledAt, laid = false, version = 0, shape = 0;
   const rare = { base: 0, title: 0 };
   let retrying = false;
+  let highlights = new Map(), highlightShape = -1, highlightsQueued = false, looseRanges = 0;
   const flush = () => {
+    if (looseRanges && highlightShape !== shape) queueHighlights();
     if (!size) return;
     let errors;
     try { errors = host('dom.batch', texts.join(''), codes, size); }
@@ -41,7 +43,8 @@
     for (const rec of records) if (rec && !rec.up) try { lists.push(json(host('dom.tree', rec.id))); } catch {}
     if (!lists.length) return;
     version++;
-    for (const rec of records) if (rec) { touch(rec); if (rec.kids.length) rec.kids = []; }
+    for (const rec of records) if (rec?.kids.length) rec.kids = [];
+    shape++;
     ids.clear();
     for (const list of lists) {
       for (let i = 0; i < list.length;) {
@@ -53,7 +56,8 @@
         i = end;
       }
     }
-    for (const rec of records) if (rec?.up && !seen.has(rec)) rec.up = null;
+    for (const rec of records) if (rec) { if (rec.up && !seen.has(rec)) rec.up = null; relist(rec); }
+    wakeAll();
   };
   const drain = () => { scheduled = false; flush(); };
   // Replace trailing lone high surrogates with U+FFFD before concatenation, or adjacent strings can pair them
@@ -61,11 +65,11 @@
   const alone = value => { const last = value.charCodeAt(value.length - 1); return last >= 0xd800 && last < 0xdc00 ? value.slice(0, -1) + '\u{fffd}' : value; };
   const op = (code, a, b = 0, c = 0) => {
     if (size === codes.length) { const grown = new Int32Array(size * 2); grown.set(codes); codes = grown; }
-    changed = stale = true; staleAt = geometry[2]; version++; codes[size] = code; codes[size + 1] = a; codes[size + 2] = typeof b === 'string' ? (texts.push(alone(b)), b.length) : b; codes[size + 3] = typeof c === 'string' ? (texts.push(alone(c)), c.length) : c; size += 4;
+    changed = stale = true; staleAt = geometry[2]; version++; if (code === 2 || code === 3) { shape++; if (readers) { const kid = records[b]; if (code === 2 && kid.up) noteTree(kid, kid.up); noteTree(kid, records[a], code === 3); } } codes[size] = code; codes[size + 1] = a; codes[size + 2] = typeof b === 'string' ? (texts.push(alone(b)), b.length) : b; codes[size + 3] = typeof c === 'string' ? (texts.push(alone(c)), c.length) : c; size += 4;
     if (!scheduled) { scheduled = true; microtask(drain); } else if (size > 1 << 18) flush();
   };
   let webviewScan = true, pickFiles, openSelect;
-  const call = (name, ...args) => { flush(); if (name === 'dom.html') { changed = true; webviewScan ||= /<webview/i.test(args[1]); } if (name === 'dom.scroll') { scrolled = true; scrolledAt = geometry[2]; version++; } else if (name === 'dom.html' || name === 'dom.focus' || name === 'dom.target' || name === 'dom.hover' || name === 'dom.active' || name === 'dom.font' || name === 'dom.animation') { stale = true; staleAt = geometry[2]; version++; } return host(name, ...args); };
+  const call = (name, ...args) => { flush(); if (name === 'dom.html') { changed = true; shape++; webviewScan ||= /<webview/i.test(args[1]); } if (name === 'dom.scroll') { scrolled = true; scrolledAt = geometry[2]; version++; } else if (name === 'dom.html' || name === 'dom.focus' || name === 'dom.target' || name === 'dom.hover' || name === 'dom.active' || name === 'dom.font' || name === 'dom.animation' || name === 'dom.sheet' || name === 'dom.adopt' || name === 'dom.constructed' && args[0] || name === 'dom.popoverSource') { stale = true; staleAt = geometry[2]; version++; } return host(name, ...args); };
   // Keep mirror arrays private. Retain constructors and avoid prototype getters. A nonzero first float means
   // Rust moved the buffer.
   const F32 = Float32Array, U8 = Uint8Array;
@@ -139,8 +143,9 @@
   const rootElement = node => node._m.tag === 'html' && node._m.up === records[0];
   // The viewport without the scroll bars of the page.
   const viewSize = () => { layout(); const [width, height, , , bars] = host('dom.viewport'); return [width - bars[1], height - bars[0]]; };
+  const xmlName = /^[A-Za-z_:\u0080-\uffff][\w:.\u0080-\uffff-]*$/;
   const create = (tag, text = '', from = -1) => {
-    if (!names.has(tag)) { if (!/^[a-z][a-z0-9-]*$/i.test(tag) && !types[tag]) throw new DOMException('Invalid tag', 'InvalidCharacterError'); names.set(tag, tag[0] === '#' ? tag === '#fragment' ? '#document-fragment' : tag : tag.toUpperCase()); }
+    if (!names.has(tag)) { if (!xmlName.test(tag) && !types[tag]) throw new DOMException('Invalid tag', 'InvalidCharacterError'); names.set(tag, tag[0] === '#' ? tag === '#fragment' ? '#document-fragment' : tag : tag.toUpperCase()); }
     if (!pool.length) pool = host('dom.reserve', reserve = Math.min(reserve * 2, 1024)).reverse();
     const id = pool.pop();
     records[id] = new Record(id, tag, text); if (tag.includes('-')) customTags.add(tag); if (from < 0) op(0, id, tag, text); else op(10, id, from); if (tag === 'base' || tag === 'title') rare[tag]++; return id;
@@ -161,7 +166,7 @@
   delete globalThis.__appsTerminal;
   const terminalOf = node => terminalSession?.(terminalSessions.get(node));
   const load = list => {
-    version++; declarative = null;
+    version++; shape++; declarative = null;
     let media = false, radios = null, controls = null;
     for (let i = 0; i < list.length;) {
       const rec = records[list[i]] = new Record(list[i], list[i + 2], list[i + 3]), up = records[list[i + 1]], end = i + 5 + 2 * list[i + 4];
@@ -170,6 +175,7 @@
       if (tag === 'base' || tag === 'title') rare[tag]++;
       if (tag === 'template' && end > i + 5 && rec.attrs.has('shadowrootmode')) (declarative ??= []).push(rec);
       media ||= tag === 'img' || tag === 'video' || tag === 'audio';
+      if (readers) noteNode(rec, up);
       if (tag === 'input' && end > i + 5 && rec.attrs.has('checked')) (radios ??= []).push(rec);
       if ((tag === 'input' || tag === 'select' || tag === 'textarea') && end > i + 5 && limited(rec.attrs)) (controls ??= []).push(rec);
       i = end;
@@ -182,7 +188,39 @@
   const of = rec => rec ? rec.ref?.deref() ?? wrap(rec.id) : null;
   // A cached list holds the wrappers of its nodes, so drop it whenever the children change, or it keeps removed
   // nodes alive.
-  const touch = rec => { const node = rec.ref?.deref(); if (node) node._nodes = node._elements = null; };
+  // `childNodes` and `children` are live, but plain arrays, so that reads are fast: each change of the children
+  // also changes the lists that the page has read. After a change a node holds its lists weakly until the next
+  // read, so lists that the page dropped go away.
+  const listRef = Symbol();
+  const liveList = (node, i) => {
+    const key = i ? '_elements' : '_nodes', list = node[key];
+    if (!list) return node._lists?.[i]?.deref() ?? null;
+    node[key] = null;
+    (node._lists ??= [null, null])[i] = list[listRef] ??= new WeakRef(list);
+    return list;
+  };
+  const listInsert = (node, kid, at) => {
+    const nodes = liveList(node, 0), elements = kid.tag[0] === '#' ? null : liveList(node, 1), kids = node._m.kids;
+    if (nodes) if (at === kids.length - 1) nodes.push(of(kid)); else nodes.splice(at, 0, of(kid));
+    if (elements) {
+      let next = at + 1;
+      while (next < kids.length && kids[next].tag[0] === '#') next++;
+      if (next === kids.length) elements.push(of(kid)); else elements.splice(elements.indexOf(of(kids[next])), 0, of(kid));
+    }
+  };
+  const listRemove = (node, kid, at) => {
+    const nodes = liveList(node, 0), elements = kid.tag[0] === '#' ? null : liveList(node, 1);
+    if (nodes) nodes.splice(at, 1);
+    if (elements) elements.splice(elements.indexOf(of(kid)), 1);
+  };
+  const relist = rec => {
+    const node = rec.ref?.deref();
+    if (!node || !(node._nodes || node._elements || node._lists)) return;
+    const nodes = liveList(node, 0), elements = liveList(node, 1);
+    if (nodes) { nodes.length = 0; for (const kid of rec.kids) nodes.push(of(kid)); }
+    if (elements) { elements.length = 0; for (const kid of rec.kids) if (kid.tag[0] !== '#') elements.push(of(kid)); }
+    if (!nodes && !elements) node._lists = null;
+  };
   const ids = new Map();
   const idAdd = (id, rec) => { const at = ids.get(id); if (!at) ids.set(id, rec); else if (Array.isArray(at)) { if (!at.includes(rec)) at.push(rec); } else if (at !== rec) ids.set(id, [at, rec]); };
   const idDrop = (id, rec) => { const at = ids.get(id); if (at === rec) ids.delete(id); else if (Array.isArray(at)) { const i = at.indexOf(rec); if (i >= 0) at.splice(i, 1); if (at.length === 1) ids.set(id, at[0]); } };
@@ -198,7 +236,7 @@
   const own = rec => rec.text ??= host('dom.source', rec.id);
   const text = root => { let value = ''; const stack = [root]; while (stack.length) { const rec = stack.pop(); if (rec !== root && (rec.tag === '#comment' || rec.tag === '#doctype')) continue; value += own(rec); for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); } return value; };
   const find = (root, test) => { const stack = []; for (let i = root.kids.length; i--;) stack.push(root.kids[i]); while (stack.length) { const rec = stack.pop(); if (test(rec)) return of(rec); if (rec.tag !== 'template') for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); } return null; };
-  const detach = rec => { version++; touch(rec); if (rec.kids.length) { for (const kid of rec.kids) kid.up = null; rec.kids = []; detached = true; } rec.text = ''; };
+  const detach = rec => { version++; shape++; if (rec.kids.length) { if (readers) for (const kid of rec.kids) noteTree(kid, rec); for (const kid of rec.kids) kid.up = null; rec.kids = []; detached = true; relist(rec); } rec.text = ''; };
   const unhold = child => { const parent = child._parent; if (!parent) return; const last = parent._held.pop(); if (last !== child) { parent._held[child._slot] = last; last._slot = child._slot; } };
   const hold = (parent, child) => { unhold(child); child._parent = parent; child._slot = (parent._held ??= []).push(child) - 1; };
   const release = node => { if (node._held) for (const child of node._held) child._parent = null; node._held = null; };
@@ -306,9 +344,9 @@
   const trusted = event => { eventState(event).trusted = true; if (event.view === null) event.view = window; return event; };
   const labelable = rec => /^(button|meter|output|progress|select|textarea)$/.test(rec.tag) || rec.tag === 'input' && rec.attrs.get('type')?.toLowerCase() !== 'hidden';
   const labelControl = label => { const id = label.getAttribute('for'), control = id === null ? find(label._m, labelable) : id && label.getRootNode().getElementById?.(id); return control && labelable(control._m) ? control : null; };
-  const disabled = node => {
-    if (!/^(button|input|select|textarea|optgroup|option|fieldset)$/.test(node.localName)) return false;
-    for (let rec = node._m, child = null; rec && rec.tag[0] !== '#'; child = rec, rec = rec.up) if (rec.attrs.has('disabled') && (rec === node._m || rec.tag === 'fieldset' && rec.kids.find(kid => kid.tag === 'legend') !== child || rec.tag === 'optgroup' && node.localName === 'option')) return true;
+  const disabled = (node, top) => {
+    if (!/^(button|input|select|textarea|optgroup|option|fieldset)$/.test(node.localName) && !node._face) return false;
+    for (let rec = node._m, child = null; rec && rec.tag[0] !== '#'; child = rec, rec = rec === top ? null : rec.up) if (rec.attrs.has('disabled') && (rec === node._m || rec.tag === 'fieldset' && rec.kids.find(kid => kid.tag === 'legend') !== child || rec.tag === 'optgroup' && node.localName === 'option')) return true;
     return false;
   };
   const activation = node => { const tag = node.localName; return tag === 'button' || tag === 'label' || tag === 'input' && /^(checkbox|radio|submit|reset|image|button|file)$/.test(node.type) || (tag === 'a' || tag === 'area') && node._m.attrs.has('href') || tag === 'summary' && node._m.up?.tag === 'details' && node._m.up.kids.find(kid => kid.tag === 'summary') === node._m; };
@@ -343,11 +381,17 @@
     const rec = node._m, tag = rec.tag;
     return /^\s*[+-]?\d/.test(rec.attrs.get('tabindex') ?? '') || node.isContentEditable || /^(select|textarea|button|iframe|dialog|terminal)$/.test(tag) || tag === 'input' && node.type !== 'hidden' || (tag === 'a' || tag === 'area') && rec.attrs.has('href') || tag === 'summary' && activation(node) || !press && scroller(node);
   };
-  const commit = node => { if (node._edited) { node._edited = false; dispatch(node, trusted(new Event('change', { bubbles: true }))); } };
+  // `:user-valid` and `:user-invalid` match with bit 256, which a change by the user and a submit of the form set.
+  const interacted = node => formState(node, node._bits | 256);
+  const edited = node => { if (!node._edited) { node._edited = true; node._before = node.value; } };
+  const commit = node => { if (node._edited) { node._edited = false; interacted(node); if (node.value !== node._before) dispatch(node, trusted(new Event('change', { bubbles: true }))); } };
   const selectors = (name, id, selector, first) => { try { return call(name, id, String(selector), first); } catch (error) { if (/^SyntaxError/.test(error?.message)) throw new DOMException(error.message.replace(/^SyntaxError: /, ''), 'SyntaxError'); throw error; } };
   const toggles = new Map();
   const validated = /^(required|pattern|min|max|step|maxlength|minlength|type|multiple|size|value|name|selected|form)$/;
   const attributeChanged = (element, name, oldValue, value) => {
+    if (name === 'class') { if (readers && classReaders.size) noteClasses(element._m, oldValue, value); return; }
+    if (readers && readAttrs.test(name)) { if (name === 'id' || name === 'name') nameShape++; wake(attrReaders.get(name === 'id' && element._m.tag === 'form' ? 'form id' : name), element._m); }
+    if (faces && name === 'id' && element._m.tag === 'form') for (const other of all(element.getRootNode()._m, rec => { const form = rec.attrs.get('form'); return !!form && (form === oldValue || form === value) && rec.tag.includes('-'); })) if (other._face) faceChanged(other);
     // As in Chrome, a type that gains the selection API starts with the caret at the start.
     if (name === 'type' && element.localName === 'input' && element._files && element.type !== 'file') element._files = null;
     if (name === 'type' && element.localName === 'input' && selectable(element)) { const old = (oldValue ?? '').toLowerCase(); if (!/^(text|search|tel|url|password)$/.test(inputTypes.has(old) ? old : 'text')) { element._start = element._end = 0; element._direction = 'none'; if (active === element) call('dom.selection', element._id, 0, 0); } }
@@ -356,7 +400,9 @@
     else if (name === 'popover' && element._popover && popoverState(oldValue) !== popoverState(value)) hidePopover(element, true, true);
     else if (name === 'open' && element.localName === 'dialog' && value === null) closeDialog(element);
     else if (name === 'checked' && element.localName === 'input' && !element._dirty && (oldValue === null) !== (value === null)) setChecked(element, value !== null);
+    else if (name === 'disabled') { if (faces) if (element._face) faceChanged(element); else if (element.localName === 'fieldset') reactions(element._m, 'formDisabledCallback'); }
     else if (validated.test(name)) {
+      if (name === 'form' && element._face) faceChanged(element);
       revalidate(element.localName === 'option' ? element.select : element);
       if ((name === 'name' || name === 'form') && element.localName === 'input' && element.type === 'radio') { const forms = new Set(); for (const other of element.getRootNode().querySelectorAll?.('input[name=' + quote(name === 'name' ? oldValue ?? '' : element.name) + ']') ?? []) if (other !== element && other.type === 'radio' && !forms.has(other.form)) { forms.add(other.form); revalidate(other); } }
     }
@@ -382,7 +428,7 @@
     const allowed = dispatch(target, event);
     if (kind === 'checkbox' || kind === 'radio') {
       if (!allowed) { if (kind === 'checkbox') { setChecked(activator, previous); activator.indeterminate = indeterminate; } else if (previous) setChecked(previous, true); else setChecked(activator, false); }
-      else if (kind === 'checkbox' || previous !== activator) { dispatch(activator, new Event('input', { bubbles: true, composed: true })); dispatch(activator, new Event('change', { bubbles: true })); }
+      else if (kind === 'checkbox' || previous !== activator) { dispatch(activator, new Event('input', { bubbles: true, composed: true })); if (native) interacted(activator); dispatch(activator, new Event('change', { bubbles: true })); }
     } else if (allowed && activator) {
       const tag = activator.localName, type = tag === 'button' ? activator.type : kind;
       if (tag === 'label') { const control = labelControl(activator), list = path(target); let inner = false; for (let i = 0; list[i] !== activator && !inner; i++) { const node = list[i], name = node.localName; inner = /^(button|details|embed|iframe|label|select|textarea)$/.test(name) || name === 'input' && node.type !== 'hidden' || (name === 'audio' || name === 'video') && node.hasAttribute('controls') || name === 'img' && node.hasAttribute('usemap'); } if (control && !inner && !control.contains(target) && !disabled(control)) { if (focusable(control)) { if (native && control !== active) { mouseFocus = true; hadKey = false; } control.focus(); } fireClick(control, init, native); } }
@@ -447,8 +493,12 @@
       const rec = stack.pop(), Type = (!only || rec.tag === only) && definitions.get(rec.tag), node = Type && (leaving ? rec.ref?.deref() : of(rec));
       if (node && !node._failed) {
         if (!(node instanceof Type)) { if (!leaving) enqueue(node, Type); }
+        else if (name === 'formDisabledCallback') { if (node._face) faceChanged(node); }
         else if (name === 'connectedMoveCallback' && typeof node[name] !== 'function') { enqueue(node, ['disconnectedCallback']); enqueue(node, ['connectedCallback']); }
-        else if (name && typeof node[name] === 'function') enqueue(node, [name]);
+        else {
+          if (name && typeof node[name] === 'function') enqueue(node, [name]);
+          if (faces && node._face) faceChanged(node, leaving ? root : null);
+        }
       }
       if (rec.tag !== 'template') for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]);
       if (rec.shadow) stack.push(rec.shadow);
@@ -459,9 +509,19 @@
     constructing = { node };
     try { new Type(); } catch (error) { node._failed = true; node._reactions.length = 0; throw error; } finally { constructing = null; }
     flag(node, 64, true);
+    if (Type.formAssociated) { faces++; node._face = true; flag(node, 512, true); }
     const observed = defined.get(Type)?.observed;
     if (observed?.size) for (let i = 0, list = node._m.attrs.list; i < list.length; i += 2) if (observed.has(list[i])) node._reactions.push(['attributeChangedCallback', list[i], null, list[i + 1]]);
     if (node.isConnected) node._reactions.push(['connectedCallback']);
+    if (node._face) faceChanged(node);
+  };
+  // Form-associated custom elements: tell one when its form or its disabled state changes.
+  let faces = 0;
+  // A node that leaves its place with `top` has only the ancestors up to `top`.
+  const faceChanged = (node, top) => {
+    const form = formOf(node, top), off = disabled(node, top);
+    if (form !== (node._form ?? null)) { node._form = form; enqueue(node, ['formAssociatedCallback', form]); }
+    if (off !== !!node._off) { node._off = off; enqueue(node, ['formDisabledCallback', off]); }
   };
   const slotChanges = new Set();
   const queueSlot = slot => { if (!slotChanges.size) queueMicrotask(() => { const slots = [...slotChanges]; slotChanges.clear(); for (const slot of slots) dispatch(slot, new Event('slotchange', { bubbles: true })); }); slotChanges.add(slot); };
@@ -483,6 +543,7 @@
   const place = (range, start, node, offset) => {
     const old = start ? range._sc : range._ec;
     if (start) { range._sc = node; range._so = offset; } else { range._ec = node; range._eo = offset; }
+    if (range._lit) { for (const highlight of range._lit) highlight._dirty.add(range); queueHighlights(); }
     if (old === node) return;
     const set = old !== range._sc && old !== range._ec && anchors.get(old._m);
     if (set) { set.delete(range._ref); if (!set.size) anchors.delete(old._m); }
@@ -532,16 +593,17 @@
   const replaceAll = scoped((node, replace) => {
     const rec = node._m;
     const observed = watched(node);
-    if (!rec.kids.length && !observed && !shadows) { replace(ignore); return; }
+    if (!rec.kids.length && !observed && !shadows) { replace(ignore); if (requiredSelects) optionsChanged(rec); return; }
     // A wrapper keeps its removed subtree in the arena until a GC, so only an observer's record wraps the old children.
     const kids = definitions.size > 0 && node.isConnected ? rec.kids.slice() : [], old = observed ? rec.kids.map(of) : [];
     if (rec.kids.length) { if (node._shadow) for (const kid of rec.kids) signal(node, of(kid)); if (iterators.size) iteratorsRemove(node, true); if (anchors.size) inside(rec, (range, at) => shift(range, at, at === rec ? offset => offset > 0 : always, node, () => 0)); }
     let pending = kids.length > 0;
     const removed = () => { if (pending) { pending = false; for (const kid of kids) reactions(kid, 'disconnectedCallback'); } };
     replace(removed); removed();
+    if (requiredSelects) optionsChanged(rec);
     forgetRemoved(node);
     if (shadows) { if (node._shadow) for (const kid of rec.kids) signal(node, of(kid)); slotsIn(node.getRootNode(), rec); }
-    if (observed && (old.length || rec.kids.length)) change({ type: 'childList', target: node, removedNodes: listOf(NodeList, old), addedNodes: node.childNodes });
+    if (observed && (old.length || rec.kids.length)) change({ type: 'childList', target: node, removedNodes: listOf(NodeList, old), addedNodes: listOf(NodeList, rec.kids.map(of)) });
   });
   const convert = children => children.map(child => child instanceof Node ? child : document.createTextNode(String(child)));
   const viable = (node, nodes) => { while (node && nodes.includes(node)) node = node.nextSibling; return node; };
@@ -552,7 +614,7 @@
       if (replaced && !nodes.includes(replaced) && replaced.parentNode === parent) parent.removeChild(replaced);
       return;
     }
-    nodes = nodes.flatMap(node => node.nodeType === 11 ? node.childNodes : [node]);
+    nodes = nodes.flatMap(node => node.nodeType === 11 ? node._m.kids.map(of) : [node]);
     for (const node of nodes) node.parentNode?.removeChild(node);
     const removed = replaced?.parentNode === parent ? [replaced] : [], previousSibling = removed.length ? replaced.previousSibling : before ? before.previousSibling : parent.lastChild;
     quiet++;
@@ -569,19 +631,137 @@
   });
   const setHTML = (node, value, inert = false) => replaceAll(node, removed => {
     const list = json(node.nodeType === 1 ? call('dom.html', node._id, String(value), contextTag(node)) : call('dom.html', node._id, String(value)));
-    release(node); detach(node._m); const media = load(list); removed();
+    release(node); detach(node._m); const media = load(list); relist(node._m); removed();
     if (!inert) { if (media) __appsImages(node); if (definitions.size) for (const kid of node._m.kids) reactions(kid); }
   });
-  class List extends Array { static get [Symbol.species]() { return Array; } item(index) { return this[index] ?? null; } }
+  class List extends Array { static get [Symbol.species]() { return Array; } item(index) { return this[index] ?? null; } toString() { return Object.prototype.toString.call(this); } }
   class NodeList extends List {}
-  class HTMLCollection extends List { namedItem(name) { return this.find(element => element.id === name || element.getAttribute('name') === name) ?? null; } }
+  // Lists give these to the runtime's own code, as a property of the page can hide a method.
+  const raw = Symbol(), lookup = Symbol(), owner = Symbol();
+  class HTMLCollection extends List { namedItem(name) { if (name === '') return null; for (const element of this[raw] ?? this) if (element._m.attrs.get('id') === name || element.namespaceURI === XHTML && element._m.attrs.get('name') === name) return element; return null; } }
+  // Other live lists are proxies that look for their nodes again after a change of what they read: elements with some
+  // tags or classes below a root, and some attributes. Only lists that are up to date wait for changes, by what they
+  // read and by their root, or under null without one.
+  let readers = 0, readersLimit = 1024, nameShape = 0;
+  const tagReaders = new Map(), classReaders = new Map(), attrReaders = new Map(), readAttrs = /^(id|name|type|form|for|href)$/;
+  // Lists of elements by tag or class only lose `gone`, an element that leaves the tree.
+  const wakeSet = (roots, root, gone) => {
+    const set = roots.get(root);
+    if (!set) return;
+    readers -= set.size;
+    for (const ref of set) {
+      const reader = ref.deref();
+      if (reader && gone && reader.reads.drops && !reader.stale) { reader.drop(gone); continue; }
+      if (reader) reader.stale = true;
+      set.delete(ref);
+    }
+    if (set.size) readers += set.size; else roots.delete(root);
+  };
+  const wake = (roots, at, gone) => {
+    if (!roots?.size) return;
+    wakeSet(roots, null, gone);
+    for (let rec = at; rec && roots.size; rec = rec.up) wakeSet(roots, rec, gone);
+  };
+  const wakeAll = () => { for (const map of [tagReaders, classReaders]) for (const roots of map.values()) for (const root of [...roots.keys()]) wakeSet(roots, root); };
+  const noteClasses = (rec, old, value) => {
+    const before = old ? old.split(/[\t\n\f\r ]+/) : [], after = value ? value.split(/[\t\n\f\r ]+/) : [];
+    for (const name of before) if (classReaders.has(name) && !after.includes(name)) wake(classReaders.get(name), rec);
+    for (const name of after) if (classReaders.has(name) && !before.includes(name)) wake(classReaders.get(name), rec);
+  };
+  const noteNode = (rec, parent, leaves) => {
+    const gone = leaves ? rec : null;
+    if (!parent || rec.tag[0] === '#') return;
+    wake(tagReaders.get(rec.tag), parent, gone); wake(tagReaders.get('*'), parent, gone);
+    if (rec.tag.includes('-')) wake(tagReaders.get('-'), parent);
+    if (classReaders.size) { const value = rec.attrs.get('class'); if (value) for (const name of value.split(/[\t\n\f\r ]+/)) wake(classReaders.get(name), parent, gone); }
+  };
+  // A node that joins or leaves `parent`. A big subtree counts as a change of everything.
+  const noteTree = (kid, parent, leaves = false) => {
+    if (!kid.kids.length) return noteNode(kid, parent, leaves);
+    const stack = [kid];
+    for (let count = 0; stack.length; count++) {
+      if (count === 64) return wakeAll();
+      const rec = stack.pop();
+      noteNode(rec, parent, leaves);
+      for (const kid of rec.kids) stack.push(kid);
+    }
+  };
+  const reserved = new Map();
+  class Live {
+    constructor(read, reads, named) { this.read = read; this.reads = reads; this.version = reads ? -1 : 0; this.ref = this.list = null; this.named = named; this.stale = true; this.names = null; this.namesAt = 0; }
+    drop(rec) { const list = this.list, last = list.length - 1; if (last < 0) return; const at = list[0]._m === rec ? 0 : list[last]._m === rec ? last : list.findIndex(node => node._m === rec); if (at >= 0) { if (at === last) list.length = last; else list.splice(at, 1); this.names = null; } }
+    sync(list) {
+      if (this.version >= 0 ? this.version !== version || this.stale : this.stale) {
+        if (this.version >= 0) this.version = version;
+        this.stale = false; this.names = null; this.list = list;
+        if (this.reads) waitFor(this, this.reads);
+        const found = this.read(); list.length = found.length;
+        for (let i = 0; i < found.length; i++) if (list[i] !== found[i]) list[i] = found[i];
+      }
+      return list;
+    }
+    // The elements by `id` and `name`. Like the properties of the browser's lists, they hide nothing but array methods.
+    byName(list, key, hidden = false) {
+      const code = typeof key === 'string' && this.named ? key.charCodeAt(0) : 48;
+      if (code >= 48 && code <= 57) return undefined;
+      if (!hidden) {
+        let own = reserved.get(Object.getPrototypeOf(list));
+        if (!own) {
+          own = new Set(Object.getOwnPropertyNames(Object.prototype).concat('length'));
+          for (let type = Object.getPrototypeOf(list); type !== Array.prototype; type = Object.getPrototypeOf(type)) for (const name of Object.getOwnPropertyNames(type)) own.add(name);
+          reserved.set(Object.getPrototypeOf(list), own);
+        }
+        if (own.has(key)) return undefined;
+      }
+      if (!this.names || this.namesAt !== nameShape) {
+        this.names = new Map(); this.namesAt = nameShape;
+        for (const node of list) for (const name of new Set([node._m.attrs.get('id'), node.namespaceURI === XHTML ? node._m.attrs.get('name') : ''])) if (name) { const found = this.names.get(name); if (found) found.push(node); else this.names.set(name, [node]); }
+      }
+      const found = this.names.get(key);
+      return found && (found.length > 1 ? this.named(key, found) : found[0]);
+    }
+    get(list, key) {
+      if (this.version >= 0 || this.stale) this.sync(list);
+      if (typeof key === 'string') { const code = key.charCodeAt(0); if (code >= 48 && code <= 57 || key === 'length') return list[key]; return this.byName(list, key) ?? list[key]; }
+      if (key === raw) return list; if (key === lookup) return name => this.byName(list, name, true);
+      return list[key];
+    }
+    has(list, key) { this.sync(list); return key in list || this.byName(list, key) !== undefined; }
+    set(list, key, value) { list[key] = value; return true; }
+    ownKeys(list) { this.byName(this.sync(list), 'x'); return [...new Set(Reflect.ownKeys(list).filter(key => key !== owner).concat(this.names ? [...this.names.keys()].filter(key => this.byName(list, key)) : []))]; }
+    getOwnPropertyDescriptor(list, key) { this.sync(list); const own = Reflect.getOwnPropertyDescriptor(list, key); if (own) return own; const value = this.byName(list, key); return value && { value, configurable: true, enumerable: false, writable: false }; }
+  }
+  const collections = new WeakMap(), first = (_, found) => found[0];
+  const waitFor = (reader, { root = null, tags = [], classes = [], attrs = [] }) => {
+    const ref = reader.ref ??= new WeakRef(reader);
+    for (const [map, keys] of [[tagReaders, tags], [classReaders, classes], [attrReaders, attrs]]) for (const key of keys) {
+      let roots = map.get(key); if (!roots) map.set(key, roots = new Map());
+      let set = roots.get(root); if (!set) roots.set(root, set = new Set());
+      readers -= set.size; set.add(ref); readers += set.size;
+    }
+    if (readers <= readersLimit) return;
+    readers = 0;
+    for (const map of [tagReaders, classReaders, attrReaders]) for (const [key, roots] of map) {
+      for (const [root, set] of roots) { for (const ref of set) if (!ref.deref()) set.delete(ref); readers += set.size; if (!set.size) roots.delete(root); }
+      if (!roots.size) map.delete(key);
+    }
+    readersLimit = Math.max(1024, readers * 2);
+  };
+  // The live list `key` of a node, the same one while the page holds it. It reads everything without `reads`.
+  const live = (node, key, Type, read, reads, named = first, handler = Live) => {
+    let lists = collections.get(node);
+    if (!lists) collections.set(node, lists = new Map());
+    let list = lists.get(key)?.deref();
+    if (!list) {
+      if (lists.size >= (lists.limit ?? 32)) { for (const [key, ref] of lists) if (!ref.deref()) lists.delete(key); lists.limit = Math.max(32, lists.size * 2); }
+      const items = listOf(Type, []), reader = new handler(read, reads, named);
+      items[owner] = node; list = new Proxy(items, reader); lists.set(key, new WeakRef(list));
+    }
+    return list;
+  };
+  const all = (root, test) => { const found = []; find(root, rec => { if (rec.tag[0] !== '#' && test(rec)) found.push(of(rec)); return false; }); return found; };
   class NamedNodeMap extends List { getNamedItem(name) { return this.find(attr => attr.name === name) ?? null; } }
   class DOMRectList extends List {}
-  class Attr {
-    constructor(ownerElement, name, value) { Object.assign(this, { ownerElement, name, localName: name, nodeName: name, nodeType: 2, namespaceURI: null, prefix: null, specified: true }); this._value = value; }
-    get value() { return this.ownerElement?._m.attrs.get(this.name) ?? this._value; } set value(value) { this._value = String(value); this.ownerElement?.setAttribute(this.name, this._value); }
-    get nodeValue() { return this.value; } set nodeValue(value) { this.value = value; }
-  }
   const badAttr = name => { if (!name || /[\0\t\n\f\r />=]/.test(name)) throw new DOMException(`'${name}' is not a valid attribute name`, 'InvalidCharacterError'); return name; };
   const attrNode = (element, name) => { const nodes = element._attrs ??= new Map(); let attr = nodes.get(name); if (attr?.ownerElement !== element) nodes.set(name, attr = new Attr(element, name, element._m.attrs.get(name))); return attr; };
   const token = value => { value = String(value); if (!value) throw new DOMException('Token is empty', 'SyntaxError'); if (/[\t\n\f\r ]/.test(value)) throw new DOMException('Token contains whitespace', 'InvalidCharacterError'); return value; };
@@ -611,12 +791,12 @@
     toString() { return rawList(this).value; }
   }
   class Node {
-    constructor(id, tag) { const rec = this._m = records[id]; this._id = id; this._nodes = this._elements = this._held = null; this._parent = null; this._slot = 0; rec.ref = new WeakRef(this); wrapped.push(rec); registered.push(id); this.nodeType = types[tag] ?? 1; this.nodeName = names.get(tag) ?? (tag[0] === '#' ? tag === '#fragment' ? '#document-fragment' : tag : tag.toUpperCase()); }
+    constructor(id, tag) { if (id === null) { this._m = new Record(null, tag, ''); this.nodeType = 2; return; } const rec = this._m = records[id]; this._id = id; this._nodes = this._elements = this._lists = this._held = null; this._parent = null; this._slot = 0; rec.ref = new WeakRef(this); wrapped.push(rec); registered.push(id); this.nodeType = types[tag] ?? 1; this.nodeName = names.get(tag) ?? (tag[0] === '#' ? tag === '#fragment' ? '#document-fragment' : tag : tag.toUpperCase()); }
     get ownerDocument() { if(this.nodeType===9)return null;const root=this.getRootNode();return root.nodeType===9?root:root._owner??document; }
     get parentNode() { return of(this._m.up); }
     get parentElement() { const up = this._m.up; return up && up.tag[0] !== '#' ? of(up) : null; }
     get assignedSlot() { const slot = assignedSlot(this); return slot?.getRootNode().mode === 'closed' ? null : slot; }
-    get childNodes() { return this._nodes ??= listOf(NodeList, this._m.kids.map(of)); }
+    get childNodes() { return this._nodes ??= liveList(this, 0) ?? listOf(NodeList, this._m.kids.map(of)); }
     get firstChild() { return of(this._m.kids[0]); }
     get lastChild() { const kids = this._m.kids; return of(kids[kids.length - 1]); }
     get nextSibling() { const rec = this._m; if (!rec.up) return null; const next = rec.up.kids[index(rec) + 1]; if (next) next.i = rec.i + 1; return of(next); }
@@ -625,14 +805,14 @@
     get textContent() { return text(this._m); }
     set textContent(value) {
       value = String(value ?? '');
-      if (this.nodeType === 3 || this.nodeType === 8) { this.data = value; return; }
+      if (this instanceof CharacterData) { this.data = value; return; }
       // Like Chrome, keep a text child with the same text. The standard replaces it, so observers still see that.
       const kids = this._m.kids;
       if (value ? kids.length === 1 && kids[0].tag === '#text' && own(kids[0]) === value && !watched(this) : !kids.length && !own(this._m)) return;
-      replaceAll(this, () => { release(this); detach(this._m); op(1, this._id, ''); if (value) { const text = document.createTextNode(value); op(2, this._id, text._id, -1); text._m.up = this._m; text._m.i = 0; this._m.kids.push(text._m); hold(this, text); } });
+      replaceAll(this, () => { release(this); detach(this._m); op(1, this._id, ''); if (value) { const text = document.createTextNode(value); op(2, this._id, text._id, -1); text._m.up = this._m; text._m.i = 0; this._m.kids.push(text._m); hold(this, text); relist(this._m); } });
     }
-    get nodeValue() { return this.nodeType === 3 || this.nodeType === 8 ? this.textContent : null; }
-    set nodeValue(value) { if (this.nodeType === 3 || this.nodeType === 8) this.textContent = value; }
+    get nodeValue() { return this instanceof CharacterData ? this.textContent : null; }
+    set nodeValue(value) { if (this instanceof CharacterData) this.textContent = value; }
     appendChild(child) { return this.insertBefore(child, null); }
     insertBefore(child, before) {
       if (!(child instanceof Node)) throw new TypeError('Expected a Node');
@@ -650,9 +830,9 @@
         const drain = !anchors.size && !iterators.size && !frag.host;
         // Move unwrapped children as records to avoid retaining removed trees. Keep SVG wrapping: wrap infers
         // namespaces from parents.
-        if (drain && !observed && !this._shadow && !child._svg && !this._svg && !(this instanceof SVGElement) && (this.nodeType === 1 || this.nodeType === 11 || this._id === 0) && kids.some(kid => !kid.ref?.deref() && kid.tag !== 'link')) {
+        if (drain && !observed && !(this._nodes || this._elements || this._lists) && !this._shadow && !child._svg && !this._svg && !(this instanceof SVGElement) && (this.nodeType === 1 || this.nodeType === 11 || this._id === 0) && kids.some(kid => !kid.ref?.deref() && kid.tag !== 'link')) {
           const connected = definitions.size > 0 && this.isConnected, root = shadows ? this.getRootNode() : null;
-          touch(frag); touch(rec); frag.kids = []; for (const kid of kids) kid.up = null;
+          frag.kids = []; for (const kid of kids) { kid.up = null; if (readers) noteTree(kid, frag); } relist(frag);
           // Insert each run before `ref` with one copy, not one splice per child.
           let run = [];
           const flush = () => {
@@ -667,18 +847,19 @@
             if (!ref) kid.i = rec.kids.push(kid) - 1;
           }
           flush();
+          if (requiredSelects) optionsChanged(rec);
           forgetRemoved();
           return child;
         }
         const nodes = kids.map(of);
-        if (drain) { touch(frag); frag.kids = []; for (const kid of kids) kid.up = null; }
+        if (drain) { frag.kids = []; for (const kid of kids) { kid.up = null; if (readers) noteTree(kid, frag); } relist(frag); }
         quiet++;
         try { for (const node of nodes) this.insertBefore(node, before); } finally { quiet--; }
         if (observed) { change({ type: 'childList', target: child, removedNodes: listOf(NodeList, nodes) }); change({ type: 'childList', target: this, addedNodes: listOf(NodeList, nodes), previousSibling: nodes[0].previousSibling, nextSibling: before }); }
         return child;
       }
       const rec = this._m, kid = child._m, ref = before?._m ?? null;
-      if (child.nodeType === 9 || child.nodeType === 10 && this.nodeType !== 9 || this.nodeType !== 1 && this.nodeType !== 11 && this.nodeType !== 9) throw new DOMException(child.nodeType === 9 || child.nodeType === 10 ? 'Invalid child' : 'Invalid parent', 'HierarchyRequestError');
+      if (child.nodeType === 9 || child.nodeType === 2 || child.nodeType === 10 && this.nodeType !== 9 || this.nodeType !== 1 && this.nodeType !== 11 && this.nodeType !== 9) throw new DOMException(child.nodeType === 9 || child.nodeType === 10 ? 'Invalid child' : 'Invalid parent', 'HierarchyRequestError');
       if (ref && ref.up !== rec) throw new DOMException('Reference is not a child', 'NotFoundError');
       for (let up = rec; up; up = up.up ?? up.host) if (up === kid) throw new DOMException('Cannot create a DOM cycle', 'HierarchyRequestError');
       if (this.nodeType === 9 && (child.nodeType === 3 || child.nodeType === 1 && rec.kids.some(other => other !== kid && other !== ref && other.tag[0] !== '#'))) throw new DOMException('A document has one element and no text', 'HierarchyRequestError');
@@ -693,9 +874,13 @@
       // Keep the option a select shows by default, so a new option inserted before it doesn't take its place.
       if (ref && (rec.tag === 'select' || rec.tag === 'optgroup' && rec.up?.tag === 'select')) selectedness(rec.tag === 'select' ? this : of(rec.up));
       op(2, this._id, child._id, ref ? ref.id : -1);
-      if (ref !== kid) { touch(rec); if (kid.up) { touch(kid.up); kid.up.kids.splice(index(kid), 1); } kid.up = rec; if (ref) rec.kids.splice(kid.i = index(ref), 0, kid); else kid.i = rec.kids.push(kid) - 1; }
+      if (ref !== kid) {
+        if (kid.up) { const from = kid.up.ref?.deref(), at = index(kid); kid.up.kids.splice(at, 1); if (from && (from._nodes || from._elements || from._lists)) listRemove(from, kid, at); }
+        kid.up = rec; if (ref) rec.kids.splice(kid.i = index(ref), 0, kid); else kid.i = rec.kids.push(kid) - 1;
+        if (this._nodes || this._elements || this._lists) listInsert(this, kid, kid.i);
+      }
       hold(this, child);
-      if (rec.tag === 'select' || rec.tag === 'optgroup') revalidate(rec.tag === 'select' ? this : this.parentElement);
+      if (rec.tag === 'select' || rec.tag === 'optgroup') revalidate(rec.tag === 'select' ? this : this.parentElement); else if (requiredSelects) optionsChanged(rec);
       if (ref && anchors.size) { const at = index(kid); each(rec, range => shift(range, rec, offset => offset > at, this, offset => offset + 1)); }
       if (connected && moving && child.isConnected) reactions(kid, 'connectedMoveCallback');
       else { if (connected) reactions(kid, 'disconnectedCallback'); if (definitions.size && child.isConnected) reactions(kid, 'connectedCallback'); }
@@ -712,8 +897,8 @@
       const record = observed ? { type: 'childList', target: this, removedNodes: listOf(NodeList, [child]), previousSibling: child.previousSibling, nextSibling: child.nextSibling } : null;
       if (this._shadow) signal(this, child);
       rangesRemove(this, child, i);
-      op(3, this._id, child._id); this._nodes = this._elements = null; this._m.kids.splice(i, 1); kid.up = null; unhold(child); child._parent = null;
-      if (this._m.tag === 'select' || this._m.tag === 'optgroup') revalidate(this._m.tag === 'select' ? this : this.parentElement);
+      op(3, this._id, child._id); this._m.kids.splice(i, 1); kid.up = null; if (this._nodes || this._elements || this._lists) listRemove(this, kid, i); unhold(child); child._parent = null;
+      if (this._m.tag === 'select' || this._m.tag === 'optgroup') revalidate(this._m.tag === 'select' ? this : this.parentElement); else if (requiredSelects) optionsChanged(this._m);
       if (connected) reactions(kid, 'disconnectedCallback');
       forgetRemoved(this, this._m.kids[i] ?? null);
       if (record) change(record);
@@ -722,7 +907,7 @@
     replaceChild(child, old) {
       if (!(old instanceof Node) || old._m.up !== this._m) throw new DOMException('Node is not a child', 'NotFoundError');
       if (child === old) return old;
-      const observed = observers.size > 0 && !quiet, previousSibling = observed ? old.previousSibling : null, nextSibling = observed ? old.nextSibling === child ? child.nextSibling : old.nextSibling : null, addedNodes = observed ? child.nodeType === 11 ? child.childNodes : listOf(NodeList, [child]) : null;
+      const observed = observers.size > 0 && !quiet, previousSibling = observed ? old.previousSibling : null, nextSibling = observed ? old.nextSibling === child ? child.nextSibling : old.nextSibling : null, addedNodes = observed ? listOf(NodeList, child.nodeType === 11 ? child._m.kids.map(of) : [child]) : null;
       quiet++;
       try { this.insertBefore(child, old); this.removeChild(old); } finally { quiet--; }
       if (observed) change({ type: 'childList', target: this, addedNodes, removedNodes: listOf(NodeList, [old]), previousSibling, nextSibling });
@@ -736,7 +921,8 @@
     contains(node) { for (let rec = node?._m; rec; rec = rec.up) if (rec === this._m) return true; return false; }
     getRootNode(options) { const composed = options?.composed; let rec = this._m; while (rec.up ?? (composed ? rec.host : null)) rec = rec.up ?? rec.host; return of(rec); }
     cloneNode(deep = false) {
-      const cloned = this.nodeType === 3 ? document.createTextNode(this.data) : this.nodeType === 8 ? document.createComment(this.data) : this.nodeType === 11 ? document.createDocumentFragment() : this.namespaceURI === XHTML ? wrap(create(this.localName)) : document.createElementNS(this.namespaceURI, this.localName);
+      if (this.nodeType === 9) { const copy = this instanceof XMLDocument ? new XMLDocument(this._type) : wrap(create('#document')); copy._declaration = this._declaration; if (deep) for (const kid of this._m.kids.map(of)) copy.append(kid.nodeType === 10 ? document.implementation.createDocumentType(kid.name, kid.publicId, kid.systemId) : kid.cloneNode(true)); return copy; }
+      const cloned = this.nodeType === 4 ? document.createTextNode(this.data) : this.nodeType === 7 ? new ProcessingInstruction(create('#comment', this.data), this.target) : this.nodeType === 3 ? document.createTextNode(this.data) : this.nodeType === 8 ? document.createComment(this.data) : this.nodeType === 11 ? document.createDocumentFragment() : this.namespaceURI === XHTML ? wrap(create(this.localName)) : document.createElementNS(this.namespaceURI, this._m.tag);
       if (this.nodeType === 1) { for (let i = 0, list = this._m.attrs.list; i < list.length; i += 2) cloned.setAttribute(list[i], list[i + 1]); if (this._value !== undefined) setValue(cloned, this._value); if (this._files) { cloned._files = fileList([...this._files]); showFiles(cloned); } if (this._checked !== undefined) { setChecked(cloned, this._checked); cloned._dirty = this._dirty; } if (this._selected !== undefined) cloned._selected = this._selected; }
       // Loop, not recursion: deep trees overflow the JavaScript stack. Fill each copy before it joins its parent.
       // Plain elements, texts and comments copy as records (op 10) and get wrappers only when read, so the namespace
@@ -763,20 +949,20 @@
         for (let i = nodes.length - 5; i >= 0; i -= 5) {
           const parent = nodes[i + 2], start = starts[i / 5], end = starts[i / 5 + 1] ?? nodes.length;
           if (start === end) continue;
-          touch(parent);
           for (let j = start; j < end; j += 5) {
             const kid = nodes[j + 2];
             if (nodes[i + 3] && (nodes[j + 3] || parent.tag === 'select' || parent.tag === 'optgroup')) nodes[i + 3].appendChild(nodes[j + 3] ?? of(kid));
             else { kid.up = parent; kid.i = parent.kids.push(kid) - 1; op(2, parent.id, kid.id, -1); if (nodes[j + 3]) held.push(parent, nodes[j + 3]); }
           }
+          relist(parent);
         }
         for (let i = 0; i < held.length; i += 2) hold(of(held[i]), held[i + 1]);
       }
       const Type = this.nodeType === 1 && definitions.get(cloned.localName); if (Type) enqueue(cloned, Type); return cloned;
     }
     isSameNode(other) { return this === other; }
-    lookupNamespaceURI(prefix) { if (prefix === 'xml') return 'http://www.w3.org/XML/1998/namespace'; if (prefix === 'xmlns') return 'http://www.w3.org/2000/xmlns/'; if (prefix) return null; const node = this.nodeType === 9 ? this.documentElement : this.nodeType === 1 ? this : this.parentElement; return node?.namespaceURI ?? null; }
-    lookupPrefix() { return null; }
+    lookupNamespaceURI(prefix) { if (prefix === 'xml') return 'http://www.w3.org/XML/1998/namespace'; if (prefix === 'xmlns') return 'http://www.w3.org/2000/xmlns/'; const node = this.nodeType === 9 ? this.documentElement : this.nodeType === 1 ? this : this.parentElement; for (let up = node; up; up = up.parentElement) { if ((up.prefix ?? null) === (prefix || null) && up.namespaceURI) return up.namespaceURI; const value = up._m.attrs.get(prefix ? 'xmlns:' + prefix : 'xmlns'); if (value !== undefined) return value || null; } return null; }
+    lookupPrefix(namespace) { if (!namespace) return null; for (let up = this.nodeType === 9 ? this.documentElement : this.nodeType === 1 ? this : this.parentElement; up; up = up.parentElement) { if (up.namespaceURI === namespace && up.prefix) return up.prefix; for (const [key, value] of up._m.attrs) if (value === namespace && key.startsWith('xmlns:')) return key.slice(6); } return null; }
     isDefaultNamespace(namespace) { return this.lookupNamespaceURI(null) === (namespace || null); }
     isEqualNode(other) {
       if (!(other instanceof Node)) return false;
@@ -788,13 +974,23 @@
       return true;
     }
     compareDocumentPosition(other) { if (this === other) return 0; const [a, b] = [this._m, other._m].map(rec => { const chain = []; for (; rec; rec = rec.up) chain.push(rec); return chain.reverse(); }); if (a[0] !== b[0]) return 1 | 32 | (a[0].id < b[0].id ? 4 : 2); let i = 0; while (a[i] && a[i] === b[i]) i++; if (i === a.length) return 4 | 16; if (i === b.length) return 2 | 8; return index(a[i]) < index(b[i]) ? 4 : 2; }
-    normalize() { for (const child of this.childNodes) { if (child.nodeType !== 3) { child.normalize(); continue; } if (child.parentNode !== this) continue; if (!child.length) { child.remove(); continue; } for (let next = child.nextSibling; next?.nodeType === 3; next = child.nextSibling) { const length = child.length, at = index(next._m); child.appendData(next.data); if (anchors.size) { each(next._m, range => shift(range, next._m, always, child, o => o + length)); each(this._m, range => shift(range, this._m, o => o === at, child, () => length)); } next.remove(); } } }
+    normalize() { for (const child of this._m.kids.map(of)) { if (child.nodeType !== 3) { child.normalize(); continue; } if (child.parentNode !== this) continue; if (!child.length) { child.remove(); continue; } for (let next = child.nextSibling; next?.nodeType === 3; next = child.nextSibling) { const length = child.length, at = index(next._m); child.appendData(next.data); if (anchors.size) { each(next._m, range => shift(range, next._m, always, child, o => o + length)); each(this._m, range => shift(range, this._m, o => o === at, child, () => length)); } next.remove(); } } }
     addEventListener(name, fn, options = false) { if (!fn || options?.signal?.aborted) return; name = String(name); const capture = typeof options === 'boolean' ? options : !!options?.capture; let listeners = events.get(this); if (!listeners) events.set(this, listeners = new Map()); const list = listeners.get(name) ?? []; if (list.some(item => item.fn === fn && item.capture === capture)) return; const scroll = name === 'wheel' || name === 'mousewheel' || name === 'touchstart' || name === 'touchmove'; if (name === 'wheel' && !wheeling) { wheeling = true; call('dom.wheel'); } if (name === 'animationiteration' && !iterating) { iterating = true; call('dom.iterations'); } if (name === 'scrollend') ending = true; const item = { fn, capture, once: !!options?.once, passive: !!(options?.passive ?? (scroll && (this === globalThis || this === document || this === document.documentElement || this === document.body))), signal: options?.signal, abort: null }; list.push(item); listeners.set(name, list); item.signal?.addEventListener('abort', item.abort = () => { const now = listeners.get(name); if (now.includes(item)) listeners.set(name, now.filter(other => other !== item)); }, { once: true }); }
     removeEventListener(name, fn, options = false) { name = String(name); const capture = typeof options === 'boolean' ? options : !!options?.capture, listeners = events.get(this), list = listeners?.get(name), item = list?.find(item => item.fn === fn && item.capture === capture); if (!item) return; item.signal?.removeEventListener('abort', item.abort); listeners.set(name, list.filter(other => other !== item)); }
     dispatchEvent(event) { if (!(event instanceof Event)) throw new TypeError('Expected an Event'); const state = eventState(event); if (!state.dispatching) state.trusted = false; return event.type === 'click' && event instanceof MouseEvent ? activateClick(this, event) : dispatch(this, event); }
   }
   Object.setPrototypeOf(Node.prototype, EventTarget.prototype); Object.setPrototypeOf(Node, EventTarget);
   for (const [name, value] of Object.entries({ ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4, PROCESSING_INSTRUCTION_NODE: 7, COMMENT_NODE: 8, DOCUMENT_NODE: 9, DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11, DOCUMENT_POSITION_DISCONNECTED: 1, DOCUMENT_POSITION_PRECEDING: 2, DOCUMENT_POSITION_FOLLOWING: 4, DOCUMENT_POSITION_CONTAINS: 8, DOCUMENT_POSITION_CONTAINED_BY: 16, DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC: 32 })) { Node[name] = value; Node.prototype[name] = value; }
+  class Attr extends Node {
+    constructor(ownerElement, name, value) { super(null, '#attr'); this.ownerElement = ownerElement; this.name = this.nodeName = name; this.localName = ownerElement && ownerElement.namespaceURI !== XHTML ? name.replace(/^.*:/, '') : name; this.prefix = this.localName === name ? null : name.slice(0, -this.localName.length - 1); this.namespaceURI = ownerElement?._spaces?.get(name) ?? (this.prefix ? ownerElement.lookupNamespaceURI(this.prefix) : null); this.specified = true; this._value = value; }
+    get value() { return this.ownerElement?._m.attrs.get(this.name) ?? this._value; } set value(value) { this._value = String(value); this.ownerElement?.setAttribute(this.name, this._value); }
+    get nodeValue() { return this.value; } set nodeValue(value) { this.value = value ?? ''; }
+    get textContent() { return this.value; } set textContent(value) { this.value = value ?? ''; }
+    get ownerDocument() { return this.ownerElement?.ownerDocument ?? document; }
+    getRootNode() { return this; }
+    cloneNode() { return new Attr(null, this.name, this.value); }
+    isEqualNode(other) { return other instanceof Attr && other.name === this.name && other.value === this.value; }
+  }
   class CharacterData extends Node {
     get data() { return own(this._m); } set data(value) { this.replaceData(0, this.length, String(value ?? '')); }
     get length() { return this.data.length; }
@@ -806,7 +1002,7 @@
       const rec = this._m, value = own(rec); offset >>>= 0; data = String(data);
       if (offset > value.length) throw new DOMException('Invalid offset', 'IndexSizeError');
       count = Math.min(count >>> 0, value.length - offset);
-      const next = value.slice(0, offset) + data + value.slice(offset + count); if (next !== value) { rec.text = next; op(1, this._id, next); }
+      const next = value.slice(0, offset) + data + value.slice(offset + count); if (next !== value) { rec.text = next; if (looseRanges) shape++; op(1, this._id, next); if (requiredSelects && this.nodeType === 3) optionsChanged(rec.up); }
       if (anchors.size) each(rec, range => shift(range, rec, at => at > offset && at <= offset + count, this, () => offset) | shift(range, rec, at => at > offset + count, this, at => at + data.length - count));
       if (observers.size) change({ type: 'characterData', target: this, oldValue: value });
     }
@@ -827,7 +1023,10 @@
     }
     get wholeText() { let node = this, text = ''; while (node.previousSibling?.nodeType === 3) node = node.previousSibling; for (; node?.nodeType === 3; node = node.nextSibling) text += node.data; return text; }
   }
+  // XML documents hold these as text and comments with another wrapper, which the tree keeps.
+  class CDATASection extends Text { constructor(id) { super(id, '#text'); this.nodeType = 4; this.nodeName = '#cdata-section'; } }
   class Comment extends CharacterData { constructor(data = '', tag) { super(tag ? data : create('#comment', String(data)), '#comment'); } }
+  class ProcessingInstruction extends CharacterData { constructor(id, target) { super(id, '#comment'); this.nodeType = 7; this.nodeName = this.target = target; } }
   class DocumentType extends Node {
     constructor(id, tag) { super(id, tag); this.nodeName = this.name; }
     get name() { return own(this._m).split('\0')[0]; } get publicId() { return own(this._m).split('\0')[1] ?? ''; } get systemId() { return own(this._m).split('\0')[2] ?? ''; }
@@ -854,7 +1053,7 @@
   const declare = text => { let list = declared.get(text); if (!list) { if (declared.size > 1023) declared.clear(); const flat = /\S/.test(text) ? host('dom.declare', text) : []; list = []; for (let i = 0; i < flat.length; i += 3) { const at = list.findIndex(entry => entry[0] === flat[i]); if (at >= 0) { if (list[at][2] && !flat[i + 2]) continue; list.splice(at, 1); } list.push([flat[i], flat[i + 1], flat[i + 2]]); } list = [...list.filter(entry => !entry[2]), ...list.filter(entry => entry[2])]; declared.set(text, list); } return list.map(entry => entry.slice()); };
   // Values keep the text as written and get Chrome's form only when read, so writes stay cheap.
   const specifiedText = new Map();
-  const specified = (name, value) => { if (name.startsWith('--') || /^[a-z-]*$/.test(value) && !/position|origin|family|counter/.test(name)) return value; const key = name + ':' + value; let text = specifiedText.get(key); if (text === undefined) { if (specifiedText.size > 1023) specifiedText.clear(); specifiedText.set(key, text = host('dom.specified', name, value)); } return text; };
+  const specified = (name, value) => { if (name.startsWith('--') || /^[a-z-]*$/.test(value) && !/position|origin|family|counter|offset|overflow-clip/.test(name)) return value; const key = name + ':' + value; let text = specifiedText.get(key); if (text === undefined) { if (specifiedText.size > 1023) specifiedText.clear(); specifiedText.set(key, text = host('dom.specified', name, value)); } return text; };
   const specifiedList = list => list.map(([name, value, priority]) => [name, specified(name, value), priority]);
   let shorthands = null, shorthandsOf = null;
   const loadShorthands = () => {
@@ -869,6 +1068,7 @@
   };
   const layers = (value, separator = ',') => { const out = []; let depth = 0, start = 0; for (let i = 0; i < value.length; i++) { const c = value[i]; if (c === '(') depth++; else if (c === ')') depth--; else if (c === separator && !depth) { out.push(value.slice(start, i).trim()); start = i + 1; } } out.push(value.slice(start).trim()); return out; };
   const shorthandValue = (name, values, parts) => {
+    if (name === 'position-try') return values[0] === 'normal' || values[0] === values[1] ? values[1] : values.join(' ');
     if (name === 'border-image') return values.every(value => value === values[0]) && /^(inherit|initial|unset|revert|revert-layer)$/.test(values[0]) ? values[0] : values.join() === 'none,100%,1,0,stretch' ? 'none' : `${values[0]} ${values[1]} / ${values[2]} / ${values[3]} ${values[4]}`;
     // `border` resets `border-image`, so it serializes only when that has its initial value.
     if (name === 'border' && parts.length === 17) { const image = values.splice(12); if (image.join() !== 'none,100%,1,0,stretch' && image.some(value => value !== values[0])) return ''; parts = parts.slice(0, 12); }
@@ -887,6 +1087,7 @@
     if (name === 'flex-flow') return values.filter((value, index) => value !== ['row', 'nowrap'][index]).join(' ') || 'row';
     // Like Chrome: position, image, type, without their initial values.
     if (name === 'list-style') { const [type, position, image] = values, kept = [position, image, type].filter((value, index) => value !== ['outside', 'none', 'disc'][index]); return kept.join(' ') || (image === 'none' && type === 'none' ? 'none' : type); }
+    if (name === 'font-variant') return values.filter(value => value !== 'normal').join(' ') || 'normal';
     if (name === 'text-decoration') { const kept = values.filter((value, index) => index === 0 || !['solid', 'currentcolor', 'auto'].includes(value)); return (kept.length ? kept : values.slice(0, 1)).join(' '); }
     const grid = parts.every(part => /^grid-.*-(start|end)$/.test(part));
     if (/^grid(-template)?$/.test(name)) return '';
@@ -895,6 +1096,8 @@
     if (lists.some(list => list.length !== count)) return '';
     return lists[0].map((_, i) => lists.map(list => list[i]).reduce((text, value, j) => text + (grid ? ' / ' : /-size$/.test(parts[j]) && /-position$/.test(parts[j - 1]) ? ' / ' : ' ') + value)).join(', ');
   };
+  // Only the `-webkit-` name takes these.
+  const written = (name, value) => name === 'mask-composite' && /clear|copy|source-|destination-|xor/.test(value) ? '-webkit-' + name : name;
   // `keys` gets the name of each piece, or '' for a folded shorthand, then the piece.
   const declarationText = (list, keys) => {
     const out = [], done = new Set();
@@ -913,7 +1116,7 @@
         break;
       }
       const key = text ? '' : name;
-      if (!text) { done.add(name); text = name + ': ' + list.findLast(entry => entry[0] === name)[1]; }
+      if (!text) { done.add(name); const value = list.findLast(entry => entry[0] === name)[1]; text = written(name, value) + ': ' + value; }
       const piece = text + (priority ? ' !important' : '') + ';';
       out.push(piece);
       if (keys) keys.push(key, piece);
@@ -965,7 +1168,8 @@
       const added = owner.raw || name.startsWith('--') ? [[name, value, priority]] : declare(name + ':' + value + (priority ? ' !important' : ''));
       if (!added.length) return;
       // As in Chrome, a set name keeps its place, unless a later name of its logical group maps the other way.
-      const next = owner.read().slice(), end = [];
+      const whole = added.find(entry => entry[0] === 'mask' || entry[0] === 'offset')?.[0];
+      const next = owner.read().filter(entry => !whole || !entry[0].startsWith(whole + '-') || entry[0] === 'mask-type'), end = [];
       for (const entry of added) {
         const i = next.findLastIndex(old => old[0] === entry[0]), group = i < 0 || entry[0].startsWith('--') ? null : logicalGroup(entry[0]);
         let moved = false;
@@ -992,7 +1196,7 @@
     set cssText(value) { if (this._owner.computed) readOnly(); this._owner.write(this._owner.raw ? String(value).split(';').flatMap(part => { const colon = part.indexOf(':'); return colon > 0 ? [[part.slice(0, colon).trim(), part.slice(colon + 1).trim(), '']] : []; }) : declare(String(value))); }
   }
   const styleKey = key => typeof key === 'string' && !(key.charCodeAt(0) <= 57 && /^\d+$/.test(key));
-  const declaration = owner => new Proxy(new CSSStyleDeclaration(owner), {
+  const declaration = (owner, Type = CSSStyleDeclaration) => new Proxy(new Type(owner), {
     get: (target, key) => typeof key !== 'string' || key in target ? Reflect.get(target, key) : /^\d+$/.test(key) ? target.item(Number(key)) : target.getPropertyValue(styleName(key)),
     set: (target, key, value) => { if (typeof key !== 'string' || key in target) return Reflect.set(target, key, value); if (styleKey(key)) target.setProperty(styleName(key), value); return true; },
     has: (target, key) => key in target || typeof key === 'string' && (styleKey(key) ? cssProperty(styleName(key)) : Number(key) < target.length),
@@ -1000,9 +1204,11 @@
     getOwnPropertyDescriptor: (target, key) => Reflect.getOwnPropertyDescriptor(target, key) ?? (typeof key === 'string' && (styleKey(key) ? cssProperty(styleName(key)) : Number(key) < target.length) ? { value: styleKey(key) ? target.getPropertyValue(styleName(key)) : target.item(Number(key)), writable: true, enumerable: true, configurable: true } : undefined),
   });
   const attrName = (element, name) => element.namespaceURI === XHTML ? String(name).toLowerCase() : String(name);
+  // The qualified name of an attribute in a namespace.
+  const nsAttr = (element, namespace, name) => namespace && element.namespaceURI !== XHTML ? element._m.attrs.keys().find(key => (key === name || key.endsWith(':' + name)) && (element._spaces?.get(key) ?? (key === name ? null : element.lookupNamespaceURI(key.slice(0, -name.length - 1)))) === namespace) ?? name : name;
   const datasetOwner = Symbol(), datasetHandler = { get: (target, name) => target[datasetOwner].getAttribute('data-' + cssName(name)) ?? undefined, set: (target, name, value) => { if (/-[a-z]/.test(name)) throw new DOMException(`'${name}' is not a valid dataset name`, 'SyntaxError'); target[datasetOwner].setAttribute('data-' + cssName(name), value); return true; }, has: (target, name) => typeof name === 'string' && target[datasetOwner].hasAttribute('data-' + cssName(name)), deleteProperty: (target, name) => { target[datasetOwner].removeAttribute('data-' + cssName(name)); return true; }, ownKeys: target => target[datasetOwner].getAttributeNames().filter(name => name.startsWith('data-')).map(name => name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())), getOwnPropertyDescriptor: () => ({ enumerable: true, configurable: true }) };
   class Element extends Node {
-    constructor(id, tag) { const custom = id === undefined; if(custom){if(constructing?.node){const node=constructing.node;constructing=null;Object.setPrototypeOf(node,new.target.prototype);return node;}tag=constructing?.tag??defined.get(new.target)?.name;if(!tag)throw new TypeError('Illegal element constructor');id=create(tag);constructing=null;} super(id, tag);  this.tagName = this.nodeName; this.localName = tag; this.namespaceURI = XHTML; if (custom) flag(this, 64, true); }
+    constructor(id, tag) { const custom = id === undefined; if(custom){if(constructing?.node){const node=constructing.node;constructing=null;Object.setPrototypeOf(node,new.target.prototype);return node;}tag=constructing?.tag??defined.get(new.target)?.name;if(!tag)throw new TypeError('Illegal element constructor');id=create(tag);constructing=null;} super(id, tag);  this.tagName = this.nodeName; this.localName = tag; this.namespaceURI = XHTML; if (custom) { flag(this, 64, true); if (new.target.formAssociated) { faces++; this._face = true; flag(this, 512, true); } } }
     get attributes() { const attrs = listOf(NamedNodeMap, this._m.attrs.keys().map(name => attrNode(this, name))); for (const attr of attrs) if (!(attr.name in attrs)) attrs[attr.name] = attr; return attrs; }
     getAttributeNames() { return [...this._m.attrs.keys()]; }
     hasAttributes() { return this._m.attrs.size > 0; }
@@ -1014,16 +1220,18 @@
     get part() { return this._part ??= new DOMTokenList(this, 'part'); } set part(value) { this.part.value = value; }
     get dataset() { return this._dataset ??= new Proxy({ [datasetOwner]: this }, datasetHandler); }
     getAttribute(name) { return this._m.attrs.get(attrName(this, name)) ?? null; }
-    getAttributeNS(_, name) { return this.getAttribute(name); }
+    getAttributeNS(namespace, name) { return this.getAttribute(nsAttr(this, namespace, name)); }
     hasAttribute(name) { return this._m.attrs.has(attrName(this, name)); }
-    hasAttributeNS(_, name) { return this.hasAttribute(name); }
+    hasAttributeNS(namespace, name) { return this.hasAttribute(nsAttr(this, namespace, name)); }
     setAttribute(name, value) { name = attrName(this, name); value = String(value); const attrs = this._m.attrs, oldValue = attrs.get(name) ?? null; if (oldValue === null) badAttr(name); if (value !== oldValue) op(4, this._id, name, value); (attrs === noAttrs ? this._m.attrs = new Attrs() : attrs).set(name, value); if (name === 'id' && value !== oldValue) { if (oldValue !== null) idDrop(oldValue, this._m); idAdd(value, this._m); } if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); if (definitions.size) attributeReaction(this, name, oldValue, value); if (value !== oldValue) attributeChanged(this, name, oldValue, value); }
-    setAttributeNS(_, name, value) { this.setAttribute(name, value); }
-    removeAttribute(name) { name = attrName(this, name); const attrs = this._m.attrs, oldValue = attrs.get(name) ?? null; if (oldValue === null) return; attrs.delete(name); op(5, this._id, name); if (name === 'id') idDrop(oldValue, this._m); if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); if (definitions.size) attributeReaction(this, name, oldValue, null); attributeChanged(this, name, oldValue, null); }
-    removeAttributeNS(_, name) { this.removeAttribute(name); }
+    setAttributeNS(namespace, name, value) { if (namespace && this.namespaceURI !== XHTML) (this._spaces ??= new Map()).set(String(name), String(namespace)); this.setAttribute(name, value); }
+    removeAttribute(name) { name = attrName(this, name); const attrs = this._m.attrs, oldValue = attrs.get(name) ?? null; if (oldValue === null) return; attrs.delete(name); op(5, this._id, name); const attr = this._attrs?.get(name); if (attr) { attr._value = oldValue; attr.ownerElement = null; this._attrs.delete(name); } if (name === 'id') idDrop(oldValue, this._m); if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); if (definitions.size) attributeReaction(this, name, oldValue, null); attributeChanged(this, name, oldValue, null); }
+    removeAttributeNS(namespace, name) { this.removeAttribute(nsAttr(this, namespace, name)); }
     toggleAttribute(name, force) { const present = this.hasAttribute(name); if (!present) badAttr(attrName(this, name)); const wanted = force === undefined ? !present : !!force; if (wanted !== present) { if (wanted) this.setAttribute(name, ''); else this.removeAttribute(name); } return wanted; }
     getAttributeNode(name) { name = attrName(this, name); return this._m.attrs.has(name) ? attrNode(this, name) : null; }
-    removeAttributeNode(attr) { if (!(attr instanceof Attr) || attr.ownerElement !== this || !this._m.attrs.has(attr.name)) throw new DOMException('The attribute is not on this element', 'NotFoundError'); attr._value = this._m.attrs.get(attr.name); this.removeAttribute(attr.name); attr.ownerElement = null; return attr; }
+    setAttributeNode(attr) { if (!(attr instanceof Attr)) throw new TypeError('Expected an Attr'); if (attr.ownerElement === this) return attr; if (attr.ownerElement) throw new DOMException('The attribute is on another element', 'InUseAttributeError'); const old = this.getAttributeNode(attr.name); if (old) this.removeAttributeNode(old); this.setAttribute(attr.name, attr.value); attr.ownerElement = this; (this._attrs ??= new Map()).set(attr.name, attr); return old; }
+    setAttributeNodeNS(attr) { return this.setAttributeNode(attr); }
+    removeAttributeNode(attr) { if (!(attr instanceof Attr) || attr.ownerElement !== this || !this._m.attrs.has(attr.name)) throw new DOMException('The attribute is not on this element', 'NotFoundError'); this.removeAttribute(attr.name); return attr; }
     get style() {
       if (this._style) return this._style;
       // The parsed list is shared, not copied, so declaration code must never change its entries.
@@ -1034,7 +1242,7 @@
         for (let i = 0; same && i < list.length; i++) if (next[i] !== list[i]) { same = at < 0 && next.length === list.length && next[i][0] === list[i][0]; at = i; }
         if (same && next.length > list.length) at = list.length;
         if (same && at >= 0 && !shorthandsOf.has(next[at][0])) {
-          const [name, value, priority] = next[at], piece = name + ': ' + value + (priority ? ' !important' : '') + ';', j = at < list.length ? keys.indexOf(name) : -1;
+          const [name, value, priority] = next[at], piece = written(name, value) + ': ' + value + (priority ? ' !important' : '') + ';', j = at < list.length ? keys.indexOf(name) : -1;
           if (j >= 0) keys[j + 1] = piece; else keys.push(name, piece);
           text = '';
           for (let k = 1; k < keys.length; k += 2) text += (k > 1 ? ' ' : '') + keys[k];
@@ -1044,12 +1252,12 @@
       return this._style = declaration({ read: () => { const now = this.getAttribute('style') ?? ''; if (now !== text) { text = now; list = declare(now); keys = null; } return list; }, write });
     }
     set style(value) { this.style.cssText = value; }
-    get innerHTML() { return serialize(this._m, true) || own(this._m); }
+    get innerHTML() { return inXML(this) ? [...this.childNodes].map(kid => new XMLSerializer().serializeToString(kid)).join('') : serialize(this._m, true) || own(this._m); }
     set innerHTML(value) { setHTML(this, value); }
-    get outerHTML() { return serialize(this._m); }
+    get outerHTML() { return inXML(this) ? new XMLSerializer().serializeToString(this) : serialize(this._m); }
     set outerHTML(value) { const parent = this.parentNode; if (!parent) return; if (parent.nodeType === 9) throw new DOMException('Cannot replace the document element', 'NoModificationAllowedError'); reactionDepth++; try { this.replaceWith(parseFragment(value, parent.nodeType === 1 ? parent : null)); } finally { leave(); } }
     get innerText() { return call('dom.skipped', this._id, false) > 0 ? '' : slot(this) < 0 ? this.textContent : call('dom.innerText', this._id); }
-    set innerText(value) { const parts = String(value ?? '').split(/\r\n|\r|\n/); replaceAll(this, () => { release(this); detach(this._m); op(1, this._id, ''); }); quiet++; try { parts.forEach((part, index) => { if (index) this.append(document.createElement('br')); if (part) this.append(part); }); } finally { quiet--; } if (observers.size && this._m.kids.length) change({ type: 'childList', target: this, addedNodes: this.childNodes }); }
+    set innerText(value) { const parts = String(value ?? '').split(/\r\n|\r|\n/); replaceAll(this, () => { release(this); detach(this._m); op(1, this._id, ''); }); quiet++; try { parts.forEach((part, index) => { if (index) this.append(document.createElement('br')); if (part) this.append(part); }); } finally { quiet--; } if (observers.size && this._m.kids.length) change({ type: 'childList', target: this, addedNodes: listOf(NodeList, this._m.kids.map(of)) }); }
     matches(selector) { return selectors('dom.matches', this._id, selector); }
     closest(selector) { return wrap(selectors('dom.closest', this._id, selector)); }
     checkVisibility(options = {}) {
@@ -1144,6 +1352,7 @@
     get outerText() { return this.innerText; } set outerText(value) { if (!this.parentNode) throw new DOMException('The element has no parent', 'NoModificationAllowedError'); this.replaceWith(...String(value ?? '').split(/\r\n|\r|\n/).flatMap((part, index) => index ? [document.createElement('br'), part] : [part]).filter(part => part !== '')); }
     insertAdjacentHTML(position, source) { const outside = /^(beforebegin|afterend)$/i.test(position), context = outside ? this.parentNode : this; if (outside && (!context || context.nodeType === 9)) throw new DOMException('The element has no parent', 'NoModificationAllowedError'); adjacent(this, position, parseFragment(source, context.nodeType === 1 && !(context.localName === 'html' && context.namespaceURI === XHTML) ? context : null)); }
   }
+  Element.prototype.prefix = null;
   for (const [Type, names] of [[Node, ['insertBefore', 'removeChild', 'replaceChild', 'cloneNode']], [Element, ['setAttribute', 'removeAttribute', 'insertAdjacentHTML']]]) for (const name of names) { const fn = Type.prototype[name]; Type.prototype[name] = { [name](a, b) { reactionDepth++; try { return fn.call(this, a, b); } finally { leave(); } } }[name]; }
   const adjacent = (element, position, node) => { position = String(position).toLowerCase(); if (position === 'beforebegin' || position === 'afterend') { if (!element.parentNode) return null; if (position === 'beforebegin') element.before(node); else element.after(node); } else if (position === 'afterbegin') element.prepend(node); else if (position === 'beforeend') element.append(node); else throw new DOMException('Invalid insertion position', 'SyntaxError'); return node; };
   const attributeReaction = (node, name, oldValue, value) => { const Type = definitions.get(node._m.tag); if (Type && node instanceof Type && !node._failed && defined.get(Type).observed.has(name)) enqueue(node, ['attributeChangedCallback', name, oldValue, value]); };
@@ -1203,7 +1412,7 @@
   const inputTypes = new Set(['hidden','text','search','tel','url','email','password','date','month','week','time','datetime-local','number','range','color','checkbox','radio','file','submit','image','reset','button']);
   const selectable = node => node instanceof HTMLTextAreaElement || /^(text|search|tel|url|password)$/.test(node.type);
   const editable = node => node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement && /^(text|search|tel|url|email|password|number)$/.test(node.type);
-  const sanitize = (type, value) => type === 'number' ? /^-?(\d+(\.\d+)?|\.\d+)([eE][-+]?\d+)?$/.test(value) ? value : '' : type === 'color' ? /^#[\da-f]{6}$/i.test(value) ? value.toLowerCase() : '#000000' : /^(text|search|tel|password|url|email)$/.test(type) ? (value = value.replace(/[\r\n]/g, ''), type === 'url' || type === 'email' ? value.trim() : value) : /^(date|time|datetime-local|month|week)$/.test(type) && Number.isNaN(stepKinds[type][3](value)) ? '' : value;
+  const sanitize = (type, value) => type === 'number' ? /^-?(\d+(\.\d+)?|\.\d+)([eE][-+]?\d+)?$/.test(value) ? value : '' : type === 'color' ? /^#[\da-f]{6}$/i.test(value) ? value.toLowerCase() : '#000000' : /^(text|search|tel|password|url|email)$/.test(type) ? (value = value.replace(/[\r\n]/g, ''), type === 'url' || type === 'email' ? value.trim() : value) : /^(date|time|datetime-local|month|week)$/.test(type) && Number.isNaN(stepKinds[type][3](value)) ? '' : type === 'datetime-local' ? value.replace(' ', 'T') : value;
   const assign = (node, value) => { const old = node.value; setValue(node, value); if (value !== old) { node._start = node._end = value.length; node._direction = 'none'; if (active === node) call('dom.selection', node._id, value.length, value.length); } };
   // The field shows the first file, which the value names, but the value is not stored.
   const showFiles = node => { op(7, node._id, node.value, 0); revalidate(node); };
@@ -1236,18 +1445,20 @@
   };
   // [scale of `step`, default step, default step base, parse, format, is a date]. Dates count ms since the epoch, months count months.
   const pad = (n, size = 2) => String(n).padStart(size, '0'), dayOf = text => /^(\d{4,})-(\d\d)-(\d\d)$/.exec(text), timeOf = text => /^(\d\d):(\d\d)(?::(\d\d)(?:\.(\d{1,3}))?)?$/.exec(text);
-  const day = text => { const m = dayOf(text); if (!m) return NaN; const value = Date.UTC(+m[1], m[2] - 1, +m[3]); return new Date(value).getUTCDate() === +m[3] && m[2] > 0 && m[2] <= 12 ? value : NaN; };
+  // `Date.UTC()` takes the years 0 to 99 as 1900 to 1999.
+  const utc = (year, month, day) => new Date(0).setUTCFullYear(year, month, day);
+  const day = text => { const m = dayOf(text); if (!m || !+m[1]) return NaN; const value = utc(+m[1], m[2] - 1, +m[3]); return new Date(value).getUTCDate() === +m[3] && m[2] > 0 && m[2] <= 12 ? value : NaN; };
   const clock = text => { const m = timeOf(text); return m && m[1] < 24 && m[2] < 60 && (m[3] ?? 0) < 60 ? ((m[1] * 60 + +m[2]) * 60 + +(m[3] ?? 0)) * 1000 + +(m[4] ?? '0').padEnd(3, '0') : NaN; };
   const dayText = value => { const d = new Date(value); return pad(d.getUTCFullYear(), 4) + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate()); };
   const clockText = value => { const d = new Date(value), s = d.getUTCSeconds(), ms = d.getUTCMilliseconds(); return pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + (s || ms ? ':' + pad(s) + (ms ? '.' + pad(ms, 3) : '') : ''); };
-  const weekStart = year => { const jan4 = Date.UTC(year, 0, 4); return jan4 - (new Date(jan4).getUTCDay() + 6) % 7 * 864e5; };
+  const weekStart = year => { const jan4 = utc(year, 0, 4); return jan4 - (new Date(jan4).getUTCDay() + 6) % 7 * 864e5; };
   const numberOf = text => text === '' ? NaN : Number(text);
   const stepKinds = {
     number: [1, 1, 0, numberOf, String], range: [1, 1, 0, numberOf, String],
     date: [864e5, 1, 0, day, dayText, true], time: [1000, 60, 0, clock, clockText, true],
-    'datetime-local': [1000, 60, 0, text => { const [date, time] = text.split('T'); return time === undefined ? NaN : day(date) + clock(time); }, value => dayText(value) + 'T' + clockText(value)],
-    month: [1, 1, 0, text => { const m = /^(\d{4,})-(\d\d)$/.exec(text); return m && m[2] > 0 && m[2] <= 12 ? (m[1] - 1970) * 12 + (m[2] - 1) : NaN; }, value => pad(1970 + Math.floor(value / 12), 4) + '-' + pad(value % 12 + 1), true],
-    week: [6048e5, 1, -2592e5, text => { const m = /^(\d{4,})-W(\d\d)$/.exec(text); return m && m[2] > 0 && m[2] <= 53 ? weekStart(+m[1]) + (m[2] - 1) * 6048e5 : NaN; }, value => { const year = new Date(value + 3 * 864e5).getUTCFullYear(); return pad(year, 4) + '-W' + pad((value - weekStart(year)) / 6048e5 + 1); }, true],
+    'datetime-local': [1000, 60, 0, text => { const [date, time] = text.split(/[T ]/); return time === undefined ? NaN : day(date) + clock(time); }, value => dayText(value) + 'T' + clockText(value)],
+    month: [1, 1, 0, text => { const m = /^(\d{4,})-(\d\d)$/.exec(text); return m && +m[1] && m[2] > 0 && m[2] <= 12 ? (m[1] - 1970) * 12 + (m[2] - 1) : NaN; }, value => pad(1970 + Math.floor(value / 12), 4) + '-' + pad(value % 12 + 1), true],
+    week: [6048e5, 1, -2592e5, text => { const m = /^(\d{4,})-W(\d\d)$/.exec(text); if (!m || !+m[1] || !+m[2]) return NaN; const value = weekStart(+m[1]) + (m[2] - 1) * 6048e5; return value < weekStart(+m[1] + 1) ? value : NaN; }, value => { const year = new Date(value + 3 * 864e5).getUTCFullYear(); return pad(year, 4) + '-W' + pad((value - weekStart(year)) / 6048e5 + 1); }, true],
   };
   const stepBy = (node, n) => {
     const kind = stepKinds[node.type], attr = node.getAttribute('step');
@@ -1263,14 +1474,18 @@
   // User edits must change internal state, not value or checked properties: frameworks intercept those
   // properties to detect script writes.
   const setChecked = (node, value) => { node._checked = value; formState(node, node._bits & ~3 | (value ? 3 : 2)); const members = node.type === 'radio' ? group(node) : undefined; if (value && members) for (const other of members) if (other !== node && (other._checked ?? other.hasAttribute('checked'))) { other._checked = false; formState(other, other._bits & ~3 | 2); } revalidate(node, members); };
+  // Text and bulk changes below a required select can change its validity.
+  let requiredSelects = false;
+  const optionsChanged = rec => { while (rec && rec.tag !== 'select') rec = rec.up; if (rec) revalidate(of(rec)); };
   const listed = /^(button|fieldset|input|object|output|select|textarea)$/;
-  const candidate = node => !disabled(node) && !node.hasAttribute('readonly') && !node._m.up?.tag?.startsWith('datalist') && (node.localName === 'input' ? !/^(hidden|reset|button)$/.test(node.type) : node.localName === 'button' ? node.type === 'submit' : /^(select|textarea)$/.test(node.localName));
+  const candidate = node => !disabled(node) && !node.hasAttribute('readonly') && !node._m.up?.tag?.startsWith('datalist') && (node.localName === 'input' ? !/^(hidden|reset|button|image)$/.test(node.type) : node.localName === 'button' ? node.type === 'submit' : /^(select|textarea)$/.test(node.localName));
   const emailPattern = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
   // Rust matches `:valid` and `:invalid` with bit 128, so only controls that can fail a constraint are validated.
   const limited = (attrs, node) => node?._bits & 128 || node?._custom || attrs.list.some((name, i) => !(i & 1) && (/^(required|pattern|min|max|step|maxlength|minlength)$/.test(name) || name === 'type' && /^(email|url|number)$/i.test(attrs.list[i + 1])));
   const revalidate = (node, members) => {
     if (!node || !/^(input|select|textarea|button)$/.test(node.localName)) return;
     const radio = node.type === 'radio'; members = radio ? members ?? group(node) : [node];
+    requiredSelects ||= node.localName === 'select' && node._m.attrs.has('required');
     if (members.some(other => limited(other._m.attrs, other))) for (const other of members) formState(other, validity(other, radio ? members : undefined).valid ? other._bits & ~128 : other._bits | 128);
   };
   class ValidityState {}
@@ -1279,7 +1494,7 @@
   const validity = (node, members) => {
     const flags = { valueMissing: false, typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false, customError: !!node._custom };
     const tag = node.localName, type = node.type, required = node.hasAttribute('required');
-    if (tag === 'select') flags.valueMissing = required && !node.selectedOptions.some(option => option.value !== '' || option.index !== 0 || node.multiple || node.size > 1);
+    if (tag === 'select') flags.valueMissing = required && !selectedness(node, true).some(option => option._current && ( option.value !== '' || option.index !== 0 || option._m.up.tag !== 'select' || node.multiple || node.size > 1));
     else if (type === 'checkbox') flags.valueMissing = required && !node.checked;
     else if (type === 'radio') { members ??= group(node); flags.valueMissing = members.some(radio => radio.hasAttribute('required')) && !members.some(radio => radio.checked); }
     else if (tag === 'textarea' || tag === 'input' && !/^(hidden|submit|image|reset|button|file)$/.test(type)) {
@@ -1303,20 +1518,33 @@
     state._valid = !Object.values(flags).includes(true);
     return state;
   };
-  const formOf = node => { const id = node.getAttribute('form'); if (id !== null) { const form = id && node.getRootNode().getElementById?.(id); return form?.localName === 'form' ? form : null; } for (let rec = node._m.up; rec && rec.tag[0] !== '#'; rec = rec.up) if (rec.tag === 'form') return of(rec); return null; };
+  const formOf = (node, top) => { const id = node.getAttribute('form'); if (id !== null) { const form = !top && id && node.getRootNode().getElementById?.(id); return form?.localName === 'form' ? form : null; } for (let rec = node._m; rec && rec.tag[0] !== '#'; rec = rec === top ? null : rec.up) if (rec.tag === 'form') return of(rec); return null; };
+  class CustomStateSet extends Set {
+    _send() { if (this._node) op(11, this._node._id, [...this].join('\0')); }
+    add(state) { super.add(String(state)); this._send(); }
+    delete(state) { const found = super.delete(String(state)); if (found) this._send(); return found; }
+    clear() { super.clear(); this._send(); }
+  }
   class ElementInternals {
-    constructor(node) { this._node = node; this._value = null; this._flags = {}; this._message = ''; this.states = new Set(); }
+    constructor(node) { this._node = node; this._value = null; this._flags = {}; this._message = ''; }
+    get states() { if (!this._states) { this._states = new CustomStateSet(); this._states._node = this._node; } return this._states; }
     get shadowRoot() { return this._node._shadow ?? null; }
-    get form() { return formOf(this._node); }
-    get labels() { return Object.getOwnPropertyDescriptor(constraints, 'labels').get.call(this._node); }
-    get willValidate() { return !this._node.matches(':disabled'); }
-    get validity() { const state = Object.create(ValidityState.prototype), flags = this._flags; for (const name of Object.keys(messages)) state['_' + name] = !!flags[name]; state._customError = !!flags.customError; state._valid = !Object.values(flags).some(Boolean); return state; }
-    get validationMessage() { return this._message; }
-    setFormValue(value) { this._value = value; }
-    setValidity(flags = {}, message = '') { this._flags = { ...flags }; this._message = Object.values(this._flags).some(Boolean) ? String(message) : ''; }
+    get form() { return formOf(face(this)._node); }
+    get labels() { return Object.getOwnPropertyDescriptor(constraints, 'labels').get.call(face(this)._node); }
+    get willValidate() { const node = face(this)._node; return !disabled(node) && !node.hasAttribute('readonly') && !node._m.up?.tag.startsWith('datalist'); }
+    get validity() { const state = Object.create(ValidityState.prototype), flags = face(this)._flags; for (const name of Object.keys(messages)) state['_' + name] = !!flags[name]; state._customError = !!flags.customError; state._valid = !(this._node._bits & 128); return state; }
+    get validationMessage() { return face(this)._message; }
+    setFormValue(value) { face(this)._value = value; }
+    setValidity(flags = {}, message = '') {
+      const invalid = !!flags.customError || Object.keys(messages).some(name => flags[name]);
+      if (invalid && !message) throw new TypeError('An invalid state needs a message');
+      face(this)._flags = { ...flags }; this._message = invalid ? String(message) : '';
+      flag(this._node, 128, invalid);
+    }
     checkValidity() { if (!this.willValidate || this.validity.valid) return true; dispatch(this._node, new Event('invalid', { cancelable: true })); return false; }
     reportValidity() { if (this.checkValidity()) return true; this._node.focus(); return false; }
   }
+  const face = internals => { if (!internals._node._face) throw new DOMException('The element is not form-associated', 'NotSupportedError'); return internals; };
   const constraints = {
     get willValidate() { return candidate(this); },
     get validity() { return validity(this); },
@@ -1327,10 +1555,12 @@
     get form() { return formOf(this); },
     get labels() {
       if (this.type === 'hidden') return null;
+      return live(this, 'labels', NodeList, () => {
       const result = [], root = this.getRootNode(), id = this.getAttribute('id');
       if (id && root.querySelectorAll) for (const label of root.querySelectorAll('label[for=' + quote(id) + ']')) if (labelControl(label) === this) result.push(label);
       for (let rec = this._m.up; rec; rec = rec.up) if (rec.tag === 'label' && !rec.attrs.has('for') && labelControl(of(rec)) === this) result.push(of(rec));
-      return listOf(NodeList, result.sort((a, b) => a.compareDocumentPosition(b) & 4 ? -1 : 1));
+      return result.sort((a, b) => a.compareDocumentPosition(b) & 4 ? -1 : 1);
+      }, { tags: ['label', 'button', 'input', 'meter', 'output', 'progress', 'select', 'textarea'], attrs: ['for', 'id', 'type'] });
     },
     get name() { return this.getAttribute('name') ?? ''; }, set name(value) { this.setAttribute('name', value); },
   };
@@ -1409,28 +1639,18 @@
     return list;
   };
   class HTMLOptionsCollection extends HTMLCollection {
-    get selectedIndex() { return this._select.selectedIndex; } set selectedIndex(value) { this._select.selectedIndex = value; }
-    add(element, before) { this._select.add(element, before); }
-    remove(index) { this._select.remove(index); }
+    get selectedIndex() { return this[owner].selectedIndex; } set selectedIndex(value) { this[owner].selectedIndex = value; }
+    add(element, before) { this[owner].add(element, before); }
+    remove(index) { this[owner].remove(index); }
   }
-  const optionsHandler = { set(list, key, value) { const select = list._select, i = tokenIndex(key); if (key === 'length') select.length = value; else if (i < 0) list[key] = value; else if (value === null) options(select)[i]?.remove(); else { if (i > select.length) select.length = i; const old = options(select)[i]; if (old) old.replaceWith(value); else select.append(value); } return true; } };
+  class LiveOptions extends Live { set(list, key, value) { const select = list[owner], i = tokenIndex(key); if (key === 'length') select.length = value; else if (i < 0) list[key] = value; else if (value === null) options(select)[i]?.remove(); else { if (i > select.length) select.length = i; const old = options(select)[i]; if (old) old.replaceWith(value); else select.append(value); } return true; } }
   class HTMLSelectElement extends HTMLElement {
     get type() { return this.multiple ? 'select-multiple' : 'select-one'; }
-    // A proxy, so `options.length = 0` and `options[i] = option` change the select, as in browsers.
-    // The same collection while the options stay the same, as in browsers. It stays a static list.
-    get options() {
-      const now = options(this);
-      if (this._optionsFrom !== now) {
-        const old = this._optionsList;
-        if (!old || old.length !== now.length || now.some((option, i) => old[i] !== option)) { const list = listOf(HTMLOptionsCollection, now.slice()); list._select = this; this._optionsList = new Proxy(list, optionsHandler); }
-        this._optionsFrom = now;
-      }
-      return this._optionsList;
-    }
+    get options() { return live(this, 'options', HTMLOptionsCollection, () => options(this), { root: this._m, tags: ['option', 'optgroup'] }, first, LiveOptions); }
     get length() { return options(this).length; }
     set length(value) { const list = options(this); value >>>= 0; for (let i = list.length; i < value; i++) this.append(document.createElement('option')); for (const option of list.slice(value)) option.remove(); }
     get size() { return Math.max(0, parseInt(this.getAttribute('size'), 10) || 0); } set size(value) { this.setAttribute('size', value >>> 0); }
-    get selectedOptions() { return listOf(HTMLCollection, selectedness(this, true).filter(option => option._current)); }
+    get selectedOptions() { return live(this, 'selectedOptions', HTMLCollection, () => selectedness(this, true).filter(option => option._current)); }
     get selectedIndex() { return selectedness(this, true).findIndex(option => option._current); }
     set selectedIndex(value) { value = Number(value); const list = options(this); this._none = list[value] ? null : list; for (const [index, option] of list.entries()) option._selected = index === value; selectedness(this); revalidate(this); }
     get value() { return selectedness(this, true).find(option => option._current)?.value ?? ''; }
@@ -1457,17 +1677,26 @@
     get type() { const type = (this.getAttribute('type') ?? '').toLowerCase(); return /^(submit|reset|button)$/.test(type) ? type : this.hasAttribute('commandfor') ? 'button' : 'submit'; } set type(value) { this.setAttribute('type', value); }
     get value() { return this.getAttribute('value') ?? ''; } set value(value) { this.setAttribute('value', value); }
   }
-  class HTMLFieldSetElement extends HTMLElement { get elements() { const result = []; find(this._m, rec => { if (listed.test(rec.tag)) result.push(of(rec)); return false; }); return listOf(HTMLCollection, result); } get type() { return 'fieldset'; } }
+  class HTMLFieldSetElement extends HTMLElement { get elements() { return live(this, 'elements', HTMLCollection, () => all(this._m, rec => listed.test(rec.tag) || associated(rec)), { root: this._m, tags: controlTags }); } get type() { return 'fieldset'; } }
   class HTMLOutputElement extends HTMLElement { get value() { return this.textContent; } set value(value) { this.textContent = value; } get defaultValue() { return this._default ?? this.textContent; } set defaultValue(value) { this._default = String(value); } get type() { return 'output'; } }
   for (const Type of [HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement]) for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(constraints))) if (!Object.hasOwn(Type.prototype, name)) Object.defineProperty(Type.prototype, name, descriptor);
-  class HTMLFormControlsCollection extends HTMLCollection { namedItem(name) { return Object.hasOwn(this, name) && typeof name === 'string' && !/^\d+$/.test(name) ? this[name] : null; } }
+  class HTMLFormControlsCollection extends HTMLCollection { namedItem(name) { return this[lookup](String(name)) ?? null; } }
   class RadioNodeList extends NodeList {
-    get value() { return this.find(node => node.type === 'radio' && node.checked)?.value ?? ''; }
-    set value(value) { const radio = this.find(node => node.type === 'radio' && node.value === String(value)); if (radio) radio.checked = true; }
+    get value() { return (this[raw] ?? this).find(node => node.type === 'radio' && node.checked)?.value ?? ''; }
+    set value(value) { const radio = (this[raw] ?? this).find(node => node.type === 'radio' && node.value === String(value)); if (radio) radio.checked = true; }
   }
+  const controlTags = ['button', 'fieldset', 'input', 'object', 'output', 'select', 'textarea', '-', 'form'];
+  const associated = rec => faces > 0 && !!definitions.get(rec.tag)?.formAssociated;
+  const controlsOf = form => {
+    const id = form.getAttribute('id'), root = form.getRootNode(), control = rec => listed.test(rec.tag) ? !(rec.tag === 'input' && rec.attrs.get('type')?.toLowerCase() === 'image') && formOf(of(rec)) === form : associated(rec) && formOf(of(rec)) === form;
+    const result = all(form._m, control), outside = id && root !== form ? all(root._m, rec => rec.attrs.get('form') === id && control(rec)).filter(node => !form.contains(node)) : [];
+    if (outside.length) { result.push(...outside); result.sort((a, b) => a.compareDocumentPosition(b) & 4 ? -1 : 1); }
+    return result;
+  };
   const submitForm = (form, submitter) => {
     if (form._submitting || !form.isConnected) return;
-    if (!form.noValidate && !submitter?.formNoValidate) { const invalid = [...form.elements].filter(control => !((control._internals ?? control).checkValidity?.() ?? true)); if (invalid.length) { invalid[0].focus(); return; } }
+    for (const control of controlsOf(form)) if (/^(input|select|textarea)$/.test(control.localName)) interacted(control);
+    if (!form.noValidate && !submitter?.formNoValidate) { const invalid = controlsOf(form).filter(control => !((control._internals ?? control).checkValidity?.() ?? true)); if (invalid.length) { invalid[0].focus(); return; } }
     form._submitting = true;
     let allowed;
     try { allowed = dispatch(form, new SubmitEvent('submit', { bubbles: true, cancelable: true, submitter })); } finally { form._submitting = false; }
@@ -1475,15 +1704,10 @@
   };
   class HTMLFormElement extends HTMLElement {
     get elements() {
-      const id = this.getAttribute('id'), root = this.getRootNode(), result = [], control = rec => listed.test(rec.tag) ? !(rec.tag === 'input' && rec.attrs.get('type')?.toLowerCase() === 'image') && of(rec).form === this : definitions.size > 0 && !!definitions.get(rec.tag)?.formAssociated && formOf(of(rec)) === this;
-      find(this._m, rec => { if (control(rec)) result.push(of(rec)); return false; });
-      const outside = id && root !== this && root.querySelectorAll ? [...root.querySelectorAll('[form=' + quote(id) + ']')].filter(node => !this.contains(node) && control(node._m)) : [];
-      if (outside.length) { result.push(...outside); result.sort((a, b) => a.compareDocumentPosition(b) & 4 ? -1 : 1); }
-      const list = listOf(HTMLFormControlsCollection, result);
-      for (const control of result) for (const key of new Set([control.id, control.getAttribute('name')])) { const at = Object.hasOwn(list, key) ? list[key] : undefined; if (!key || at === undefined && key in list) continue; if (at === undefined) list[key] = control; else if (at instanceof RadioNodeList) at.push(control); else list[key] = listOf(RadioNodeList, [at, control]); }
-      return list;
+      return live(this, 'elements', HTMLFormControlsCollection, () => controlsOf(this), { tags: controlTags, attrs: ['form', 'type', 'form id'] }, name => live(this, 'named ' + name, RadioNodeList, () => controlsOf(this).filter(({ _m: { attrs } }) => attrs.get('id') === name || attrs.get('name') === name), { tags: controlTags, attrs: ['form', 'type', 'form id', 'id', 'name'] }, null));
     }
-    get length() { return this.elements.length; }
+    get length() { return controlsOf(this).length; }
+    get name() { return this.getAttribute('name') ?? ''; } set name(value) { this.setAttribute('name', value); }
     get method() { const value = (this.getAttribute('method') ?? '').toLowerCase(); return value === 'post' || value === 'dialog' ? value : 'get'; } set method(value) { this.setAttribute('method', value); }
     get action() { const value = this.getAttribute('action'); return value ? resolved(value) : document.URL; } set action(value) { this.setAttribute('action', value); }
     get enctype() { const value = this.getAttribute('enctype')?.toLowerCase(); return value === 'multipart/form-data' || value === 'text/plain' ? value : 'application/x-www-form-urlencoded'; } set enctype(value) { this.setAttribute('enctype', value); }
@@ -1496,25 +1720,27 @@
     reset() {
       if (!dispatch(this, new Event('reset', { bubbles: true, cancelable: true }))) return;
       const radios = [];
-      for (const control of this.elements) {
+      for (const control of controlsOf(this)) {
         if (control.localName === 'select') { for (const option of options(control)) option._selected = undefined; control._none = null; selectedness(control); }
         else if (control.localName === 'input' || control.localName === 'textarea') { const old = control.value; control._value = control._checked = control._edited = control._dirty = undefined; if (control._files) setFiles(control._files, []); op(7, control._id, '', 1); formState(control, control._bits & ~3); if (control.value !== old) { const end = control._start = control._end = control.value.length; control._direction = 'none'; if (active === control) call('dom.selection', control._id, end, end); } if (control.type === 'radio' && control.hasAttribute('checked')) setChecked(control, true); }
         else if (control.localName === 'output') control.textContent = control.defaultValue;
+        else if (control._face) enqueue(control, ['formResetCallback']);
+        flag(control, 256, false);
         if (control.localName === 'input' && control.type === 'radio') radios.push(control); else revalidate(control);
       }
       const done = new Set();
       for (const radio of radios) if (!done.has(radio)) { const members = group(radio); for (const member of members) done.add(member); revalidate(radio, members); }
     }
-    checkValidity() { return [...this.elements].map(control => (control._internals ?? control).checkValidity?.() ?? true).every(Boolean); }
-    reportValidity() { const invalid = [...this.elements].filter(control => !((control._internals ?? control).checkValidity?.() ?? true)); invalid[0]?.focus(); return !invalid.length; }
+    checkValidity() { return controlsOf(this).map(control => (control._internals ?? control).checkValidity?.() ?? true).every(Boolean); }
+    reportValidity() { const invalid = controlsOf(this).filter(control => !((control._internals ?? control).checkValidity?.() ?? true)); invalid[0]?.focus(); return !invalid.length; }
     _entries(submitter, data) {
       if (this._building) throw new DOMException('The form is already building its entry list', 'InvalidStateError');
-      for (const control of this.elements) {
+      for (const control of controlsOf(this)) {
         const tag = control.localName, type = control.type, name = control.getAttribute('name'), value = control._internals?._value;
         if (!listed.test(tag)) { if (value instanceof FormData) for (const [key, item] of value) data.append(key, item); else if (name && value != null && !control.matches(':disabled')) data.append(name, value); continue; }
         let inList = false; for (let rec = control._m.up; rec && !inList; rec = rec.up) inList = rec.tag === 'datalist';
         if (!name || disabled(control) || inList || tag === 'button' && control !== submitter || tag === 'input' && /^(submit|image|reset|button)$/.test(type) && control !== submitter || /^(checkbox|radio)$/.test(type) && !control.checked || tag === 'object' || tag === 'output' || tag === 'fieldset') continue;
-        if (tag === 'select') for (const option of control.selectedOptions) data.append(name, option.value);
+        if (tag === 'select') { for (const option of selectedness(control, true)) if (option._current) data.append(name, option.value); }
         else if (type === 'file') for (const file of control.files.length ? control.files : [new File([], '', { type: 'application/octet-stream' })]) data.append(name, file);
         else data.append(name, control.value);
       }
@@ -1553,6 +1779,7 @@
     if (!popoverReady(node, false)) return;
     node._popover = mode; node._returnFocus = active;
     if (mode !== 'manual') { stackOf(node).push(node); watchers.push(node); }
+    if (source || node._source) { node._source = source; call('dom.popoverSource', node._id, source?._id ?? 0); }
     flag(node, 8, true); layer(node, true);
     (node.hasAttribute('autofocus') ? node : [...node.querySelectorAll('[autofocus]')].find(focusable))?.focus();
     toggled(node, 'closed', 'open', source);
@@ -1685,7 +1912,7 @@
   class HTMLLabelElement extends HTMLElement { get htmlFor() { return this.getAttribute('for') ?? ''; } set htmlFor(value) { this.setAttribute('for', value); } get control() { return labelControl(this); } get form() { return this.control?.form ?? null; } }
   const resolved = value => { try { return new URL(value, document.baseURI).href; } catch { return value; } };
   class HTMLTemplateElement extends HTMLElement {
-    get content() { if (!this._content) { this._content = new DocumentFragment(); this._content.append(...this.childNodes); } return this._content; }
+    get content() { if (!this._content) { this._content = new DocumentFragment(); this._content.append(...this._m.kids.map(of)); } return this._content; }
     get innerHTML() { return serialize(this.content._m, true); } set innerHTML(value) { setHTML(this.content, value, true); }
     cloneNode(deep = false) { const clone = super.cloneNode(false); if (deep) clone.content.append(this.content.cloneNode(true)); return clone; }
   }
@@ -1930,7 +2157,7 @@
   class DocumentFragment extends Node { constructor(id, tag) { super(tag ? id : create('#fragment'), '#fragment'); } }
   const ruleText = data => {
     // Like Chrome, rules inside a block go on their own lines, two spaces in.
-    const block = list => '\n' + list.map(rule => ruleText(rule).replace(/^/gm, '  ') + '\n').join(''), declarations = list => declarationText(specifiedList(declare(list.map(([name, value, priority]) => `${name}:${value}${priority ? ' !important' : ''}`).join(';'))));
+    const block = list => '\n' + list.map(rule => ruleText(rule).replace(/^/gm, '  ') + '\n').join(''), declarations = list => declarationText(specifiedList(declare(list.map(([name, value, priority]) => `${written(name, value)}:${value}${priority ? ' !important' : ''}`).join(';'))));
     switch (data[0]) {
       case 'style': { const text = declarations(data[2]); return data[3].length ? `${data[1]} {${text && '\n  ' + text}${block(data[3])}}` : `${data[1]} { ${text}${text && ' '}}`; }
       case 'media': return `@media ${data[1].join(', ')} {${block(data[2])}}`;
@@ -1940,6 +2167,7 @@
       case 'container': return `@container ${data[1]} {${block(data[2])}}`;
       case 'keyframes': return `@keyframes ${data[1]} { \n${data[2].map(frame => `  ${frame[0]} { ${declarations(frame[1])} }\n`).join('')}}`;
       case 'font-face': return `@font-face { ${declarationText(specifiedList(data[1]))} }`;
+      case 'position-try': { const text = declarationText(specifiedList(data[2])); return `@position-try ${data[1]} { ${text}${text && ' '}}`; }
       case 'property': return `@property ${data[1]} { syntax: ${JSON.stringify(data[2])}; inherits: ${data[3]};${data[4] == null ? '' : ` initial-value: ${data[4]};`} }`;
       case 'import': return `@import url("${data[1]}");`;
       default: return data[1];
@@ -1997,9 +2225,12 @@
     deleteRule(key) { const rule = this.findRule(key); if (!rule) return; const index = this.cssRules.indexOf(rule); this._sheet._edit('keyframe', this._path(), String(index)); this._data[2].splice(index, 1); this.cssRules.splice(index, 1); }
   }
   class CSSFontFaceRule extends CSSRule { get style() { return this._style ??= declaration({ rule: this, raw: true, read: () => this._data[1], write: list => { this._data[1] = list; this._sheet._edit('style', this._path(), declarationText(list)); } }); } }
+  class CSSPositionTryDescriptors extends CSSStyleDeclaration {}
+  class CSSPositionTryRule extends CSSRule { get name() { return this._data[1]; } get style() { return this._style ??= declaration({ rule: this, read: () => this._list ??= declare(this._data[2].map(([name, value]) => `${name}:${value}`).join(';')), write: list => { this._list = this._data[2] = list.filter(([name, , priority]) => !priority && tryDescriptor.test(name)); this._sheet._edit('style', this._path(), declarationText(this._list)); } }, CSSPositionTryDescriptors); } }
+  const tryDescriptor = /^(top|right|bottom|left|inset.*|margin.*|(min-|max-)?(width|height|inline-size|block-size)|(align|justify|place)-self|position-(anchor|area))$/;
   class CSSPropertyRule extends CSSRule { get name() { return this._data[1]; } get syntax() { return this._data[2]; } get inherits() { return this._data[3]; } get initialValue() { return this._data[4] ?? null; } }
   class CSSImportRule extends CSSRule { get href() { return this._data[1]; } get media() { return this._media ??= new MediaList(() => []); } get styleSheet() { return null; } get layerName() { return null; } get supportsText() { return null; } }
-  const ruleTypes = { style: CSSStyleRule, media: CSSMediaRule, supports: CSSSupportsRule, container: CSSContainerRule, layer: CSSLayerBlockRule, layers: CSSLayerStatementRule, keyframes: CSSKeyframesRule, 'font-face': CSSFontFaceRule, property: CSSPropertyRule, import: CSSImportRule };
+  const ruleTypes = { style: CSSStyleRule, media: CSSMediaRule, supports: CSSSupportsRule, container: CSSContainerRule, layer: CSSLayerBlockRule, layers: CSSLayerStatementRule, keyframes: CSSKeyframesRule, 'font-face': CSSFontFaceRule, property: CSSPropertyRule, 'position-try': CSSPositionTryRule, import: CSSImportRule };
   const makeRule = (sheet, parent, data) => new (ruleTypes[data[0]] ?? CSSRule)(sheet, parent, data);
   let sheetIds = 1;
   class StyleSheet {
@@ -2065,7 +2296,58 @@
     while (stack.length) { const rec = stack.pop(); if (rec.tag === 'style' || rec.tag === 'link') { const sheet = of(rec).sheet; if (sheet) sheets.push(sheet); } if (rec.tag !== 'template' && rec.tag !== 'noscript') for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); }
     return sheets;
   };
+  // The renderer gets the text of each range of a highlight, again when the range changes. Ranges over more nodes,
+  // static ones and ones outside the document are loose: a change of the tree can also change their text.
+  let highlightOrder = '[]', highlightIds = 0, rangeIds = 0;
+  const rangeParts = range => {
+    const { startContainer: node, startOffset: start, endContainer: end, endOffset: to } = range;
+    if (!node.isConnected || end !== node && end.getRootNode() !== node.getRootNode()) return [];
+    if (node === end && node.nodeType === 3) return to > start ? [[node._id, start, to]] : [];
+    return call('dom.rangeNodes', node._id, start, end._id, to).filter(part => part[2] > part[1]);
+  };
+  const queueHighlights = () => {
+    if (highlightsQueued) return;
+    highlightsQueued = true;
+    microtask(() => {
+      highlightsQueued = false;
+      const tree = highlightShape !== shape, updates = [], order = JSON.stringify([...highlights].sort((a, b) => a[1]._priority - b[1]._priority).map(([name, highlight]) => [name, highlight._id]));
+      highlightShape = shape;
+      for (const highlight of new Set(highlights.values())) {
+        if (tree) for (const range of highlight._loose) highlight._dirty.add(range);
+        for (const range of highlight._dirty) {
+          const inside = highlight.has(range), parts = inside ? rangeParts(range) : [], sent = parts.length === 1 ? parts[0].join() : parts.length ? JSON.stringify(parts) : '';
+          const loose = inside && (range instanceof StaticRange || range.startContainer !== range.endContainer || range.startContainer.nodeType !== 3 || !range.startContainer.isConnected);
+          if (loose !== highlight._loose.has(range)) { looseRanges += loose ? 1 : -1; if (loose) highlight._loose.add(range); else highlight._loose.delete(range); }
+          if ((highlight._sent.get(range) ?? '') !== sent) { updates.push([highlight._id, range._highlightId ??= ++rangeIds, parts]); if (sent) highlight._sent.set(range, sent); else highlight._sent.delete(range); }
+        }
+        highlight._dirty.clear();
+      }
+      if (updates.length || order !== highlightOrder) call('dom.highlights', order === highlightOrder ? null : json(order), updates);
+      highlightOrder = order;
+    });
+  };
+  class Highlight extends Set {
+    constructor(...ranges) { super(); this._id = ++highlightIds; this._priority = 0; this._names = 0; this._dirty = new Set(); this._loose = new Set(); this._sent = new Map(); this.type = 'highlight'; for (const range of ranges) this.add(range); }
+    get priority() { return this._priority; } set priority(value) { this._priority = Number(value) | 0; if (this._names) queueHighlights(); }
+    _touch(range) { this._dirty.add(range); if (this._names) queueHighlights(); }
+    add(range) { if (!(range instanceof Range) && !(range instanceof StaticRange)) throw new TypeError('Expected a range'); if (!this.has(range)) { super.add(range); (range._lit ??= new Set()).add(this); this._touch(range); } return this; }
+    delete(range) { const found = super.delete(range); if (found) { range._lit.delete(this); this._touch(range); } return found; }
+    clear() { for (const range of [...this]) this.delete(range); }
+  }
+  const nameHighlight = (highlight, by) => {
+    highlight._names += by;
+    // The renderer forgets a highlight without a name.
+    if (!highlight._names) { looseRanges -= highlight._loose.size; highlight._loose.clear(); highlight._sent.clear(); for (const range of highlight) highlight._dirty.add(range); }
+    queueHighlights();
+  };
+  class HighlightRegistry extends Map {
+    set(name, highlight) { if (!(highlight instanceof Highlight)) throw new TypeError('Expected a Highlight'); const old = this.get(name = String(name)); if (old !== highlight) { super.set(name, highlight); nameHighlight(highlight, 1); if (old) nameHighlight(old, -1); } return this; }
+    delete(name) { const old = this.get(name = String(name)), found = super.delete(name); if (found) nameHighlight(old, -1); return found; }
+    clear() { for (const name of [...this.keys()]) this.delete(name); }
+  }
+  highlights = new HighlightRegistry();
   const CSS = {
+    highlights,
     supports(name, value) { return call('dom.supports', String(name), arguments.length > 1 ? String(value) : null); },
     escape(value) {
       value = String(value); let out = '';
@@ -2103,7 +2385,7 @@
       if (!/^[a-z][a-z0-9._-]*-[a-z0-9._-]*$/.test(name) || /^(annotation-xml|color-profile|font-face(-src|-uri|-format|-name)?|missing-glyph)$/.test(name)) throw new DOMException(`'${name}' is not a valid custom element name`, 'SyntaxError');
       if (definitions.has(name) || defined.has(Type)) throw new DOMException('Invalid custom element definition', 'NotSupportedError');
       const observed = new Set(typeof Type.prototype.attributeChangedCallback === 'function' ? Array.from(Type.observedAttributes ?? [], String) : []);
-      definitions.set(name, Type); defined.set(Type, { name, observed });
+      wake(tagReaders.get('-'), document._m); definitions.set(name, Type); defined.set(Type, { name, observed });
       if (customTags.has(name)) reactions(document._m, undefined, name);
       for (const resolve of definitionsWaiting.get(name) ?? []) resolve(Type);
       definitionsWaiting.delete(name);
@@ -2212,19 +2494,22 @@
     _target(element) { call('dom.target', element?._id ?? null); }
     // As in browsers, a fragment shows its target: each `hidden=until-found` box around it gets `beforematch` and loses `hidden`, and closed details open.
     _reveal(element) { for (let node = element; node; node = node.parentElement) { if (node.getAttribute('hidden')?.toLowerCase() === 'until-found') { node.dispatchEvent(new Event('beforematch', { bubbles: true })); node.removeAttribute('hidden'); } else if (node.localName === 'details' && !node.open && node !== element && !node.querySelector(':scope > summary')?.contains(element)) node.open = true; } }
-    createElement(tag) {tag=String(tag).toLowerCase();if(tag[0]==='#')throw new DOMException('Invalid tag','InvalidCharacterError');const Type=definitions.get(tag);if(Type){constructing={tag};try{return new Type();}finally{constructing=null;}}return this===document?wrap(create(tag)):owned(this,wrap(create(tag)));}
-    createAttribute(name) {return new Attr(null,badAttr(String(name).toLowerCase()),'');}
-    createElementNS(namespace, tag) {namespace=namespace==null?null:String(namespace);tag=String(tag);if(tag[0]==='#')throw new DOMException('Invalid tag','InvalidCharacterError');if(namespace==='http://www.w3.org/1999/xhtml')return this.createElement(tag);const id=create(tag),Type=namespace==='http://www.w3.org/2000/svg'?(tag==='svg'?SVGSVGElement:SVGElement):Element;const node=new Type(id,tag);node.namespaceURI=namespace;return node;}
+    createElement(tag) {if(this instanceof XMLDocument)return this._element(create(String(tag)),this.contentType==='application/xhtml+xml'?XHTML:null,String(tag));tag=String(tag).toLowerCase();if(tag[0]==='#')throw new DOMException('Invalid tag','InvalidCharacterError');const Type=definitions.get(tag);if(Type){constructing={tag};try{return new Type();}finally{constructing=null;}}return this===document?wrap(create(tag)):owned(this,wrap(create(tag)));}
+    createAttribute(name) {name=badAttr(String(name));return new Attr(null,this instanceof XMLDocument?name:name.toLowerCase(),'');}
+    _element(id, namespace, tag) { const Type = namespace === XHTML ? htmlTypes.get(tag.replace(/^.*:/, '')) ?? HTMLElement : namespace === SVG ? tag === 'svg' ? SVGSVGElement : SVGElement : Element, node = new Type(id, tag), colon = tag.indexOf(':'); node.namespaceURI = namespace || null; node.nodeName = node.tagName = tag; if (colon > 0) { node.prefix = tag.slice(0, colon); node.localName = tag.slice(colon + 1); } return owned(this, node); }
+    createElementNS(namespace, tag) {namespace=namespace==null?null:String(namespace);tag=String(tag);const colon=tag.indexOf(':'),prefix=colon<0?null:tag.slice(0,colon);if(!colon||colon===tag.length-1)throw new DOMException('Invalid tag','InvalidCharacterError');if(prefix!==null&&!namespace||prefix==='xml'&&namespace!==XML||(tag==='xmlns'||prefix==='xmlns')!==(namespace===XMLNS))throw new DOMException('Invalid namespace','NamespaceError');if(tag[0]==='#')throw new DOMException('Invalid tag','InvalidCharacterError');if(namespace===XHTML&&!(this instanceof XMLDocument))return this.createElement(tag);return this._element(create(tag),namespace,tag);}
     createTextNode(text) { return owned(this, wrap(create('#text', String(text)))); }
     createComment(text) { return owned(this, wrap(create('#comment', String(text)))); }
+    createCDATASection(data) { if (!(this instanceof XMLDocument)) throw new DOMException('HTML documents have no CDATA sections', 'NotSupportedError'); return owned(this, new CDATASection(create('#text', String(data)))); }
+    createProcessingInstruction(target, data) { return owned(this, new ProcessingInstruction(create('#comment', String(data)), String(target))); }
     createDocumentFragment() { return owned(this, wrap(create('#fragment'))); }
     createRange() { return new Range(); }
-    get implementation(){return this._implementation??={createDocumentType:(name,publicId,systemId)=>{name=String(name);if(!/^[A-Za-z_][\w.-]*(:[A-Za-z_][\w.-]*)?$/.test(name))throw new DOMException('Invalid doctype name','InvalidCharacterError');publicId=String(publicId);systemId=String(systemId);return wrap(create('#doctype',publicId||systemId?[name,publicId,systemId].join('\0'):name));},createHTMLDocument:title=>{const doc=new DOMParser().parseFromString('<!doctype html><html><head></head><body></body></html>','text/html');if(title!==undefined)doc.title=title;return doc;},hasFeature:()=>true};}
+    get implementation(){return this._implementation??={createDocumentType:(name,publicId,systemId)=>{name=String(name);if(!/^[A-Za-z_][\w.-]*(:[A-Za-z_][\w.-]*)?$/.test(name))throw new DOMException('Invalid doctype name','InvalidCharacterError');publicId=String(publicId);systemId=String(systemId);return wrap(create('#doctype',publicId||systemId?[name,publicId,systemId].join('\0'):name));},createHTMLDocument:title=>{const doc=new DOMParser().parseFromString('<!doctype html><html><head></head><body></body></html>','text/html');if(title!==undefined)doc.title=title;return doc;},createDocument:(namespace,name,doctype)=>{const doc=new XMLDocument();if(doctype)doc.append(doctype);if(name)doc.append(doc.createElementNS(namespace,name));return doc;},hasFeature:()=>true};}
     createEvent(type) { const Type = { event: Event, events: Event, htmlevents: Event, customevent: CustomEvent, uievent: UIEvent, uievents: UIEvent, focusevent: FocusEvent, mouseevent: MouseEvent, mouseevents: MouseEvent, keyboardevent: KeyboardEvent, compositionevent: CompositionEvent, dragevent: DragEvent, messageevent: MessageEvent, storageevent: StorageEvent, hashchangeevent: HashChangeEvent, beforeunloadevent: BeforeUnloadEvent }[String(type).toLowerCase()]; if (!Type) throw new DOMException('Unsupported event interface', 'NotSupportedError'); return new Type(''); }
     importNode(node, deep = false) { return owned(this, node.cloneNode(deep)); }
-    adoptNode(node) { if (node.nodeType === 9) throw new DOMException('A document cannot be adopted', 'NotSupportedError'); node.remove(); node._owner = this === document ? undefined : this; return node; }
+    adoptNode(node) { if (node instanceof Attr) { node.ownerElement?.removeAttributeNode(node); return node; } if (node.nodeType === 9) throw new DOMException('A document cannot be adopted', 'NotSupportedError'); node.remove(); node._owner = this === document ? undefined : this; return node; }
     getElementById(id) { id = String(id); const found = idsWithin(this._m, id); return found.length < 2 ? of(found[0]) : find(this._m, rec => rec.attrs?.get('id') === id); }
-    getElementsByName(name) { return this.querySelectorAll('[name=' + quote(name) + ']'); }
+    getElementsByName(name) { name = String(name); return live(this, 'name ' + name, NodeList, () => all(this._m, rec => rec.attrs.get('name') === name), { root: this._m, tags: ['*'], attrs: ['name'] }, null); }
     get body() { const html = this._m.kids.find(rec => rec.tag[0] !== '#'); return html?.tag === 'html' ? of(html.kids.find(rec => rec.tag === 'body' || rec.tag === 'frameset')) : null; }
     get head() { const html = this._m.kids.find(rec => rec.tag[0] !== '#'); return html?.tag === 'html' ? of(html.kids.find(rec => rec.tag === 'head')) : null; }
     get documentElement() { return of(this._m.kids.find(rec => rec.tag[0] !== '#')); }
@@ -2245,7 +2530,7 @@
     // Cookies live in memory, like a private session with no server.
     get cookie() { return this === document ? [...cookies].map(([name, value]) => name ? name + '=' + value : value).join('; ') : ''; } set cookie(value) { const [pair, ...attrs] = String(value).split(';'), at = pair.indexOf('='), name = at < 0 ? '' : pair.slice(0, at).trim(), expired = attrs.some(attr => { const [key, text = ''] = attr.split('=').map(part => part.trim()); return /^max-age$/i.test(key) ? Number(text) <= 0 : /^expires$/i.test(key) && Date.parse(text) <= Date.now(); }); if (this !== document) return; if (expired) cookies.delete(name); else cookies.set(name, (at < 0 ? pair : pair.slice(at + 1)).trim()); }
     get contentType() { return 'text/html'; } get scrollingElement() { return this.documentElement; }
-    get readyState() { return this === document ? readyState : 'complete'; } get currentScript() { return this === document ? currentScript : null; } get compatMode() { return (this._quirks ??= quirks(this.doctype)) ? 'BackCompat' : 'CSS1Compat'; } get doctype() { return of(this._m.kids.find(rec => rec.tag === '#doctype')); } get visibilityState() { return 'visible'; } get hidden() { return false; }
+    get readyState() { return this === document ? readyState : 'complete'; } get currentScript() { return this === document ? currentScript : null; } get compatMode() { return !(this instanceof XMLDocument) && (this._quirks ??= quirks(this.doctype)) ? 'BackCompat' : 'CSS1Compat'; } get doctype() { return of(this._m.kids.find(rec => rec.tag === '#doctype')); } get visibilityState() { return 'visible'; } get hidden() { return false; }
     get title() { return (rare.title && find(this._m, rec => rec.tag === 'title')?.textContent || '').replace(/[\t\n\f\r ]+/g, ' ').replace(/^ | $/g, ''); }
     set title(value) {
       let title = rare.title ? find(this._m, rec => rec.tag === 'title') : null;
@@ -2272,12 +2557,15 @@
     get webkitFullscreenElement() { return this.fullscreenElement; } get webkitCurrentFullScreenElement() { return this.fullscreenElement; } get webkitFullscreenEnabled() { return true; } get webkitIsFullScreen() { return this.fullscreen; }
     webkitExitFullscreen() { return this.exitFullscreen(); } webkitCancelFullScreen() { return this.exitFullscreen(); }
   }
+  class XMLDocument extends Document { constructor(type = 'application/xml') { super(); xmlDocuments++; this._type = type; } get contentType() { return this._type; } get body() { return this.documentElement?.namespaceURI === XHTML ? super.body : null; } }
+  let xmlDocuments = 0;
+  const inXML = node => xmlDocuments > 0 && node.getRootNode() instanceof XMLDocument;
   DocumentFragment.prototype.getElementById = Document.prototype.getElementById;
   const cookies = new Map();
-  for (const [name, selector] of [['forms', 'form'], ['images', 'img'], ['links', 'a[href], area[href]'], ['scripts', 'script'], ['anchors', 'a[name]'], ['embeds', 'embed'], ['plugins', 'embed']]) Object.defineProperty(Document.prototype, name, { configurable: true, get() { const list = listOf(HTMLCollection, [...this.querySelectorAll(selector)]); for (const node of list) for (const key of [node.id, node.getAttribute('name')]) if (key && !(key in list)) list[key] = node; return list; } });
+  for (const [name, selector, tags, attrs] of [['forms', 'form', ['form']], ['images', 'img', ['img']], ['links', 'a[href], area[href]', ['a', 'area'], ['href']], ['scripts', 'script', ['script']], ['anchors', 'a[name]', ['a'], ['name']], ['embeds', 'embed', ['embed']], ['plugins', 'embed', ['embed']]]) Object.defineProperty(Document.prototype, name, { configurable: true, get() { return live(this, name, HTMLCollection, () => this.querySelectorAll(selector), { root: this._m, tags, attrs }); } });
   class ParentNode {
-    get children() { return this._elements ??= listOf(HTMLCollection, this._m.kids.filter(rec => rec.tag[0] !== '#').map(of)); }
-    get childElementCount() { return this.children.length; }
+    get children() { return this._elements ??= liveList(this, 1) ?? listOf(HTMLCollection, this._m.kids.filter(rec => rec.tag[0] !== '#').map(of)); }
+    get childElementCount() { let count = 0; for (const kid of this._m.kids) if (kid.tag[0] !== '#') count++; return count; }
     get firstElementChild() { return of(this._m.kids.find(rec => rec.tag[0] !== '#')); }
     get lastElementChild() { return of(this._m.kids.findLast(rec => rec.tag[0] !== '#')); }
     append(...children) { insertNodes(this, convert(children), null); }
@@ -2286,9 +2574,13 @@
     moveBefore(node, child) { if (!(node instanceof Node) || node.nodeType === 9 || node.nodeType === 11 || node.getRootNode({ composed: true }) !== this.getRootNode({ composed: true })) throw new DOMException('Cannot move the node here', 'HierarchyRequestError'); reactionDepth++; moving = true; try { this.insertBefore(node, child); } finally { moving = false; leave(); } }
     querySelector(selector) { selector = String(selector); const found = idSelector.test(selector) && idsWithin(this._m, selector.slice(1)); return found?.length < 2 ? of(found[0]) : wrap(selectors('dom.queryWithin', this._id, selector, true)); }
     querySelectorAll(selector) { selector = String(selector); const found = idSelector.test(selector) && idsWithin(this._m, selector.slice(1)); return listOf(NodeList, found?.length < 2 ? found.map(of) : selectors('dom.queryWithin', this._id, selector).map(wrap)); }
-    getElementsByTagName(name) { name = String(name); const lower = name.toLowerCase(), result = []; find(this._m, rec => { if (rec.tag[0] !== '#' && (name === '*' || rec.tag === lower || rec.tag === name)) result.push(of(rec)); return false; }); return listOf(HTMLCollection, result); }
-    getElementsByTagNameNS(namespace, name) { const all = this.getElementsByTagName(name); return namespace === '*' ? all : listOf(HTMLCollection, all.filter(node => node.namespaceURI === (namespace || null))); }
-    getElementsByClassName(names) { names = String(names).split(/[\t\n\f\r ]+/).filter(Boolean); return listOf(HTMLCollection, names.length ? this.querySelectorAll(names.map(name => '[class~=' + quote(name) + ']').join('')) : []); }
+    getElementsByTagName(name) { name = String(name); const lower = name.toLowerCase(); return live(this, 'tag ' + name, HTMLCollection, () => all(this._m, rec => name === '*' || rec.tag === lower || rec.tag === name), { root: this._m, tags: new Set([lower, name]), drops: true }); }
+    getElementsByTagNameNS(namespace, name) { namespace ||= null; name = String(name); return live(this, `ns ${namespace} ${name}`, HTMLCollection, () => all(this._m, rec => name === '*' || rec.tag.endsWith(name)).filter(node => (name === '*' || node.localName === name) && (namespace === '*' || node.namespaceURI === namespace)), { root: this._m, tags: ['*'], drops: true }); }
+    getElementsByClassName(names) {
+      names = String(names).split(/[\t\n\f\r ]+/).filter(Boolean);
+      const has = rec => { const value = rec.attrs.get('class'); if (!value) return false; if (names.length === 1 && value === names[0]) return true; for (const name of names) if (!value.includes(name)) return false; const own = value.split(/[\t\n\f\r ]+/); return names.every(name => own.includes(name)); };
+      return live(this, 'class ' + names.join(' '), HTMLCollection, () => names.length ? all(this._m, has) : [], { root: this._m, classes: names, drops: true });
+    }
   }
   const { constructor: _, ...parentNode } = Object.getOwnPropertyDescriptors(ParentNode.prototype);
   for (const Type of [Element, Document, DocumentFragment]) Object.defineProperties(Type.prototype, parentNode);
@@ -2297,29 +2589,142 @@
     serializeToString(root) {
       if (!(root instanceof Node)) throw new TypeError('Expected a Node');
       let out = '';
-      for (const stack = [[root, null]]; stack.length;) {
+      // Entries: a node, its default namespace, and the prefixes in scope.
+      if (root._declaration) out += root._declaration;
+      for (const stack = [[root, null, { __proto__: null }]]; stack.length;) {
         const item = stack.pop();
         if (typeof item === 'string') { out += item; continue; }
-        const [node, ns] = item, type = node.nodeType;
+        const [node, ns, outer] = item, type = node.nodeType;
         if (type === 3) out += xmlText(node.data);
+        else if (type === 4) out += '<![CDATA[' + node.data + ']]>';
+        else if (type === 7) out += '<?' + node.target + (node.data && ' ' + node.data) + '?>';
         else if (type === 8) out += '<!--' + node.data + '-->';
+        else if (type === 2) out += xmlText(node.value, true);
         else if (type === 10) out += '<!DOCTYPE ' + node.name + (node.publicId ? ' PUBLIC "' + node.publicId + '"' : node.systemId ? ' SYSTEM' : '') + (node.systemId ? ' "' + node.systemId + '"' : '') + '>';
         else if (type === 1) {
-          const space = node.namespaceURI, name = node.localName, html = space === XHTML, attrs = node._m.attrs;
-          out += '<' + name + (space && space !== ns && !attrs.has('xmlns') ? ' xmlns="' + xmlText(space, true) + '"' : '');
+          const space = node.namespaceURI, html = space === XHTML, name = node.prefix ? node._m.tag : node.localName, attrs = node._m.attrs, prefixes = Object.assign({ __proto__: null }, outer);
+          for (const [key, value] of attrs) if (key.startsWith('xmlns:')) prefixes[key.slice(6)] = value;
+          out += '<' + name;
+          if (node.prefix) { if (prefixes[node.prefix] !== space) { prefixes[node.prefix] = space; out += ' xmlns:' + node.prefix + '="' + xmlText(space ?? '', true) + '"'; } }
+          else if (space !== ns && !attrs.has('xmlns')) out += ' xmlns="' + xmlText(space ?? '', true) + '"';
+          for (const [key, space] of node._spaces ?? []) { const prefix = key.slice(0, key.indexOf(':')); if (attrs.has(key) && key.includes(':') && prefix !== 'xml' && prefix !== 'xmlns' && prefixes[prefix] !== space) { prefixes[prefix] = space; out += ' xmlns:' + prefix + '="' + xmlText(space, true) + '"'; } }
           for (const [key, value] of attrs) out += ' ' + key + '="' + xmlText(value, true) + '"';
           const kids = (html && name === 'template' ? node.content : node).childNodes;
           if (!kids.length && (!html || voids.test(name))) { out += html ? ' />' : '/>'; continue; }
           out += '>'; stack.push('</' + name + '>');
-          for (let i = kids.length; i--;) stack.push([kids[i], space]);
-        } else { const kids = node.childNodes; for (let i = kids.length; i--;) stack.push([kids[i], ns]); }
+          for (let i = kids.length; i--;) stack.push([kids[i], node.prefix ? attrs.get('xmlns') ?? ns : space, prefixes]);
+        } else { const kids = node.childNodes; for (let i = kids.length; i--;) stack.push([kids[i], ns, outer]); }
       }
       return out;
     }
   }
+  // As in Chrome, a document is at most this deep.
+  const xmlDepth = 5000, XML = 'http://www.w3.org/XML/1998/namespace', XMLNS = 'http://www.w3.org/2000/xmlns/';
+  const parseXML = (source, type) => {
+    const doc = new XMLDocument(type), open = [doc], scopes = [{ __proto__: null, '': null, xml: 'http://www.w3.org/XML/1998/namespace', xmlns: 'http://www.w3.org/2000/xmlns/' }], entities = new Map([['amp', '&'], ['lt', '<'], ['gt', '>'], ['quot', '"'], ['apos', "'"]]);
+    const link = node => { const parent = open.at(-1), kid = node._m; op(2, parent._id, node._id, -1); kid.up = parent._m; kid.i = parent._m.kids.push(kid) - 1; hold(parent, node); };
+    let at = 0, expanded = 0, doctype = false;
+    const fail = (message = 'Unexpected token: ' + (source[at] ?? ''), where = at) => { throw [message, where]; };
+    const decode = (text, start) => text.includes('&') ? text.replace(/&(?:#x([\da-f]+)|#(\d+)|([^\s;&<]+));|&/gi, (found, hex, digits, name, offset) => {
+      const code = hex ? parseInt(hex, 16) : digits ? +digits : -1;
+      if (code >= 0) { if (code > 0x10ffff || code >= 0xd800 && code < 0xe000 || code === 0xfffe || code === 0xffff || code < 32 && !/[\t\n\r]/.test(String.fromCharCode(code))) fail('Invalid character U+' + code.toString(16).toUpperCase().padStart(4, '0'), start + offset + found.length - 1); return String.fromCodePoint(code); }
+      if (!name) fail('Unexpected token inside entity: ' + (text[offset + 1] ?? ''), start + offset + 1);
+      const value = entities.get(name) ?? fail('Unexpected entity: ' + name, start + offset + found.length - 1);
+      expanded += value.length;
+      if (expanded > 1e7) fail('Too much entity text', start + offset);
+      return value;
+    }) : text;
+    const name = /[A-Za-z_:\u0080-￿][\w:.·\u0080-￿-]*/y, space = /[ \t\n\r]*/y;
+    const take = pattern => { pattern.lastIndex = at; const found = pattern.exec(source); if (found) at = pattern.lastIndex; return found?.[0]; };
+    const until = (end, message = 'Unexpected end of stream') => { const stop = source.indexOf(end, at); if (stop < 0) { at = source.length; fail(message); } const text = source.slice(at, stop); at = stop + end.length; return text; };
+    source = source.replace(/\r\n?/g, '\n');
+    if (source[0] === '\ufeff') source = source.slice(1);
+    const invalid = source.search(/[\0-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]/), code = source.charCodeAt(invalid);
+    if (invalid >= 0) source = source.slice(0, invalid);
+    try {
+      if (/^<\?xml\s/.test(source)) { at = 5; until('?>'); doc._declaration = source.slice(0, at); }
+      while (at < source.length) {
+        const start = at, depth = open.length;
+        if (source[at] !== '<') {
+          const stop = source.indexOf('<', at), text = source.slice(at, stop < 0 ? source.length : stop);
+          if (depth === 1) { const bad = text.search(/[^ \t\n]/); if (bad >= 0) { at += bad; fail('Unexpected characters outside the root element: ' + source[at]); } at += text.length; continue; }
+          if (text.includes(']]>')) { at += text.indexOf(']]>'); fail('Unexpected token: ]]>'); }
+          const value = decode(text, at);
+          at += text.length; link(owned(doc, new Text(create('#text', value), '#text')));
+        } else if (source.startsWith('<!--', at)) { at += 4; const data = until('-->'); const dashes = (data + '-').indexOf('--'); if (dashes >= 0) fail(`Unexpected token '--' before '${data[dashes + 2] ?? '-'}'`, start + 4 + dashes); link(doc.createComment(data)); }
+        else if (source.startsWith('<![CDATA[', at) && depth > 1) { at += 9; link(doc.createCDATASection(until(']]>'))); }
+        else if (source.startsWith('<!DOCTYPE', at) && depth === 1 && !doc.documentElement && !doctype) {
+          const found = /<!DOCTYPE\s+([^\s>[]+)(?:\s+PUBLIC\s+(?:"([^"]*)"|'([^']*)')(?:\s+(?:"([^"]*)"|'([^']*)'))?|\s+SYSTEM\s+(?:"([^"]*)"|'([^']*)'))?\s*(?:\[([^\]]*)\]\s*)?>/y;
+          found.lastIndex = at; const [whole, kind, p1, p2, s1, s2, s3, s4, subset] = found.exec(source) ?? fail();
+          at += whole.length;
+          doctype = true;
+          const entity = /<!ENTITY\s+([^\s%"']+)\s+(["'])/g;
+          for (let found; subset && (found = entity.exec(subset));) { const stop = subset.indexOf(found[2], entity.lastIndex); if (stop < 0) break; if (!entities.has(found[1])) entities.set(found[1], subset.slice(entity.lastIndex, stop).replace(/&#(?:x([\da-f]+)|(\d+));/gi, (_, hex, digits) => String.fromCodePoint(Math.min(hex ? parseInt(hex, 16) : +digits, 0x10ffff)))); entity.lastIndex = stop + 1; }
+          link(doc.implementation.createDocumentType(kind, p1 ?? p2 ?? '', s1 ?? s2 ?? s3 ?? s4 ?? ''));
+        } else if (source.startsWith('<?', at)) {
+          at += 2; const target = take(name) ?? fail();
+          if (/^xml$/i.test(target)) fail();
+          take(space); link(doc.createProcessingInstruction(target, until('?>')));
+        } else if (source[at + 1] === '/') {
+          at += 2; const tag = take(name), element = open.at(-1); take(space);
+          if (depth === 1) { at = start; fail(); }
+          if (source[at] !== '>') fail();
+          if (tag !== element._m.tag) fail(`Unexpected closing tag: ${tag} != ${element._m.tag}`);
+          at++; open.pop(); scopes.pop();
+        } else {
+          if (depth === 1 && doc.documentElement) fail();
+          at++; const tag = take(name) ?? fail(), end = at, attrs = [], places = [], own = new Set();
+          let scope = scopes.at(-1), empty = false;
+          if (depth > xmlDepth) fail('Excessive depth in document');
+          for (;;) {
+            const gap = take(space);
+            if (source[at] === '>') { at++; break; }
+            if (source.startsWith('/>', at)) { at += 2; empty = true; break; }
+            if (at >= source.length) fail('Unexpected end of stream');
+            if (!gap) fail();
+            const place = at, key = take(name) ?? fail();
+            take(space); if (source[at] !== '=') fail();
+            at++; take(space); const quote = source[at]; if (quote !== '"' && quote !== "'") fail();
+            const from = ++at, value = until(quote);
+            if (value.includes('<')) { at = from + value.indexOf('<'); fail(); }
+            if (own.has(key)) fail(`Attribute '${key}' is redefined`, place);
+            own.add(key); const text = decode(value.replace(/[\t\n]/g, ' '), from);
+            attrs.push(key, text); places.push(place);
+            if (key === 'xmlns' || key.startsWith('xmlns:')) { const prefix = key.slice(6); if (prefix === 'xmlns' || (prefix === 'xml') !== (text === XML) || text === XMLNS || prefix && !text) fail(`Namespace ${text || 'empty'} can't have the prefix ${prefix || 'xmlns'}`, place); if (scope === scopes.at(-1)) scope = Object.assign({ __proto__: null }, scope); scope[prefix] = text || null; }
+          }
+          for (let i = 0; i < attrs.length; i += 2) { const colon = attrs[i].indexOf(':'); if (colon < 0) continue; const space = scope[attrs[i].slice(0, colon)], full = space + ' ' + attrs[i].slice(colon + 1); if (space === undefined) fail(`Attribute ${attrs[i]} prefix is unbound`, places[i / 2]); if (!/^[^:]+:[^:]+$/.test(attrs[i])) fail(undefined, places[i / 2]); if (own.has(full)) fail(`Attribute '${attrs[i].slice(colon + 1)}' is redefined`, places[i / 2]); own.add(full); }
+          const colon = tag.indexOf(':'), prefix = colon > 0 ? tag.slice(0, colon) : '';
+          if (colon >= 0 && !/^[^:]+:[^:]+$/.test(tag)) fail(undefined, end);
+          if (!(prefix in scope)) fail(`Element ${tag} prefix is unbound`, end);
+          const id = create(tag), element = doc._element(id, scope[prefix], tag);
+          if (attrs.length) { element._m.attrs = new Attrs(attrs); for (let i = 0; i < attrs.length; i += 2) { op(4, id, attrs[i], attrs[i + 1]); if (attrs[i] === 'id') idAdd(attrs[i + 1], element._m); } }
+          link(element);
+          if (!empty) { open.push(element); scopes.push(scope); }
+        }
+      }
+      if (invalid >= 0) fail(`Invalid character U+${code.toString(16).toUpperCase().padStart(4, '0')}`, invalid);
+      if (open.length > 1) fail('Unexpected end of stream: still inside the root element');
+      if (!doc.documentElement) fail('Unexpected end of stream: no root element found');
+    } catch (error) {
+      if (!Array.isArray(error)) throw error;
+      const [message, where] = invalid >= 0 && error[1] >= invalid ? [`Invalid character U+${code.toString(16).toUpperCase().padStart(4, '0')}`, invalid] : error, lines = source.slice(0, where).split('\n');
+      // As in Chrome, the document keeps what was read before the error, and tells about it in its first element.
+      const make = (tag, style, ...kids) => { const node = doc.createElementNS(XHTML, tag); if (style) node.setAttribute('style', style); node.append(...kids); return node; };
+      const report = make('parsererror', 'display: block; white-space: pre; border: 2px solid #c77; padding: 0 1em 0 1em; margin: 1em; background-color: #fdd; color: black',
+        make('h3', '', 'This page contains the following errors:'), make('div', 'font-family:monospace;font-size:12px', `error on line ${lines.length} at column ${lines.at(-1).length + 1}: ${message}`), make('h3', '', 'Below is a rendering of the page up to the first error.'));
+      const root = doc.documentElement;
+      if (root) root.prepend(report); else doc.append(make('html', '', make('body', '', report)));
+    }
+    return doc;
+  };
   class DOMParser {
-    parseFromString(source,type){if(type!=='text/html'&&type!=='image/svg+xml')throw new DOMException('Only HTML and SVG parsing is supported','NotSupportedError');const doc=wrap(create('#document'));load(json(call('dom.html',doc._id,String(source))));if(type!=='text/html')Object.defineProperty(doc,'documentElement',{value:doc.querySelector('svg')});return doc;}
+    parseFromString(source, type) {
+      if (type === 'text/xml' || type === 'application/xml' || type === 'application/xhtml+xml' || type === 'image/svg+xml') return parseXML(String(source), type);
+      if (type !== 'text/html') throw new TypeError(`'${type}' is not a supported type`);
+      const doc = wrap(create('#document')); load(json(call('dom.html', doc._id, String(source)))); return doc;
+    }
   }
+  Document.parseHTMLUnsafe = html => { const doc = new DOMParser().parseFromString(html, 'text/html'); attachDeclarative(); return doc; };
   const comparePoints = (a, start, b, end) => {
     if (a === b) return Math.sign(start - end);
     const ra = a._m, rb = b._m;
@@ -2330,7 +2735,7 @@
   const rangeNodes=(range,elements)=>call('dom.rangeNodes',range.startContainer._id,range.startOffset,range.endContainer._id,range.endOffset,elements).map(([id,start,end])=>({node:wrap(id),start,end}));
   const textPoint=(root,offset)=>{const [id,index]=call('dom.textPoint',root._id,offset);return [wrap(id),index];};
   const textOffset=(root,node,offset)=>call('dom.textOffset',root._id,node?._id,offset);
-  const characterData = node => node.nodeType === 3 || node.nodeType === 8;
+  const characterData = node => node instanceof CharacterData;
   class Range {
     constructor() { this._ref = new WeakRef(this); this._sc = this._ec = document; this._so = this._eo = 0; }
     get startContainer() { return this._sc; } get startOffset() { return this._so; } get endContainer() { return this._ec; } get endOffset() { return this._eo; }
@@ -2472,6 +2877,7 @@
     }
     get collapsed() { return this.startContainer === this.endContainer && this.startOffset === this.endOffset; }
   }
+  const rtlBlock = node => { while (node && (node.nodeType !== 1 || /^(inline|contents)$/.test(getComputedStyle(node).display))) node = node.parentNode; return !!node && getComputedStyle(node).direction === 'rtl'; };
   class Selection {
     constructor() { this.ranges = []; this.direction = 'none'; }
     get anchorNode() { return this.ranges[0]?.[this.direction === 'backward' ? 'endContainer' : 'startContainer'] ?? null; }
@@ -2542,7 +2948,7 @@
     _point(alter, direction, granularity) {
       [alter, direction, granularity] = [alter, direction, granularity].map(value => String(value).toLowerCase());
       if (!this.rangeCount || !/^(move|extend)$/.test(alter) || !/^(forward|backward|left|right)$/.test(direction) || !/^(character|word|sentence|line|paragraph|lineboundary|sentenceboundary|paragraphboundary|documentboundary)$/.test(granularity)) return;
-      const forward = direction === 'forward' || direction === 'right', focus = this.focusNode, range = this.ranges[0];
+      const focus = this.focusNode, forward = direction === 'forward' || /^(left|right)$/.test(direction) && (direction === 'right') !== rtlBlock(focus), range = this.ranges[0];
       if (granularity === 'character' && alter === 'move' && !range.collapsed) return forward ? [range.endContainer, range.endOffset] : [range.startContainer, range.startOffset];
       let host = focus.nodeType === 1 ? focus : focus.parentElement;
       if (host?.isContentEditable) while (host.parentElement?.isContentEditable) host = host.parentElement; else host = null;
@@ -3424,7 +3830,7 @@
     Object.defineProperty(Document.prototype, 'dir', { configurable: true, get() { return this.documentElement?.dir ?? ''; }, set(value) { if (this.documentElement) this.documentElement.dir = value; } });
   }
   {
-    const kids = (el, ...tags) => [...el.children].filter(child => tags.includes(child.localName));
+    const kids = (el, ...tags) => el._m.kids.filter(kid => tags.includes(kid.tag)).map(of);
     const rows = el => kids(el, 'tr', 'thead', 'tbody', 'tfoot').flatMap(child => child.localName === 'tr' ? [child] : kids(child, 'tr'));
     const insertRow = (section, index, all = kids(section, 'tr')) => { if (index < -1 || index > all.length) throw new DOMException('Row index out of range', 'IndexSizeError'); const row = document.createElement('tr'); return index === -1 || index === all.length ? (all.at(-1)?.parentNode ?? section).appendChild(row) : all[index].before(row) ?? row; };
     const remove = (list, index) => { const item = list.at(index); if (!item || index < -1 || index >= list.length) throw new DOMException('Index out of range', 'IndexSizeError'); item.remove(); };
@@ -3433,8 +3839,8 @@
       get caption() { return kids(this, 'caption')[0] ?? null; },
       get tHead() { return kids(this, 'thead')[0] ?? null; },
       get tFoot() { return kids(this, 'tfoot')[0] ?? null; },
-      get tBodies() { return listOf(HTMLCollection, kids(this, 'tbody')); },
-      get rows() { return listOf(HTMLCollection, rows(this)); },
+      get tBodies() { return live(this, 'tBodies', HTMLCollection, () => kids(this, 'tbody'), { root: this._m, tags: ['tbody'] }); },
+      get rows() { return live(this, 'rows', HTMLCollection, () => rows(this), { root: this._m, tags: ['tr', 'thead', 'tbody', 'tfoot'] }); },
       createCaption() { return section(this, 'caption', () => this.firstChild); },
       createTHead() { return section(this, 'thead', () => kids(this, 'tbody', 'tfoot', 'tr')[0]); },
       createTFoot() { return section(this, 'tfoot'); },
@@ -3444,12 +3850,12 @@
       deleteRow(index) { remove(rows(this), index); },
     }));
     Object.defineProperties(HTMLTableSectionElement.prototype, Object.getOwnPropertyDescriptors({
-      get rows() { return listOf(HTMLCollection, kids(this, 'tr')); },
+      get rows() { return live(this, 'rows', HTMLCollection, () => kids(this, 'tr'), { root: this._m, tags: ['tr'] }); },
       insertRow(index = -1) { return insertRow(this, index); },
       deleteRow(index) { remove(kids(this, 'tr'), index); },
     }));
     Object.defineProperties(HTMLTableRowElement.prototype, Object.getOwnPropertyDescriptors({
-      get cells() { return listOf(HTMLCollection, kids(this, 'td', 'th')); },
+      get cells() { return live(this, 'cells', HTMLCollection, () => kids(this, 'td', 'th'), { root: this._m, tags: ['td', 'th'] }); },
       get rowIndex() { const table = this.closest('table'); return table ? rows(table).indexOf(this) : -1; },
       get sectionRowIndex() { return this.parentNode ? kids(this.parentNode, 'tr').indexOf(this) : -1; },
       insertCell(index = -1) { const cells = kids(this, 'td', 'th'); if (index < -1 || index > cells.length) throw new DOMException('Cell index out of range', 'IndexSizeError'); const cell = document.createElement('td'); return index === -1 || index === cells.length ? this.appendChild(cell) : this.insertBefore(cell, cells[index]); },
@@ -3462,7 +3868,7 @@
   globalThis.window = globalThis; globalThis.self = globalThis;
   selection = new Selection(); attachDeclarative();
   for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) globalThis[name] = Node.prototype[name].bind(globalThis);
-  Object.assign(globalThis, { ContentVisibilityAutoStateChangeEvent, SnapEvent, ElementImage, CanvasPaintEvent, ElementGeometryUpdateEvent, ImageBitmap, ImageBitmapRenderingContext, OffscreenCanvas, OffscreenCanvasRenderingContext2D, Screen, ScreenOrientation, CanvasGradient, Path2D, CanvasPattern, DOMMatrix, DOMMatrixReadOnly, DOMPoint, DOMPointReadOnly, TextMetrics, AudioContext, OfflineAudioContext, AudioNode, AudioParam, AudioScheduledSourceNode, GainNode, BiquadFilterNode, OscillatorNode, PeriodicWave, AudioBuffer, AudioBufferSourceNode, AudioDestinationNode, Node, CharacterData, Text, Comment, DocumentType, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, SVGAnimatedString, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, CommandEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, FileList, ClipboardEvent, DragEvent, StaticRange, customElements, ShadowRoot, CSSStyleSheet, DOMParser, CSS, StyleSheet, StyleSheetList, MediaList, CSSRule, CSSRuleList, CSSGroupingRule, CSSStyleRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule, CSSLayerStatementRule, CSSKeyframesRule, CSSKeyframeRule, CSSFontFaceRule, CSSPropertyRule, CSSImportRule, CSSStyleDeclaration, AnimationEvent, BeforeUnloadEvent, ElementInternals, FormDataEvent, HashChangeEvent, PageTransitionEvent, PopStateEvent, RadioNodeList, StorageEvent, TransitionEvent });
+  Object.assign(globalThis, { CSSPositionTryRule, CSSPositionTryDescriptors, ContentVisibilityAutoStateChangeEvent, SnapEvent, ElementImage, CanvasPaintEvent, ElementGeometryUpdateEvent, ImageBitmap, ImageBitmapRenderingContext, OffscreenCanvas, OffscreenCanvasRenderingContext2D, Screen, ScreenOrientation, CanvasGradient, Path2D, CanvasPattern, DOMMatrix, DOMMatrixReadOnly, DOMPoint, DOMPointReadOnly, TextMetrics, AudioContext, OfflineAudioContext, AudioNode, AudioParam, AudioScheduledSourceNode, GainNode, BiquadFilterNode, OscillatorNode, PeriodicWave, AudioBuffer, AudioBufferSourceNode, AudioDestinationNode, Node, CharacterData, Text, Comment, DocumentType, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, SVGAnimatedString, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, CommandEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, FileList, ClipboardEvent, DragEvent, StaticRange, customElements, ShadowRoot, CSSStyleSheet, DOMParser, CSS, StyleSheet, StyleSheetList, MediaList, CSSRule, CSSRuleList, CSSGroupingRule, CSSStyleRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule, CSSLayerStatementRule, CSSKeyframesRule, CSSKeyframeRule, CSSFontFaceRule, CSSPropertyRule, CSSImportRule, CSSStyleDeclaration, AnimationEvent, BeforeUnloadEvent, CustomStateSet, Highlight, HighlightRegistry, XMLDocument, CDATASection, ProcessingInstruction, ElementInternals, FormDataEvent, HashChangeEvent, PageTransitionEvent, PopStateEvent, RadioNodeList, StorageEvent, TransitionEvent });
   Object.defineProperty(ShadowRoot.prototype, 'adoptedStyleSheets', adoptedProperty);
   Object.defineProperty(Document.prototype, 'adoptedStyleSheets', adoptedProperty);
   Object.defineProperty(Document.prototype, 'styleSheets', { configurable: true, get() { return styleSheetsOf(this); } });
@@ -3495,7 +3901,7 @@
   handler(HTMLCanvasElement.prototype, 'paint'); handler(HTMLCanvasElement.prototype, 'elementgeometryupdate');
   for (const name of ['fullscreenchange', 'fullscreenerror']) for (const target of [Element.prototype, Document.prototype]) handler(target, name);
   for (const name of [...globalHandlers, ...'afterprint beforeprint beforeunload hashchange languagechange message messageerror offline online pagehide pageshow popstate rejectionhandled storage unhandledrejection unload'.split(' ')]) if (!Object.hasOwn(globalThis, 'on' + name)) handler(globalThis, name);
-  for (const [name, Type] of Object.entries(globalThis)) if (typeof Type === 'function' && Type.prototype && (Type.prototype instanceof Node || Type === Event || Type.prototype instanceof Event || /^(HTML|SVG|DOM|Node|Text|Comment|Attr|Range|Selection|Tree|Mutation|Resize|Intersection|Validity|Static|XML|CSS|ShadowRoot|Custom|Image|Canvas|Font|Media|Data|Clipboard|Drag|Composition|Input|Focus|Keyboard|Mouse|Pointer|Wheel|UI|Toggle|Command|Submit|Offscreen|Screen|ElementImage|FileList)/.test(name)) && !Object.hasOwn(Type.prototype, Symbol.toStringTag)) Object.defineProperty(Type.prototype, Symbol.toStringTag, { configurable: true, value: name === 'HTMLDocument' ? 'Document' : name });
+  for (const [name, Type] of Object.entries(globalThis)) if (typeof Type === 'function' && Type.prototype && (Type.prototype instanceof Node || Type === Event || Type.prototype instanceof Event || /^(HTML|SVG|DOM|Node|Text|Comment|Attr|Range|Selection|Tree|Mutation|Resize|Intersection|Validity|Static|XML|CSS|ShadowRoot|Custom|Image|Canvas|Font|Media|Data|Clipboard|Drag|Composition|Input|Focus|Keyboard|Mouse|Pointer|Wheel|UI|Toggle|Command|Submit|Offscreen|Screen|ElementImage|FileList|Highlight)/.test(name)) && !Object.hasOwn(Type.prototype, Symbol.toStringTag)) Object.defineProperty(Type.prototype, Symbol.toStringTag, { configurable: true, value: name === 'HTMLDocument' ? 'Document' : name });
   Object.defineProperty(globalThis, Symbol.toStringTag, { configurable: true, value: 'Window' });
   globalThis.__appsScript = node => { currentScript = node ?? null; };
   globalThis.__appsLoaded = () => {
@@ -3512,12 +3918,12 @@
   globalThis.Image = function Image(width,height) { const image=document.createElement('img'); if(width!==undefined) image.width=width; if(height!==undefined) image.height=height; return image; };
   class FontFace {
     constructor(family,source,descriptors={}) { Object.assign(this,{family:String(family),style:'normal',weight:'normal',stretch:'normal',unicodeRange:'U+0-10FFFF',status:'unloaded'},descriptors); this._source=source;this.loaded=new Promise((resolve,reject)=>{this._resolve=resolve;this._reject=reject;});this.loaded.catch(()=>{});if(typeof source!=='string')this.load(); }
-    load() { if (this.status!=='unloaded') return this.loaded; this.status='loading'; (async()=>{const source=this._source;let error=new DOMException('No supported font source','SyntaxError');for(const [kind,value] of typeof source==='string'?call('dom.fontSources',0,source):[['data',source]]) try {if(kind==='local'){if(call('dom.font',0,this.family,value))return this._done('loaded');throw new DOMException('Local font unavailable','NetworkError');}let bytes=value;if(kind==='url'){const response=await fetch(value);if(!response.ok)throw new DOMException('Font request failed','NetworkError');bytes=await response.arrayBuffer();}call('dom.font',0,this.family,ArrayBuffer.isView(bytes)?new Uint8Array(bytes.buffer,bytes.byteOffset,bytes.byteLength):new Uint8Array(bytes));return this._done('loaded');}catch(caught){error=kind==='data'&&!(caught instanceof DOMException)?new DOMException(caught?.message,'SyntaxError'):caught;}this._done('error',error);})();return this.loaded; }
+    load() { if (this.status!=='unloaded') return this.loaded; this.status='loading'; (async()=>{const source=this._source;let error=new DOMException('No supported font source','SyntaxError');for(const [kind,value] of typeof source==='string'?call('dom.fontSources',0,source):[['data',source]]) try {if(kind==='local'){if(call('dom.font',0,this.family,value))return this._done('loaded');throw new DOMException('Local font unavailable','NetworkError');}let bytes=value;if(kind==='url'){const response=await fetch(value);if(!response.ok)throw new DOMException('Font request failed','NetworkError');bytes=await response.arrayBuffer();}call('dom.font',0,this.family,ArrayBuffer.isView(bytes)?new Uint8Array(bytes.buffer,bytes.byteOffset,bytes.byteLength):new Uint8Array(bytes),[this.unicodeRange,this.weight,this.style,this.stretch].map(String));return this._done('loaded');}catch(caught){error=kind==='data'&&!(caught instanceof DOMException)?new DOMException(caught?.message,'SyntaxError'):caught;}this._done('error',error);})();return this.loaded; }
     _done(status,error) { this.status=status; if(status==='loaded')this._resolve(this); else if(status==='error')this._reject(error); }
   }
   class FontFaceSet extends EventTarget {
     constructor() {super();this._faces=new Set();this._css=[];}
-    _all() {const [added,css]=call('dom.fonts',0);if(added){stale=true;staleAt=geometry[2];version++;}this._css=css.map(([family,source,range,status],i)=>{let face=this._css[i];if(face?.family!==family||face._source!==source||face.status!==status&&face.status!=='loading'){face=new FontFace(family,source,range?{unicodeRange:range}:{});face._done(status,new DOMException('Font load failed','NetworkError'));}return face;});return [...this._css,...this._faces];}
+    _all() {const [added,css]=call('dom.fonts',0);if(added){stale=true;staleAt=geometry[2];version++;}this._css=css.map(([family,source,range,status,[weight,style,stretch]],i)=>{let face=this._css[i];if(face?.family!==family||face._source!==source||face.status!==status&&face.status!=='loading'){face=new FontFace(family,source,{...range&&{unicodeRange:range},...weight&&{weight},...style&&{style},...stretch&&{stretch}});face._done(status,new DOMException('Font load failed','NetworkError'));}return face;});return [...this._css,...this._faces];}
     add(face) {if(!(face instanceof FontFace))throw new TypeError('Expected FontFace');this._faces.add(face);return this;} delete(face){return this._faces.delete(face);} clear(){this._faces.clear();} has(face){return this._all().includes(face);} get size(){return this._all().length;} values(){return this._all().values();} keys(){return this.values();} entries(){return this._all().map(face=>[face,face]).values();} forEach(fn,thisArg){for(const face of this._all())fn.call(thisArg,face,face,this);} [Symbol.iterator](){return this.values();}
     get status() {return this._all().some(face=>face.status==='loading')?'loading':'loaded';}
     get ready() {return Promise.all(this._all().map(face=>face.status==='loading'&&face.loaded.catch(()=>{}))).then(()=>this);}
@@ -4423,7 +4829,7 @@
     // Like Chrome, a delete with nothing to delete fires no `input`.
     if ((explicit || lazy ? replaced().collapsed : start === end) && inputType.startsWith('delete')) return true;
     if (control) {
-      target._edited = true;
+      edited(target);
       setValue(target, state.text.slice(0,start) + text + state.text.slice(end));
       target.setSelectionRange(start + (selected?.[0] ?? text.length), start + (selected?.[1] ?? text.length), target._direction, true);
     } else {
@@ -4447,7 +4853,7 @@
           if (last !== first && !last.contains(first) && last.isConnected && start.isConnected) {
             // Like Chrome, the <br> that ends the last block stays behind.
             if (last.lastChild?.localName === 'br') last.lastChild.remove();
-            const moved = last.childNodes; let gone = last;
+            const moved = [...last.childNodes]; let gone = last;
             while (gone.parentNode !== target && !gone.parentNode.contains(first) && gone.parentNode.childNodes.every(node => node === gone || node.nodeType === 3 && !/[^ \t\n\r]/.test(node.data))) gone = gone.parentNode;
             let after = start.nodeType === 3 ? start : start.childNodes[offset - 1];
             while (after && !after.nextSibling && after.parentNode !== first && after.parentNode !== target) after = after.parentNode;
@@ -4613,7 +5019,7 @@
     if (!target || disabled(target)) return;
     if (value === null) return void fireClick(target, { detail: 1 }, true);
     if (target.type === 'range') value = rangeValue(target, value);
-    if (value !== target.value) { target._edited = true; setValue(target, value); dispatch(target, trusted(new Event('input', { bubbles: true, composed: true }))); }
+    if (value !== target.value) { edited(target); setValue(target, value); dispatch(target, trusted(new Event('input', { bubbles: true, composed: true }))); }
     if (done) commit(target);
   };
   globalThis.__appsFrameEvent=(id,event)=>{const target=wrap(id);if(event.type==='did-finish-load')dispatch(target,new Event('load'));else if(event.type==='did-fail-load')dispatch(target,new Event('error'));else if(event.type==='message')dispatch(target,new MessageEvent('message',{data:event.data,origin:'null'}));};
@@ -4636,7 +5042,7 @@
   const picks=new Map();let nextPick=0;
   pickFiles=input=>{if(!native)return;const id=++nextPick;picks.set(id,input);call('dom.filePicker',{id,multiple:input.multiple,directory:input.hasAttribute('webkitdirectory'),accept:input.getAttribute('accept')??''});};
   globalThis.__appsFilesPicked=(id,files)=>{const input=picks.get(id);picks.delete(id);if(!input)return;if(!files){dispatch(input,new Event('cancel',{bubbles:true}));return;}input._files=fileList(files.map(({name,lastModified,data})=>new File([Uint8Array.fromBase64(data)],name,{lastModified,type:fileType(name)})));showFiles(input);dispatch(input,new Event('input',{bubbles:true,composed:true}));dispatch(input,new Event('change',{bubbles:true}));};
-  const pickOption=(select,option)=>{if(option._current)return;for(const other of options(select))other._selected=other===option;select._none=false;selectedness(select);revalidate(select);dispatch(select,trusted(new Event('input',{bubbles:true,composed:true})));dispatch(select,trusted(new Event('change',{bubbles:true})));};
+  const pickOption=(select,option)=>{if(option._current)return;for(const other of options(select))other._selected=other===option;select._none=false;selectedness(select);revalidate(select);dispatch(select,trusted(new Event('input',{bubbles:true,composed:true})));interacted(select);dispatch(select,trusted(new Event('change',{bubbles:true})));};
   openSelect=select=>{
     if(!native||!navigator.platform.includes('Mac')||select.multiple||select.size>1||disabled(select))return;
     const id=++nextPick,list=[],items=[],rect=select.getBoundingClientRect();let selected=-1;
@@ -4840,13 +5246,15 @@
         }
         if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End'].includes(event.key)) {
           const word = mac ? event.altKey : event.ctrlKey, documentEdge = mac ? event.metaKey : event.ctrlKey;
-          const right = ['ArrowRight','ArrowDown','End'].includes(event.key), pos = state.end, horizontal = ['ArrowLeft','ArrowRight'].includes(event.key);
+          const horizontal = ['ArrowLeft','ArrowRight'].includes(event.key), pos = state.end;
+          // Like Chrome, left and right follow the direction of the block.
+          const right = ['ArrowRight','ArrowDown','End'].includes(event.key) !== (horizontal && rtlBlock(editable(target) ? target : selection.focusNode));
           const unit = documentEdge && !horizontal || mac && ['Home','End'].includes(event.key) ? 'documentboundary' : ['Home','End'].includes(event.key) || mac && event.metaKey && horizontal ? 'lineboundary' : horizontal ? (word ? 'word' : 'character') : 'line';
           if (!editable(target)) { selection.modify(event.shiftKey ? 'extend' : 'move', right ? 'forward' : 'backward', unit); return false; }
           let next = pos;
           if (unit === 'documentboundary') next = right ? state.text.length : 0;
           else if (unit === 'lineboundary') next = right ? (state.text.indexOf('\n',pos) < 0 ? state.text.length : state.text.indexOf('\n',pos)) : pos === 0 ? 0 : state.text.lastIndexOf('\n',pos - 1) + 1;
-          else if (!event.shiftKey && start !== end && horizontal) next = right ? end : start;
+          else if (!event.shiftKey && start !== end && horizontal && !word) next = right ? end : start;
           else if (horizontal) next = textBoundary(state.text,pos,right,word);
           else {
             const lineStart = state.text.lastIndexOf('\n',pos - 1) + 1, column = pos - lineStart;
@@ -4863,7 +5271,7 @@
         if (editable(target)) dispatch(target, trusted(new InputEvent('beforeinput', { bubbles: true, cancelable: true, composed: true, inputType: 'insertLineBreak', data: null })));
         commit(target);
         const form = target.form;
-        if (form && active === target) { const submit = [...form.elements].find(control => control.localName === 'button' ? control.type === 'submit' : /^(submit|image)$/.test(control.type)); if (submit) { if (!disabled(submit)) fireClick(submit, { detail: 0 }, true); } else if ([...form.elements].filter(control => editable(control) && control.localName === 'input').length === 1) submitForm(form, null); }
+        if (form && active === target) { const submit = controlsOf(form).find(control => control.localName === 'button' ? control.type === 'submit' : /^(submit|image)$/.test(control.type)); if (submit) { if (!disabled(submit)) fireClick(submit, { detail: 0 }, true); } else if ([...form.elements].filter(control => editable(control) && control.localName === 'input').length === 1) submitForm(form, null); }
         return false;
       }
       if (event.key === 'Enter' && plain && (tag === 'button' || /^(button|submit|reset|image)$/.test(type) || (tag === 'a' || tag === 'area') && target.hasAttribute('href') || tag === 'summary') && !disabled(target)) { fireClick(target, { detail: 0 }, true); return false; }
@@ -4875,7 +5283,7 @@
       }
       if (tag === 'select' && plain && event.key === ' ') { openSelect(target); return false; }
       if (tag === 'select' && plain && !disabled(target) && /^(ArrowUp|ArrowDown|Home|End|PageUp|PageDown)$/.test(event.key) || tag === 'select' && plain && event.key.length === 1 && event.key !== ' ') {
-        const list = options(target).filter(option => !disabled(option)), index = list.indexOf(target.selectedOptions[0]);
+        const list = options(target).filter(option => !disabled(option)), index = list.findIndex(option => option._current);
         const next = event.key.length === 1 ? list.find((option, i) => i > index && option.text.toLowerCase().startsWith(event.key.toLowerCase())) ?? list.find(option => option.text.toLowerCase().startsWith(event.key.toLowerCase())) : list[event.key === 'Home' || event.key === 'PageUp' ? 0 : event.key === 'End' || event.key === 'PageDown' ? list.length - 1 : Math.max(0, Math.min(list.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1)))];
         if (next) pickOption(target, next);
         return false;
@@ -4883,7 +5291,7 @@
       if (tag === 'input' && type === 'range' && plain && !disabled(target) && /^(Arrow(Up|Down|Left|Right)|Home|End|Page(Up|Down))$/.test(event.key)) {
         const [min, max, step] = rangeBounds(target), unit = step || (max - min) / 100, key = event.key, before = target.value;
         setRange(target, key === 'Home' ? min : key === 'End' ? max : Number(before) + (/Up|Right/.test(key) ? 1 : -1) * (key.startsWith('Page') ? Math.max(unit, (max - min) / 10) : unit));
-        if (target.value !== before) dispatch(target, trusted(new Event('change', { bubbles: true })));
+        if (target.value !== before) { interacted(target); dispatch(target, trusted(new Event('change', { bubbles: true }))); }
         return false;
       }
       if (type === 'radio' && plain && /^Arrow(Up|Down|Left|Right)$/.test(event.key)) {
@@ -5021,7 +5429,7 @@
         }
       }
     }
-    if (sliding && name !== 'pointerdown') { slide(sliding[0], data.clientX); if (ended) { if (sliding[0].value !== sliding[1]) dispatch(sliding[0], trusted(new Event('change', { bubbles: true }))); sliding = null; } }
+    if (sliding && name !== 'pointerdown') { slide(sliding[0], data.clientX); if (ended) { if (sliding[0].value !== sliding[1]) { interacted(sliding[0]); dispatch(sliding[0], trusted(new Event('change', { bubbles: true }))); } sliding = null; } }
     if (name === 'pointerdown' && !blocked && (button === 2 || button === 0 && data.ctrlKey && navigator.platform.includes('Mac')) && dispatch(target, trusted(new PointerEvent('contextmenu', { ...init, button: 2 })))) {
       const element = target.nodeType === 1 ? target : target.parentElement, link = element?.closest?.('a[href]'), media = element?.closest?.('img,video,audio,canvas'), field = element?.closest?.('input,textarea,[contenteditable=""],[contenteditable="true"]'), selected = String(getSelection?.() ?? ''), kind = media?.localName;
       host('dom.contextMenu', { x: data.clientX, y: data.clientY, linkURL: link?.href ?? '', linkText: link?.textContent ?? '', pageURL: location.href, frameURL: location.href, srcURL: media?.currentSrc ?? media?.src ?? '', mediaType: kind === 'img' ? 'image' : kind ?? 'none', hasImageContents: kind === 'img', isEditable: !!field, selectionText: selected, titleText: element?.title ?? '', altText: media?.alt ?? '', misspelledWord: '', dictionarySuggestions: [], selectionRect: { x: 0, y: 0, width: 0, height: 0 }, frameCharset: 'UTF-8', formControlType: field?.localName === 'input' ? field.type : 'none', spellcheckEnabled: false, menuSourceType: 'mouse', mediaFlags: {}, editFlags: { canUndo: !!field, canRedo: !!field, canCut: !!field && !!selected, canCopy: !!selected, canPaste: !!field, canDelete: !!field && !!selected, canSelectAll: true, canEditRichly: false } });

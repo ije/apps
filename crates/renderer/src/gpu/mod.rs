@@ -35,7 +35,7 @@ pub(crate) struct Instance {
     // Kind, flags, then two values that depend on the kind:
     // box: flags 0-7 border style, 8-11 sides to draw (0 draws all)
     // shadow: flag 1 inset, blur sigma
-    // line: flag 1 wavy, thickness
+    // line: flags 1 wavy, 2 dashes, 4 round dots, thickness, aux the length and period of dashes
     // glyph: -, atlas page
     // image: flag 1 grayscale, flag 2 premultiplied source, flag 4 pixelated, flag 8 Display P3 source, opacity,
     // atlas page

@@ -20,6 +20,8 @@ pub struct Geometry {
     pub mirror: LayoutMirror,
     // The parts of boxes that columns split, which take pointer events.
     pub(crate) fragments: rustc_hash::FxHashMap<usize, Box<[[f32; 4]]>>,
+    // The corners of boxes in 3D, which take pointer events inside them. Boxes that show a hidden back have none.
+    pub(crate) shapes: rustc_hash::FxHashMap<usize, Box<[renderer::Point<renderer::Pixels>]>>,
     // The parts of spliced inline boxes in each line of text that holds them, by the key of that text.
     pub(crate) pieces: rustc_hash::FxHashMap<usize, Vec<(usize, [f32; 4])>>,
     pub scroll: rustc_hash::FxHashMap<usize, renderer::ScrollRef>,
@@ -302,6 +304,7 @@ impl Geometry {
     pub(crate) fn forget(&mut self, id: usize) {
         self.mirror.remove(&id);
         self.fragments.remove(&id);
+        self.shapes.remove(&id);
         self.pieces.remove(&id);
         self.scroll.remove(&id);
         self.snaps.remove(&id);

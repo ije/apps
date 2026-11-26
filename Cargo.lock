@@ -161,6 +161,7 @@ dependencies = [
  "rustc-hash 2.1.3",
  "swash",
  "taffy",
+ "unicode-bidi",
  "wayland-backend",
  "wayland-client",
  "wayland-cursor",

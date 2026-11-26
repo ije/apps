@@ -1,3 +1,4 @@
+use super::intercept::{Segment, intercept};
 use crate::{
     Color, Pixels, Rect, Size, point, px, size,
     text::{
@@ -368,7 +369,7 @@ impl TextSystem {
                 ))
             })
             .collect();
-        let at = best(&traits, font.weight, font.style)?;
+        let at = best(&traits, font.weight, font.style, font.stretch)?;
         shelf.face(faces[at], traits[at].0, font)
     }
 
@@ -421,6 +422,13 @@ impl TextSystem {
         }
     }
 
+    pub fn substitutions(&self, font: FontId) -> (Vec<u8>, Vec<[u8; 4]>) {
+        let shelf = self.0.borrow();
+        let swash = shelf.faces[font as usize].font.as_swash();
+        let table = swash.table(tag_from_bytes(b"GSUB"));
+        (table.map_or_else(Vec::new, <[u8]>::to_vec), Vec::new())
+    }
+
     pub fn glyph(&self, font: FontId, ch: char) -> Option<GlyphId> {
         let shelf = self.0.borrow();
         let glyph = shelf.faces[font as usize].font.as_swash().charmap().map(ch);
@@ -447,6 +455,51 @@ impl TextSystem {
         let outline = builder.build().scale_outline(glyph)?;
         let bounds = outline.bounds();
         Some([bounds.min.x, bounds.max.x, bounds.max.y, bounds.min.y])
+    }
+
+    pub fn intercept(
+        &self,
+        font: FontId,
+        glyph: GlyphId,
+        size: f32,
+        top: f32,
+        bottom: f32,
+    ) -> Option<[f32; 2]> {
+        use swash::zeno::{Command, PathData};
+        let shelf = &mut *self.0.borrow_mut();
+        let face = &shelf.faces[font as usize];
+        let outline = (shelf.scaler.builder(face.font.as_swash()).size(size))
+            .variations((face.axes.iter()).map(|(tag, value)| (tag_from_bytes(tag), *value)))
+            .build()
+            .scale_outline(glyph)?;
+        let (mut start, mut at) = ([0.; 2], [0.; 2]);
+        let segments = outline.path().commands().filter_map(move |command| {
+            let point = |point: swash::zeno::Point| [point.x, -point.y];
+            let from = at;
+            match command {
+                Command::MoveTo(to) => {
+                    (start, at) = (point(to), point(to));
+                    None
+                }
+                Command::LineTo(to) => {
+                    at = point(to);
+                    Some(Segment::Line([from, at]))
+                }
+                Command::QuadTo(control, to) => {
+                    at = point(to);
+                    Some(Segment::quad([from, point(control), at]))
+                }
+                Command::CurveTo(a, b, to) => {
+                    at = point(to);
+                    Some(Segment::Cubic([from, point(a), point(b), at]))
+                }
+                Command::Close => {
+                    at = start;
+                    Some(Segment::Line([from, at]))
+                }
+            }
+        });
+        intercept(segments, top, bottom)
     }
 
     pub fn shape(&self, text: &str, font_size: Pixels, spans: &[Span]) -> Line {
@@ -544,6 +597,10 @@ impl TextSystem {
             }
         }
         Ok((canvas, pixels))
+    }
+
+    pub fn hyphenate(&self, _: &str, _: &str) -> Vec<usize> {
+        Vec::new()
     }
 
     pub fn warm(_: Vec<Vec<String>>) {}

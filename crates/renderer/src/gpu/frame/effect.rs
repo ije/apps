@@ -292,6 +292,10 @@ impl RenderFrame {
                 });
                 let room = match seen {
                     Some([left, top, right, bottom]) => {
+                        // Near the horizon of a perspective, the visible part is much larger than the content.
+                        let [left, top] = [left.max(content.left()), top.max(content.top())];
+                        let [right, bottom] =
+                            [right.min(content.right()), bottom.min(content.bottom())];
                         // At most 4 windows on a side, around the middle of the visible part.
                         let span = |low: f32, high: f32, step: f32| {
                             let from = (low / step).floor() * step - step;

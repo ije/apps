@@ -1,8 +1,9 @@
 pub(crate) mod effects;
 mod element;
-pub(crate) use element::margin::viewport_overflow;
+pub(crate) use element::margin::{trims, viewport_overflow};
 pub mod fonts;
 pub(crate) mod frame;
+pub(crate) use frame::anchor::{Anchored, unplaced};
 pub(crate) mod hit;
 mod hud;
 pub(crate) mod inline;

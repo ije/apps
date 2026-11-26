@@ -12,6 +12,7 @@ mod props;
 mod pseudos;
 mod replaced;
 mod svg;
+mod turn;
 
 use self::align::vertical_align;
 use self::children::children;
@@ -27,6 +28,7 @@ use self::props::{new_box, props};
 use self::pseudos::pseudo_elements;
 use self::replaced::replaced;
 use self::svg::svg_box;
+use self::turn::{turn, turn_corners, turn_style};
 use super::border::{border_canvas, fieldset_border, inset_shadows, shade_border};
 use super::columns::columns;
 use super::kept::{Query, Read, Replay, hashed};
@@ -37,7 +39,9 @@ use super::query::{
 use super::{Build, element};
 use crate::css;
 use crate::css::properties::Prop;
-use crate::render::layout::size::{broken_image, field_size, legend, natural_size, text_field};
+use crate::render::layout::size::{
+    broken_image, field_size, legend, natural_size, text_field, turn_sides,
+};
 use crate::render::{
     layout::cull,
     paint::{background::css_background, scrollbar},
@@ -71,6 +75,7 @@ pub(super) fn create(
         info,
         ref zone,
         columned,
+        space,
         top_layer,
         reads,
         ..
@@ -121,9 +126,16 @@ pub(super) fn create(
     // Keep one stacking context and layer throughout opacity animations so frames only patch opacity.
     let composited = info[id].flags & cull::COMPOSITED != 0;
     let made = parsed.made;
+    // A box in a 3D rendering context draws in a plane of its own.
+    let joins = space
+        && display != "inline"
+        && (made.transformed
+            || made.preserves
+            || parent_perspective.is_some()
+            || style.get(Prop::BACKFACE_VISIBILITY) == Some("hidden"));
     // Every layer needs a stacking context so z-indexed descendants cannot escape its transform, opacity or
     // clip.
-    let stacking = id == 0 || composited || made.stacking || layered;
+    let stacking = id == 0 || composited || made.stacking || layered || joins;
     let chain: Rc<[usize]> = ancestors.iter().copied().chain([id]).collect();
     // A column width can give columns for a wider content box than the containing one, so it always counts here.
     let multicol = columns(style, &units, containing[0]).is_some()
@@ -132,6 +144,7 @@ pub(super) fn create(
             .is_some_and(|value| value != "auto");
     let child_build = Build {
         columned: columned || multicol,
+        space: made.preserves,
         #[cfg(debug_assertions)]
         extra: Default::default(),
         #[cfg(debug_assertions)]
@@ -411,7 +424,16 @@ pub(super) fn create(
         node.children.iter().rev().filter(boxes).copied().collect()
     } else if matches!(
         node.tag.as_str(),
-        "svg" | "canvas" | "iframe" | "progress" | "meter" | "terminal"
+        "svg"
+            | "canvas"
+            | "iframe"
+            | "progress"
+            | "meter"
+            | "terminal"
+            | "input"
+            | "img"
+            | "video"
+            | "audio"
     ) {
         Vec::new()
     } else {
@@ -512,6 +534,7 @@ pub(super) fn create(
         mark,
         order,
         positioned,
+        joins,
         parent_box,
         positioner,
         share: None,
@@ -614,6 +637,7 @@ pub(super) fn create(
             block_size.is_some(),
             flex_parent,
             columned,
+            space,
             info[id].flags & !(cull::CHANGED | cull::CHILDREN_CHANGED | cull::GEOMETRY_CHANGED),
             (
                 all_inline,
@@ -811,13 +835,19 @@ pub(super) fn create(
         true => ["visible"; 2],
         false => overflow,
     };
-    // `content-visibility` contains the paint of the contents, like `overflow: clip`.
-    let overflow = if info[id].flags & cull::SKIPS != 0
-        && !matches!(node.tag.as_str(), "html" | "body")
-        && style
-            .get(Prop::CONTENT_VISIBILITY)
-            .is_some_and(|v| v != "visible")
-    {
+    // `content-visibility` and `contain` contain the paint of the contents, like `overflow: clip`.
+    let overflow = if !matches!(node.tag.as_str(), "html" | "body")
+        && (info[id].flags & cull::SKIPS != 0
+            && style
+                .get(Prop::CONTENT_VISIBILITY)
+                .is_some_and(|v| v != "visible")
+            || hit.is_none()
+                && !inline_box
+                && style.get(Prop::CONTAIN).is_some_and(|value| {
+                    ["paint", "strict", "content"]
+                        .iter()
+                        .any(|kind| value.contains(kind))
+                })) {
         overflow.map(|value| if value == "visible" { "clip" } else { value })
     } else {
         overflow
@@ -836,6 +866,12 @@ pub(super) fn create(
     if hit.is_none() && overflow != [renderer::Overflow::Visible; 2] && !editable {
         el.style().overflow.x = overflow[0];
         el.style().overflow.y = overflow[1];
+        if overflow.contains(&renderer::Overflow::Clip)
+            && let Some(value) = style.get(Prop::OVERFLOW_CLIP_MARGIN)
+        {
+            let margin = crate::render::effects::clip::margin(value, style, &units, containing[0]);
+            el.style().clip_margin = margin.map(Box::new);
+        }
     }
     let scrolls = overflow.map(|axis| axis == renderer::Overflow::Scroll);
     let gutter = overflow[1] == renderer::Overflow::Hidden
@@ -942,9 +978,8 @@ pub(super) fn create(
     if hit.is_none() && rtl {
         el.style().flow |= renderer::Flow::RTL_BLOCK;
     }
-    if hit.is_none()
-        && !flex_parent
-        && rtl_parent
+    let blockish = !flex_parent
+        && slot.is_none()
         && style.get(Prop::DISPLAY).is_some_and(|value| {
             matches!(
                 value,
@@ -952,15 +987,23 @@ pub(super) fn create(
             )
         })
         && style.get(Prop::FLOAT).is_none_or(|value| value == "none")
-        && style
-            .get(Prop::POSITION)
-            .is_none_or(|value| !matches!(value, "absolute" | "fixed"))
-        && style.get(Prop::WIDTH).is_some_and(|value| value != "auto")
+        && !matches!(position, "absolute" | "fixed")
+        && (style.get(Prop::WIDTH).is_some_and(|value| value != "auto") || natural.is_some())
         && [Prop::MARGIN_LEFT, Prop::MARGIN_RIGHT]
             .into_iter()
-            .all(|prop| style.get(prop).is_none_or(|value| value != "auto"))
-    {
-        el = el.ml_auto();
+            .all(|prop| style.get(prop).is_none_or(|value| value != "auto"));
+    // Like Chrome, the `-webkit-` text alignments also align the blocks inside.
+    let side = blockish
+        .then(|| reader.parent(id, Prop::TEXT_ALIGN))
+        .flatten()
+        .and_then(|value| value.strip_prefix("-webkit-"));
+    if hit.is_none() && blockish {
+        match side {
+            Some("center") if margin[1] == margin[3] => el = el.ml_auto().mr_auto(),
+            Some("right") => el = el.ml_auto(),
+            None if rtl_parent => el = el.ml_auto(),
+            _ => {}
+        }
     }
     let mut borders = parsed
         .borders
@@ -968,6 +1011,20 @@ pub(super) fn create(
     let sides = css::properties::BORDERS.map(|[width, kind, color]| (width, kind, color));
     let mut border_colors = parsed.border_colors;
     let mut border_kinds = sides.map(|(_, kind, _)| style.get(kind).unwrap_or("none"));
+    // The box lays out in its turned frame. Its margins stay on the page.
+    let page = [padding, borders];
+    let turn = turn(&cx, margin, padding, borders);
+    if let Some(turn) = &turn {
+        padding = turn_sides(padding, turn.clockwise);
+        borders = turn_sides(borders, turn.clockwise);
+        border_colors = turn_sides(border_colors, turn.clockwise);
+        border_kinds = turn_sides(border_kinds, turn.clockwise);
+        el = el
+            .pt(px(padding[0]))
+            .pr(px(padding[1]))
+            .pb(px(padding[2]))
+            .pl(px(padding[3]));
+    }
     if inline_box {
         let [above, below] = [padding[0] + borders[0], padding[2] + borders[2]];
         // Like browsers, padding and borders of an inline box hang outside its line, hence the negative
@@ -1152,6 +1209,10 @@ pub(super) fn create(
     {
         [0.; 2]
     } else {
+        let [padding, borders] = match turn {
+            Some(_) => page,
+            None => [padding, borders],
+        };
         [
             padding[1] + padding[3] + borders[1] + borders[3] - reserved[1] - opposite,
             padding[0] + padding[2] + borders[0] + borders[2] - reserved[0],
@@ -1170,6 +1231,7 @@ pub(super) fn create(
         margin,
         extra,
         intrinsic_width: None,
+        turn,
         inset_x,
         natural_ratio,
     };
@@ -1178,8 +1240,11 @@ pub(super) fn create(
             padding[1] + padding[3] + borders[1] + borders[3],
             padding[0] + padding[2] + borders[0] + borders[2],
         ];
-        let auto =
-            [Prop::WIDTH, Prop::HEIGHT].map(|prop| style.get(prop).is_none_or(|v| v == "auto"));
+        let auto = [Prop::WIDTH, Prop::HEIGHT].map(|prop| {
+            style
+                .get(prop)
+                .is_none_or(|v| v == "auto" || prop == Prop::HEIGHT && css::value::content_size(v))
+        });
         let percent = style.get(Prop::WIDTH).is_some_and(|v| v.ends_with('%'));
         let [width, height] = field_size(
             doc,
@@ -1209,6 +1274,17 @@ pub(super) fn create(
         } else if percent {
             el = el.child(crate::render::paint::field::natural_width(px(width)));
         }
+        // Like Chrome, a textarea in a flex line has the baseline of its first line.
+        if flex_parent && node.tag == "textarea" {
+            let above = above(reader, &units, &parsed);
+            let mut mark = renderer::node()
+                .w(px(0.))
+                .h(px(above))
+                .mb(px(-above))
+                .baseline(renderer::Baseline::Bottom);
+            mark.style().baseline_source = true;
+            el = el.child(mark);
+        }
         if auto[1] && (node.tag != "textarea" || style.get(Prop::FIELD_SIZING) != Some("content")) {
             el = el.min_h(px(height + chrome[1]));
         }
@@ -1222,9 +1298,13 @@ pub(super) fn create(
                 .unwrap_or(base)
         })
     };
-    let radius = parsed
+    let mut radius = parsed
         .radii
         .unwrap_or_else(|| crate::render::effects::clip::radii(style, &units, basis));
+    let upright = radius;
+    if let Some(turn) = &fr.turn {
+        radius = turn_corners(radius, turn.clockwise);
+    }
     if hit.is_none() {
         el.style().corner_radii = radius;
     }
@@ -1258,6 +1338,18 @@ pub(super) fn create(
         && !matches!(position, "absolute" | "fixed")
         && parent.is_some_and(|parent| doc.nodes[parent].tag == "details");
     el = props(&cx, &mut fr, el, &mut inner_shadows, line_base, in_details);
+    if let Some(turn) = &fr.turn {
+        el.style().corner_radii = upright;
+        turn_style(el.style(), turn);
+    }
+    // In a frame turned clockwise, the lines and blocks of `vertical-lr` go from the bottom.
+    if style.get(Prop::WRITING_MODE) == Some("vertical-lr") && flow {
+        if all_inline {
+            el.style().align_content = Some(renderer::AlignContent::FlexEnd);
+        } else {
+            el.style().flex_direction = renderer::FlexDirection::ColumnReverse;
+        }
+    }
     if let Some(natural) = natural {
         el = natural_box(&cx, &fr, el, natural, line_base);
     }
@@ -1550,6 +1642,15 @@ pub(super) fn create(
         if split {
             bands.push(([0.; 4], [0.; 4], [renderer::Color::TRANSPARENT; 4]));
         }
+        // Like Chrome, the shades of an `<hr>` don't follow its `color`.
+        let ink = (node.tag == "hr")
+            .then(|| style.get(Prop::COLOR).and_then(css::value::color::paint))
+            .flatten();
+        let shade_border = |color, dark| match ink == Some(color) {
+            true if dark => renderer::Color::hex(0x9a9a9aff),
+            true => renderer::Color::hex(0xeeeeeeff),
+            false => shade_border(color, dark),
+        };
         for side in 0..4 {
             let color = border_colors[side];
             let raised = side == 0 || side == 3;
@@ -1584,13 +1685,18 @@ pub(super) fn create(
                 }
             });
         }
-        el = el.child(border_canvas(
+        let mut border = border_canvas(
             bands,
             borders,
             radius,
             border_kinds.map(crate::render::effects::border_style),
             false,
-        ));
+        );
+        // The overflow clip of the box is inside its border.
+        if overflow != [renderer::Overflow::Visible; 2] {
+            border.style().escape = renderer::Escape::OUTLINE;
+        }
+        el = el.child(border);
     }
     if native.is_some() || node.tag == "textarea" {
         el = control_layer(&cx, &fr, el, native);

@@ -1,6 +1,6 @@
 use crate::css::{
-    properties::Prop, properties::Style, value::tokens::components, value::units::Kind,
-    value::units::Lengths,
+    properties::Prop, properties::Style, value::shape::Position, value::tokens::components,
+    value::units::Kind, value::units::Lengths,
 };
 use renderer::{Pixels, Rect};
 
@@ -160,6 +160,32 @@ pub(crate) fn transform(
             parts.get(1).map_or(Some(x), |y| number(y))?,
             parts.get(2).map_or(Some(1.), |z| number(z))?,
         ));
+    }
+    if let Some(value) = style
+        .get(Prop::OFFSET_PATH)
+        .filter(|value| *value != "none")
+        && let Some(track) = super::shape::path_track(value)
+    {
+        let distance = length(
+            style.get(Prop::OFFSET_DISTANCE).unwrap_or("0px"),
+            track.length(),
+        )?;
+        let ([x, y], tangent) = track.point(distance);
+        let (auto, turn) =
+            super::shape::turn(style.get(Prop::OFFSET_ROTATE).unwrap_or("auto"), units)?;
+        let turn = turn as f32 + if auto { tangent } else { 0. };
+        let [ox, oy, _] = origin(
+            style.get(Prop::TRANSFORM_ORIGIN).unwrap_or("50% 50%"),
+            units,
+            size,
+        );
+        let anchor = style
+            .get(Prop::OFFSET_ANCHOR)
+            .and_then(|value| Position::parse(&components(value, ' '))?.point(units, size));
+        let [ax, ay] = anchor.map_or([0.; 2], |[x, y]| [x - ox, y - oy]);
+        then(translate(x - ox, y - oy, 0.));
+        then(rotate([0., 0., 1.], turn.to_radians())?);
+        then(translate(-ax, -ay, 0.));
     }
     for part in components(style.get(Prop::TRANSFORM).unwrap_or(""), ' ') {
         let Some((name, args)) = part.strip_suffix(')').and_then(|part| part.split_once('('))

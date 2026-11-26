@@ -1793,7 +1793,7 @@ fn static_places_in_lines_follow_chrome() {
         r#"
         await load('lines.html');
         const step = async (name, code) => console.log('STATIC ' + name + ' ' + await run(code));
-        for (const id of ['end', 'br', 'block', 'center', 'wrap', 'mixed', 'tall']) await step(id, `at('${id}')`);
+        for (const id of ['end', 'br', 'block', 'center', 'wrap', 'mixed', 'tall', 'odd', 'lead', 'even']) await step(id, `at('${id}')`);
         for (const position of ['static', 'absolute', 'static', 'absolute']) {
             await step('table', `cell.style.position = '${position}'; first.offsetHeight`);
             await win.webContents.capturePage();
@@ -1802,7 +1802,7 @@ fn static_places_in_lines_follow_chrome() {
         "#,
         &[(
             "lines.html",
-            "<body style='margin:0'><style>body{font:16px/20px Helvetica}.s,.f{position:absolute;width:10px;height:10px}.f{position:fixed}\
+            "<meta charset=utf-8><body style='margin:0'><style>body{font:16px/20px Helvetica}.s,.f{position:absolute;width:10px;height:10px}.f{position:fixed}\
              .sc{overflow:auto;width:100px;height:50px;scrollbar-width:none}.l{width:100px}table{border-spacing:0}td{padding:0}</style>\
              <div class=l>one <span class=s id=end></span> </div><div class=l>one <span class=s id=br></span><br>two</div>\
              <div class=l>one <b>two <div class=s id=block></div></b> x</div>\
@@ -1810,6 +1810,8 @@ fn static_places_in_lines_follow_chrome() {
              <div class=l>one two three <div class=s id=wrap></div>four</div>\
              <div class=l>one <b>x <div class=s id=mixed></div></b><p style='margin:0'>block</p></div>\
              <div class=l><u style='display:inline-block;width:20px;height:40px'></u> x<div class=s id=tall></div></div>\
+             <div class=l>אבג <span class=s id=odd></span>דהו abc</div><div class=l><span class=s id=lead></span>אבג abc</div>\
+             <div class=l dir=rtl>abc <span class=s id=even></span>def</div>\
              <table id=first><tr><td>a<td>b <div class=s id=cell style='height:60px'></div></table>\
              <div class=sc id=auto style='transform:translate(1px)'><p style='margin:0;height:45px'></p><div class=f></div></div>\
              <div class=sc id=deep style='transform:translate(1px)'><div style='position:relative'><div class=f style='top:150px;left:190px'></div></div></div>\
@@ -1827,6 +1829,9 @@ fn static_places_in_lines_follow_chrome() {
         "wrap 0,20",
         "mixed 0,20",
         "tall 0,45",
+        "odd 15,0",
+        "lead 0,0",
+        "even 78,0",
         "range 55,160,200,50",
     ] {
         assert!(text.contains(&format!("STATIC {line}\n")), "{line}: {text}");
@@ -1836,4 +1841,134 @@ fn static_places_in_lines_follow_chrome() {
         .filter_map(|line| line.strip_prefix("STATIC table "))
         .collect();
     assert_eq!(heights, ["80", "20", "80", "20"], "{text}");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn keyword_sizes_baselines_shapes_and_turned_boxes_lay_out_like_chrome() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const box = id => run(`(r => [r.left, r.top, r.width, r.height].map(Math.round).join())(document.getElementById('${id}').getBoundingClientRect())`);
+        const is = async (id, want) => { const got = await box(id); if (got !== want) fail(id + ': ' + got + ', not ' + want); };
+        await is('keyword', '0,0,40,40');
+        await is('calc', '0,40,100,40');
+        await is('stretch', '5,85,390,30');
+        await is('trim', '0,120,400,20');
+        await is('first', '0,140,20,20');
+        await is('last', '20,140,20,40');
+        await is('turned', '0,180,30,40');
+        await is('after', '0,220,400,20');
+        await is('bottom', '0,280,100,20');
+        await is('framed', '0,300,50,40');
+        await is('below', '0,340,400,10');
+        await is('wide', '0,350,40,40');
+        await is('self', '0,390,60,50');
+        await is('rows', '0,440,400,50');
+        const dates = await run(`['0001-01-01', '0000-01-01', '2026-02-30'].map(value => { const e = document.createElement('input'); e.type = 'date'; e.value = value; return e.value + e.valueAsNumber; }).concat([['week', '2025-W53'], ['week', '2026-W53'], ['datetime-local', '2026-10-31 10:20']].map(([type, value]) => { const e = document.createElement('input'); e.type = type; e.value = value; return e.value; })).join()`);
+        if (dates !== '0001-01-01-62135596800000,NaN,NaN,,2026-W53,2026-10-31T10:20') fail('dates: ' + dates);
+        const sides = await run(`(e => (e.style.cssText = 'writing-mode:vertical-rl;margin-inline:1px 2px;border-start-start-radius:3px', (s => [s.marginTop, s.marginInlineStart, s.marginBottom, s.borderTopRightRadius, s.borderStartStartRadius].join())(getComputedStyle(e))))(document.getElementById('last'))`);
+        if (sides !== '1px,1px,2px,3px,3px') fail('logical sides: ' + sides);
+        const closed = await run(`(e => (e.style.height = 'auto', e.offsetHeight, e.getAnimations().length))(document.getElementById('open'))`);
+        if (closed !== 1) fail('a height that opens to auto: ' + closed);
+        "#,
+        &[(
+            "page.html",
+            "<head><style>body{margin:0;width:400px} i{display:block} #open{height:0;overflow:hidden;transition:height 1s;interpolate-size:allow-keywords}</style></head><body>\
+             <div id=keyword style='width:fit-content;max-width:min-content;height:100px;max-height:max-content'><i style='width:40px;height:20px'></i><i style='width:40px;height:20px'></i></div>\
+             <div id=calc style='width:calc-size(max-content,size*2);height:calc-size(auto,size + 10px)'><i style='width:50px;height:30px'></i></div>\
+             <div style='height:40px;overflow:hidden'><div id=stretch style='height:stretch;width:stretch;margin:5px'></div></div>\
+             <div id=trim style='margin-trim:block'><i style='margin:9px 0;height:20px'></i></div>\
+             <div style='display:flex;align-items:last baseline;height:40px'><i id=first style='width:20px;height:20px;align-self:flex-start'></i><i id=last style='width:20px;height:40px'></i></div>\
+             <div id=turned style='writing-mode:vertical-rl;padding:10px 5px'><i style='width:20px;height:20px'></i></div>\
+             <div id=after style='height:20px'></div>\
+             <table cellspacing=0 cellpadding=0 style='width:100px'><caption id=bottom style='caption-side:bottom;height:20px'></caption><tr><td height=40></table>\
+             <div style='display:flex'><table id=framed cellspacing=0 cellpadding=0 style='width:50px'><caption style='height:20px'></caption><tr><td height=20></table></div>\
+             <div id=below style='height:10px'></div>\
+             <table id=wide cellspacing=0 cellpadding=0><tr><td width=20 height=20><td width=20><tr><td colspan=100 height=20></table>\
+             <div id=self style='width:60px;height:calc-size(auto, size);display:grid;grid-template-columns:1fr'><i style='height:20px'></i><i style='height:30px'></i></div>\
+             <div id=rows style='height:calc-size(fit-content, size + 10px)'><i style='height:40px'></i></div>\
+             <div id=open><i style='height:50px'></i></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn children_of_inputs_and_images_have_no_boxes() {
+    let (text, rects) = picture_rects(
+        "kids.html",
+        "<body class=w style='margin:0'><input type=radio id=r><input type=checkbox id=c style='display:grid'><input id=t><img id=m><script>\
+         for (const id of ['r', 'c', 't', 'm']) { const el = document.getElementById(id); document.body.offsetWidth; el.append(document.createElement('form')); document.body.offsetWidth; el.firstChild.append(document.createElement('fieldset')); el.firstChild.firstChild.id = 'kid-' + id; }\
+         </script></body>",
+    );
+    for id in ["r", "c", "t", "m"] {
+        assert!(rects.contains_key(id), "{text}");
+        assert!(
+            rects
+                .get(&format!("kid-{id}"))
+                .is_none_or(|rect| rect.ends_with(",0,0")),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn content_heights_take_floats_canvases_margins_and_percentages_like_chrome() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const box = id => run(`(r => [r.top, r.height].map(Math.round).join())(document.getElementById('${id}').getBoundingClientRect())`);
+        const is = async (id, want) => { const got = await box(id); if (got !== want) fail(id + ': ' + got + ', not ' + want); };
+        await is('canvas', '0,40');
+        await is('passes', '60,20');
+        await is('after', '110,5');
+        await is('grows', '125,26');
+        await is('next', '151,5');
+        await is('percent', '156,20');
+        await is('ratio', '176,60');
+        await is('half', '236,35');
+        await is('open', '316,40');
+        await is('mixed', '356,50');
+        await is('least', '406,50');
+        await is('stale', '456,50');
+        await run(`document.getElementById('tall').style.height = '200px'`);
+        await is('stale', '456,190');
+        await run(`document.getElementById('tall').style.height = '40px'`);
+        await is('stale', '456,30');
+        for (const style of ['height:calc-size(auto, size + 1px)', 'overflow:hidden;height:calc-size(auto, size + 1px)']) {
+          const time = await run(`(() => {
+            let html = 'word word';
+            for (let i = 0; i < 20; i++) html = '<div style="${style}"><div style="float:left;width:9px;height:9px"></div>' + html + '</div>';
+            const host = document.createElement('div');
+            document.body.append(host);
+            const start = performance.now();
+            host.innerHTML = html;
+            const height = host.offsetHeight;
+            host.remove();
+            return height > 20 ? performance.now() - start : -1;
+          })()`);
+          if (time < 0 || time > 1000) fail('nested floats: ' + time);
+        }
+        const style = await run(`(e => (e.style.setProperty('-internal-lines', 'vertical-rl'), ['-internal-lines' in e.style, e.style.length, CSS.supports('-internal-lines', 'vertical-rl'), CSS.supports('flex', '1 1 calc-size(auto, size)')].join()))(document.getElementById('next'))`);
+        if (style !== 'false,1,false,false') fail('internal properties: ' + style);
+        "#,
+        &[(
+            "page.html",
+            "<head><style>body{margin:0;width:400px} i{display:block}</style></head><body>\
+             <div style='display:flex;height:calc-size(auto, size)'><canvas id=canvas width=50 height=40></canvas></div>\
+             <div id=passes style='height:max-content;margin-top:20px'><i style='height:20px;margin-bottom:30px'></i></div>\
+             <div id=after style='height:5px'></div>\
+             <div id=grows style='height:calc-size(auto, size + 6px);margin-top:10px'><i style='height:20px;margin-bottom:30px'></i></div>\
+             <div id=next style='height:5px'></div>\
+             <div id=percent style='height:calc-size(auto, size + 10%)'><i style='height:20px'></i></div>\
+             <div id=ratio style='width:100px;aspect-ratio:2;height:calc-size(auto, size + 10px)'></div>\
+             <div style='height:80px'><div style='height:calc-size(stretch, size - 10px)'><i id=half style='height:50%'></i></div></div>\
+             <div id=open style='min-height:max-content'><i style='height:50%'><i style='height:20px'></i></i><i style='height:20px'></i></div>\
+             <div id=mixed style='height:60px;max-height:max-content'><i style='height:50%'></i><i style='height:20px'></i></div>\
+             <div id=least style='height:20px;min-height:calc-size(max-content, size + 10px)'><i style='height:50%'></i><i style='height:30px'></i></div>\
+             <div id=tall style='height:60px'><div style='height:100%'><div id=stale style='height:calc-size(stretch, size - 10px)'></div></div></div></body>",
+        )],
+    );
 }
