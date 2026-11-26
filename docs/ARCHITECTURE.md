@@ -202,7 +202,7 @@ A display link stays on for 30 ticks after the last frame, because a start takes
 
 ### Native content
 
-System web views sit above the GPU page. Their engines are WKWebView on macOS, WebView2 on Windows, and WebKitGTK on Linux. The Windows and Linux implementations use Wry. WebKitGTK can only embed in X11 windows, so on Linux an app whose code outside `node_modules` names `WebContentsView`, `<webview>` or `<iframe>` uses X11 or XWayland when it is available, and Wayland otherwise. CSS effects from the custom renderer cannot clip or blend these views.
+System web views sit above the GPU page. Their engines are WKWebView on macOS, WebView2 on Windows, and WebKitGTK on Linux. The Windows and Linux implementations use Wry. On Linux they are in their own library, `libapps_webview.so`, which the runtime loads for the first web view, so other apps don't load GTK, WebKitGTK and GStreamer. WebKitGTK can only embed in X11 windows, so on Linux an app whose code outside `node_modules` names `WebContentsView`, `<webview>` or `<iframe>` uses X11 or XWayland when it is available, and Wayland otherwise. CSS effects from the custom renderer cannot clip or blend these views.
 
 The runtime tracks `<webview>` and `<iframe>` bounds and routes view events back to their DOM elements. `webContents.debugger` supports only commands with an equivalent in the system web view.
 

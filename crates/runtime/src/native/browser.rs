@@ -1,5 +1,5 @@
+use crate::webview::Browser;
 use anyhow::{Context, Result, bail, ensure};
-use apps_webview::Browser;
 use serde_json::Value;
 use std::collections::HashMap;
 

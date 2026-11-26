@@ -51,6 +51,8 @@ jsc=target/bun-jsc/$system-$arch
 jscs=("${lib}JavaScriptCore$ext" JavaScriptCore.LICENSE)
 # Linux links WebGPU into the runtime.
 [[ $os != linux ]] && files+=("${lib}apps_webgpu$ext")
+# Linux loads the system web view from its own library.
+[[ $os == linux ]] && files+=(libapps_webview.so)
 # build-jsc.sh --aot writes these. Linux packages include them when that build has been run.
 [[ $os-$cpu == darwin-arm64 ]] && jscs+=(libJavaScriptCoreAOT.dylib libJavaScriptCoreCompiler.dylib libapps_aot.dylib)
 [[ $os == linux && -f $jsc/libJavaScriptCoreAOT.so ]] && jscs+=(libJavaScriptCoreAOT.so libJavaScriptCoreCompiler.so libapps_aot.so)

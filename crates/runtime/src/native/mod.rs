@@ -2,6 +2,13 @@
 pub(crate) mod browser;
 pub(crate) mod devtools;
 pub mod library;
+#[cfg(target_os = "linux")]
+pub mod webview;
+
+// Linux loads the system web view from this library, next to the runtime.
+pub fn webview_library(platform: &str) -> Option<&'static str> {
+    (platform == "linux").then_some("libapps_webview.so")
+}
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
