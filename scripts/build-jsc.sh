@@ -173,15 +173,17 @@ case "$system" in
       done < "$root/scripts/jsc.exports"
       printf '%s\n' '  local:' '    *;' '};'
     } > "$version_script"
+    # WebKit builds without C++ exceptions, so unwind tables only serve crash backtraces. They are 4 MB.
+    linux_flags='-ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -fno-unwind-tables'
     options+=(
-      '-DCMAKE_C_FLAGS=-DENABLE_AOT=0 -DAPPS_JSC_AOT_RUNTIME=0 -ffunction-sections -fdata-sections'
-      '-DCMAKE_CXX_FLAGS=-DENABLE_AOT=0 -DAPPS_JSC_AOT_RUNTIME=0 -ffunction-sections -fdata-sections'
+      "-DCMAKE_C_FLAGS=-DENABLE_AOT=0 -DAPPS_JSC_AOT_RUNTIME=0 $linux_flags"
+      "-DCMAKE_CXX_FLAGS=-DENABLE_AOT=0 -DAPPS_JSC_AOT_RUNTIME=0 $linux_flags"
       '-DCMAKE_C_FLAGS_RELEASE=-Os -DNDEBUG'
       '-DCMAKE_CXX_FLAGS_RELEASE=-Os -DNDEBUG'
       -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
       "-DCMAKE_C_COMPILER_LAUNCHER=$root/scripts/jsc-cc.sh"
       "-DCMAKE_CXX_COMPILER_LAUNCHER=$root/scripts/jsc-cc.sh"
-      "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--gc-sections -Wl,--version-script,$version_script"
+      "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--gc-sections -Wl,-z,pack-relative-relocs -Wl,--version-script,$version_script"
     )
     ;;
 esac
