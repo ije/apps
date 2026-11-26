@@ -1099,8 +1099,7 @@ pub(crate) fn registrable(syntax: &str) -> bool {
                     .any(|kind| kind == name),
                 None => {
                     let rest = name.strip_prefix('-').unwrap_or(name);
-                    name == part
-                        && rest.starts_with(|c: char| word(c) && !c.is_ascii_digit())
+                    rest.starts_with(|c: char| word(c) && !c.is_ascii_digit())
                         && name.chars().all(word)
                         && !"initial inherit unset revert revert-layer default"
                             .split(' ')

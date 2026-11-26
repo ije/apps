@@ -627,7 +627,7 @@ fn registered_properties_take_only_the_syntax_names_of_chrome() {
         for (const [syntax, value] of [['<place>', 'center'], ['<size>', 'max-content'], ['<non-negative-length>', '1px'], ['<easing-function>', 'ease'], ['[a|b]', 'a'], ['<length>{1,2}', '1px'],
           ['<transform-list>+', 'scale(2)'], ['<length> +', '1px'], ['inherit', 'inherit'], ['default', 'default'], ['<length>|*', '1px'], ['foo bar', 'foo bar'], ['1a', '1a']])
           if (reg(syntax, value) !== 'SyntaxError') throw Error('took ' + syntax);
-        for (const [syntax, value] of [['<length>', '1px'], ['<string>', '"x"'], ['foo | bar', 'bar'], ['<length>#', '1px'], ['<color> | <length>+', 'red'], ['<transform-list>', 'scale(2)'], ['*', undefined]])
+        for (const [syntax, value] of [['<length>', '1px'], ['<string>', '"x"'], ['foo | bar', 'bar'], ['<length>#', '1px'], ['foo+', 'foo foo'], ['<color> | <length>+', 'red'], ['<transform-list>', 'scale(2)'], ['*', undefined]])
           if (reg(syntax, value) !== 'ok') throw Error('dropped ' + syntax);
         const style = getComputedStyle(document.getElementById('p'));
         if (style.getPropertyValue('--place') !== '' || style.getPropertyValue('--len') !== '1px 2px') throw Error('@property ' + style.getPropertyValue('--place'));
