@@ -165,7 +165,7 @@ pub(super) fn node(
     mut pointer_events: renderer::Node,
     root: renderer::Child,
     overlay: Vec<renderer::Child>,
-    [autos, anchored]: [bool; 2],
+    [autos, anchored, transition]: [bool; 3],
     started: std::time::Instant,
 ) -> renderer::Child {
     let id = view.id;
@@ -307,8 +307,18 @@ pub(super) fn node(
             )
             .absolute()
         }));
-    if overlay.is_empty() && !anchored {
+    if overlay.is_empty() && !anchored && !view.captured.active() {
         page.into()
+    } else if view.captured.active() {
+        // The root captures the page and its top layer, below the pseudo-elements of the transition.
+        let mut overlay = overlay;
+        let pseudos = overlay.pop().filter(|_| transition);
+        let mut window = renderer::node().size_full();
+        let mut root = renderer::node().size_full();
+        (window.style().bars, root.style().bars) = (bars, bars);
+        let root = root.hooks(super::super::transition::Root(view.clone()));
+        let root = root.child(page).children(overlay);
+        window.child(root).children(pseudos).children(mirror).into()
     } else {
         let mut window = renderer::node().size_full();
         window.style().bars = bars;
@@ -323,7 +333,10 @@ pub(super) fn overlay(build: &Build, backdrops: &[(usize, Rc<Style>)]) -> Vec<re
         let [width, height] = build.port.map(renderer::px);
         renderer::node().absolute().w(width).h(height)
     };
-    for &id in build.top_layer {
+    // The pseudo-elements of a view transition paint above the rest of the top layer.
+    let (transition, layered): (Vec<usize>, Vec<usize>) =
+        (build.top_layer.iter()).partition(|&&id| build.doc.nodes[id].tag.starts_with("::"));
+    for id in layered.into_iter().chain(transition) {
         if let Some(backdrop) = backdrops
             .iter()
             .find_map(|(node, style)| (*node == id).then_some(style))

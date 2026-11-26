@@ -14,6 +14,7 @@ mod page;
 pub(crate) mod paint;
 pub mod raster;
 mod store;
+pub(crate) mod transition;
 
 use crate::css::properties::Prop;
 use crate::style;
@@ -97,6 +98,7 @@ pub(crate) struct ViewState {
     drawing: Cell<renderer::Point<renderer::Pixels>>,
     // The page asked for a `paint` event after the frame.
     paint: Cell<bool>,
+    pub(crate) captured: transition::Captured,
 }
 
 pub(crate) struct Frame {
@@ -197,6 +199,7 @@ impl ViewState {
                 dom.layout.painted[id] = order as u64 + 1;
             }
         }
+        self.captured.fresh.set(false);
         if snapshots.is_empty() && !self.paint.take() {
             return None;
         }
@@ -222,6 +225,10 @@ impl ViewState {
                     changed.push(key);
                 }
             }
+        }
+        if self.captured.active() {
+            let mut store = self.store.borrow_mut();
+            self.captured.drawn(store.state(self.id), &changed);
         }
         self.paint.set(false);
         Some(changed)
@@ -295,6 +302,7 @@ impl ViewState {
             rtl: Cell::default(),
             drawing: Cell::default(),
             paint: Cell::default(),
+            captured: Default::default(),
             kept_frame: RefCell::default(),
             mismatched: RefCell::default(),
             motion_frame: Cell::default(),

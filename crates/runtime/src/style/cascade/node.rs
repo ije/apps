@@ -15,7 +15,7 @@ use crate::style::cascade::moves::mark_moves;
 use crate::style::cascade::rank::{AGENT, CascadeRank, physical, put};
 use crate::style::cascade::scope::{MatchedRules, PSEUDO, SELECTOR, intern};
 use crate::style::cascade::shadow::{
-    ELEMENT, HIGHLIGHT, PART, SLOTTED, STARTING, ShadowRule, Shadowed, exported_parts,
+    ELEMENT, HIGHLIGHT, PART, SLOTTED, STARTING, ShadowRule, Shadowed, TRANSITION, exported_parts,
 };
 use crate::style::cascade::used_values::Element;
 use crate::style::cascade::{Container, Passed, TreeWalk};
@@ -1240,7 +1240,7 @@ impl NodePass<'_> {
             for &index in again.as_deref().unwrap_or(&key.pseudos) {
                 let (pseudo, selector, order, _) = &scoped.pseudos[index];
                 let (_, declarations, layer) = &scoped.rules[*order];
-                if *pseudo == HIGHLIGHT {
+                if *pseudo == HIGHLIGHT || *pseudo >= TRANSITION {
                     continue;
                 }
                 if matches!(*pseudo, SLOTTED | PART) {

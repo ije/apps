@@ -675,3 +675,75 @@ fn nested_parent_selectors_record_their_attributes_once() {
         cache.finish();
     }
 }
+
+#[test]
+fn view_transition_pseudo_elements_take_the_rules_of_the_root() {
+    let mut doc = Document::parse(
+        "<style>::view-transition-group(*){width:5px;color:red}html::view-transition-group(a.k){height:7px}\
+         ::view-transition-group(b){width:9px}div{color:blue;width:1px}:root{color:green}\
+         ::view-transition-group(a){left:3px}:active-view-transition-type(x)::view-transition-group(*){top:2px}</style>\
+         <div id=g left=8px right=4px></div>",
+    );
+    let g = element(&doc, "#g");
+    doc.nodes[g].tag = "::view-transition-group".into();
+    doc.nodes[g].attrs.set("name", "a");
+    doc.nodes[g].attrs.set("class", "k j");
+    let html = element(&doc, "html");
+    doc.nodes[html].attrs.set(":vt", "x y");
+    let styles = styles(&doc, 800., 600.);
+    let get = |name: &str| styles[g].get(name).map(String::as_str);
+    // Author rules beat the hints, which beat nothing else.
+    assert_eq!(
+        [
+            get("width"),
+            get("height"),
+            get("left"),
+            get("right"),
+            get("top"),
+            get("color")
+        ],
+        [
+            Some("5px"),
+            Some("7px"),
+            Some("3px"),
+            Some("4px"),
+            Some("2px"),
+            Some("red")
+        ]
+    );
+    assert_eq!(
+        styles[html].get("view-transition-name").map(String::as_str),
+        Some("root")
+    );
+}
+
+#[test]
+fn view_transition_selectors_and_values_parse_as_in_chrome() {
+    for (selector, valid) in [
+        ("::view-transition-group(*.a.b)", true),
+        ("::view-transition-group(.a)", true),
+        ("::view-transition-group(a .b)", true),
+        ("::view-transition-group(* .a)", false),
+        ("::view-transition-group(a b)", false),
+        ("::view-transition-group()", false),
+        ("::view-transition-group(default)", false),
+        ("::view-transition(a)", false),
+        ("::view-transition-new(root)::before", false),
+        ("::view-transition-group(a):hover", false),
+        (":active-view-transition-type(a, b)", true),
+        (":active-view-transition-type(*)", false),
+    ] {
+        let parsed = crate::css::selector::Selector::parse(selector, None);
+        assert_eq!(!parsed.is_empty(), valid, "{selector}");
+    }
+    for (name, value, valid) in [
+        ("view-transition-name", "match-element", true),
+        ("view-transition-name", "auto", false),
+        ("view-transition-name", "a b", false),
+        ("view-transition-class", "a b", true),
+        ("view-transition-class", "none a", false),
+        ("view-transition-class", "default", false),
+    ] {
+        assert_eq!(supports(name, value), Some(valid), "{name}: {value}");
+    }
+}

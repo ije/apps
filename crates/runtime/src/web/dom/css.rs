@@ -366,7 +366,7 @@ pub(super) fn computed(
     };
     let scripted = slot.and_then(|slot| state.styles.motion.scripted(id, slot, &styles, u32::MAX));
     // The compositor can play animations between frames, so they are sampled now. As in Chrome, values that
-    // move boxes stay those of the last frame, which match its layout.
+    // move boxes stay those of the last frame, which match its layout, unless a script moved the animations.
     let current = state.styles.animating.get(&id).and_then(|last| {
         let now = std::time::Instant::now();
         let current = state
@@ -377,7 +377,7 @@ pub(super) fn computed(
         let paints = current.iter().all(|(prop, value)| {
             crate::render::effects::composited(prop) || last.get(prop) == Some(&**value)
         });
-        paints.then_some(current)
+        (paints || state.styles.motion.controlled).then_some(current)
     });
     let mut sampled = None;
     let backdrop = (pseudo == "backdrop")

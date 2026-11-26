@@ -71,6 +71,8 @@ pub(crate) const SLOTTED: usize = 12;
 pub(crate) const PART: usize = 13;
 pub(crate) const STARTING: usize = 14;
 pub(crate) const HIGHLIGHT: usize = 22;
+// `::view-transition`, then its `-group`, `-image-pair`, `-old` and `-new`.
+pub(crate) const TRANSITION: usize = 23;
 
 #[derive(Clone)]
 pub(crate) struct Passed {

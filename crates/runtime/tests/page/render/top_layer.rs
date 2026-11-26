@@ -297,3 +297,35 @@ fn positioned_grids_and_popovers_size_like_chrome() {
     );
     assert_eq!(line("REMOVED "), "255,255,255");
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn view_transitions_cross_fade_captures_and_end() {
+    run_hidden(
+        r#"
+        const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap().subarray(0, 3)].reverse();
+        await load('vt.html');
+        await run(`globalThis.t = document.startViewTransition(() => document.body.className = 'on'); t.ready.then(() => globalThis.ready = 1); 0`);
+        for (let n = 0; n < 20 && !await run('globalThis.ready'); n++) await win.webContents.capturePage();
+        if (!await run('globalThis.ready')) fail('not ready: ' + await run('document.activeViewTransition?._phase'));
+        const state = await run(`[document.activeViewTransition === t, document.documentElement.matches(':active-view-transition'), document.elementFromPoint(30, 30).localName, document.getAnimations().length, getComputedStyle(document.documentElement, '::view-transition-group(box)').width].join()`);
+        if (state !== 'true,true,html,10,40px') fail('during: ' + state);
+        // Halfway, the old red box and the new blue one blend on the way.
+        await run(`for (const a of document.getAnimations()) { a.pause(); a.currentTime = 125; }`);
+        for (let n = 0; n < 3; n++) await win.webContents.capturePage();
+        const [r, g, b] = await pixel(190, 30);
+        if (!(r > 40 && b > 40 && g < 60)) fail('halfway: ' + [r, g, b]);
+        await run(`for (const a of document.getAnimations()) a.finish(); t.finished.then(() => globalThis.done = 1); 0`);
+        for (let n = 0; n < 60 && !await run('globalThis.done'); n++) await win.webContents.capturePage();
+        const after = await run(`[document.activeViewTransition, document.documentElement.matches(':active-view-transition'), document.getAnimations().length].join()`);
+        if (after !== ',false,0') fail('after: ' + after);
+        const blue = await pixel(230, 30);
+        if (!(blue[2] > 200 && blue[0] < 60)) fail('the page after: ' + blue);
+        "#,
+        &[(
+            "vt.html",
+            "<body style='margin:0;background:#fff'><style>#box{position:absolute;left:10px;top:10px;width:40px;height:40px;\
+             background:red;view-transition-name:box}.on #box{left:210px;background:blue}</style><div id=box></div></body>",
+        )],
+    );
+}

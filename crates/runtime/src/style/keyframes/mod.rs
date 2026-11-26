@@ -169,8 +169,13 @@ impl Animation {
                         .max(0.)
                 };
                 let name = name.trim_matches(['\'', '"']);
+                // The group animation of a view transition reads its start from the hints of the group.
+                let shared = name
+                    .strip_prefix("-ua-view-transition-group-anim-")
+                    .map(|_| "-ua-view-transition-group-anim");
                 let rules: Vec<_> = keyframes
-                    .get(name)?
+                    .get(name)
+                    .or_else(|| keyframes.get(shared?))?
                     .iter()
                     .map(|(offset, declarations)| {
                         let declarations = declarations.resolve();

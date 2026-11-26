@@ -160,6 +160,18 @@ pub(crate) fn html(doc: &Document, id: usize, hints: &mut Hints) {
         "input" if node.input_type().eq_ignore_ascii_case("image") => IMAGE,
         "iframe" => IFRAME,
         "br" => BR,
+        // The styles that a view transition gives its pseudo-elements, which author rules override.
+        tag if tag.starts_with("::") => {
+            for (name, value) in node.attrs.iter() {
+                let prop = if name.starts_with("--") {
+                    Some(Prop::new(name))
+                } else {
+                    Prop::find(name)
+                };
+                hints.extend(prop.map(|prop| (prop, value.as_str().into())));
+            }
+            return;
+        }
         _ => return,
     };
     let of = |tags: u32| tag & tags != 0;

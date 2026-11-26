@@ -46,6 +46,15 @@ pub(super) fn hit_test(
     let y = args[1].as_f64().context("Expected y")? as f32;
     let computed = state.restyle(doc, viewport);
     let (first, caret) = (args[2].as_bool(), args[3].as_bool());
+    if let Some(root) =
+        crate::render::transition::covered(doc, state).filter(|_| caret != Some(true))
+    {
+        return Ok(if first == Some(true) {
+            json!(root)
+        } else {
+            json!([root])
+        });
+    }
     Ok(crate::render::hit::hit_test(
         doc,
         state,

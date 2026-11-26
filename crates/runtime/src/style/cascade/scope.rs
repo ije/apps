@@ -9,7 +9,7 @@ use crate::style::cascade::TreeWalk;
 use crate::style::cascade::container::{ContainerQuery, style_query};
 use crate::style::cascade::memo::{CachedNode, CachedStyle, Share};
 use crate::style::cascade::rank::{AGENT, AUTHOR, DELETED, Layer, UNLAYERED, USER};
-use crate::style::cascade::shadow::{HIGHLIGHT, PART, SLOTTED};
+use crate::style::cascade::shadow::{HIGHLIGHT, PART, SLOTTED, TRANSITION};
 #[cfg(target_os = "macos")]
 use crate::style::ua::GLASS_SHEET;
 use crate::style::ua::{FULLSCREEN_SHEET, UA_SHEET};
@@ -17,6 +17,17 @@ use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::rc::Rc;
 pub(crate) type Key = Box<[(u8, String)]>;
+
+thread_local! {
+    static UA_KEYFRAMES: Vec<(String, Vec<(f32, Declarations)>)> = UA_SHEET.with(|sheet| {
+        (sheet.0.iter())
+            .filter_map(|rule| match &**rule {
+                Rule::Keyframes(name, frames) => Some((name.clone(), frames.clone())),
+                _ => None,
+            })
+            .collect()
+    });
+}
 
 pub(crate) const PSEUDO: usize = 1 << (usize::BITS - 1);
 pub(crate) const SELECTOR: usize = 32;
@@ -100,7 +111,7 @@ impl StyleScope {
                             self.arguments
                                 .insert(self.pseudos.len(), (argument.into(), compound, target));
                         }
-                        if kind == HIGHLIGHT {
+                        if kind == HIGHLIGHT || kind >= TRANSITION {
                             let name = selector.pseudo_argument().unwrap_or_default().into();
                             self.arguments
                                 .insert(self.pseudos.len(), (name, Rc::default(), kind));
@@ -856,11 +867,19 @@ impl StyleCache {
                         cached.push(pending, None, &mut self.matches);
                         let local = cached.rematch(start, doc, &mut self.matches);
                         let Collect {
-                            keyframes,
+                            mut keyframes,
                             properties,
                             blocks,
                             ..
                         } = std::mem::replace(&mut collected, blank());
+                        // The keyframes of the built-in sheet stay under those of the author.
+                        UA_KEYFRAMES.with(|built| {
+                            for (name, frames) in built {
+                                keyframes
+                                    .entry(name.clone())
+                                    .or_insert_with(|| frames.clone());
+                            }
+                        });
                         let plain = local
                             && cached.keyframes == keyframes
                             && cached.properties == properties;
@@ -1155,6 +1174,56 @@ impl StyleScope {
             && matches.valid_since(&cached.dependencies, &cached.checked)
         {
             (cached.rules.clone(), cached.pseudos.clone())
+        } else if let Some(kind) = node.tag.strip_prefix("::") {
+            // A view transition pseudo-element takes the rules that its kind matched on the root.
+            let root = std::iter::successors(Some(id), |&at| doc.nodes[at].parent)
+                .find(|&at| doc.nodes[at].tag == "html")
+                .unwrap_or(id);
+            let kind = [
+                "view-transition",
+                "view-transition-group",
+                "view-transition-image-pair",
+            ]
+            .iter()
+            .chain(&["view-transition-old", "view-transition-new"])
+            .position(|name| *name == kind)
+            .map_or(usize::MAX, |at| TRANSITION + at);
+            let (name, classes) = (node.attrs.get("name"), node.attrs.get("class"));
+            let found = |argument: &str| {
+                let mut parts = argument.split('.');
+                parts.next().is_some_and(|first| {
+                    matches!(first, "*" | "") || Some(first) == name.map(|n| n.as_str())
+                }) && parts
+                    .all(|class| classes.is_some_and(|all| all.split(' ').any(|own| own == class)))
+            };
+            let mut matched: Vec<(usize, [usize; 3])> = (self.nodes[root].as_ref())
+                .into_iter()
+                .flat_map(|root| root.pseudos.iter())
+                .filter_map(|&index| {
+                    let (own, selector, order, _) = &self.pseudos[index];
+                    (*own == kind
+                        && self
+                            .arguments
+                            .get(&index)
+                            .is_none_or(|(argument, ..)| found(argument)))
+                    .then_some((*order, selector.specificity))
+                })
+                .collect();
+            matched.sort_unstable();
+            matches.begin();
+            matches.depend(id, 0);
+            for kind in 0..9 {
+                matches.depend(root, kind);
+            }
+            let rules = intern(&mut self.lists, &matched);
+            self.nodes[id] = Some(MatchedRules {
+                checked: std::cell::Cell::new(matches.epoch),
+                cached: None,
+                dependencies: matches.recorded().into(),
+                rules: rules.clone(),
+                pseudos: no_pseudos.clone(),
+            });
+            (rules, no_pseudos.clone())
         } else if node.tag.starts_with('#') {
             let none = intern(&mut self.lists, &[]);
             self.nodes[id] = Some(MatchedRules {
@@ -1240,7 +1309,11 @@ impl StyleScope {
             for &entry in candidates.iter() {
                 if entry >= PSEUDO {
                     let index = entry & !PSEUDO;
-                    if test(&self.pseudos[index].1, matches) {
+                    // View transition pseudo-elements come only from the root.
+                    if (self.pseudos[index].0 < TRANSITION
+                        || node.tag == "html" && node.parent == Some(0))
+                        && test(&self.pseudos[index].1, matches)
+                    {
                         matched_pseudos.push(index);
                     }
                     continue;

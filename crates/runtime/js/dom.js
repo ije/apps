@@ -3681,6 +3681,7 @@
   class ElementGeometryUpdateEvent extends Event { constructor(type, options = {}) { super(type, options); this.elements = Object.freeze([...options.elements ?? []]); } }
   // Runs after a frame with the drawable elements that draw otherwise than before. Canvases inside others paint first.
   globalThis.__appsPaint = ids => {
+    if (transition?._phase === 1) runUpdate(transition);
     const changed = new Map();
     for (const canvas of paintRequests) changed.set(canvas, []);
     paintRequests.clear();
@@ -3966,7 +3967,8 @@
   globalThis.getSelection = () => selection;
   globalThis.getComputedStyle = (node, pseudo = null) => {
     if (!(node instanceof Element)) throw new TypeError('Expected an element');
-    const id = node._id, kind = pseudo == null ? '' : String(pseudo);
+    let id = node._id, kind = pseudo == null ? '' : String(pseudo);
+    if (kind.startsWith('::view-transition')) { const pseudo = kind.replace(/\s+/g, '').replace(/\([^)]*$/, '$&)'), own = node === document.documentElement && transition?._pseudos?.get(pseudo); if (own) { id = own; kind = ''; } else { const style = standIn(pseudo); if (style) return style; } }
     let names = null;
     // Container queries need sizes, so the first read of a page lays it out like Chrome does.
     return declaration({ computed: name => { if (timelineShorthand.test(name)) { const parts = (shorthands ?? loadShorthands()).get(name); return shorthandValue(name, parts.map(part => call('dom.computed', id, part, kind)), parts); } relayout(name); return call('dom.computed', id, name, kind); }, names: () => names ??= call('dom.computed', id, null, kind) });
@@ -4012,6 +4014,7 @@
       // As in browsers, microtasks run after each callback.
       drainMicrotasks?.();
     }
+    if (transition?._phase === 0) captureOld(transition);
     microtask(() => { timelineTime = null; });
   };
   // One request covers every callback until the next frame runs.
@@ -4423,15 +4426,15 @@
       }
     }
     #sync(force) {
-      const effect = this.#effect && effects.get(this.#effect), target = effect?.target, time = this.#current(), scroll = this.#scroll();
-      if (!target || effect.pseudo !== null && effect.pseudo !== '::before' && effect.pseudo !== '::after' || (scroll ? this.#start === null && this.#hold === null : time === null) || !force && (this.#replace === 'removed' || this.playState === 'finished' && !this.#fills() && !scroll)) { if (this.#synced !== null) { this.#synced = null; call('dom.animation', this.#id, -1, null); } return; }
+      const effect = this.#effect && effects.get(this.#effect), own = effect?.pseudo?.startsWith('::view-transition') && effect.target === document.documentElement && transition?._pseudos?.get(effect.pseudo), target = own ? { _id: own } : effect?.target, time = this.#current(), scroll = this.#scroll();
+      if (!target || !own && effect.pseudo !== null && effect.pseudo !== '::before' && effect.pseudo !== '::after' || (scroll ? this.#start === null && this.#hold === null : time === null) || !force && (this.#replace === 'removed' || this.playState === 'finished' && !this.#fills() && !scroll)) { if (this.#synced !== null) { this.#synced = null; call('dom.animation', this.#id, -1, null); } return; }
       // As in Chrome, `auto` fills the range of a scroll timeline.
       const { timing } = effect, duration = timing.duration === 'auto' ? scroll && timing.iterations > 0 ? 1000 / timing.iterations : 0 : Math.min(timing.duration, 1e12), sent = this.#synced === target._id && this.#sent === effect.frames;
       this.#synced = target._id; this.#sent = effect.frames;
       call('dom.animation', this.#id, target._id, {
         frames: sent ? undefined : effect.frames.map(frame => [frame.computed, frame.props.map(([name, value]) => `${name}:${value}`).join(';'), frame.easing]),
         timing: [timing.delay, timing.endDelay, duration, timing.iterations === Infinity ? -1 : timing.iterations, timing.iterationStart],
-        direction: timing.direction, fill: timing.fill === 'auto' ? 'none' : timing.fill, easing: timing.easing, composite: effect.composite, pseudo: effect.pseudo,
+        direction: timing.direction, fill: timing.fill === 'auto' ? 'none' : timing.fill, easing: timing.easing, composite: effect.composite, pseudo: own ? null : effect.pseudo,
         time, rate: this.#start !== null && this.#hold === null && this.#now() !== null ? this.#rate : null,
         scroll: scroll && [scroll._at?._id ?? -1, scroll._spec, ...this.#range, this.#start],
       });
@@ -4461,7 +4464,7 @@
   const cssState = animation => {
     const data = cssData.get(animation), target = data.effect.target;
     if (data.state !== 'idle') {
-      const entry = target && call('dom.cssAnimations', target._id, false, true).find(entry => entry[0] === data.serial);
+      const entry = target && call('dom.cssAnimations', data.node, false, true).find(entry => entry[0] === data.serial);
       if (entry) Object.assign(data, { time: entry[4], state: entry[5] }); else Object.assign(data, data.ended ? { time: computedTiming(effects.get(data.effect).timing, null, 1).endTime, state: 'finished' } : { time: null, state: 'idle' });
     }
     return data;
@@ -4473,7 +4476,7 @@
     let settled = false;
     for (const animation of cssAnimations.values()) {
       const own = cssData.get(animation);
-      if (own.kind === kind && own.name === name && own.effect.target?._id === id && (own.effect.pseudoElement ?? '') === (data.pseudoElement ?? '')) settled = cssSettle(animation, type.endsWith('end')) || settled;
+      if (own.kind === kind && own.name === name && own.node === id && (own.effect.pseudoElement ?? '') === (data.pseudoElement ?? '')) settled = cssSettle(animation, type.endsWith('end')) || settled;
     }
     return settled;
   };
@@ -4519,9 +4522,10 @@
           frame[camelName(property)] = value;
         }
         keyframes.sort((a, b) => a.offset - b.offset);
-        const effect = new KeyframeEffect(wrap(id), keyframes, { delay: timing[0], endDelay: timing[1], duration: timing[2], iterations: timing[3] < 0 ? Infinity : timing[3], iterationStart: timing[4], direction, fill, easing, pseudoElement: pseudo || null });
+        const own = transitionNodes.get(id);
+        const effect = new KeyframeEffect(own ? document.documentElement : wrap(id), keyframes, { delay: timing[0], endDelay: timing[1], duration: timing[2], iterations: timing[3] < 0 ? Infinity : timing[3], iterationStart: timing[4], direction, fill, easing, pseudoElement: own ?? (pseudo || null) });
         effects.get(effect).animation = animation;
-        const data = { serial, kind, name, effect, scroll };
+        const data = { serial, kind, name, effect, scroll, node: id };
         cssReset(data);
         cssData.set(animation, data);
         cssAnimations.set(serial, animation);
@@ -4530,7 +4534,12 @@
       return animation;
     });
     if (node._id === 0) { const live = new Set(list); for (const [serial, animation] of cssAnimations) if (!live.has(animation)) cssAnimations.delete(serial); }
-    return list;
+    const pseudos = transition ? list.filter(animation => transitionNodes.has(cssData.get(animation).node)) : [];
+    if (!pseudos.length) return list;
+    const rest = list.filter(animation => !pseudos.includes(animation)), root = document.documentElement._id;
+    pseudos.sort((a, b) => transitionOrder(transition, cssData.get(a).node) - transitionOrder(transition, cssData.get(b).node));
+    rest.splice(rest.findLastIndex(animation => cssData.get(animation).node === root) + 1, 0, ...pseudos);
+    return rest;
   };
   const animationsOf = test => [...liveAnimations].filter(animation => (animation.playState !== 'finished' || filling(animation)) && animation.effect && test(effects.get(animation.effect))).sort((a, b) => animationOrder(a) - animationOrder(b));
   Object.defineProperties(Element.prototype, {
@@ -4542,6 +4551,163 @@
     getAnimations: { value() { return [...cssOf(this, true), ...animationsOf(({ target }) => !!target?.isConnected)]; }, writable: true, configurable: true },
   });
   Object.assign(globalThis, { Animation, AnimationEffect, KeyframeEffect, AnimationTimeline, DocumentTimeline, ScrollTimeline, ViewTimeline, AnimationPlaybackEvent, CSSAnimation, CSSTransition });
+  // View transitions. The pseudo-elements are nodes under the root that dom.js doesn't link, so only styles, frames
+  // and the animation APIs see them. Attributes named like properties give them the styles of the transition. While
+  // a transition runs, the root holds its types in `:vt`.
+  let transition = null;
+  const transitionNodes = new Map();
+  const deferred = () => { const out = {}; out.promise = new Promise((resolve, reject) => Object.assign(out, { resolve, reject })); return out; };
+  const transitionTypes = () => { const root = document.documentElement; if (root) { if (transition) op(4, root._id, ':vt', [...transition._types].join(' ')); else op(5, root._id, ':vt'); } };
+  class ViewTransitionTypeSet {
+    #set = new Set();
+    constructor(types) { for (const type of types) this.#set.add(type); }
+    get size() { return this.#set.size; }
+    has(value) { return this.#set.has(String(value)); }
+    add(value) { this.#set.add(String(value)); if (transition?._types === this) transitionTypes(); return this; }
+    delete(value) { const found = this.#set.delete(String(value)); if (transition?._types === this) transitionTypes(); return found; }
+    clear() { this.#set.clear(); if (transition?._types === this) transitionTypes(); }
+    forEach(fn, self) { this.#set.forEach(value => fn.call(self, value, value, this)); }
+    keys() { return this.#set.values(); } values() { return this.#set.values(); } entries() { return this.#set.entries(); } [Symbol.iterator]() { return this.#set.values(); }
+    get [Symbol.toStringTag]() { return 'ViewTransitionTypeSet'; }
+  }
+  class ViewTransition {
+    constructor(token, update, types) { if (token !== cssToken) throw new TypeError('Illegal constructor'); Object.assign(this, { _update: update, _phase: 0, _called: false, _done: deferred(), _ready: deferred(), _finished: deferred(), _types: new ViewTransitionTypeSet(types), _vt: 0, _old: null, _new: null, _pseudos: new Map() }); }
+    get updateCallbackDone() { return this._done.promise; }
+    get ready() { return this._ready.promise; }
+    get finished() { return this._finished.promise; }
+    get types() { return this._types; }
+    skipTransition() { skipTransition(this, new DOMException('Transition was skipped. skipTransition() called', 'AbortError')); }
+  }
+  // Chrome lists the animations of the groups last to first, then those of the images of each name, the new before the
+  // old. It cancels them last name first, the old before the new and the group.
+  const transitionOrder = (t, id, cancel) => {
+    const pseudo = transitionNodes.get(id), [, kind, name] = /^::view-transition-?([a-z-]*)\((.*)\)$/.exec(pseudo) ?? [, '', ''];
+    const names = [...t._pseudos.keys()].filter(key => key.startsWith('::view-transition-group(')), at = names.indexOf(`::view-transition-group(${name})`);
+    const rank = ['new', 'old', 'image-pair', 'group'].indexOf(kind);
+    return cancel ? at * 4 + 3 - [1, 0, 2, 3][rank] : kind === 'group' ? -at : names.length + at * 4 + rank;
+  };
+  // A pseudo-element that doesn't exist gets the styles that the rules give it, from a node in a hidden box.
+  const standIn = pseudo => {
+    const [, kind, name = '*', classes = ''] = /^::view-transition(-group|-image-pair|-old|-new)?(?:\(([^).]*)\.?([^)]*)\))?$/.exec(pseudo) ?? [];
+    const root = document.documentElement;
+    if (kind === undefined && pseudo !== '::view-transition' || !root || kind && (name === '*' || classes)) return null;
+    const hidden = create('::view-transition'), id = create('::view-transition' + (kind ?? ''));
+    op(4, hidden, 'display', 'none');
+    if (name !== '*') op(4, id, 'name', name);
+    if (classes) op(4, id, 'class', classes.replaceAll('.', ' '));
+    op(2, hidden, id, -1); op(2, root._id, hidden, -1);
+    const values = new Map(call('dom.computed', id, null, '').map(name => [name, call('dom.computed', id, name, '')]));
+    op(3, root._id, hidden); detached = true;
+    return declaration({ computed: name => values.get(name) ?? '', names: () => [...values.keys()] });
+  };
+  const callUpdate = t => {
+    if (t._called) return;
+    t._called = true;
+    let result;
+    try { result = Promise.resolve(t._update?.()); } catch (error) { result = Promise.reject(error); }
+    result.then(() => t._done.resolve(), error => t._done.reject(error));
+  };
+  const endTransition = (t, done) => {
+    transition = null; transitionTypes();
+    if (t._vt) {
+      // As in Chrome, a skip cancels the animations, the last pseudo-elements first.
+      const running = done ? [] : call('dom.cssAnimations', t._vt, true, true, false).filter(entry => entry[2] === 'animation' && entry[5] !== 'finished');
+      running.sort((a, b) => transitionOrder(t, b[1], true) - transitionOrder(t, a[1], true));
+      const root = document.documentElement, events = running.map(entry => new AnimationEvent('animationcancel', { bubbles: true, animationName: entry[3], elapsedTime: Math.max(0, entry[4] - entry[6][0]) / 1000, pseudoElement: transitionNodes.get(entry[1]) }));
+      op(3, root._id, t._vt); detached = true;
+      for (const event of events) dispatch(root, trusted(event));
+    }
+    for (const id of t._pseudos.values()) transitionNodes.delete(id);
+    call('dom.viewTransition', 'end');
+  };
+  const skipTransition = (t, reason) => {
+    if (t._phase > 3) return;
+    if (!t._called) setTimeout(() => callUpdate(t));
+    if (transition === t) endTransition(t, false);
+    t._phase = 4;
+    t._ready.reject(reason);
+    t._done.promise.then(() => t._finished.resolve(), error => t._finished.reject(error));
+  };
+  // The captured elements in tree order, or the first name that two of them have.
+  const transitionNames = () => {
+    const names = new Map();
+    for (const [id, name, classes] of call('dom.viewTransition', 'names')) {
+      const key = name === 'match-element' ? '-ua-match-element-' + id : name;
+      if (names.has(key)) return key;
+      const element = wrap(id), root = element === document.documentElement, rect = root ? null : element.getBoundingClientRect();
+      names.set(key, { id, root, classes: classes === 'none' ? '' : classes, box: root ? [0, 0, innerWidth, innerHeight] : [rect.x, rect.y, rect.width, rect.height] });
+    }
+    return names;
+  };
+  const duplicate = step => new DOMException('Transition was aborted because of invalid state. ' + step, 'InvalidStateError');
+  const capture = (mode, names, images) => { const list = [...names.values()]; call('dom.viewTransition', 'capture', mode, list.find(entry => entry.root)?.id ?? null, list.filter(entry => !entry.root).map(entry => entry.id), images); };
+  // The frame after this draws the page as it is and captures the named elements.
+  const captureOld = t => {
+    t._phase = 1;
+    const names = transitionNames();
+    if (typeof names === 'string') return skipTransition(t, duplicate('Snapshot capture failed'));
+    capture(1, t._old = names, []);
+  };
+  // Frames wait while the update callback runs.
+  const runUpdate = t => {
+    t._phase = 2;
+    call('dom.viewTransition', 'suppress');
+    const timer = setTimeout(() => skipTransition(t, new DOMException('Transition was aborted because of timeout in DOM update', 'TimeoutError')), 4000);
+    callUpdate(t);
+    t._done.promise.then(() => { clearTimeout(timer); if (transition === t) captureNew(t); }, error => { clearTimeout(timer); skipTransition(t, error); });
+  };
+  const captureNew = t => {
+    const names = t._new = transitionNames();
+    if (typeof names === 'string') return skipTransition(t, duplicate('Animation start failed'));
+    const images = [], box = ([x, y, width, height], prefix = '') => [[prefix + 'width', width + 'px'], [prefix + 'height', height + 'px'], [prefix + 'transform', `matrix(1, 0, 0, 1, ${x}, ${y})`]];
+    const node = (kind, parent, name, classes, styles) => {
+      const id = create('::view-transition' + kind), pseudo = name === null ? '::view-transition' : `::view-transition${kind}(${name})`;
+      for (const [key, value] of [['name', name], ['class', classes], ...styles]) if (value) op(4, id, key, value);
+      op(2, parent, id, -1);
+      t._pseudos.set(pseudo, id); transitionNodes.set(id, pseudo);
+      return id;
+    };
+    const vt = t._vt = node('', document.documentElement._id, null, '', []);
+    for (const name of new Set([...t._old.keys(), ...names.keys()])) {
+      const before = t._old.get(name), after = names.get(name), both = before && after, classes = (after ?? before).classes, blend = both ? ', -ua-mix-blend-mode-plus-lighter' : '';
+      const group = node('-group', vt, name, classes, [...box((after ?? before).box), ...both ? [...box(before.box, '--ua-'), ['animation-name', '-ua-view-transition-group-anim-' + name]] : []]);
+      const pair = node('-image-pair', group, name, classes, both ? [['isolation', 'isolate']] : []);
+      if (before) images.push(node('-old', pair, name, classes, [['animation-name', '-ua-view-transition-fade-out' + blend]]), 2 ** 40 + before.id, before.box[2], before.box[3]);
+      if (after) images.push(node('-new', pair, name, classes, [['animation-name', '-ua-view-transition-fade-in' + blend]]), after.id + 2 ** 41, after.box[2], after.box[3]);
+    }
+    op(9, vt, 1);
+    capture(2, names, images);
+    t._phase = 3;
+    t._ready.resolve();
+    watchTransition(t);
+  };
+  // The transition ends when no animation of its pseudo-elements runs or waits, and skips when a captured element
+  // loses its box.
+  const watchTransition = t => requestAnimationFrame(() => {
+    if (transition !== t) return;
+    const shown = new Set(call('dom.viewTransition', 'names').map(entry => entry[0]));
+    if ([...t._new.values()].some(entry => !shown.has(entry.id))) return skipTransition(t, new DOMException('Transition was aborted because of invalid state', 'InvalidStateError'));
+    let found = call('dom.cssAnimations', t._vt, true, true, true);
+    if (found === null) { layout(); found = call('dom.cssAnimations', t._vt, true, true, false); }
+    const busy = state => state === 'running' || state === 'paused';
+    if (found.some(entry => busy(entry[5])) || [...liveAnimations].some(animation => effects.get(animation.effect)?.pseudo?.startsWith('::view-transition') && busy(animation.playState))) return watchTransition(t);
+    endTransition(t, true);
+    t._phase = 4;
+    t._finished.resolve();
+  });
+  Object.defineProperties(Document.prototype, {
+    startViewTransition: { value(options) {
+      const update = typeof options === 'function' ? options : options?.update ?? null, types = typeof options === 'object' ? options?.types : null;
+      if (update !== null && typeof update !== 'function') throw new TypeError('The update callback is not a function');
+      const t = new ViewTransition(cssToken, update, types == null ? [] : [...types].map(String));
+      if (this !== document || !document.documentElement) { skipTransition(t, new DOMException('The document has no root', 'InvalidStateError')); return t; }
+      if (transition) skipTransition(transition, new DOMException('Transition was skipped. New ViewTransition started', 'AbortError'));
+      transition = t; transitionTypes(); requestFrame();
+      return t;
+    }, writable: true, configurable: true },
+    activeViewTransition: { get() { return this === document ? transition : null; }, configurable: true },
+  });
+  Object.assign(globalThis, { ViewTransition, ViewTransitionTypeSet });
   const mediaQueries = new Set();
   let mediaViewport = '';
   class MediaQueryListEvent extends Event {
@@ -5285,7 +5451,7 @@
   const slide = (node, x) => { const rect = node.getBoundingClientRect(), thumb = Math.min(rect.height, 16), [min, max] = rangeBounds(node); setRange(node, min + Math.min(1, Math.max(0, (x - rect.left - thumb / 2) / (rect.width - thumb || 1))) * (max - min)); };
   const mouseInit = (data, extra) => ({ bubbles: true, cancelable: true, composed: true, view: window, clientX: data.clientX, clientY: data.clientY, screenX: data.screenX ?? data.clientX, screenY: data.screenY ?? data.clientY, ctrlKey: !!data.ctrlKey, metaKey: !!data.metaKey, altKey: !!data.altKey, shiftKey: !!data.shiftKey, button: data.button ?? 0, buttons: data.buttons ?? 0, detail: data.detail ?? 0, movementX: last ? data.clientX - last[0] : 0, movementY: last ? data.clientY - last[1] : 0, pointerId: 1, pointerType: 'mouse', isPrimary: true, ...extra });
   // Queue the end event after finished-promise reactions, as browsers do.
-  globalThis.__appsDispatch = (name, ids, data = {}) => { const run = () => { native++; try { return nativeEvent(name, ids, data); } finally { native--; } }; if (/^(animation|transition)(end|cancel)$/.test(name) && cssEvent(name, ids[0], data)) { microtask(run); return true; } return run(); };
+  globalThis.__appsDispatch = (name, ids, data = {}) => { if (transition?._phase === 3 && /^(pointer|mouse|click|dblclick|auxclick|contextmenu|wheel|drag|drop)/.test(name)) ids = ids?.map(() => document.documentElement._id); else if (transitionNodes.size && ids?.some(id => transitionNodes.has(id))) { if (transitionNodes.has(ids[0]) && /^(animation|transition)/.test(name)) data = { ...data, pseudoElement: transitionNodes.get(ids[0]) }; ids = ids.map(id => transitionNodes.has(id) ? document.documentElement._id : id); } const run = () => { native++; try { return nativeEvent(name, ids, data); } finally { native--; } }; if (/^(animation|transition)(end|cancel)$/.test(name) && cssEvent(name, ids[0], data)) { microtask(run); return true; } return run(); };
   const nativeEvent = (name, ids, data) => {
     if (name === 'pointerexit') { hover(null, data); last = null; return true; }
     if (name === 'fullscreen:exit') { if (fullscreens.length) exitFullscreen(true, true); return true; }

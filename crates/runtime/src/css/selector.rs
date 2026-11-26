@@ -127,6 +127,27 @@ pub(crate) fn identifier(source: &str) -> Option<(String, usize)> {
     (!invalid).then_some((name, length))
 }
 
+// The argument of a `::view-transition-*()` pseudo-element: a name or `*`, then classes, as `name.a.b`.
+fn transition_argument(argument: &str) -> Option<String> {
+    let argument = argument.trim();
+    let (mut out, mut rest) = match argument.strip_prefix('*') {
+        Some(rest) => ("*".to_owned(), rest),
+        None if argument.starts_with('.') => ("*".to_owned(), argument),
+        None => {
+            let (name, length) = identifier(argument)?;
+            (name != "default").then_some(())?;
+            (name, argument[length..].trim_start())
+        }
+    };
+    while let Some(after) = rest.strip_prefix('.') {
+        let (class, length) = identifier(after)?;
+        out.push('.');
+        out.push_str(&class);
+        rest = &after[length..];
+    }
+    rest.is_empty().then_some(out)
+}
+
 pub(crate) fn selector_boundary(source: &str, separator: impl Fn(char) -> bool) -> usize {
     let mut depth = 0;
     let mut quote = None;
@@ -354,6 +375,11 @@ impl Selector {
                     "file-selector-button",
                     "-webkit-file-upload-button",
                     "highlight",
+                    "view-transition",
+                    "view-transition-group",
+                    "view-transition-image-pair",
+                    "view-transition-old",
+                    "view-transition-new",
                 ]
                 .iter()
                 .position(|n| n == name)
@@ -840,6 +866,12 @@ impl Selector {
                         continue;
                     }
                     if marker == b':' {
+                        // Like Chrome, nothing can follow a view transition pseudo-element.
+                        if simple.iter().any(|part| {
+                            matches!(part, SimpleSelector::Element(name, _) if name.starts_with("view-transition"))
+                        }) {
+                            return None;
+                        }
                         let element = compound.starts_with("::");
                         compound = &compound[if element { 2 } else { 1 }..];
                         let (name, length) = identifier(compound)?;
@@ -878,6 +910,22 @@ impl Selector {
                                 return None;
                             }
                             argument = &ident;
+                        }
+                        if name == "active-view-transition-type"
+                            && !argument.split(',').all(|kind| {
+                                let kind = kind.trim();
+                                identifier(kind).is_some_and(|(_, length)| length == kind.len())
+                            })
+                        {
+                            return None;
+                        }
+                        let named;
+                        if element && functional && name.starts_with("view-transition-") {
+                            named = transition_argument(argument)?;
+                            if !named.starts_with(['*', '.']) {
+                                specificity[2] = specificity[2].saturating_add(1);
+                            }
+                            argument = &named;
                         }
                         if element {
                             specificity[2] = specificity[2].saturating_add(1);

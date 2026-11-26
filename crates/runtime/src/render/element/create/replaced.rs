@@ -111,16 +111,19 @@ pub(super) fn replaced(
             );
         }
     }
-    if node.tag == "img" || node.tag == "video" {
-        let (image, vector) = view
+    // The captures of a view transition are images of their device pixels.
+    let captured = node.tag.starts_with("::");
+    if node.tag == "img" || node.tag == "video" || captured {
+        let (image, vector, waiting) = view
             .store
             .borrow()
             .page_state(view.id)
             .filter(|_| !broken)
-            .map_or((None, None), |state| {
+            .map_or((None, None, None), |state| {
                 (
                     state.media.images.get(&id).cloned(),
                     state.media.svg_images.get(&id).cloned(),
+                    (state.transition.as_ref()).and_then(|capture| capture.size(id)),
                 )
             });
         reader.log(
@@ -135,9 +138,11 @@ pub(super) fn replaced(
                 .as_ref()
                 .map(|image| {
                     let size = image.size();
-                    [size.width as u32 as f32, size.height as u32 as f32]
+                    let scale = if captured { reader.pixel_ratio } else { 1. };
+                    [size.width as u32 as f32, size.height as u32 as f32].map(|side| side / scale)
                 })
-                .or(vector.as_ref().map(|(_, natural)| *natural)),
+                .or(vector.as_ref().map(|(_, natural)| *natural))
+                .or(waiting),
             style,
         )
         .map_or((None, None), |(size, ratio)| (Some(size), ratio));

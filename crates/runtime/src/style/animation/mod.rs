@@ -52,6 +52,8 @@ pub(crate) struct Motion {
     // The progress of each scroll-driven effect by the node its timeline is read from, and whether there are any.
     progress: FxHashMap<(usize, *const Scroll), [f64; 5]>,
     pub(crate) scrolls: bool,
+    // A script played, paused or moved a CSS animation since the last frame.
+    pub(crate) controlled: bool,
 }
 
 // What one `update` of the animations gives the frame.
@@ -509,6 +511,7 @@ impl Motion {
         styles: &ComputedStyles,
     ) -> bool {
         let now = Instant::now();
+        self.controlled = true;
         for (&node, clocks) in &mut self.clocks {
             let Some(index) = clocks.iter().position(|clock| clock.serial == serial) else {
                 continue;
@@ -642,6 +645,7 @@ impl Motion {
         repass: bool,
         events: &mut Events,
     ) -> Frame {
+        self.controlled = false;
         let mut frame = Frame::default();
         let registry = &*styles.registry;
         let coarse = |id: usize| f64::from((48. / side(id).max(1.)).clamp(1., 4.));

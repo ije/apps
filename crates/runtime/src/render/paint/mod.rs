@@ -1658,6 +1658,15 @@ impl Hooks for DomBox {
         if self.hidden.get() {
             return;
         }
+        let captured = &self.view.captured;
+        let bounds = self.placed.get().0;
+        if captured.active()
+            && captured.paint(Some(self.id), bounds, cx.window, &mut |window| {
+                self.draw(window, inner)
+            })
+        {
+            return;
+        }
         if !self.drawn {
             return self.draw(cx.window, inner);
         }
@@ -1673,6 +1682,28 @@ impl Hooks for DomBox {
 }
 
 impl DomBox {
+    // A transform or z-index makes a stacking context, which isolates the blending in it.
+    fn stacked(&self) -> bool {
+        (crate::render::effects::TRANSFORM_PROPS.iter())
+            .any(|&prop| self.style.get(prop).is_some_and(|value| value != "none"))
+            || self
+                .style
+                .get(Prop::Z_INDEX)
+                .is_some_and(|value| value != "auto")
+                && self
+                    .style
+                    .get(Prop::POSITION)
+                    .is_some_and(|value| value != "static")
+    }
+
+    fn blended(&self) -> bool {
+        let store = self.view.store.borrow();
+        let styles = store
+            .page_state(self.view.id)
+            .and_then(|dom| dom.styles.last());
+        styles.is_some_and(|styles| styles.blended())
+    }
+
     fn backface_hidden(&self) -> bool {
         self.style.get(Prop::BACKFACE_VISIBILITY) == Some("hidden")
     }
@@ -1722,7 +1753,7 @@ impl DomBox {
                 false => inner(window),
             }
         };
-        if matrix.is_none() && self.effects.is_none() {
+        if matrix.is_none() && self.effects.is_none() && !(self.stacked() && self.blended()) {
             return inner(window);
         }
         // The matrix of a box in a 3D rendering context goes to the plane of the context.
@@ -1882,10 +1913,11 @@ impl DomBox {
             ..Default::default()
         };
         // Isolation affects mix-blend-mode only. An extra group without blending incorrectly hides content
-        // from descendant backdrop filters.
-        let isolate = style
-            .get(Prop::ISOLATION)
-            .is_some_and(|value| value == "isolate")
+        // from descendant backdrop filters. As in Chrome, transforms and z-index make stacking contexts that
+        // isolate too.
+        let isolate = (style.get(Prop::ISOLATION) == Some("isolate") || self.stacked())
+            && outer.opacity >= 1.
+            && outer.blend_mode == renderer::BlendMode::Normal
             && store
                 .page_state(view.id)
                 .and_then(|dom| dom.styles.last())
@@ -1909,6 +1941,10 @@ impl DomBox {
                 });
             } else {
                 layers.push(outer);
+            }
+            // A transform alone draws in its parent, so a group of its own isolates the blending in it.
+            if isolate && layers.last().is_some_and(|layer| layer.transform.is_some()) {
+                layers.insert(0, renderer::PaintEffect::default());
             }
         }
         (clip, layers)

@@ -156,7 +156,9 @@ pub(crate) fn natural_size(
     }
     match (node.tag.as_str(), decoded.filter(|_| !broken_image(node))) {
         ("canvas", _) => Some(pictured([attr("width", 300.), attr("height", 150.)])),
-        ("img" | "video", Some(size)) => Some(pictured(size)),
+        ("img" | "video" | "::view-transition-old" | "::view-transition-new", Some(size)) => {
+            Some(pictured(size))
+        }
         ("video", None) => Some(([300., 150.], None)),
         ("img", None) => {
             let (broken, alt) = (broken_image(node), node.attrs.get("alt"));

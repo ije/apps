@@ -190,6 +190,13 @@ impl ComputedStyles {
                 style
                     .get(Prop::MIX_BLEND_MODE)
                     .is_some_and(|value| value != "normal")
+            }) || self.animations().any(|(_, list)| {
+                (list.iter()).any(|effect| {
+                    effect
+                        .tracks
+                        .iter()
+                        .any(|(prop, _)| *prop == Prop::MIX_BLEND_MODE)
+                })
             });
             self.blended.set(Some(blended));
             blended

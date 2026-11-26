@@ -112,6 +112,8 @@ pub struct RenderFrame {
     pub shots: Vec<(u64, Target, [i32; 4])>,
     // The commands of the snapshot layers start here.
     pub shot_commands: usize,
+    // While a snapshot layer is read, the snapshot layers in it don't draw.
+    in_shot: Option<Vec<usize>>,
     // Set by a backend that draws damage regions over the last frame: it then keeps the window below what paints
     // after a scrolled content, so a scroll draws again only what changed there and what paints after it.
     keeps_under: bool,
@@ -446,6 +448,7 @@ impl RenderFrame {
         }
         self.shots.clear();
         self.shot_commands = self.commands.len();
+        self.in_shot = Some(scene.shots.iter().map(|shot| shot.layer).collect());
         for shot in scene.shots.iter().filter(|shot| shot.read) {
             let [x, y, width, height] = shot.region;
             let region = [
@@ -460,6 +463,7 @@ impl RenderFrame {
                 self.shots.push((shot.key, target, region));
             }
         }
+        self.in_shot = None;
         // Layers that the frame could have used and didn't age. A damage region could use only some.
         let damage = &self.damage;
         for cached in &mut self.cache {
@@ -1063,6 +1067,7 @@ impl RenderFrame {
         depth: usize,
     ) {
         if !nested.reach().is_empty()
+            && !(self.in_shot.as_ref()).is_some_and(|shots| shots.contains(&nested.layer))
             && (layer != 0
                 || !self.skip.contains(&nested.layer)
                     && self.cull.is_none_or(|cull| cull.intersects(nested.reach())))

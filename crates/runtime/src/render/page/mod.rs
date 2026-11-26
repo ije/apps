@@ -25,6 +25,7 @@ pub struct PageState {
     pub(crate) window: renderer::WindowState,
     pub pixel_ratio: f32,
     pub(crate) paint_requested: bool,
+    pub(crate) transition: Option<std::rc::Rc<super::transition::Capture>>,
 }
 
 impl PageState {

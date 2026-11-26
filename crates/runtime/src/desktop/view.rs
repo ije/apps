@@ -433,6 +433,10 @@ impl renderer::View for PageView {
             .render_page(tree, window, cx, events(self.clone()))
     }
 
+    fn suppressed(&self) -> bool {
+        crate::render::transition::Captured::suppressed(&self.page)
+    }
+
     fn drawn(&mut self, snapshots: Vec<renderer::Snapshot>, window: &mut Window, cx: &mut App) {
         let Some(changed) = self.page.drawn(snapshots, window) else {
             return;

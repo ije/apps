@@ -42,6 +42,7 @@ pub fn call(
         Ok(id)
     };
     match op {
+        "dom.viewTransition" => crate::render::transition::call(args, doc, state, viewport),
         "dom.cssControl" => css::css_control(args, doc, state, viewport),
         "dom.easing" => css::easing(args),
         "dom.animation" => css::animation(args, doc, state),

@@ -157,6 +157,7 @@ impl ViewState {
         if std::mem::take(&mut dom.paint_requested) {
             self.paint.set(true);
         }
+        self.captured.update(dom, window);
         let cached = dom.styles.computed.clone();
         let mut styles = dom.restyle(&mut doc, [width, height]);
         if cached.is_none_or(|cached| !std::rc::Rc::ptr_eq(&cached, &styles))
@@ -465,7 +466,9 @@ impl ViewState {
                 if !kept && state & crate::dom::LEAVING != 0 {
                     left.push(id);
                 }
-                kept && visible.get(id) == Some(&true) && doc.nodes[id].tag != "html"
+                (kept || doc.nodes[id].tag.starts_with("::"))
+                    && visible.get(id) == Some(&true)
+                    && doc.nodes[id].tag != "html"
             })
             .collect();
         dom.layout.measurements.pixel_ratio = window.scale_factor();
@@ -572,6 +575,7 @@ impl ViewState {
         let root = element(&build, 0, port, port, None);
         build.zone = None;
         let overlay = page::overlay(&build, &backdrops);
+        let transition = (top_layer.iter()).any(|&id| doc.nodes[id].tag.starts_with("::"));
         if !same {
             patch::patch(&build, window);
         }
@@ -664,7 +668,7 @@ impl ViewState {
             pointer_events,
             root,
             overlay,
-            [autos, anchored],
+            [autos, anchored, transition],
             started,
         )
     }

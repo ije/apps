@@ -47,7 +47,8 @@ pub(crate) fn specified(name: &str, value: &str) -> String {
     ) || name.starts_with("grid")
         || name.starts_with("counter-")
         || name.starts_with("container")
-        || name.ends_with("-name");
+        || name.ends_with("-name")
+        || name == "view-transition-class";
     let mut out = String::with_capacity(value.len());
     canonical(value, length, named, &mut out);
     let numeric =

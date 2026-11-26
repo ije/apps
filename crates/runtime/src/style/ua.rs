@@ -112,6 +112,16 @@ dialog::backdrop{background:rgba(0,0,0,.1)}
 [popover]:not(:popover-open):not(dialog[open]){display:none}
 dialog:popover-open{display:block}
 [popover]:popover-open::backdrop{pointer-events:none!important;background-color:transparent}
+:root{view-transition-name:root}
+html::view-transition{position:fixed;inset:0}
+html::view-transition-group(*){position:absolute;top:0;left:0;animation-duration:.25s;animation-fill-mode:both}
+html::view-transition-image-pair(*){position:absolute;inset:0}
+html::view-transition-old(*),html::view-transition-new(*){position:absolute;inset-block-start:0;inline-size:100%;block-size:auto}
+html::view-transition-image-pair(*),html::view-transition-old(*),html::view-transition-new(*){animation-duration:inherit;animation-fill-mode:inherit;animation-delay:inherit;animation-timing-function:inherit;animation-iteration-count:inherit;animation-direction:inherit;animation-play-state:inherit}
+@keyframes -ua-view-transition-fade-out{to{opacity:0}}
+@keyframes -ua-view-transition-fade-in{from{opacity:0}}
+@keyframes -ua-mix-blend-mode-plus-lighter{from{mix-blend-mode:plus-lighter}to{mix-blend-mode:plus-lighter}}
+@keyframes -ua-view-transition-group-anim{from{width:var(--ua-width);height:var(--ua-height);transform:var(--ua-transform)}}
 ";
 
 pub(crate) const FULLSCREEN_UA: &str = "

@@ -44,6 +44,10 @@ pub trait View: 'static {
     fn event(&mut self, event: &Event, window: &mut Window, app: &mut App);
     /// Runs after each frame, with the layers of `Window::with_snapshot` that changed.
     fn drawn(&mut self, _snapshots: Vec<Snapshot>, _window: &mut Window, _app: &mut App) {}
+    /// While true, frames draw nothing, so the window keeps its last frame.
+    fn suppressed(&self) -> bool {
+        false
+    }
 
     fn selection(&mut self, window: &mut Window, app: &mut App) -> Option<Utf16Selection>;
     fn composition(&mut self, window: &mut Window, app: &mut App) -> Option<Range<usize>>;
@@ -1056,7 +1060,9 @@ impl Window {
         for callback in mem::take(&mut self.frame_callbacks) {
             callback(self, app);
         }
-        if self.dirty || !self.captures.is_empty() {
+        // A capture draws also while frames are suppressed, as nothing would draw it later.
+        let suppressed = self.view.as_ref().is_some_and(|view| view.suppressed());
+        if self.dirty && !suppressed || !self.captures.is_empty() {
             // The diff damage holds the regions of a patch that was not drawn.
             self.patch = false;
             self.draw(app);
@@ -1823,6 +1829,16 @@ impl Window {
         let shot = key.map(|key| (key, self.snap_bounds(bounds)));
         self.scene.pop_offscreen(shot);
         result
+    }
+
+    /// Like `with_snapshot` with a fresh key, but the window shows what `f` paints too. The pixels of the
+    /// snapshots inside are not part of this one.
+    pub fn with_shown_snapshot(&mut self, key: u64, bounds: Rect, f: &mut dyn FnMut(&mut Self)) {
+        self.shots.remove(&key);
+        let layer = self.scene.next_layer();
+        self.with_effect(PaintEffect::default(), f);
+        let bounds = self.snap_bounds(bounds);
+        self.scene.shoot(layer, key, bounds);
     }
 
     /// Makes the transforms of this place the space of `with_hits_at`, where regions miss outside `clip`.

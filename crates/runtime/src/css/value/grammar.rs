@@ -52,6 +52,16 @@ pub(crate) fn supports(name: &str, value: &str) -> Option<bool> {
     if matches!(name, "orphans" | "widows") && value.parse::<f64>().is_ok_and(|lines| lines < 1.) {
         return Some(false);
     }
+    // Like Chrome, `default` is no name, and `auto` and a list with `none` are reserved.
+    if name.starts_with("view-transition-")
+        && value.split_ascii_whitespace().any(|word| {
+            word.eq_ignore_ascii_case("default")
+                || name == "view-transition-name" && word.eq_ignore_ascii_case("auto")
+                || word.eq_ignore_ascii_case("none") && value.contains(' ')
+        })
+    {
+        return Some(false);
+    }
     // `<position>` has no three-value form, unlike `<bg-position>`.
     if matches!(name, "object-position" | "perspective-origin") && components(value, ' ').len() == 3
     {
@@ -697,6 +707,7 @@ const INITIAL: &[(&str, &str)] = &[
     ("view-timeline-axis", "block"),
     ("view-timeline-inset", "auto"),
     ("view-timeline-name", "none"),
+    ("view-transition-class", "none"),
     ("view-transition-name", "none"),
     ("visibility", "visible"),
     ("white-space", "normal"),

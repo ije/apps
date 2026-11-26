@@ -791,6 +791,22 @@ impl Scene {
         }
     }
 
+    // Reads the pixels of a layer that its parent shows, like those of `pop_offscreen`.
+    pub(crate) fn shoot(&mut self, layer: usize, key: u64, bounds: Rect<f32>) {
+        if self
+            .layers
+            .get(layer)
+            .is_some_and(|layer| layer.effect.is_some())
+        {
+            self.shots.push(Shot {
+                key,
+                layer,
+                region: crate::geometry::region(bounds),
+                read: false,
+            });
+        }
+    }
+
     // The glass layers that Core Animation can draw: plain glass in the window layer that nothing paints over.
     // Later glass draws above earlier glass, so it comes first.
     #[cfg(target_os = "macos")]

@@ -54,6 +54,26 @@ fn snapshot_layers_draw_into_their_own_target_when_they_are_read() {
 }
 
 #[test]
+fn shown_snapshots_leave_out_the_snapshots_inside() {
+    let mask = Clip::from(bounds([0., 0., 100., 100.]));
+    let mut scene: Scene = Default::default();
+    for (key, quad) in [(1, [0., 0., 50., 50.]), (2, [10., 10., 10., 10.])] {
+        let layer = scene.next_layer();
+        scene.push_effect(effect(mask), None);
+        scene.push(Instance::new(BOX, bounds(quad), mask));
+        scene.shoot(layer, key, bounds(quad));
+    }
+    scene.pop_effect();
+    scene.pop_effect();
+    scene.shots.iter_mut().for_each(|shot| shot.read = true);
+    let mut frame = RenderFrame::default();
+    frame.record(&scene, [100, 100], 4096, true);
+    // The window draws both boxes, the outer snapshot only its own and the inner one its own.
+    assert_eq!(frame.shots.len(), 2);
+    assert_eq!(frame.instances.len(), 4);
+}
+
+#[test]
 fn text_masks_composite_through_their_own_layer() {
     let mask = Clip::from(bounds([0., 0., 100., 100.]));
     for has_text in [false, true] {

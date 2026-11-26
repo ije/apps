@@ -750,6 +750,16 @@ fn matches_with(
                     _ => false,
                 }
             }
+            // The root holds the types of the active view transition in `:vt`.
+            "active-view-transition" | "active-view-transition-type" => {
+                memo.depend(id, 0);
+                node.attrs.get(":vt").is_some_and(|types| {
+                    name.len() == 22
+                        || argument
+                            .split(',')
+                            .any(|wanted| types.split(' ').any(|kind| kind == wanted.trim()))
+                })
+            }
             "state" => {
                 memo.depend(id, 3);
                 node.tag.contains('-')

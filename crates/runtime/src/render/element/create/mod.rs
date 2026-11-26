@@ -720,7 +720,17 @@ pub(super) fn create(
     // The content of replaced elements paints above the background layers, which are built later.
     let mut content_layers: Vec<Child> = Vec::new();
     let (mut grid_bar, mut picture) = (None, None);
-    if broken || matches!(node.tag.as_str(), "canvas" | "terminal" | "img" | "video") {
+    if broken
+        || matches!(
+            node.tag.as_str(),
+            "canvas"
+                | "terminal"
+                | "img"
+                | "video"
+                | "::view-transition-old"
+                | "::view-transition-new"
+        )
+    {
         el = replaced(
             &cx,
             el,
