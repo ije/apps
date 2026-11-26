@@ -370,6 +370,16 @@ fn mutation_records_and_live_ranges_follow_the_dom_standard() {
         r#"
         const p = document.getElementById('p'), a = document.getElementById('a'), b = document.getElementById('b');
         check('observe needs a kind', () => { try { new MutationObserver(() => {}).observe(p, {}); return false; } catch (e) { return e instanceof TypeError; } });
+        {
+            const both = new MutationObserver(() => {}), other = new MutationObserver(() => {}), own = new MutationObserver(() => {}), sized = new ResizeObserver(() => {});
+            both.observe(document.body, { attributes: true, subtree: true }); both.observe(p, { attributes: true, subtree: true, attributeOldValue: true, attributeFilter: ['title'] });
+            other.observe(b, { attributes: true, childList: true, subtree: true }); own.observe(document.body, { attributes: true, childList: true }); sized.observe(a);
+            a.setAttribute('title', 'x'); a.setAttribute('title', 'y'); a.setAttribute('lang', 'en'); a.textContent = 'a';
+            const records = both.takeRecords();
+            check('an observer of two ancestors gets one record for each change', () => records.map(record => record.attributeName + ':' + record.oldValue).join() === 'title:null,title:x,lang:null' && records.every(record => record.target === a));
+            check('observers of other nodes and of a parent without subtree get nothing', () => !other.takeRecords().length && !own.takeRecords().length);
+            a.removeAttribute('title'); a.removeAttribute('lang'); both.disconnect(); other.disconnect(); own.disconnect(); sized.disconnect();
+        }
         const observer = new MutationObserver(() => {});
         observer.observe(p, { childList: true });
         p.insertBefore(b, a);

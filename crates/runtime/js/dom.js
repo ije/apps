@@ -14,7 +14,7 @@
     *[Symbol.iterator]() { const list = this.list; for (let i = 0; i < list.length; i += 2) yield [list[i], list[i + 1]]; }
   }
   const noAttrs = new Attrs(), noKids = Object.freeze([]);
-  class Record { constructor(id, tag, text) { this.id = id; this.tag = tag; this.text = text; this.attrs = tag[0] === '#' ? null : noAttrs; this.up = null; this.kids = tag === '#text' || tag === '#comment' ? noKids : []; this.i = 0; this.shadow = null; this.host = null; this.ref = null; } }
+  class Record { constructor(id, tag, text) { this.id = id; this.tag = tag; this.text = text; this.attrs = tag[0] === '#' ? null : noAttrs; this.up = null; this.kids = tag === '#text' || tag === '#comment' ? noKids : []; this.i = 0; this.shadow = null; this.host = null; this.ref = null; this.watched = false; } }
   const records = [], texts = [];
   let detached = false;
   let scheduled = false, changed = false, pool = [], reserve = 32, codes = new Int32Array(1024), size = 0;
@@ -262,27 +262,31 @@
   };
   const path = node => { const result = []; while (node) { result.push(node); const parent = node.parentNode; node = assignedSlot(node, parent) ?? parent ?? (node instanceof ShadowRoot ? node.host : null); } return result; };
   // Use WeakRefs for observer targets and global sets so forgotten observers cannot retain removed trees.
-  const watch = (observer, target, value, set) => { observer.targets.set(target._m.ref, value); (target._observers ??= new Set()).add(observer); set.add(observer._ref ??= new WeakRef(observer)); };
-  const unwatch = (observer, target, set) => { observer.targets.delete(target._m.ref); target._observers?.delete(observer); if (!observer.targets.size) set.delete(observer._ref); };
-  const unwatchAll = (observer, set) => { for (const ref of observer.targets.keys()) ref.deref()?._observers?.delete(observer); observer.targets.clear(); set.delete(observer._ref); };
+  // `watched` on a record says that its node has observers, so a walk up the tree reads no other node.
+  const watch = (observer, target, value, set) => { observer.targets.set(target._m.ref, value); (target._observers ??= new Set()).add(observer); target._m.watched = true; set.add(observer._ref ??= new WeakRef(observer)); };
+  const unwatchNode = (observer, target) => { const set = target?._observers; if (set?.delete(observer) && !set.size) target._m.watched = false; };
+  const unwatch = (observer, target, set) => { observer.targets.delete(target._m.ref); unwatchNode(observer, target); if (!observer.targets.size) set.delete(observer._ref); };
+  const unwatchAll = (observer, set) => { for (const ref of observer.targets.keys()) unwatchNode(observer, ref.deref()); observer.targets.clear(); set.delete(observer._ref); };
+  // Asks only the observers of the target and of its ancestors, so observers of other trees cost a change nothing.
+  // `found` holds each observer that takes the record, followed by whether it takes the old value.
   const change = record => {
     if (!observers.size || quiet) return;
-    for (const ref of observers) {
-      const observer = ref.deref();
-      if (!observer) { observers.delete(ref); continue; }
-      for (const [key, options] of observer.targets) {
-        const target = key.deref();
-        if (!target) { observer.targets.delete(key); continue; }
-        if (target !== record.target && !(options.subtree && target.contains(record.target))) continue;
-        if (!options[record.type] || (record.type === 'attributes' && options.attributeFilter && !options.attributeFilter.includes(record.attributeName))) continue;
-        const old = record.type === 'attributes' ? options.attributeOldValue : record.type === 'characterData' && options.characterDataOldValue;
-        observer.records.push({ addedNodes: [], removedNodes: [], previousSibling: null, nextSibling: null, attributeName: null, attributeNamespace: null, ...record, oldValue: old ? record.oldValue ?? null : null });
-        break;
+    const type = record.type, attributes = type === 'attributes', own = record.target._m;
+    let found = null;
+    for (let rec = own; rec; rec = rec.up) {
+      const set = rec.watched && rec.ref.deref()?._observers;
+      if (set) for (const observer of set) {
+        const options = observer.targets.get(rec.ref);
+        if (!options?.[type] || rec !== own && !options.subtree || attributes && options.attributeFilter && !options.attributeFilter.includes(record.attributeName)) continue;
+        const old = !!(attributes ? options.attributeOldValue : type === 'characterData' && options.characterDataOldValue), at = found ? found.indexOf(observer) : -1;
+        if (at < 0) (found ??= []).push(observer, old); else if (old) found[at + 1] = true;
       }
     }
+    if (!found) return;
+    for (let i = 0; i < found.length; i += 2) found[i].records.push({ addedNodes: [], removedNodes: [], previousSibling: null, nextSibling: null, attributeName: null, attributeNamespace: null, ...record, oldValue: found[i + 1] ? record.oldValue ?? null : null });
     if (!mutationQueued) {
       mutationQueued = true;
-      queueMicrotask(() => { mutationQueued = false; for (const ref of observers) { const observer = ref.deref(), records = observer?.takeRecords(); if (records?.length) try { observer.callback(records, observer); } catch (error) { report(error); } } });
+      queueMicrotask(() => { mutationQueued = false; for (const ref of observers) { const observer = ref.deref(); if (!observer) { observers.delete(ref); continue; } const records = observer.takeRecords(); if (records.length) try { observer.callback(records, observer); } catch (error) { report(error); } } });
     }
   };
   let reporting = false;
@@ -586,7 +590,7 @@
     // As in Chrome, Tab goes on from the place of the removed element.
     const previous = active, ancestors = () => parent?.isConnected ? [...path(previous), ...path(parent)] : undefined; active = null; navStart = parent ? [parent, next && of(next)] : null; call('dom.focus', []); if (windowFocused) { dispatch(previous, new FocusEvent('blur', { view: window, composed: true }), ancestors()); dispatch(previous, new FocusEvent('focusout', { view: window, bubbles: true, composed: true }), ancestors()); }
   };
-  const watched = node => { if (observers.size && !quiet) for (const ref of observers) for (const [key, options] of ref.deref()?.targets ?? []) { const target = key.deref(); if (target && options.childList && (target === node || options.subtree && target.contains(node))) return true; } return false; };
+  const watched = node => { if (observers.size && !quiet) for (let own = node._m, rec = own; rec; rec = rec.up) { const set = rec.watched && rec.ref.deref()?._observers; if (set) for (const observer of set) { const options = observer.targets.get(rec.ref); if (options?.childList && (rec === own || options.subtree)) return true; } } return false; };
   const ignore = () => {};
   // Call removed after both trees detach the old children, before reinserted children run connected
   // callbacks.
@@ -3013,6 +3017,7 @@
       if (!options.childList && !attributes && !characterData) throw new TypeError('The options must set childList, attributes or characterData');
       if (!attributes && (options.attributeOldValue || options.attributeFilter) || !characterData && options.characterDataOldValue) throw new TypeError('Old values and filters need their kind of record');
       watch(this, target, { ...options, attributes, characterData, attributeFilter: options.attributeFilter === undefined ? undefined : Array.from(options.attributeFilter, String) }, observers);
+      if (this.targets.size > (this._limit ?? 64)) { for (const key of this.targets.keys()) if (!key.deref()) this.targets.delete(key); this._limit = Math.max(64, this.targets.size * 2); }
     }
     disconnect() { unwatchAll(this, observers); this.records = []; } takeRecords() { return this.records.splice(0); }
   }
