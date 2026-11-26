@@ -190,6 +190,17 @@ impl<'a> Build<'a> {
                 // The 0.5 px must match prepaint, which draws again only for a size more than half a pixel
                 // off.
                 let used = f32::from_bits(read.value as u32);
+                // A grid that took a new content width in this build reads no laid-out width in it.
+                if axis == 0
+                    && dom.is_some_and(|dom| {
+                        dom.layout
+                            .grid_widest
+                            .get(&(node as usize))
+                            .is_some_and(|widest| widest.1 == dom.layout.builds)
+                    })
+                {
+                    return Replay::Same;
+                }
                 return match dom
                     .and_then(|dom| dom.layout.cull.widths.get(&(node as usize)))
                     .map(|size| size[usize::from(axis)])

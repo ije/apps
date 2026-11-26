@@ -496,6 +496,28 @@ fn first_builds_log_reads_that_replay_the_same() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn shrunk_grids_with_new_content_replay_their_width_in_the_same_build() {
+    // Debug builds build the second flex item again when it takes the style of the first, and visit the grid
+    // that just took a narrower content width.
+    run_hidden(
+        r#"
+        await load('page.html');
+        await run("document.getElementById('g').textContent = 'ab'");
+        await win.webContents.capturePage();
+        const width = await run("document.getElementById('g').getBoundingClientRect().width");
+        const want = await run("(r => (r.selectNodeContents(document.getElementById('g')), r.getBoundingClientRect().width))(document.createRange())");
+        if (Math.abs(width - want) > 1) fail('the grid fits its new text: ' + width + ' ' + want);
+        "#,
+        &[(
+            "page.html",
+            "<body style='margin:0'><div style='display:flex'><div><div style='display:grid'>first</div></div></div>\
+             <div style='display:flex'><div><div id=g style='display:grid'>second row</div></div></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn the_only_box_of_a_run_paints_its_new_color() {
     run_hidden(
         r#"
