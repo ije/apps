@@ -100,7 +100,7 @@ pub(crate) struct ViewState {
 }
 
 pub(crate) struct Frame {
-    pub(crate) browser: apps_webview::Browser,
+    pub(crate) browser: crate::webview::Browser,
     loaded: String,
     pub(crate) bounds: [f64; 4],
     revision: u64,

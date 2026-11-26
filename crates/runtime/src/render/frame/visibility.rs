@@ -211,7 +211,10 @@ pub(super) fn drop_hidden_images(
                     .is_some_and(|style| masked(style, &images)),
             }
             || {
-                if let Some(image) = image {
+                // Boxes with the same mask share its image.
+                if let Some(image) = image
+                    && Arc::strong_count(image) == 1
+                {
                     release(image.clone());
                 }
                 false

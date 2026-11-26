@@ -237,7 +237,7 @@ impl Desktop {
             let link = link.clone();
             move || link.wake_main()
         });
-        apps_webview::on_event({
+        crate::webview::on_event({
             let link = link.clone();
             move || {
                 link.wake_main();
@@ -963,7 +963,7 @@ impl Desktop {
         } = self;
         drop((api, host));
         let main = main.context("Missing the main side")?;
-        apps_webview::on_main_thread(|task| renderer::sync_main(task), renderer::post_main);
+        crate::webview::on_main_thread(|task| renderer::sync_main(task), renderer::post_main);
         if let Some(port) = mcp {
             mcp::start(port, link.clone())?;
         }

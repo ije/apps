@@ -22,7 +22,7 @@ pub(super) fn sync(
         let frame = match frames.entry(node) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                match apps_webview::Browser::new(
+                match crate::webview::Browser::new(
                     window,
                     window.scale_factor() as f64,
                     &serde_json::json!({"javascript":attrs.get("sandbox").is_none_or(|s|s.split_whitespace().any(|s|s=="allow-scripts")),"inspectable":inspectable}),

@@ -35,6 +35,10 @@ pub mod render;
 pub mod script;
 pub mod style;
 mod web;
+#[cfg(not(target_os = "linux"))]
+pub(crate) use apps_webview as webview;
+#[cfg(target_os = "linux")]
+pub(crate) use native::webview;
 pub use web::download;
 // The DOM operations of page scripts, which tests drive directly.
 pub use render::media::{gpu, player, terminal};

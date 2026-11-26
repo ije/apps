@@ -1,6 +1,6 @@
+use crate::webview::Browser;
 use crate::{host::Host, host::context::JsContext, jsc::Role};
 use anyhow::{Context, Result, bail, ensure};
-use apps_webview::Browser;
 use serde_json::{Value, json};
 use std::{
     cell::{Cell, RefCell},

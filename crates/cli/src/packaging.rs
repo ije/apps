@@ -34,7 +34,7 @@ pub fn package_app(
         version,
         identifier,
         features,
-        ..
+        webview,
     } = apps_runtime::bundle::Package::parse(files.get("package.json").map(String::as_str))?;
     let library_name = apps_runtime::jsc::library_name(target.platform)?;
     let enabled = |feature| features.has(feature);
@@ -233,6 +233,12 @@ pub fn package_app(
     let mut shipped = vec![(jsc, library_name, None)];
     if license.is_file() {
         shipped.push((license, "JavaScriptCore.LICENSE", None));
+    }
+    // Web views can come from packages that the bundler doesn't check, so the library ships when it exists.
+    if let Some(name) = apps_runtime::native::webview_library(target.platform)
+        && (webview || folder.with_file_name(name).is_file())
+    {
+        shipped.push((folder.with_file_name(name), name, Some("The system web views need the web view library next to the runtime. Build the workspace first with cargo build --workspace --release.")));
     }
     if let Some(name) = webgpu {
         shipped.push((folder.with_file_name(name), name, Some("The webgpu feature needs the WebGPU library next to the runtime. Build the workspace first with cargo build --workspace --release.")));

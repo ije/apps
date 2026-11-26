@@ -93,7 +93,12 @@ impl Rasters {
                 .filter(|image| Arc::strong_count(image) == 1),
         );
         for slot in 0..3 {
-            retired.extend(self.masks.remove(&(id, slot)).and_then(|(_, image)| image));
+            retired.extend(
+                self.masks
+                    .remove(&(id, slot))
+                    .and_then(|(_, image)| image)
+                    .filter(|image| Arc::strong_count(image) == 1),
+            );
         }
         self.svg_boxes.remove(&id);
         self.svg_trees.remove(&id);

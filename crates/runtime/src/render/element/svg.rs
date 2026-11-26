@@ -365,20 +365,27 @@ pub(super) fn svg_layer(
             let view = &*view;
             let mut store = view.store.borrow_mut();
             let state = store.state(view.id);
-            // The painted area in the box, in CSS pixels on device pixel edges. A long spill paints only near
-            // the content mask, in steps, so it keeps the device scale.
+            // The painted area in the box, in CSS pixels on device pixel edges. A long spill or a large box
+            // paints only near the content mask, in steps, so it keeps the device scale.
             let mask = window.content_mask().bounds;
             let mut cut = false;
-            let area = match state.rasters.svg_boxes.get(&id).filter(|_| spill) {
+            let area = match state.rasters.svg_boxes.get(&id) {
                 Some((_, _, [sw, sh], _, _, [x, y, w, h], _)) => {
-                    let [kx, ky] = [width / sw.max(f32::EPSILON), height / sh.max(f32::EPSILON)];
-                    let mut edges = [
-                        (x * kx).min(0.),
-                        (y * ky).min(0.),
-                        ((x + w) * kx).max(width),
-                        ((y + h) * ky).max(height),
-                    ];
-                    if mask.size.width < px(1e5) {
+                    let mut edges = [0., 0., width, height];
+                    if spill {
+                        let [kx, ky] =
+                            [width / sw.max(f32::EPSILON), height / sh.max(f32::EPSILON)];
+                        edges = [
+                            (x * kx).min(0.),
+                            (y * ky).min(0.),
+                            ((x + w) * kx).max(width),
+                            ((y + h) * ky).max(height),
+                        ];
+                    }
+                    // Above 4 MB of pixels.
+                    let large = (edges[2] - edges[0]) * (edges[3] - edges[1]) * scale * scale
+                        > 1024. * 1024.;
+                    if (spill || large) && mask.size.width < px(1e5) {
                         const STEP: f32 = 256.;
                         let [left, top] = [mask.left() - bounds.left(), mask.top() - bounds.top()]
                             .map(|at| ((f32::from(at) - STEP) / STEP).floor() * STEP);
@@ -394,10 +401,15 @@ pub(super) fn svg_layer(
                         cut = near != edges;
                         edges = near;
                     }
-                    let [left, top] = [edges[0], edges[1]].map(|at| (at * scale).floor() / scale);
-                    let [right, bottom] =
-                        [edges[2], edges[3]].map(|at| (at * scale).ceil() / scale);
-                    [left, top, right - left, bottom - top]
+                    if !spill && !cut {
+                        [0., 0., width, height]
+                    } else {
+                        let [left, top] =
+                            [edges[0], edges[1]].map(|at| (at * scale).floor() / scale);
+                        let [right, bottom] =
+                            [edges[2], edges[3]].map(|at| (at * scale).ceil() / scale);
+                        [left, top, right - left, bottom - top]
+                    }
                 }
                 _ => [0., 0., width, height],
             };
@@ -408,8 +420,20 @@ pub(super) fn svg_layer(
                 return;
             }
             let moved = area != [0., 0., width, height];
-            let raster =
-                [area[2], area[3]].map(|extent| (extent * scale).ceil().clamp(1., 4096.) as u32);
+            // A transform that shows the box smaller gets fewer pixels. A raster with up to twice the pixels it
+            // shows stays, so an animated transform doesn't draw it again in each frame.
+            let shown = window.transform_scale().clamp(1. / 8., 1.);
+            let kept = state
+                .rasters
+                .svgs
+                .get(&id)
+                .map(|(_, image)| image.size().width as f32 / (area[2] * scale).max(1.));
+            let ratio = match kept {
+                Some(kept) if kept >= shown && kept <= shown * 2. && kept < 1. => kept,
+                _ => (shown * 8.).ceil() / 8.,
+            };
+            let raster = [area[2], area[3]]
+                .map(|extent| (extent * scale * ratio).ceil().clamp(1., 4096.) as u32);
             let source = if inline {
                 state.media.svg_sources.get(&id).cloned()
             } else {
