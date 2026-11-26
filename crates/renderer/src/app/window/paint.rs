@@ -502,12 +502,12 @@ impl Window {
         self.push_content_mask(unbounded_mask());
         let groups = mem::take(&mut self.group_clips);
         let outer_scale = self.transform_scale;
-        if let Some(m) = effect.transform {
-            let axis = |x: f32, y: f32| (x * x + y * y).sqrt();
-            let scale = axis(m[0], m[1]).max(axis(m[4], m[5]));
-            if scale.is_finite() {
-                self.transform_scale *= scale;
-            }
+        if let Some(scale) = effect
+            .scale
+            .or(effect.transform.as_ref().map(crate::scale_of))
+            && scale.is_finite()
+        {
+            self.transform_scale *= scale;
         }
         let result = f(self);
         self.transform_scale = outer_scale;

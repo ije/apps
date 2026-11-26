@@ -1770,6 +1770,33 @@ impl DomBox {
             return;
         }
         let (clip, mut layers) = self.effects(bounds, matrix, window);
+        // Frames change the transform without a paint, so rasters inside take its largest scale, like Chrome.
+        if let Some(outer) = layers
+            .last_mut()
+            .filter(|_| self.transformed && !self.drawn)
+        {
+            let store = self.view.store.borrow();
+            let placed = self
+                .view
+                .composited_transforms
+                .borrow()
+                .get(&self.id)
+                .copied();
+            if let Some(placed) = placed
+                && let Some(dom) = store.page_state(self.view.id)
+                && let Some(styles) = dom.styles.last()
+            {
+                outer.scale = super::effects::transform::largest_scale(
+                    outer.transform.as_ref(),
+                    &dom.styles.motion,
+                    styles,
+                    self.id,
+                    &self.units,
+                    placed,
+                    std::time::Instant::now(),
+                );
+            }
+        }
         // Filters nest inside the layer with the transform, which is the last one.
         if let Some(outer) = layers.last_mut().filter(|_| space) {
             outer.space = renderer::Space {

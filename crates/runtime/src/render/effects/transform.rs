@@ -69,6 +69,30 @@ pub(crate) fn translation(matrix: &Matrix) -> Option<[f32; 2]> {
     (*matrix == plain).then_some([matrix[12], matrix[13]])
 }
 
+/// The scale for the rasters in the layer of a composited transform animation: the largest that the animation
+/// gives from `now` on, over one loop or 4 seconds, since frames change the transform without a paint.
+pub(crate) fn largest_scale(
+    current: Option<&Matrix>,
+    motion: &crate::style::Motion,
+    styles: &crate::style::ComputedStyles,
+    id: usize,
+    units: &Lengths,
+    (bounds, perspective): crate::render::CompositedTransform,
+    now: std::time::Instant,
+) -> Option<f32> {
+    let span = (motion.period(id, 0, styles, now)).map_or(4., |(period, ..)| period);
+    let times: Vec<_> = (0..=64)
+        .map(|k| now + std::time::Duration::from_secs_f64(span * f64::from(k) / 64.))
+        .collect();
+    let timeline = motion.timeline(id, 0, styles, &times, &super::TRANSFORM_PROPS);
+    let scales = timeline.iter().map(|style| {
+        transform(style, units, bounds, perspective).map_or(1., |m| renderer::scale_of(&m))
+    });
+    (scales.chain(current.map(renderer::scale_of)))
+        .filter(|scale| scale.is_finite())
+        .reduce(f32::max)
+}
+
 fn map(matrix: &Matrix, [x, y]: [f32; 2]) -> Option<[f32; 2]> {
     let w = matrix[3] * x + matrix[7] * y + matrix[15];
     (w > 1e-4).then(|| {
@@ -173,5 +197,47 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn composited_scale_animations_raster_at_their_largest_scale() {
+        // Grows for one second, then holds at its own size.
+        let mut doc = crate::dom::Document::parse(
+            "<style>@keyframes up{from{transform:scale(.25)}5%,to{transform:scale(1)}}\
+             div{width:100px;height:100px;animation:up 20s linear}</style><div></div>",
+        );
+        let mut dom = crate::render::PageState::default();
+        let div = doc.nodes.iter().position(|node| node.tag == "div").unwrap();
+        let styles = dom.restyle(&mut doc, [800., 600.]);
+        let now = std::time::Instant::now();
+        let frame = dom.styles.motion.update(
+            &doc,
+            &styles,
+            &vec![true; doc.nodes.len()],
+            &|_| true,
+            &|_| f32::INFINITY,
+            now,
+            false,
+            &mut Vec::new(),
+        );
+        let (_, style, _) = frame.animated.iter().find(|(id, ..)| *id == div).unwrap();
+        let units = styles.lengths[div];
+        let bounds = Rect::new(point(px(0.), px(0.)), renderer::size(px(100.), px(100.)));
+        let first = transform(style, &units, bounds, None).unwrap();
+        assert!(
+            (renderer::scale_of(&first) - 0.25).abs() < 0.01,
+            "{first:?}"
+        );
+        // The first paint sees a quarter of the size, but frames grow the layer to its full size.
+        let largest = largest_scale(
+            Some(&first),
+            &dom.styles.motion,
+            &styles,
+            div,
+            &units,
+            (bounds, None),
+            now,
+        );
+        assert_eq!(largest, Some(1.));
     }
 }

@@ -924,6 +924,8 @@ pub struct PaintEffect {
     pub backdrop: Option<Backdrop>,
     pub glass: Option<Glass>,
     pub key: Option<u64>,
+    // The largest scale that an animation gives `transform`, for the rasters inside a layer that frames patch.
+    pub scale: Option<f32>,
     pub space: Space,
     // The box of a plane of a 3D rendering context.
     pub plane: Rect<Pixels>,
@@ -945,6 +947,7 @@ impl Default for PaintEffect {
             backdrop: None,
             glass: None,
             key: None,
+            scale: None,
             space: Space::default(),
             plane: Rect::default(),
             text_mask: false,
