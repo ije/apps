@@ -551,6 +551,8 @@ pub struct Window {
     // The digest and the size of each snapshot layer of the last frame.
     shots: FxHashMap<u64, (u64, [i32; 2])>,
     opacity: f32,
+    // The scale of the transforms of the effects around the current paint.
+    transform_scale: f32,
     // The mask layer and effect depth of `with_text_clip`.
     text_clip: Option<(usize, usize)>,
     states: FxHashMap<(NodeKey, TypeId), Box<dyn Any>>,
@@ -645,6 +647,7 @@ impl Window {
             hit_bases: Vec::new(),
             shots: FxHashMap::default(),
             opacity: 1.,
+            transform_scale: 1.,
             text_clip: None,
             states: FxHashMap::default(),
             next_states: FxHashMap::default(),
@@ -696,6 +699,12 @@ impl Window {
     /// Includes the zoom.
     pub fn scale_factor(&self) -> f32 {
         self.scale_factor
+    }
+
+    /// How much the transforms around the current paint scale it, without the device scale. A 3D or
+    /// skewed transform gives the larger axis.
+    pub fn transform_scale(&self) -> f32 {
+        self.transform_scale
     }
 
     /// In CSS pixels, with the zoom.

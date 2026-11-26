@@ -84,7 +84,19 @@ pub(crate) fn mask(
                         || (image.size().height as u32) != raster[1]
                 })
         }) {
-            let image = if shapes.is_none()
+            // Boxes with the same mask inputs and size share one image.
+            let shared = masks.values().find_map(|(old, image)| {
+                image
+                    .as_ref()
+                    .filter(|image| {
+                        *old == inputs
+                            && [image.size().width as u32, image.size().height as u32] == raster
+                    })
+                    .cloned()
+            });
+            let image = if shared.is_some() {
+                shared
+            } else if shapes.is_none()
                 && let Some(bytes) = super::super::effects::gradient::axis_mask(style, &units, size, raster)
             {
                 bytes.map(|bytes| {
@@ -154,7 +166,9 @@ pub(crate) fn mask(
                     }
                 }
             };
-            if let Some((_, Some(old))) = masks.insert(key, (inputs, image)) {
+            if let Some((_, Some(old))) = masks.insert(key, (inputs, image))
+                && std::sync::Arc::strong_count(&old) == 1
+            {
                 window.release_image(old);
             }
         }
