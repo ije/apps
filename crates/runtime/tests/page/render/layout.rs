@@ -2197,3 +2197,26 @@ fn animations_follow_first_frames_seeks_shorthands_and_shadow_trees() {
         )],
     );
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn column_items_clamped_by_max_height_keep_the_column_and_line_heights_like_chrome() {
+    // Debug builds lay out again from scratch and panic when the kept line has another height.
+    run_hidden(
+        r#"
+        await load('page.html');
+        const read = () => run(`['b', 'n', 'c'].map(id => document.getElementById(id).getBoundingClientRect().height).concat(document.body.getBoundingClientRect().height).join()`);
+        const before = await read();
+        await run("document.getElementById('n').style.height = '20px'");
+        await win.webContents.capturePage();
+        const after = await read();
+        if (before !== '0,0,0,36.390625' || after !== before) fail('heights: ' + before + ' ' + after);
+        "#,
+        &[(
+            "page.html",
+            "<body style='margin:0;font:13px/1.4 Helvetica'><div id=b style='display:inline-flex;flex-direction:column;width:260px'>\
+             <div id=n style='max-height:0;overflow:hidden'>one two three four five six seven eight nine ten</div></div>\
+             <div id=c style='display:flex;flex-direction:column;width:200px'><div style='max-height:0;overflow:hidden'>a<br>b</div></div><i>x</i></body>",
+        )],
+    );
+}

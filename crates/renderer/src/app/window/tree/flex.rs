@@ -18,6 +18,20 @@ impl LayoutTree<'_> {
         {
             inputs.known_dimensions.height = None;
         }
+        // With a definite available height, Taffy sizes an auto column from the flex bases of its items, without
+        // their max heights. The height of a single-line column doesn't depend on the room, so it lays out as
+        // max-content.
+        let style = self.slots[usize::from(node)].taffy();
+        if inputs.known_dimensions.height.is_none()
+            && inputs.available_space.height.is_definite()
+            && style.flex_wrap == taffy::FlexWrap::NoWrap
+            && matches!(
+                style.flex_direction,
+                FlexDirection::Column | FlexDirection::ColumnReverse
+            )
+        {
+            inputs.available_space.height = taffy::AvailableSpace::MaxContent;
+        }
         let start = self.hung.len();
         let mut output = self.lines(node, inputs, start);
         let index = usize::from(node);
