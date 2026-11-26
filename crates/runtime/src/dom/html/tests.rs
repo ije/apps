@@ -585,3 +585,8 @@ fn hostile_markup_never_panics() {
         "\"a\\nb\\nc\""
     );
 }
+
+#[test]
+fn packed_entities_match_the_source() {
+    assert_eq!(packed!("entities"), entities::ENTITIES);
+}

@@ -2101,3 +2101,14 @@ fn changed_configurations_restyle_like_a_fresh_page() {
         previous = Some(Rc::new(styles));
     }
 }
+
+#[test]
+fn packed_tables_match_the_source() {
+    use super::{tables::TEXT, text};
+    assert_eq!(TEXT.properties, text::PROPERTIES);
+    assert_eq!(TEXT.statics, text::STATIC);
+    assert_eq!(TEXT.specs, text::SPECS);
+    assert_eq!(TEXT.preflight, include_str!("preflight.css"));
+    assert_eq!(TEXT.static_lines.len(), text::STATIC.lines().count());
+    assert!(super::ORDER_INDEX.len() == text::ORDER.split_ascii_whitespace().count());
+}

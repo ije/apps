@@ -1853,7 +1853,7 @@ fn decode(value: &str, attribute: bool) -> String {
         0x2122, 0x161, 0x203a, 0x153, 0, 0x17e, 0x178,
     ];
     let entity = |name: &str| -> Option<&'static str> {
-        let data = entities::ENTITIES;
+        let data = packed!("entities");
         let (mut low, mut high) = (0, data.len());
         while low < high {
             let middle = (low + high) / 2;

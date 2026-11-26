@@ -1,7 +1,6 @@
 use super::*;
 use crate::style::tailwind::tables::{
-    BACKDROP, Bare, EDGES, FILTER, MASK, ROOT, SHADOW, SPEC_LINES, SPECS, STATIC, STATIC_LINES,
-    Spec, TRANSFORM, Typed, find,
+    BACKDROP, Bare, EDGES, FILTER, MASK, ROOT, SHADOW, Spec, TEXT, TRANSFORM, Typed, find,
 };
 use crate::style::tailwind::value::{
     arbitrary, call, calls, decode, direction, infer, integer, math, named_value, nest, quarter,
@@ -397,7 +396,7 @@ impl Config {
                 .flatten()
                 .and_then(|value| Body::new(&[(property, value)]));
         }
-        let fixed = find(STATIC, &STATIC_LINES, class).map(|css| Body::fill(css, ""));
+        let fixed = find(TEXT.statics, &TEXT.static_lines, class).map(|css| Body::fill(css, ""));
         // The theme of the page can replace the words of a utility, like `rounded-full`.
         if fixed.is_some() && self.theme.is_empty() {
             return fixed;
@@ -459,7 +458,7 @@ impl Config {
         negative: bool,
     ) -> Option<Body> {
         let known = |names: &[&str]| names.contains(&root);
-        let (spec, typed) = match find(SPECS, &SPEC_LINES, root) {
+        let (spec, typed) = match find(TEXT.specs, &TEXT.spec_lines, root) {
             Some(line) => match Spec::parse(line) {
                 Some(spec) => (Some(spec), None),
                 None => (None, Typed::parse(line)),

@@ -244,6 +244,10 @@ opt-level = "s"
 [profile.release.package.alsa]
 opt-level = "s"
 
+# build.rs of apps-runtime packs text with zopfli.
+[profile.release.package.zopfli]
+opt-level = 3
+
 # avif-parse asserts on truncated input before returning its decoding error.
 [profile.dev.package.avif-parse]
 debug-assertions = false

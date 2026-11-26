@@ -1,9 +1,7 @@
 use super::{Declaration, Declarations, Prop, Rule, Style, Stylesheet};
 use crate::css::value::color::color;
 use crate::dom::Document;
-use crate::style::tailwind::tables::{
-    BASE, DEFAULTS, KEYFRAMES, ORDER_INDEX, PREFLIGHT, PROPERTIES,
-};
+use crate::style::tailwind::tables::{BASE, DEFAULTS, KEYFRAMES, ORDER_INDEX, TEXT};
 use crate::style::tailwind::value::{braces, calls, escape, escape_name, removes, split};
 use rustc_hash::FxHashMap;
 use std::{
@@ -15,6 +13,7 @@ use std::{
 };
 
 mod tables;
+mod text;
 mod utility;
 mod value;
 mod variant;
@@ -476,8 +475,9 @@ impl Config {
             }
             if self.imports[BASE_STYLES].is_some() {
                 let preflight = match self.prefix.as_str() {
-                    "" => PREFLIGHT.to_owned(),
-                    _ => PREFLIGHT
+                    "" => TEXT.preflight.to_owned(),
+                    _ => TEXT
+                        .preflight
                         .replace("var(--default", &format!("var(--{}-default", self.prefix)),
                 };
                 used.push_str(&preflight);
@@ -587,7 +587,7 @@ impl Config {
                 "@layer properties;{}@layer theme,base,components,utilities;",
                 self.order
             );
-            for line in PROPERTIES.lines().skip(1) {
+            for line in TEXT.properties.lines().skip(1) {
                 let mut fields = line.split('|');
                 let mut field = || fields.next().unwrap_or_default();
                 let (name, value, syntax) = (field(), field(), field());
@@ -795,11 +795,11 @@ impl Config {
             if self.properties.contains(name) {
                 continue;
             }
-            if let Some(start) = PROPERTIES.find(&format!("\n--tw-{name}|")) {
+            if let Some(start) = TEXT.properties.find(&format!("\n--tw-{name}|")) {
                 let start = start + 6;
                 changed |= self
                     .properties
-                    .insert(&PROPERTIES[start..start + name.len()]);
+                    .insert(&TEXT.properties[start..start + name.len()]);
             }
         }
         changed

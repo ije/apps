@@ -164,5 +164,7 @@ cc = "1.11.1"
 miniz_oxide = "0.9.1"
 oxc_allocator = "=0.158.0"
 oxc_codegen = "=0.158.0"
+oxc_mangler = "=0.158.0"
 oxc_parser = { version = "=0.158.0", default-features = false }
 oxc_span = "=0.158.0"
+zopfli = { version = "0.8.4", default-features = false, features = ["std"] }

@@ -1,5 +1,11 @@
+#[allow(dead_code)]
+#[path = "src/dom/html/entities.rs"]
+mod entities;
 #[path = "../../scripts/napi_exports.rs"]
 mod napi_exports;
+#[allow(dead_code)]
+#[path = "src/style/tailwind/text.rs"]
+mod tailwind;
 
 use std::{env, fs, path::PathBuf};
 
@@ -26,7 +32,49 @@ fn main() {
         _ => {}
     }
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    println!("cargo:rerun-if-changed={}", root.join("js").display());
+    // Zopfli is slow without optimization, so debug builds use miniz.
+    let release = env::var("PROFILE").as_deref() == Ok("release");
+    let pack = |path: PathBuf, text: &str| {
+        let data = if release {
+            let mut data = Vec::new();
+            zopfli::compress(
+                zopfli::Options::default(),
+                zopfli::Format::Deflate,
+                text.as_bytes(),
+                &mut data,
+            )
+            .unwrap();
+            data
+        } else {
+            miniz_oxide::deflate::compress_to_vec(text.as_bytes(), 10)
+        };
+        fs::write(path, data).unwrap();
+    };
+    for file in [
+        "js",
+        "src/dom/html/entities.rs",
+        "src/style/tailwind/text.rs",
+        "src/style/tailwind/theme.css",
+        "src/style/tailwind/preflight.css",
+        "src/style/ua.css",
+    ] {
+        println!("cargo:rerun-if-changed={}", root.join(file).display());
+    }
+    let read = |path: &str| fs::read_to_string(root.join(path)).unwrap();
+    pack(out.join("entities"), entities::ENTITIES);
+    pack(out.join("ua.css"), &read("src/style/ua.css"));
+    pack(
+        out.join("tailwind"),
+        &[
+            tailwind::PROPERTIES,
+            tailwind::ORDER,
+            tailwind::STATIC,
+            tailwind::SPECS,
+            &read("src/style/tailwind/theme.css"),
+            &read("src/style/tailwind/preflight.css"),
+        ]
+        .join("\0"),
+    );
     let mut scripts = 0u64;
     let mut hash = |path: &std::path::Path, text: &str| {
         let bytes = path.to_string_lossy().into_owned() + text;
@@ -39,7 +87,8 @@ fn main() {
         for entry in fs::read_dir(root.join(dir)).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|extension| extension == "js") {
-                // Strip only whitespace and comments: compression loses script completion values.
+                // Strip whitespace and comments and shorten local names, but don't compress:
+                // compression loses script completion values.
                 let source = fs::read_to_string(&path).unwrap();
                 let allocator = oxc_allocator::Allocator::default();
                 let parsed =
@@ -54,18 +103,26 @@ fn main() {
                     "Cannot parse {}",
                     path.display()
                 );
+                // Top-level names and the `name` of functions and classes stay.
+                let mangled = oxc_mangler::Mangler::new()
+                    .with_options(oxc_mangler::MangleOptions {
+                        top_level: Some(false),
+                        keep_names: oxc_mangler::MangleOptionsKeepNames::all_true(),
+                        ..Default::default()
+                    })
+                    .build(&parsed.program);
                 let text = oxc_codegen::Codegen::new()
                     .with_options(oxc_codegen::CodegenOptions {
                         ascii_only: true,
                         comments: oxc_codegen::CommentOptions::disabled(),
                         ..oxc_codegen::CodegenOptions::minify()
                     })
+                    .with_scoping(Some(mangled.scoping))
                     .build(&parsed.program)
                     .code;
                 assert!(text.is_ascii(), "{} must stay ASCII", path.display());
                 hash(path.strip_prefix(&root).unwrap(), &text);
-                let data = miniz_oxide::deflate::compress_to_vec(text.as_bytes(), 10);
-                fs::write(out.join(dir).join(path.file_name().unwrap()), data).unwrap();
+                pack(out.join(dir).join(path.file_name().unwrap()), &text);
             }
         }
     }
