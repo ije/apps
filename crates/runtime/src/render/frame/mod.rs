@@ -574,7 +574,8 @@ impl ViewState {
         let port = build.port;
         let root = element(&build, 0, port, port, None);
         build.zone = None;
-        let overlay = page::overlay(&build, &backdrops);
+        let mut overlay = page::overlay(&build, &backdrops);
+        overlay.extend(self.runtime.clone().popup().map(Into::into));
         let transition = (top_layer.iter()).any(|&id| doc.nodes[id].tag.starts_with("::"));
         if !same {
             patch::patch(&build, window);

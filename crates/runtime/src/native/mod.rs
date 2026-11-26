@@ -1,7 +1,11 @@
 // The services of the operating system, and the optional native libraries next to the runtime.
 pub(crate) mod browser;
+#[cfg(target_os = "linux")]
+mod dbus;
 pub(crate) mod devtools;
 pub mod library;
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "linux")]
 pub mod webview;
 
@@ -29,7 +33,11 @@ pub(crate) fn theme_state() -> u32 {
     unsafe {
         apps_theme_state()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::theme_state()
+    }
+    #[cfg(windows)]
     {
         0
     }
@@ -60,6 +68,9 @@ pub(crate) fn date_patterns() -> String {
         )
     }
 }
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux::observe;
 
 #[cfg(target_os = "macos")]
 pub(crate) fn observe() {
@@ -400,6 +411,10 @@ pub(crate) fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
     {
         if operation == "image" {
             return image(arguments);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(value) = linux::call(operation, arguments)? {
+            return Ok(value);
         }
         bail!("This native desktop operation is currently available on macOS");
     }

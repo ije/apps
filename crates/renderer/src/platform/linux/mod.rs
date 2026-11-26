@@ -52,6 +52,37 @@ struct Turn {
 
 thread_local! {
     static TURN: Turn = Turn::default();
+    static DISPLAY: Cell<Option<Rc<dyn Display>>> = const { Cell::new(None) };
+}
+
+/// The clipboard of the display, for code without a window, like the main process.
+pub mod clipboard {
+    use super::{DISPLAY, Display};
+    use std::rc::Rc;
+
+    fn display() -> Option<Rc<dyn Display>> {
+        let display = DISPLAY.take();
+        DISPLAY.set(display.clone());
+        display
+    }
+
+    pub fn text() -> Option<String> {
+        display()?.read_clipboard()
+    }
+
+    pub fn types() -> Vec<String> {
+        display().map_or_else(Vec::new, |display| display.clipboard_types())
+    }
+
+    pub fn read(kind: &str) -> Option<Vec<u8>> {
+        display()?.read_clipboard_data(kind)
+    }
+
+    pub fn write(items: Vec<(String, Vec<u8>)>) {
+        if let Some(display) = display() {
+            display.write_clipboard(items);
+        }
+    }
 }
 
 pub(crate) fn on_main() -> bool {
@@ -97,7 +128,11 @@ trait Display {
     fn prepare(&self) -> bool;
     fn finish(&self, readable: bool) -> bool;
     fn read_clipboard(&self) -> Option<String>;
-    fn write_clipboard(&self, text: &str);
+    /// The MIME types on the clipboard, with all text types as `text/plain`.
+    fn clipboard_types(&self) -> Vec<String>;
+    fn read_clipboard_data(&self, kind: &str) -> Option<Vec<u8>>;
+    /// Each item is a MIME type and its data. `text/plain` is also offered under the other text types.
+    fn write_clipboard(&self, items: Vec<(String, Vec<u8>)>);
     fn set_cursor(&self, cursor: Cursor);
     fn display_bounds(&self) -> Option<Rect>;
     fn open(self: Rc<Self>, options: &WindowOptions, calls: Callbacks) -> Result<Opened>;
@@ -171,6 +206,7 @@ impl Platform {
             eprintln!("apps: no display: {}", reasons.join("; "));
             std::process::exit(1);
         };
+        DISPLAY.set(Some(display.clone()));
         Self { display }
     }
 
@@ -298,7 +334,8 @@ impl Platform {
     }
 
     pub fn write_clipboard(&self, text: &str) {
-        self.display.write_clipboard(text);
+        self.display
+            .write_clipboard(vec![("text/plain".into(), text.as_bytes().to_vec())]);
     }
 
     pub fn set_cursor(&self, cursor: Cursor) {

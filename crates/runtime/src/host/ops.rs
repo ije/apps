@@ -553,11 +553,16 @@ pub(super) fn dispatch(
                 && ["x", "y", "width"]
                     .iter()
                     .all(|name| popup[name].is_number())
+                && popup.get("height").is_none_or(serde_json::Value::is_number)
                 && popup["items"].as_array().is_some_and(|items| items
                     .iter()
                     .all(|item| item.is_null() || item[0].is_string() && item[1].is_u64())),
             "Invalid select popup"
         );
+        // macOS shows a system menu from main. Elsewhere the window draws the list.
+        #[cfg(not(target_os = "macos"))]
+        crate::desktop::open_select(id, popup);
+        #[cfg(target_os = "macos")]
         if let Some(link) = host.try_borrow().context("Host is busy")?.link.clone() {
             link.event("select-popup", id, Some(popup.clone()), "apps:select-popup");
         }

@@ -59,10 +59,13 @@ fn hold<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+// The data of each target, with text under all text targets.
+type Items = Vec<(Atom, Arc<[u8]>)>;
+
 struct Owner {
     port: Port,
     names: Names,
-    text: Mutex<Option<Vec<u8>>>,
+    items: Mutex<Option<Items>>,
     handover: Mutex<Handover>,
 }
 
@@ -76,11 +79,11 @@ impl Selection {
     pub fn open() -> Result<Self> {
         let port = Port::open()?;
         let names = Names::new(&port.conn)?.reply()?;
-        let (text, handover) = (Mutex::new(None), Mutex::default());
+        let (items, handover) = (Mutex::new(None), Mutex::default());
         let owner = Arc::new(Owner {
             port,
             names,
-            text,
+            items,
             handover,
         });
         let serving = owner.clone();
@@ -96,17 +99,86 @@ impl Selection {
         })
     }
 
-    pub fn copy(&self, text: &str) {
-        let owner = &self.owner;
-        *hold(&owner.text) = Some(text.as_bytes().to_vec());
-        let (conn, port) = (&owner.port.conn, owner.port.window);
-        let taken = conn.set_selection_owner(port, owner.names.CLIPBOARD, x11rb::CURRENT_TIME);
-        if let Err(error) = taken
-            .map_err(anyhow::Error::from)
-            .and_then(|_| Ok(conn.flush()?))
-        {
+    pub fn copy(&self, items: Vec<(String, Vec<u8>)>) {
+        if let Err(error) = self.owner.copy(items) {
             eprintln!("apps: clipboard: {error:#}");
         }
+    }
+
+    pub fn types(&self) -> Vec<String> {
+        self.kinds()
+            .inspect_err(|error| eprintln!("apps: clipboard: {error:#}"))
+            .unwrap_or_default()
+    }
+
+    fn kinds(&self) -> Result<Vec<String>> {
+        let names = &self.owner.names;
+        let text = [
+            names.Utf8,
+            names.PlainUtf8,
+            names.PlainUtf8Upper,
+            names.Latin1,
+            names.Text,
+            names.Plain,
+        ];
+        let atoms: Vec<Atom> = match self.owner.owns()? {
+            true => hold(&self.owner.items)
+                .iter()
+                .flatten()
+                .map(|(atom, _)| *atom)
+                .collect(),
+            false => {
+                let mut reader = self.reader.borrow_mut();
+                let port = match &mut *reader {
+                    Some(port) => port,
+                    empty => empty.insert(Port::open()?),
+                };
+                let (data, _) = self.fetch(port, names.Targets)?;
+                let words = data.as_chunks::<4>().0.iter();
+                words.map(|word| u32::from_ne_bytes(*word)).collect()
+            }
+        };
+        let conn = &self.owner.port.conn;
+        let cookies: Vec<_> = atoms
+            .iter()
+            .filter(|atom| !text.contains(atom))
+            .map(|atom| conn.get_atom_name(*atom))
+            .collect::<Result<_, _>>()?;
+        let mut kinds = Vec::new();
+        if atoms.iter().any(|atom| text.contains(atom)) {
+            kinds.push("text/plain".to_owned());
+        }
+        for cookie in cookies {
+            let name = String::from_utf8(cookie.reply()?.name)?;
+            if name.contains('/') && !kinds.contains(&name) {
+                kinds.push(name);
+            }
+        }
+        Ok(kinds)
+    }
+
+    pub fn data(&self, kind: &str) -> Option<Vec<u8>> {
+        if kind == "text/plain" {
+            return self.paste().map(String::into_bytes);
+        }
+        let read = || -> Result<Vec<u8>> {
+            let atom = self.owner.port.conn.intern_atom(false, kind.as_bytes())?;
+            let atom = atom.reply()?.atom;
+            if self.owner.owns()? {
+                let items = hold(&self.owner.items);
+                let item = items.iter().flatten().find(|(own, _)| *own == atom);
+                return Ok(item.context("the clipboard has no such type")?.1.to_vec());
+            }
+            let mut reader = self.reader.borrow_mut();
+            let port = match &mut *reader {
+                Some(port) => port,
+                empty => empty.insert(Port::open()?),
+            };
+            Ok(self.fetch(port, atom)?.0)
+        };
+        read()
+            .inspect_err(|error| eprintln!("apps: clipboard: {error:#}"))
+            .ok()
     }
 
     pub fn paste(&self) -> Option<String> {
@@ -118,8 +190,11 @@ impl Selection {
     fn text(&self) -> Result<String> {
         let names = &self.owner.names;
         if self.owner.owns()? {
-            let text = hold(&self.owner.text).clone();
-            return Ok(String::from_utf8(text.context("the clipboard is empty")?)?);
+            let items = hold(&self.owner.items);
+            let text = items.iter().flatten().find(|(atom, _)| *atom == names.Utf8);
+            return Ok(String::from_utf8(
+                text.context("the clipboard holds no text")?.1.to_vec(),
+            )?);
         }
         let mut reader = self.reader.borrow_mut();
         let port = match &mut *reader {
@@ -257,6 +332,25 @@ impl Drop for Selection {
 }
 
 impl Owner {
+    fn copy(&self, items: Vec<(String, Vec<u8>)>) -> Result<()> {
+        let (conn, names) = (&self.port.conn, &self.names);
+        let mut owned: Items = Vec::new();
+        for (kind, data) in items {
+            let data: Arc<[u8]> = data.into();
+            if kind == "text/plain" {
+                let text = [names.Utf8, names.PlainUtf8, names.PlainUtf8Upper];
+                owned.extend(text.map(|atom| (atom, data.clone())));
+                continue;
+            }
+            let atom = conn.intern_atom(false, kind.as_bytes())?.reply()?.atom;
+            owned.push((atom, data));
+        }
+        *hold(&self.items) = Some(owned);
+        conn.set_selection_owner(self.port.window, names.CLIPBOARD, x11rb::CURRENT_TIME)?;
+        conn.flush()?;
+        Ok(())
+    }
+
     fn owns(&self) -> Result<bool> {
         let owner = self
             .port
@@ -273,7 +367,7 @@ impl Owner {
             match self.port.conn.wait_for_event()? {
                 Event::DestroyNotify(gone) if gone.window == self.port.window => return Ok(()),
                 Event::SelectionClear(lost) if lost.selection == names.CLIPBOARD => {
-                    *hold(&self.text) = None;
+                    *hold(&self.items) = None;
                 }
                 Event::SelectionRequest(request) => {
                     // One refused answer, like a text past the request size limit, must not end the server.
@@ -316,12 +410,12 @@ impl Owner {
         } else {
             request.property
         };
-        let text = hold(&self.text).clone();
-        let utf8 = [names.Utf8, names.PlainUtf8, names.PlainUtf8Upper];
+        let items = hold(&self.items).clone();
         let (to, ours) = (request.requestor, request.selection == names.CLIPBOARD);
-        let given = match text {
-            Some(_) if ours && request.target == names.Targets => {
-                let targets = [names.Targets, names.Save, utf8[0], utf8[1], utf8[2]];
+        let given = match items.filter(|_| ours) {
+            Some(items) if request.target == names.Targets => {
+                let mut targets = vec![names.Targets, names.Save];
+                targets.extend(items.iter().map(|(atom, _)| *atom));
                 conn.change_property32(
                     xproto::PropMode::REPLACE,
                     to,
@@ -331,17 +425,20 @@ impl Owner {
                 )?;
                 true
             }
-            Some(text) if ours && utf8.contains(&request.target) => {
-                conn.change_property8(
-                    xproto::PropMode::REPLACE,
-                    to,
-                    property,
-                    request.target,
-                    &text,
-                )?;
-                true
-            }
-            _ => false,
+            Some(items) => match items.iter().find(|(atom, _)| *atom == request.target) {
+                Some((_, data)) => {
+                    conn.change_property8(
+                        xproto::PropMode::REPLACE,
+                        to,
+                        property,
+                        request.target,
+                        data,
+                    )?;
+                    true
+                }
+                None => false,
+            },
+            None => false,
         };
         let note = xproto::SelectionNotifyEvent {
             response_type: xproto::SELECTION_NOTIFY_EVENT,
@@ -359,7 +456,7 @@ impl Owner {
 
     // Waits for the clipboard manager at most 100 ms.
     fn hand_over(&self) -> Result<()> {
-        let empty = hold(&self.text).is_none();
+        let empty = hold(&self.items).is_none();
         if empty || !self.owns()? {
             return Ok(());
         }

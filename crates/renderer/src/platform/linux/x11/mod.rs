@@ -1163,8 +1163,16 @@ impl Display for Client {
         self.clipboard.paste()
     }
 
-    fn write_clipboard(&self, text: &str) {
-        self.clipboard.copy(text);
+    fn clipboard_types(&self) -> Vec<String> {
+        self.clipboard.types()
+    }
+
+    fn read_clipboard_data(&self, kind: &str) -> Option<Vec<u8>> {
+        self.clipboard.data(kind)
+    }
+
+    fn write_clipboard(&self, items: Vec<(String, Vec<u8>)>) {
+        self.clipboard.copy(items);
     }
 
     fn set_cursor(&self, cursor: Cursor) {

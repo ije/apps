@@ -40,6 +40,7 @@ pub(crate) struct Input {
     buttons: Cell<u8>,
     origin: Cell<Option<Point<Pixels>>>,
     dropped: RefCell<Vec<PathBuf>>,
+    select: RefCell<Option<Select>>,
 }
 
 #[derive(Clone)]
@@ -67,6 +68,7 @@ impl PageView {
             buttons: Cell::new(0),
             origin: Cell::new(None),
             dropped: RefCell::default(),
+            select: RefCell::default(),
         });
         let page = ViewState::new(id, input.clone(), store);
         VIEWS.with_borrow_mut(|views| {
@@ -265,6 +267,144 @@ impl Pages for Input {
             }
         }
         Desktop::drive(self.desktop.clone(), cx);
+    }
+
+    fn popup(self: Rc<Self>) -> Option<renderer::Node> {
+        let port = self
+            .store
+            .try_borrow()
+            .ok()?
+            .viewports
+            .get(&self.id)
+            .copied();
+        let mut guard = self.select.borrow_mut();
+        let select = guard.as_mut()?;
+        let [x, y, width, height] = select.at;
+        // The list goes below the select, or above it when there is more room there, with as many rows as fit.
+        let below = port.map_or(f32::MAX, |port| port[1]) - y - height;
+        let room = below.max(y);
+        select.rows = select
+            .items
+            .len()
+            .min(ROWS)
+            .min(((room - 2.) / ROW).max(1.) as usize);
+        if let Some(current) = select.current {
+            select.go(current as isize, 1);
+        }
+        let tall = select.rows as f32 * ROW + 2.;
+        let top = if below >= tall || below >= y {
+            y + height
+        } else {
+            (y - tall).max(0.)
+        };
+        let colors = if select.dark {
+            [0x3b3b3bff, 0xffffffff, 0x9d9d9dff]
+        } else {
+            [0xffffffff, 0x000000ff, 0x6d6d6dff]
+        };
+        let [back, text, muted] = colors.map(renderer::Color::hex);
+        let line = renderer::Color::hex(0x767676ff);
+        let rows = select
+            .items
+            .iter()
+            .enumerate()
+            .skip(select.top)
+            .take(select.rows)
+            .map(|(index, item)| {
+                let row = renderer::node()
+                    .h(px(ROW))
+                    .flex()
+                    .items_center()
+                    .pl(px(4.))
+                    .pr(px(4.));
+                let Some((label, disabled)) = item else {
+                    return row.child(renderer::node().h(px(1.)).flex_1().bg(line));
+                };
+                let disabled = *disabled;
+                let row = match (select.current == Some(index), disabled) {
+                    (true, _) => row
+                        .bg(renderer::Color::hex(0x1967d2ff))
+                        .text_color(renderer::Color::WHITE),
+                    (_, true) => row.text_color(muted),
+                    _ => row,
+                };
+                let input = self.clone();
+                row.child(renderer::text(label.clone(), None)).on_pointer(
+                    move |event, window, cx| match event {
+                        Event::PointerMove { .. } if !disabled => {
+                            let mut select = input.select.borrow_mut();
+                            if select
+                                .as_mut()
+                                .is_some_and(|select| select.current.replace(index) != Some(index))
+                            {
+                                drop(select);
+                                input.repaint(Some(window));
+                            }
+                        }
+                        Event::PointerUp { .. } if !disabled => {
+                            cx.stop_event();
+                            input.close_select(Some(index), window, cx);
+                        }
+                        _ => {}
+                    },
+                )
+            });
+        let input = self.clone();
+        let list = renderer::node()
+            .absolute()
+            .left(px(x))
+            .top(px(top))
+            .min_w(px(width))
+            .flex()
+            .flex_col()
+            .bg(back)
+            .text_color(text)
+            .border(px(1.))
+            .border_color(line)
+            .text_size(px(13.))
+            .line_height(px(ROW))
+            .whitespace_nowrap()
+            .children(rows)
+            .on_pointer(move |event, window, cx| {
+                let Event::Wheel { delta, lines, .. } = *event else {
+                    // A press in the list is not a press outside it.
+                    if let Event::PointerDown { .. } = event {
+                        cx.stop_event();
+                    }
+                    return;
+                };
+                let mut guard = input.select.borrow_mut();
+                let Some(select) = guard.as_mut() else {
+                    return;
+                };
+                select.wheel -= delta.y * if lines { ROW } else { 1. };
+                let rows = (select.wheel / ROW).trunc();
+                select.wheel -= rows * ROW;
+                let last = select.items.len().saturating_sub(select.rows);
+                let top = (select.top as isize + rows as isize).clamp(0, last as isize) as usize;
+                if select.top != top {
+                    select.top = top;
+                    drop(guard);
+                    input.repaint(Some(window));
+                }
+            });
+        let input = self.clone();
+        Some(
+            renderer::node()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .on_pointer(move |event, window, cx| match event {
+                    Event::PointerDown { .. } => {
+                        cx.stop_event();
+                        input.close_select(None, window, cx);
+                    }
+                    Event::Wheel { .. } => cx.stop_event(),
+                    _ => {}
+                })
+                .child(list),
+        )
     }
 
     fn lint(&self, warnings: Vec<String>) {
@@ -485,6 +625,11 @@ impl renderer::View for PageView {
                 ime,
             } => {
                 let key = named.name.as_str();
+                if input.select.borrow().is_some() {
+                    input.select_key(key, window, cx);
+                    cx.stop_event();
+                    return;
+                }
                 let pick = (key == "escape" && self.page.inspect.get().pick).then_some(Tool::Pick);
                 let tool = pick.or_else(|| {
                     tool(key, *modifiers).filter(|_| !input.store.borrow().app.packaged)
@@ -827,6 +972,9 @@ fn events(data: PageView) -> renderer::Node {
             let (Event::PointerLeave { at: position } | Event::PointerMove { at: position, .. } | Event::PointerUp { at: position, .. }) = *event else {
                 return;
             };
+            if view.select.borrow().is_some() {
+                return;
+            }
             let (kind, button) = match *event {
                 Event::PointerLeave { .. } => {
                     let [x, y] = view.screen(window, position);
@@ -867,6 +1015,9 @@ fn events(data: PageView) -> renderer::Node {
             let Event::Wheel { at: position, delta, lines, phase, modifiers } = *event else {
                 return;
             };
+            if view.select.borrow().is_some() {
+                return;
+            }
             if let (renderer::WheelPhase::Began | renderer::WheelPhase::Ended, Ok(host)) =
                 (phase, view.host.try_borrow())
                 && let Some(link) = &host.link
@@ -933,4 +1084,127 @@ fn events(data: PageView) -> renderer::Node {
     })
     .absolute()
     .size_full()
+}
+
+const ROW: f32 = 20.;
+const ROWS: usize = 20;
+
+// The list of a `<select>` where the system has no menu for it.
+struct Select {
+    id: u64,
+    // The label of each option, and whether it is disabled. Separators are `None`.
+    items: Vec<Option<(String, bool)>>,
+    // The border box of the select.
+    at: [f32; 4],
+    dark: bool,
+    current: Option<usize>,
+    // The first row that shows, the rows that show, and the wheel distance that has not scrolled a row yet.
+    top: usize,
+    rows: usize,
+    wheel: f32,
+}
+
+impl Select {
+    fn enabled(&self, index: usize) -> bool {
+        matches!(self.items.get(index), Some(Some((_, false))))
+    }
+
+    // Moves to the nearest enabled option from `target`, first toward `step`.
+    fn go(&mut self, target: isize, step: isize) {
+        let last = self.items.len() as isize - 1;
+        let target = target.clamp(0, last.max(0));
+        let found = [step, -step].into_iter().find_map(|step| {
+            (0..=last)
+                .map(|offset| target + offset * step)
+                .take_while(|index| (0..=last).contains(index))
+                .find(|index| self.enabled(*index as usize))
+        });
+        if let Some(index) = found {
+            let index = index as usize;
+            self.current = Some(index);
+            self.top = self
+                .top
+                .min(index)
+                .max((index + 1).saturating_sub(self.rows));
+        }
+    }
+}
+
+// macOS shows a system menu from main instead.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn open_select(page: u64, popup: &serde_json::Value) {
+    let Some(input) = VIEWS.with_borrow(|views| views.get(&page)?.1.upgrade()) else {
+        return;
+    };
+    let items = popup["items"].as_array().into_iter().flatten();
+    let items = items.map(|item| Some((item[0].as_str()?.to_owned(), item[1].as_u64()? != 0)));
+    let mut select = Select {
+        id: popup["id"].as_u64().unwrap_or(0),
+        items: items.collect(),
+        at: ["x", "y", "width", "height"].map(|name| popup[name].as_f64().unwrap_or(0.) as f32),
+        dark: popup["dark"] == true,
+        current: None,
+        top: 0,
+        rows: ROWS,
+        wheel: 0.,
+    };
+    if let Some(index) = popup["selected"].as_u64() {
+        select.go(index as isize, 1);
+    }
+    input.select.replace(Some(select));
+    input.repaint(None);
+}
+
+impl Input {
+    fn repaint(&self, window: Option<&mut Window>) {
+        if let Ok(mut store) = self.store.try_borrow_mut()
+            && let Some(page) = store.pages.get_mut(&self.id)
+        {
+            page.dirty = true;
+        }
+        if let Some(window) = window {
+            window.refresh();
+        }
+    }
+
+    fn close_select(&self, picked: Option<usize>, window: &mut Window, cx: &mut App) {
+        let Some(select) = self.select.take() else {
+            return;
+        };
+        self.repaint(None);
+        let index = picked
+            .filter(|index| select.enabled(*index))
+            .map_or(-1, |index| index as i64);
+        self.run(
+            &format!("__appsSelectPicked({},{index})", select.id),
+            window,
+            cx,
+        );
+    }
+
+    // The open list takes all keys.
+    fn select_key(&self, key: &str, window: &mut Window, cx: &mut App) {
+        let mut guard = self.select.borrow_mut();
+        let Some(select) = guard.as_mut() else {
+            return;
+        };
+        let current = select.current.map_or(-1, |index| index as isize);
+        let page = select.rows as isize - 1;
+        match key {
+            "down" => select.go(current + 1, 1),
+            "up" => select.go(current - 1, -1),
+            "pagedown" => select.go(current + page, 1),
+            "pageup" => select.go(current - page, -1),
+            "home" => select.go(0, 1),
+            "end" => select.go(isize::MAX / 2, -1),
+            "enter" | "space" | "tab" | "escape" => {
+                let picked = select.current.filter(|_| key != "escape");
+                drop(guard);
+                return self.close_select(picked, window, cx);
+            }
+            _ => return,
+        }
+        drop(guard);
+        self.repaint(Some(window));
+    }
 }

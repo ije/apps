@@ -6,6 +6,8 @@ pub(crate) mod panel;
 #[cfg(test)]
 mod tests;
 mod view;
+#[cfg(not(target_os = "macos"))]
+pub(crate) use view::open_select;
 
 use crate::bundle::Feature;
 use crate::host::link::{Link, PageQueue, ToMain, ToPage};
@@ -1045,7 +1047,7 @@ impl Desktop {
                 crate::host::context::stop_pages();
                 renderer::before_exit();
             }));
-            #[cfg(target_os = "macos")]
+            #[cfg(not(windows))]
             crate::native::observe();
             if let Err(error) = main.ready() {
                 eprintln!("apps: {error}");
