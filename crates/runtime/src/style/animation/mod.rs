@@ -1,3 +1,4 @@
+use crate::css::value::timeline::{Scroll, Timeline};
 use crate::css::{properties::Prop, properties::Style};
 use crate::dom::Document;
 use crate::style::animation::timing::{
@@ -12,6 +13,25 @@ use std::{borrow::Cow, collections::HashMap, rc::Rc, time::Instant};
 use timing::Scripted;
 
 pub(crate) mod timing;
+
+// The held playback of a scroll-driven effect at its progress, with a NaN time while its timeline is inactive.
+fn scrolled(
+    progress: &FxHashMap<(usize, *const Scroll), [f64; 5]>,
+    scrolls: &mut bool,
+    id: usize,
+    effect: &Animation,
+) -> Option<Playback> {
+    let scroll = effect.scroll.as_ref()?;
+    *scrolls = true;
+    let time = progress
+        .get(&(scroll.at.unwrap_or(id), Rc::as_ptr(scroll)))
+        .map_or(f64::NAN, |&progress| effect.scrolled(progress));
+    Some(Playback {
+        time,
+        since: Instant::now(),
+        rate: 0.,
+    })
+}
 
 #[derive(Default)]
 pub(crate) struct Motion {
@@ -29,6 +49,9 @@ pub(crate) struct Motion {
     queued: Events,
     backdrop: FxHashMap<usize, (Rc<Style>, Vec<Transition>)>,
     iterations: bool,
+    // The progress of each scroll-driven effect by the node its timeline is read from, and whether there are any.
+    progress: FxHashMap<(usize, *const Scroll), [f64; 5]>,
+    pub(crate) scrolls: bool,
 }
 
 // What one `update` of the animations gives the frame.
@@ -71,6 +94,39 @@ impl Motion {
             .iter()
             .zip(self.clocks.get(&id).into_iter().flatten())
             .filter(|(effect, clock)| effect.name == clock.name)
+    }
+
+    // Reads the progress of each scroll-driven effect, and tells whether one changed.
+    pub(crate) fn measure(
+        &mut self,
+        styles: &ComputedStyles,
+        progress: &dyn Fn(usize, &Scroll) -> Option<[f64; 5]>,
+    ) -> bool {
+        let old = std::mem::take(&mut self.progress);
+        let scripted = self
+            .scripted
+            .iter()
+            .flat_map(|(&id, list)| list.iter().map(move |animation| (id, &animation.effect)));
+        for (id, effect) in styles
+            .animations()
+            .flat_map(|(id, effects)| effects.iter().map(move |effect| (id, effect)))
+            .chain(scripted)
+        {
+            if let Some(scroll) = &effect.scroll {
+                let key = (scroll.at.unwrap_or(id), Rc::as_ptr(scroll));
+                let value = progress(key.0, scroll).unwrap_or([f64::NAN; 5]);
+                self.progress.insert(key, value);
+            }
+        }
+        self.scrolls = !self.progress.is_empty();
+        self.progress.len() != old.len()
+            || self.progress.iter().any(|(key, value)| {
+                old.get(key).is_none_or(|old| {
+                    old.iter()
+                        .zip(value)
+                        .any(|(a, b)| (a - b).abs() > 1e-6 || a.is_nan() != b.is_nan())
+                })
+            })
     }
 
     /// The styles of a node, or of its `::before` (`slot` 1) or `::after` (`slot` 2), at each time.
@@ -162,6 +218,9 @@ impl Motion {
             .filter(|(effect, _)| effect.pseudo == slot)
         {
             effects += 1;
+            if effect.scroll.is_some() {
+                return None;
+            }
             let local = playback.at(now);
             let stop = effect.delay + effect.active() + effect.end_delay.min(0.);
             if playback.rate == 0. || local >= stop {
@@ -381,7 +440,10 @@ impl Motion {
             for (effect, clock) in self.pairs(node, styles) {
                 if clock.phase == Phase::Canceled
                     || effect.pseudo != 0 && !pseudos
-                    || clock.phase == Phase::Ended && effect.fill & 2 == 0
+                    || clock.phase == Phase::Ended
+                        && effect.fill & 2 == 0
+                        && (effect.scroll.as_ref())
+                            .is_none_or(|scroll| scroll.timeline == Timeline::None)
                 {
                     continue;
                 }
@@ -432,6 +494,7 @@ impl Motion {
                     "linear",
                     frames,
                     pseudo,
+                    effect.scroll.as_ref().map(|scroll| scroll.texts()),
                 ]));
             }
         }
@@ -828,14 +891,24 @@ impl Motion {
             }
             for (effect, clock) in effects.iter().zip(clocks.iter_mut()) {
                 let paused = clock.held.unwrap_or(effect.paused);
-                if paused != (clock.playback.rate == 0.) {
-                    clock.playback.set(now, f64::from(u8::from(!paused)));
+                // Like Chrome, a paused scroll-driven animation keeps its time.
+                match scrolled(&self.progress, &mut self.scrolls, id, effect) {
+                    Some(playback) if !paused || clock.phase == Phase::Pending => {
+                        clock.playback = playback;
+                    }
+                    None if paused != (clock.playback.rate == 0.) => {
+                        clock.playback.set(now, f64::from(u8::from(!paused)));
+                    }
+                    _ => {}
                 }
                 clock.delay = effect.delay;
                 if clock.phase == Phase::Canceled {
                     continue;
                 }
                 let elapsed = clock.playback.at(now);
+                if elapsed.is_nan() {
+                    continue;
+                }
                 let (base, out) = match effect.pseudo {
                     0 => (&*styles.values[id], animated.entry(id).or_default()),
                     slot => {
@@ -848,7 +921,8 @@ impl Motion {
                         )
                     }
                 };
-                let (wake, ended) = effect.sample(elapsed, paused, base, registry, out, coarse(id));
+                let still = paused || effect.scroll.is_some();
+                let (wake, ended) = effect.sample(elapsed, still, base, registry, out, coarse(id));
                 let active = elapsed - effect.delay;
                 let iteration = if effect.duration > 0. {
                     (active / effect.duration).floor().max(0.)
@@ -884,6 +958,9 @@ impl Motion {
                 } else if clock.phase == Phase::Ended {
                     clock.phase = Phase::Running;
                 }
+                if effect.scroll.is_some() {
+                    continue;
+                }
                 let end = if paused || ended {
                     f64::INFINITY
                 } else {
@@ -908,6 +985,11 @@ impl Motion {
                 continue;
             }
             for animation in list.iter_mut() {
+                if let Some(playback) =
+                    scrolled(&self.progress, &mut self.scrolls, id, &animation.effect)
+                {
+                    animation.playback = playback;
+                }
                 let slot = animation.effect.pseudo;
                 let Some(wake) = animation.sample(
                     id,

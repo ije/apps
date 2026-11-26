@@ -398,7 +398,7 @@ pub(crate) fn positioner(
 
 // Find the scroll container by style, not by handle, since scripts make handles for any box. `escape` is the state
 // of the walk when it reaches the first ancestor, as `escape_step` gives it.
-pub(super) fn scroller(
+pub(crate) fn scroller(
     doc: &Document,
     styles: &ComputedStyles,
     mut ancestors: impl Iterator<Item = usize>,
@@ -425,7 +425,7 @@ pub(super) fn scroller(
 
 // Past an absolute (1) or fixed (2) box, only its containing block chain scrolls it. Returns `None` when the walk
 // skips `node`, else the state after it.
-pub(super) fn escape_step(styles: &ComputedStyles, node: usize, escape: u8) -> Option<u8> {
+pub(crate) fn escape_step(styles: &ComputedStyles, node: usize, escape: u8) -> Option<u8> {
     let style = &styles.values[node];
     if escape != 0 {
         let made = super::super::effects::establishes(style);

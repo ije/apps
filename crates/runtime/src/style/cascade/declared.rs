@@ -112,6 +112,9 @@ impl NodePass<'_> {
                     Prop::ANIMATION_DIRECTION,
                     Prop::ANIMATION_FILL_MODE,
                     Prop::ANIMATION_PLAY_STATE,
+                    Prop::ANIMATION_TIMELINE,
+                    Prop::ANIMATION_RANGE_START,
+                    Prop::ANIMATION_RANGE_END,
                 ][..],
             ),
         ] {

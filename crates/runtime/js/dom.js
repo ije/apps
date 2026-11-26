@@ -1065,6 +1065,15 @@
   const specified = (name, value) => { if (name.startsWith('--') || /^[a-z-]*$/.test(value) && !/position|origin|family|counter|offset|overflow-clip/.test(name)) return value; const key = name + ':' + value; let text = specifiedText.get(key); if (text === undefined) { if (specifiedText.size > 1023) specifiedText.clear(); specifiedText.set(key, text = host('dom.specified', name, value)); } return text; };
   const specifiedList = list => list.map(([name, value, priority]) => [name, specified(name, value), priority]);
   let shorthands = null, shorthandsOf = null;
+  const timelineShorthand = /^(animation-range|scroll-timeline|view-timeline)$/;
+  // Like Chrome, `animation` writes its longhands when a timeline or range longhand comes after it.
+  const animationLonghands = list => {
+    const at = list.findIndex(entry => entry[0] === 'animation');
+    if (at < 0 || !list.slice(at + 1).some(entry => /^animation-(timeline|range)/.test(entry[0]))) return list;
+    const items = layers(list[at][1]).map(item => layers(item, ' ')), parts = ['duration', 'timing-function', 'delay', 'iteration-count', 'direction', 'fill-mode', 'play-state', 'name'];
+    const out = [...list.slice(0, at), ...parts.map((part, i) => ['animation-' + part, items.map(item => item[i]).join(', '), list[at][2]]), ...[['range-start', 'normal'], ['range-end', 'normal'], ['timeline', 'auto']].map(([part, value]) => ['animation-' + part, value, list[at][2]]), ...list.slice(at + 1)];
+    return out.filter((entry, i) => out.findLastIndex(other => other[0] === entry[0]) === i);
+  };
   const loadShorthands = () => {
     const names = [...properties()], flat = host('dom.declare', names.map((name, i) => `--i:${i};${name}:initial`).join(';'));
     shorthands = new Map(); shorthandsOf = new Map();
@@ -1077,6 +1086,7 @@
   };
   const layers = (value, separator = ',') => { const out = []; let depth = 0, start = 0; for (let i = 0; i < value.length; i++) { const c = value[i]; if (c === '(') depth++; else if (c === ')') depth--; else if (c === separator && !depth) { out.push(value.slice(start, i).trim()); start = i + 1; } } out.push(value.slice(start).trim()); return out; };
   const shorthandValue = (name, values, parts) => {
+    if (timelineShorthand.test(name)) { const lists = values.map(value => layers(value)); return lists.some(list => list.length !== lists[0].length) ? '' : specified(name, lists[0].map((_, i) => lists.map(list => list[i]).join(' ')).join(', ')); }
     if (name === 'position-try') return values[0] === 'normal' || values[0] === values[1] ? values[1] : values.join(' ');
     if (name === 'border-image') return values.every(value => value === values[0]) && /^(inherit|initial|unset|revert|revert-layer)$/.test(values[0]) ? values[0] : values.join() === 'none,100%,1,0,stretch' ? 'none' : `${values[0]} ${values[1]} / ${values[2]} / ${values[3]} ${values[4]}`;
     // `border` resets `border-image`, so it serializes only when that has its initial value.
@@ -1158,6 +1168,8 @@
       if (name.startsWith('-webkit-') && (cssAliases ??= new Set(call('dom.aliases'))).has(name)) name = name.slice(8);
       if (this._owner.computed) return this._owner.computed(name);
       const list = this._list, found = list.findLast(entry => entry[0] === name);
+      // Like Chrome, `animation` has no value when a timeline or range longhand follows it.
+      if (found && name === 'animation' && animationLonghands(list) !== list) return '';
       if (found) return specified(name, found[1]);
       const parts = (shorthands ?? loadShorthands()).get(name), entries = parts?.map(part => list.findLast(entry => entry[0] === part));
       return entries && entries.every(entry => entry && entry[2] === entries[0][2]) ? shorthandValue(name, entries.map(entry => specified(entry[0], entry[1])), parts) : '';
@@ -1202,7 +1214,7 @@
       return old;
     }
     *[Symbol.iterator]() { for (let i = 0, length = this.length; i < length; i++) yield this.item(i); }
-    get cssText() { return this._owner.computed ? '' : declarationText(specifiedList(this._list)); }
+    get cssText() { return this._owner.computed ? '' : declarationText(animationLonghands(specifiedList(this._list))); }
     set cssText(value) { if (this._owner.computed) readOnly(); this._owner.write(this._owner.raw ? String(value).split(';').flatMap(part => { const colon = part.indexOf(':'); return colon > 0 ? [[part.slice(0, colon).trim(), part.slice(colon + 1).trim(), '']] : []; }) : declare(String(value))); }
   }
   const styleKey = key => typeof key === 'string' && !(key.charCodeAt(0) <= 57 && /^\d+$/.test(key));
@@ -3957,7 +3969,7 @@
     const id = node._id, kind = pseudo == null ? '' : String(pseudo);
     let names = null;
     // Container queries need sizes, so the first read of a page lays it out like Chrome does.
-    return declaration({ computed: name => { relayout(name); return call('dom.computed', id, name, kind); }, names: () => names ??= call('dom.computed', id, null, kind) });
+    return declaration({ computed: name => { if (timelineShorthand.test(name)) { const parts = (shorthands ?? loadShorthands()).get(name); return shorthandValue(name, parts.map(part => call('dom.computed', id, part, kind)), parts); } relayout(name); return call('dom.computed', id, name, kind); }, names: () => names ??= call('dom.computed', id, null, kind) });
   };
   const relayout = name => { if (!laid || /^(width|height|min-|max-|margin|padding|inset|top|right|bottom|left|transform|perspective-origin|grid-template)/.test(name)) layout(); };
   // CSS Typed OM: its globals make the classes of typed_om.js on first use.
@@ -4016,6 +4028,41 @@
   class AnimationTimeline { constructor() { if (new.target === AnimationTimeline) throw new TypeError('Illegal constructor'); } get currentTime() { return timelineNow(); } get duration() { return null; } }
   class DocumentTimeline extends AnimationTimeline { #origin; constructor(options = {}) { super(); this.#origin = Number(options?.originTime ?? 0); } get currentTime() { return timelineNow() - this.#origin; } }
   const documentTimeline = new DocumentTimeline();
+  // Scroll-driven timelines keep a node and a timeline of `animation-timeline` that Rust reads at it. Typed OM gives `CSSUnitValue`.
+  class UnitValue { #value; #unit; constructor(value, unit) { this.#value = value; this.#unit = unit; } get value() { return this.#value; } get unit() { return this.#unit; } toString() { return +this.#value.toPrecision(6) + (this.#unit === 'percent' ? '%' : this.#unit); } }
+  const unitValue = (value, unit) => new (typeof CSSUnitValue === 'function' ? CSSUnitValue : UnitValue)(value, unit);
+  const timelineToken = Symbol();
+  // The progress in the range, 1 at the end of the timeline, then the timeline, range start and range end in percent, the scroller, the subject and the axis.
+  const scrollState = (timeline, start = 'normal', end = 'normal') => { const at = timeline._at; if (!at?.isConnected) return null; layout(); return call('dom.timeline', at._id, timeline._spec, start, end); };
+  const axisOf = axis => { axis = String(axis ?? 'block'); if (!['block', 'inline', 'x', 'y'].includes(axis)) throw new TypeError(`'${axis}' is not a valid axis`); return axis; };
+  class ScrollTimeline extends AnimationTimeline {
+    constructor(options = {}, token, at, spec) {
+      super();
+      if (token === timelineToken) { this._at = at; this._spec = spec; return; }
+      const source = options?.source === undefined ? document.scrollingElement : options.source;
+      this._axis = axisOf(options?.axis);
+      this._at = source; this._spec = source === document.scrollingElement ? `scroll(root ${this._axis})` : `scroll(self ${this._axis})`;
+    }
+    get source() { const state = scrollState(this); return state ? state[5] === 0 ? document.scrollingElement : wrap(state[5]) : this._at ?? null; }
+    get axis() { return this._axis ?? scrollState(this)?.[7] ?? 'block'; }
+    get currentTime() { const time = scrollState(this)?.[2]; return time == null ? null : unitValue(time, 'percent'); }
+    get duration() { return unitValue(100, 'percent'); }
+    get [Symbol.toStringTag]() { return this instanceof ViewTimeline ? 'ViewTimeline' : 'ScrollTimeline'; }
+  }
+  class ViewTimeline extends ScrollTimeline {
+    constructor(options = {}, token, at, spec) {
+      if (token === timelineToken) { super(options, token, at, spec); return; }
+      super({ source: null });
+      const inset = options?.inset == null ? 'auto' : Array.isArray(options.inset) ? options.inset.join(' ') : String(options.inset);
+      this._axis = axisOf(options?.axis); this._at = options?.subject ?? null; this._spec = `view(${this._axis} ${inset})`;
+      if (!call('dom.supports', 'animation-timeline', this._spec)) throw new TypeError(`'${inset}' is not a valid inset`);
+    }
+    get subject() { const state = scrollState(this); return state && state[6] >= 0 ? wrap(state[6]) : this._at ?? null; }
+  }
+  const rangeText = value => value == null ? 'normal' : typeof value === 'object' ? `${value.rangeName === 'none' ? '' : value.rangeName ?? ''} ${value.offset ?? ''}`.trim() || 'normal' : String(value);
+  const rangeOf = text => { if (text === 'normal') return text; const parts = text.split(' '), named = /^[a-z]/.test(parts[0]) && !parts[0].startsWith('calc'), offset = parts[named ? 1 : 0] ?? (named ? '0%' : ''), number = /^(-?[\d.]+)(%|px)$/.exec(offset); return { rangeName: named ? parts[0] : 'none', offset: number ? unitValue(Number(number[1]), number[2] === '%' ? 'percent' : 'px') : offset }; };
+  // The current and start times of a scroll-driven animation, in percent of its timeline.
+  const scrollTimes = (timeline, start, end) => { const state = scrollState(timeline, start, end); return state?.[2] == null ? [null, null] : [unitValue(state[2] - state[3], 'percent'), unitValue(state[3], 'percent'), state]; };
   const easings = new Map();
   const easingOf = value => {
     value = String(value).trim();
@@ -4116,7 +4163,17 @@
   class AnimationEffect {
     constructor() { if (new.target === AnimationEffect) throw new TypeError('Illegal constructor'); }
     getTiming() { return { ...effects.get(this).timing }; }
-    getComputedTiming() { const { timing, animation } = effects.get(this); return computedTiming(timing, animation?.currentTime ?? null, animation?.playbackRate ?? 1); }
+    getComputedTiming() {
+      const { timing, animation } = effects.get(this), length = animation?._length?.();
+      if (length == null) return computedTiming(timing, animation?.currentTime ?? null, animation?.playbackRate ?? 1);
+      // Like Chrome, times of a scroll-driven animation are parts of its range, and `auto` fills it.
+      const scaled = { ...timing }, total = timing.duration === 'auto' ? 0 : timing.delay + timing.duration * timing.iterations + timing.endDelay;
+      if (total > 0 && total < Infinity) for (const key of ['delay', 'endDelay', 'duration']) scaled[key] *= length / total;
+      else Object.assign(scaled, { delay: 0, endDelay: 0, duration: timing.iterations > 0 && timing.iterations < Infinity ? length / timing.iterations : 0 });
+      const out = computedTiming(scaled, animation.currentTime?.value ?? null, animation.playbackRate);
+      for (const key of ['duration', 'activeDuration', 'endTime', 'localTime']) if (out[key] !== null) out[key] = unitValue(out[key], 'percent');
+      return Object.assign(out, { delay: timing.delay, endDelay: timing.endDelay });
+    }
     updateTiming(input = {}) { const effect = effects.get(this); effect.timing = timingOf(input, effect.timing); if (effect.animation) retimed(effect.animation); }
   }
   class KeyframeEffect extends AnimationEffect {
@@ -4141,6 +4198,8 @@
   }
   class AnimationPlaybackEvent extends Event { constructor(type, init = {}) { super(type, init); this.currentTime = init?.currentTime ?? null; this.timelineTime = init?.timelineTime ?? null; } }
   const liveAnimations = new Set();
+  let scrollWatch = false;
+  const percentOf = value => value?.unit === 'percent' ? value.value : typeof value === 'string' && value.endsWith('%') ? parseFloat(value) : value;
   let animationIds = 0;
   const pendingAnimations = new Set();
   let readyAnimation;
@@ -4148,7 +4207,7 @@
   const boxless = target => { if (!target.isConnected) return true; for (let node = target; node; node = node.assignedSlot ?? node.parentElement ?? node.parentNode?.host) { const style = getComputedStyle(node); if (style.display === 'none' || node === target && style.display === 'contents' || node !== target && style.contentVisibility === 'hidden') return true; } return false; };
   class Animation extends EventTarget {
     #id = ++animationIds; #effect = null; #timeline; #start = null; #hold = null; #rate = 1; #pendingRate = null; #playing = false; #pausing = false; #previous = null;
-    #finished; #settle; #fail; #done = false; #queued = false; #ready; #readyResolve = null; #readyReject = null; #timer; #replace = 'active'; #synced = null; #sent = null;
+    #finished; #settle; #fail; #done = false; #queued = false; #ready; #readyResolve = null; #readyReject = null; #timer; #replace = 'active'; #synced = null; #sent = null; #range = ['normal', 'normal'];
     static {
       retimed = animation => animation.#update(false, false);
       animationOrder = animation => animation.#id;
@@ -4161,11 +4220,13 @@
     #wait() { this.#ready = new Promise((resolve, reject) => { this.#readyResolve = resolve; this.#readyReject = reject; }); this.#ready.catch(() => {}); }
     #resolve() { this.#readyResolve?.(this); this.#readyResolve = this.#readyReject = null; }
     #schedule() { pendingAnimations.add(this); requestFrame(); }
-    #now() { return this.#timeline?.currentTime ?? null; }
+    #now() { const time = this.#timeline?.currentTime ?? null; return time?.value ?? time; }
+    #scroll() { return this.#timeline instanceof ScrollTimeline ? this.#timeline : null; }
     #current() { if (this.#hold !== null) return this.#hold; const now = this.#now(); return this.#start === null || now === null ? null : (now - this.#start) * this.#rate; }
     #effective() { return this.#pendingRate ?? this.#rate; }
     #apply() { if (this.#pendingRate !== null) { this.#rate = this.#pendingRate; this.#pendingRate = null; } }
-    #end() { return this.#effect ? computedTiming(effects.get(this.#effect).timing, null, 1).endTime : 0; }
+    // A scroll-driven animation counts in percent of its timeline, and ends with its range.
+    #end() { const scroll = this.#scroll(), state = scroll && scrollState(scroll, ...this.#range); return scroll ? state?.[4] == null ? 100 : state[4] - state[3] : this.#effect ? computedTiming(effects.get(this.#effect).timing, null, 1).endTime : 0; }
     #fills() { const fill = this.#effect ? effects.get(this.#effect).timing.fill : 'none'; return this.#rate < 0 ? fill === 'backwards' || fill === 'both' : fill === 'forwards' || fill === 'both'; }
     #seek(time) { const now = this.#now(); if (this.#hold !== null || this.#start === null || now === null || this.#rate === 0) this.#hold = time; else this.#start = now - time / this.#rate; if (now === null) this.#start = null; this.#previous = null; }
     get effect() { return this.#effect; }
@@ -4184,9 +4245,14 @@
       if (time !== null) { this.#start = null; this.#hold = time; if (running) { this.#playing = true; this.#schedule(); } }
       this.#update(false, false);
     }
-    get startTime() { return this.#start; }
+    get startTime() { return this.#scroll() && this.#start !== null ? unitValue(this.#start, 'percent') : this.#start; }
+    _length() { return this.#scroll() ? this.#end() : null; }
+    get rangeStart() { return rangeOf(this.#range[0]); }
+    set rangeStart(value) { this.#range[0] = rangeText(value); this.#update(false, false); }
+    get rangeEnd() { return rangeOf(this.#range[1]); }
+    set rangeEnd(value) { this.#range[1] = rangeText(value); this.#update(false, false); }
     set startTime(value) {
-      const time = value == null ? null : finite(value);
+      const time = value == null ? null : finite(percentOf(value));
       if (this.#now() === null && time !== null) this.#hold = null;
       const previous = this.#current();
       this.#apply();
@@ -4195,10 +4261,10 @@
       if (this.pending) { this.#playing = this.#pausing = false; this.#resolve(); }
       this.#update(true, false);
     }
-    get currentTime() { return this.#current(); }
+    get currentTime() { const time = this.#current(); return this.#scroll() && time !== null ? unitValue(time, 'percent') : time; }
     set currentTime(value) {
       if (value == null) { if (this.#current() !== null) throw new TypeError('The current time cannot be null'); return; }
-      const time = finite(value);
+      const time = finite(percentOf(value));
       this.#seek(time);
       if (this.#pausing) { this.#hold = time; this.#apply(); this.#start = null; this.#pausing = false; this.#resolve(); }
       this.#update(true, false);
@@ -4253,6 +4319,8 @@
       if (rewind && rate > 0 && (time === null || time < 0 || time >= end)) seek = 0;
       else if (rewind && rate < 0 && (time === null || time <= 0 || time > end)) { if (end === Infinity) throw new DOMException('Cannot play an endless animation in reverse', 'InvalidStateError'); seek = end; }
       else if (rate === 0 && time === null) seek = 0;
+      // Like Chrome, a scroll-driven animation that plays from its start starts at the edge of its range.
+      if (seek !== null && this.#scroll()) { const state = scrollState(this.#scroll(), ...this.#range); this.#start = state?.[3] == null ? 0 : rate < 0 ? state[4] : state[3]; this.#hold = null; this.#playing = this.#pausing = false; this.#update(false, false); return; }
       if (seek !== null) this.#hold = seek;
       if (this.#hold !== null) this.#start = null;
       const waiting = this.pending;
@@ -4335,10 +4403,10 @@
         if (this.#done) this.#reset();
         if (state === 'running' && !this.pending && rate !== 0) {
           const left = rate > 0 ? (end - this.#previous) / rate : this.#previous / -rate;
-          if (Number.isFinite(left)) this.#timer = setTimeout(() => this.#update(false, false), Math.max(0, left));
+          if (Number.isFinite(left) && !this.#scroll()) this.#timer = setTimeout(() => this.#update(false, false), Math.max(0, left));
         }
       }
-      if (state === 'idle' || this.#replace === 'removed' || state === 'finished' && !this.#fills()) liveAnimations.delete(this); else liveAnimations.add(this);
+      if (state === 'idle' || this.#replace === 'removed' || state === 'finished' && !this.#fills() && !this.#scroll()) liveAnimations.delete(this); else liveAnimations.add(this);
       this.#sync();
     }
     #replaceOlder() {
@@ -4355,22 +4423,28 @@
       }
     }
     #sync(force) {
-      const effect = this.#effect && effects.get(this.#effect), target = effect?.target, time = this.#current();
-      if (!target || effect.pseudo !== null && effect.pseudo !== '::before' && effect.pseudo !== '::after' || time === null || !force && (this.#replace === 'removed' || this.playState === 'finished' && !this.#fills())) { if (this.#synced !== null) { this.#synced = null; call('dom.animation', this.#id, -1, null); } return; }
-      const { timing } = effect, duration = timing.duration === 'auto' ? 0 : Math.min(timing.duration, 1e12), sent = this.#synced === target._id && this.#sent === effect.frames;
+      const effect = this.#effect && effects.get(this.#effect), target = effect?.target, time = this.#current(), scroll = this.#scroll();
+      if (!target || effect.pseudo !== null && effect.pseudo !== '::before' && effect.pseudo !== '::after' || (scroll ? this.#start === null && this.#hold === null : time === null) || !force && (this.#replace === 'removed' || this.playState === 'finished' && !this.#fills() && !scroll)) { if (this.#synced !== null) { this.#synced = null; call('dom.animation', this.#id, -1, null); } return; }
+      // As in Chrome, `auto` fills the range of a scroll timeline.
+      const { timing } = effect, duration = timing.duration === 'auto' ? scroll && timing.iterations > 0 ? 1000 / timing.iterations : 0 : Math.min(timing.duration, 1e12), sent = this.#synced === target._id && this.#sent === effect.frames;
       this.#synced = target._id; this.#sent = effect.frames;
       call('dom.animation', this.#id, target._id, {
         frames: sent ? undefined : effect.frames.map(frame => [frame.computed, frame.props.map(([name, value]) => `${name}:${value}`).join(';'), frame.easing]),
         timing: [timing.delay, timing.endDelay, duration, timing.iterations === Infinity ? -1 : timing.iterations, timing.iterationStart],
         direction: timing.direction, fill: timing.fill === 'auto' ? 'none' : timing.fill, easing: timing.easing, composite: effect.composite, pseudo: effect.pseudo,
         time, rate: this.#start !== null && this.#hold === null && this.#now() !== null ? this.#rate : null,
+        scroll: scroll && [scroll._at?._id ?? -1, scroll._spec, ...this.#range, this.#start],
       });
+      // Scrolls move the state of scroll-driven animations, like `finished`.
+      if (scroll && !scrollWatch) { scrollWatch = true; addEventListener('scroll', () => { for (const animation of liveAnimations) if (animation.timeline instanceof ScrollTimeline) retimed(animation); }, { capture: true, passive: true }); }
     }
   }
   for (const name of ['finish', 'cancel', 'remove']) handler(Animation.prototype, name);
   const cssAnimations = new Map(), cssData = new WeakMap(), cssToken = Symbol();
   class CSSAnimation extends Animation { constructor(token) { if (token !== cssToken) throw new TypeError('Illegal constructor'); super(); } get animationName() { return cssData.get(this).name; } }
   class CSSTransition extends Animation { constructor(token) { if (token !== cssToken) throw new TypeError('Illegal constructor'); super(); } get transitionProperty() { return cssData.get(this).name; } }
+  // Like Chrome, the time of a finished scroll-driven CSS animation stays at its end.
+  const cssScrollTime = (animation, data) => { const [time] = scrollTimes(animation.timeline, data.scroll[1], data.scroll[2]), { timing } = effects.get(data.effect); return time && data.state === 'finished' ? unitValue(Math.min(time.value, timing.delay + timing.duration * timing.iterations > 0 ? animation._length() : 0), 'percent') : time; };
   const cssReset = data => { data.settled = false; data.finished = new Promise((resolve, reject) => { data.resolve = resolve; data.reject = reject; }); data.finished.catch(() => {}); };
   const cssSettle = (animation, done) => {
     const data = cssData.get(animation);
@@ -4405,9 +4479,12 @@
   };
   for (const Type of [CSSAnimation, CSSTransition]) Object.defineProperties(Type.prototype, {
     effect: { get() { return cssData.get(this).effect; }, set() {}, configurable: true },
-    timeline: { get() { return documentTimeline; }, set() {}, configurable: true },
-    currentTime: { get() { return cssState(this).time; }, set(value) { if (value == null) throw new TypeError('The current time cannot be null'); cssControl(this, 'seek', finite(value)); }, configurable: true },
-    startTime: { get() { const data = cssState(this); return data.state === 'running' ? timelineNow() - data.time : null; }, set(value) { if (value != null) cssControl(this, 'seek', timelineNow() - finite(value)); }, configurable: true },
+    timeline: { get() { const data = cssData.get(this); if (!data.scroll) return documentTimeline; const state = scrollState({ _at: data.effect.target, _spec: data.scroll[0] }); return state?.length > 5 ? data.timeline ??= new (state[6] >= 0 ? ViewTimeline : ScrollTimeline)(null, timelineToken, data.effect.target, data.scroll[0]) : null; }, set() {}, configurable: true },
+    rangeStart: { get() { return rangeOf(cssData.get(this).scroll?.[1] ?? 'normal'); }, configurable: true },
+    _length: { value() { const data = cssData.get(this), timeline = data.scroll && this.timeline, state = timeline && scrollState(timeline, data.scroll[1], data.scroll[2]); return timeline ? state?.[4] == null ? 100 : state[4] - state[3] : null; }, configurable: true },
+    rangeEnd: { get() { return rangeOf(cssData.get(this).scroll?.[2] ?? 'normal'); }, configurable: true },
+    currentTime: { get() { const data = cssState(this), timeline = data.scroll && this.timeline; return data.scroll ? data.state === 'idle' ? null : timeline ? cssScrollTime(this, data) : scrollState({ _at: data.effect.target, _spec: data.scroll[0] })?.[1] === 0 ? 0 : null : data.time; }, set(value) { if (value == null) throw new TypeError('The current time cannot be null'); cssControl(this, 'seek', finite(value)); }, configurable: true },
+    startTime: { get() { const data = cssState(this), timeline = data.scroll && this.timeline; return data.scroll ? timeline && unitValue(scrollState(timeline, data.scroll[1], data.scroll[2])?.[3] ?? 0, 'percent') : data.state === 'running' ? timelineNow() - data.time : null; }, set(value) { if (value != null) cssControl(this, 'seek', timelineNow() - finite(value)); }, configurable: true },
     playState: { get() { return cssState(this).state; }, configurable: true },
     pending: { get() { return false; }, configurable: true },
     ready: { get() { return cssData.get(this).ready ??= Promise.resolve(this); }, configurable: true },
@@ -4431,7 +4508,7 @@
     // style that can start one, the styles alone answer.
     let found = call('dom.cssAnimations', node._id, subtree, subtree, true);
     if (found === null) { layout(); found = call('dom.cssAnimations', node._id, subtree, subtree, false); }
-    const list = found.map(([serial, id, kind, name, time, state, timing, direction, fill, easing, frames, pseudo]) => {
+    const list = found.map(([serial, id, kind, name, time, state, timing, direction, fill, easing, frames, pseudo, scroll]) => {
       let animation = cssAnimations.get(serial);
       if (!animation) {
         animation = new (kind === 'animation' ? CSSAnimation : CSSTransition)(cssToken);
@@ -4444,7 +4521,7 @@
         keyframes.sort((a, b) => a.offset - b.offset);
         const effect = new KeyframeEffect(wrap(id), keyframes, { delay: timing[0], endDelay: timing[1], duration: timing[2], iterations: timing[3] < 0 ? Infinity : timing[3], iterationStart: timing[4], direction, fill, easing, pseudoElement: pseudo || null });
         effects.get(effect).animation = animation;
-        const data = { serial, kind, name, effect };
+        const data = { serial, kind, name, effect, scroll };
         cssReset(data);
         cssData.set(animation, data);
         cssAnimations.set(serial, animation);
@@ -4457,14 +4534,14 @@
   };
   const animationsOf = test => [...liveAnimations].filter(animation => (animation.playState !== 'finished' || filling(animation)) && animation.effect && test(effects.get(animation.effect))).sort((a, b) => animationOrder(a) - animationOrder(b));
   Object.defineProperties(Element.prototype, {
-    animate: { value(keyframes, options) { const animation = new Animation(new KeyframeEffect(this, keyframes, options), options?.timeline === undefined ? documentTimeline : options.timeline); if (options?.id !== undefined) animation.id = String(options.id); animation.play(); return animation; }, writable: true, configurable: true },
+    animate: { value(keyframes, options) { const animation = new Animation(new KeyframeEffect(this, keyframes, options), options?.timeline === undefined ? documentTimeline : options.timeline); if (options?.id !== undefined) animation.id = String(options.id); if (options?.rangeStart !== undefined) animation.rangeStart = options.rangeStart; if (options?.rangeEnd !== undefined) animation.rangeEnd = options.rangeEnd; animation.play(); return animation; }, writable: true, configurable: true },
     getAnimations: { value(options) { const subtree = !!options?.subtree; return [...cssOf(this, subtree), ...animationsOf(({ target, pseudo }) => target === this && (!pseudo || subtree) || subtree && !!target && this.contains(target))]; }, writable: true, configurable: true },
   });
   Object.defineProperties(Document.prototype, {
     timeline: { get() { return documentTimeline; }, configurable: true },
     getAnimations: { value() { return [...cssOf(this, true), ...animationsOf(({ target }) => !!target?.isConnected)]; }, writable: true, configurable: true },
   });
-  Object.assign(globalThis, { Animation, AnimationEffect, KeyframeEffect, AnimationTimeline, DocumentTimeline, AnimationPlaybackEvent, CSSAnimation, CSSTransition });
+  Object.assign(globalThis, { Animation, AnimationEffect, KeyframeEffect, AnimationTimeline, DocumentTimeline, ScrollTimeline, ViewTimeline, AnimationPlaybackEvent, CSSAnimation, CSSTransition });
   const mediaQueries = new Set();
   let mediaViewport = '';
   class MediaQueryListEvent extends Event {

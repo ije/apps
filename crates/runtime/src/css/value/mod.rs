@@ -9,6 +9,7 @@ pub(crate) mod resolved;
 pub(crate) mod shape;
 pub(crate) mod shorthand;
 pub(crate) mod specified;
+pub(crate) mod timeline;
 pub(crate) mod tokens;
 pub(crate) mod transform;
 pub(crate) mod units;

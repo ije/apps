@@ -787,3 +787,35 @@ fn kept_boxes_follow_their_containing_blocks_scrollers_and_transforms() {
         )],
     );
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn scroll_timelines_follow_the_offset_in_the_same_frame() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const step = async code => { await run(code); await win.webContents.capturePage(); };
+        const read = () => run(`['a', 'b', 'c'].map(id => getComputedStyle(document.getElementById(id)).opacity).join()`);
+        await step(`document.getElementById('s').scrollTop = 100; document.getElementById('v').scrollTop = 300`);
+        const half = await read();
+        if (half !== '0.5,0.5,1') fail('half way: ' + half);
+        await step(`document.getElementById('s').scrollTop = 200`);
+        const end = await read();
+        if (end !== '1,0.5,1') fail('at the end, in the same frame: ' + end);
+        await step(`document.getElementById('s').style.overflow = 'visible'`);
+        const gone = await read();
+        if (gone !== '0,0.5,1') fail('the page takes over from a box that stops scrolling: ' + gone);
+        const time = await run(`String(document.getElementById('b').getAnimations()[0].timeline.currentTime)`);
+        if (time !== '50%') fail('the view timeline: ' + time);
+        "#,
+        &[(
+            "page.html",
+            "<head><style>.s{width:100px;height:100px;overflow:auto} .c{height:300px}\
+             i{display:block;width:20px;height:20px;animation:f linear both}\
+             @keyframes f{from{opacity:0}to{opacity:1}}</style></head><body style='margin:0'>\
+             <div class=s id=s><div class=c><i id=a style='animation-timeline:scroll()'></i></div></div>\
+             <div class=s id=v><div class=c></div><i id=b style='height:100px;animation-timeline:view()'></i><div class=c></div></div>\
+             <div class=s id=n><div class=c><i id=c style='animation-timeline:--none'></i></div></div></body>",
+        )],
+    );
+}

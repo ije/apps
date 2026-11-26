@@ -121,6 +121,18 @@ pub(super) fn animation(args: &Value, doc: &mut Document, state: &mut PageState)
             _ => 0,
         },
     );
+    let mut animation = animation;
+    // A scroll-driven animation: the node of its timeline, the timeline and its range, and its start in percent.
+    if let Some(scroll) = spec["scroll"].as_array().filter(|scroll| scroll.len() == 5) {
+        let at = scroll[0].as_u64().map_or(usize::MAX, |at| at as usize);
+        let mut scroll = crate::css::value::timeline::Scroll::of(Some(at), &scroll[1..]);
+        scroll.start = spec["scroll"][4].as_f64();
+        (scroll.hold, scroll.rate) = match spec["rate"].as_f64() {
+            Some(rate) => (None, rate),
+            None => (spec["time"].as_f64(), 1.),
+        };
+        animation.effect.scroll = Some(std::rc::Rc::new(scroll));
+    }
     state.styles.motion.script(
         node,
         animation,

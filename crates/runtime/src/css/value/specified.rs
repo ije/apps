@@ -22,6 +22,9 @@ pub(crate) fn specified(name: &str, value: &str) -> String {
     if let Some(text) = anchor::specified(name, value) {
         return text;
     }
+    if let Some(text) = super::timeline::specified(name, value) {
+        return text;
+    }
     let functions = anchor::has_function(value)
         .then(|| anchor::canonical(name, value))
         .flatten();
@@ -197,7 +200,7 @@ pub(crate) fn specified(name: &str, value: &str) -> String {
             let mut times = 0;
             for part in parts {
                 let slot = match part {
-                    _ if numeric(part) && part.ends_with('s') => {
+                    _ if numeric(part) && part.ends_with('s') || part == "auto" && times == 0 => {
                         times += 1;
                         if times == 1 { 0 } else { 2 }
                     }

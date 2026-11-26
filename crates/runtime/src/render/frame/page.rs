@@ -1,5 +1,5 @@
 use super::super::element::{self, Build, element};
-use super::{Cx, anchor, snap};
+use super::{Cx, anchor, snap, timeline};
 use crate::css;
 use crate::css::properties::{Prop, Style};
 use crate::dom::Document;
@@ -210,6 +210,20 @@ pub(super) fn node(
                         window.redraw();
                     }
                     dom.geometry.sync_scroll();
+                    // A layout that moves scroll timelines builds the frame again.
+                    if dom.styles.motion.scrolls
+                        && let Some(styles) = dom.styles.computed.clone()
+                    {
+                        let timelines =
+                            timeline::Timelines::new(&page.doc, &styles, &dom.tree, &dom.geometry);
+                        if dom
+                            .styles
+                            .motion
+                            .measure(&styles, &|id, scroll| timelines.progress(id, scroll))
+                        {
+                            window.restart();
+                        }
+                    }
                     let size = window.viewport_size();
                     let passes = [!window.redrawing(), !data.reflowing.get()];
                     if anchored

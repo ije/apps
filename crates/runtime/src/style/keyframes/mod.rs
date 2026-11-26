@@ -10,7 +10,7 @@ pub(crate) mod interpolate;
 use crate::css::{
     properties::Prop, properties::Registry, properties::Style, sheet::Declarations,
     value::easing::Easing, value::easing::time, value::easing::timing_function,
-    value::tokens::components,
+    value::timeline::Scroll, value::tokens::components,
 };
 
 #[derive(Clone, Debug)]
@@ -30,6 +30,7 @@ pub(crate) struct Animation {
     pub(crate) composite: u8,
     pub pseudo: u8,
     pub(crate) tracks: Vec<(Prop, Vec<Keyframe>)>,
+    pub(crate) scroll: Option<Rc<Scroll>>,
 }
 
 pub(crate) const DIRECTIONS: [&str; 4] = ["normal", "reverse", "alternate", "alternate-reverse"];
@@ -91,16 +92,24 @@ impl Animation {
         if shorthand.is_empty() {
             return Vec::new();
         }
+        let scrolls = [
+            Prop::ANIMATION_TIMELINE,
+            Prop::ANIMATION_RANGE_START,
+            Prop::ANIMATION_RANGE_END,
+        ]
+        .map(|prop| components(style.get(prop).unwrap_or(""), ','));
         let names = style
             .get(Prop::ANIMATION_NAME)
             .map(|value| components(value, ','));
         (0..names.as_ref().map_or(shorthand.len(), Vec::len))
             .filter_map(|index| {
                 // Name, duration, delay, iteration count, direction, fill mode, timing function, play state.
-                let mut values = ["none", "0s", "0s", "1", "normal", "none", "ease", "running"];
+                let mut values = [
+                    "none", "auto", "0s", "1", "normal", "none", "ease", "running",
+                ];
                 let mut times = 0;
                 for part in components(shorthand[index % shorthand.len()], ' ') {
-                    let slot = if time(part).is_some() {
+                    let slot = if time(part).is_some() || part == "auto" {
                         times += 1;
                         if times == 1 { 1 } else { 2 }
                     } else if part == "infinite" || part.parse::<f64>().is_ok() {
@@ -139,6 +148,26 @@ impl Animation {
                     }
                 }
                 let [name, duration, delay, count, direction, fill, timing, state] = values;
+                // Like Chrome, a time duration on a scroll timeline is a part of its range, and `auto` fills it.
+                let [timeline, start, end] = scrolls.each_ref().map(|list| {
+                    list.get(index % list.len().max(1))
+                        .copied()
+                        .unwrap_or("normal")
+                });
+                let scroll = (!matches!(timeline.trim(), "" | "auto" | "normal")).then(|| {
+                    let mut scroll = Scroll::new(None, [timeline, start, end]);
+                    scroll.auto = duration == "auto";
+                    Rc::new(scroll)
+                });
+                let count = if count == "infinite" {
+                    f64::INFINITY
+                } else {
+                    count
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|value| value.is_finite())?
+                        .max(0.)
+                };
                 let name = name.trim_matches(['\'', '"']);
                 let rules: Vec<_> = keyframes
                     .get(name)?
@@ -154,17 +183,19 @@ impl Animation {
                 Some(Self {
                     name: name.into(),
                     paused: state == "paused",
-                    duration: time(duration)?.max(0.),
-                    delay: time(delay)?,
-                    iterations: if count == "infinite" {
-                        f64::INFINITY
-                    } else {
-                        count
-                            .parse::<f64>()
-                            .ok()
-                            .filter(|value| value.is_finite())?
-                            .max(0.)
+                    duration: match duration {
+                        // Endless iterations of no length have no effect.
+                        "auto" if scroll.is_some() && count.is_infinite() => f64::INFINITY,
+                        "auto" if scroll.is_some() && count > 0. => 1. / count,
+                        "auto" => 0.,
+                        _ => time(duration)?.max(0.),
                     },
+                    delay: if duration == "auto" && scroll.is_some() {
+                        0.
+                    } else {
+                        time(delay)?
+                    },
+                    iterations: count,
                     direction: keyword(&DIRECTIONS, direction).unwrap_or(0),
                     fill: keyword(&FILLS, fill).unwrap_or(0),
                     timing: Easing::parse(timing)?,
@@ -182,6 +213,7 @@ impl Animation {
                         .unwrap_or(0),
                     pseudo: 0,
                     tracks: tracks(style, &rules, registry, theme, true),
+                    scroll,
                 })
             })
             .collect()
@@ -269,6 +301,30 @@ impl Animation {
         }
     }
 
+    // The local time of a scroll-driven effect at `[1/0 without a timeline, 1 at the end of the timeline, the
+    // timeline, the range start and end]`, the last three in percent. Like Chrome, the end of a timeline is in the
+    // active phase, and an effect without a timeline holds the time 0, where an `auto` duration is 0.
+    pub(crate) fn scrolled(&self, [none, end, at, from, to]: [f64; 5]) -> f64 {
+        let total = self.delay + self.active();
+        let Some(scroll) = &self.scroll else {
+            return f64::NAN;
+        };
+        if none.is_infinite() {
+            return if scroll.auto { total } else { 0. };
+        }
+        let current = (scroll.hold).unwrap_or((at - scroll.start.unwrap_or(from)) * scroll.rate);
+        let progress = match (to - from, current) {
+            (0., current) => current.signum(),
+            (span, current) if end > 0. && (current - span).abs() < 1e-9 => 1. - 1e-9,
+            (span, current) => current / span,
+        };
+        match total {
+            _ if !total.is_finite() => f64::NAN,
+            0. => progress.min(0.),
+            _ => progress * total,
+        }
+    }
+
     // Whether the effect only paints, and whether it keeps the box in place.
     pub(crate) fn paints(&self) -> (bool, bool) {
         (
@@ -289,6 +345,9 @@ impl Animation {
         out: &mut Style,
         coarse: f64,
     ) -> (Option<f64>, bool) {
+        if elapsed.is_nan() {
+            return (None, false);
+        }
         let length = self.active();
         let end = (self.delay + length + self.end_delay).max(0.);
         let start = self.delay.min(end).max(0.);

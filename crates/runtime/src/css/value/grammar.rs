@@ -220,6 +220,49 @@ pub(crate) fn supports(name: &str, value: &str) -> Option<bool> {
                 || anchor::specified(name, value).is_some(),
         );
     }
+    // Like Chrome, an animation has two times at most, where `auto` is the first, and one name.
+    if name == "animation" && !lower.contains("var(") {
+        for item in components(&lower, ',') {
+            let (mut times, mut names) = (0, 0);
+            for part in components(item, ' ') {
+                if crate::css::value::easing::time(part).is_some() || part == "auto" && times == 0 {
+                    times += 1;
+                } else if !part.contains('(')
+                    && part.parse::<f64>().is_err()
+                    && !crate::css::value::easing::timing_function(part)
+                    && !matches!(
+                        part,
+                        "infinite"
+                            | "normal"
+                            | "reverse"
+                            | "alternate"
+                            | "alternate-reverse"
+                            | "forwards"
+                            | "backwards"
+                            | "both"
+                            | "none"
+                            | "running"
+                            | "paused"
+                    )
+                {
+                    names += 1;
+                }
+            }
+            if times > 2 || names > 1 {
+                return Some(false);
+            }
+        }
+    }
+    if name.contains("timeline") || name.starts_with("animation-range") {
+        return Some(
+            lower.contains("var(")
+                || matches!(
+                    lower.as_str(),
+                    "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+                )
+                || super::timeline::items(name, value).is_some(),
+        );
+    }
     if anchor::has_function(value) && !lower.contains("var(") {
         return Some(anchor::canonical(name, value).is_some_and(|text| {
             anchor::replace(&text, &mut |_| Some("1px".into()))
@@ -397,6 +440,9 @@ const INITIAL: &[(&str, &str)] = &[
     ("animation-iteration-count", "1"),
     ("animation-name", "none"),
     ("animation-play-state", "running"),
+    ("animation-range-end", "normal"),
+    ("animation-range-start", "normal"),
+    ("animation-timeline", "auto"),
     ("animation-timing-function", "ease"),
     ("app-region", "none"),
     ("appearance", "none"),
@@ -598,6 +644,8 @@ const INITIAL: &[(&str, &str)] = &[
     ("scroll-snap-align", "none"),
     ("scroll-snap-stop", "normal"),
     ("scroll-snap-type", "none"),
+    ("scroll-timeline-axis", "block"),
+    ("scroll-timeline-name", "none"),
     ("scrollbar-color", "auto"),
     ("scrollbar-gutter", "auto"),
     ("scrollbar-width", "auto"),
@@ -630,6 +678,7 @@ const INITIAL: &[(&str, &str)] = &[
     ("text-underline-offset", "auto"),
     ("text-underline-position", "auto"),
     ("text-wrap", "wrap"),
+    ("timeline-scope", "none"),
     ("top", "auto"),
     ("touch-action", "auto"),
     ("transform", "none"),
@@ -645,6 +694,9 @@ const INITIAL: &[(&str, &str)] = &[
     ("unicode-bidi", "normal"),
     ("user-select", "auto"),
     ("vertical-align", "baseline"),
+    ("view-timeline-axis", "block"),
+    ("view-timeline-inset", "auto"),
+    ("view-timeline-name", "none"),
     ("view-transition-name", "none"),
     ("visibility", "visible"),
     ("white-space", "normal"),

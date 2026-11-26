@@ -6,6 +6,7 @@ mod motion;
 mod page;
 mod patch;
 pub(crate) mod snap;
+pub(crate) mod timeline;
 mod visibility;
 
 use super::element::{Build, element};
@@ -188,6 +189,12 @@ impl ViewState {
         if styles.anchors.is_some() {
             dom.layout.anchors.now = Some(now);
         }
+        if dom.styles.motion.scrolls {
+            let timelines = timeline::Timelines::new(&doc, &styles, &dom.tree, &dom.geometry);
+            dom.styles
+                .motion
+                .measure(&styles, &|id, scroll| timelines.progress(id, scroll));
+        }
         let bounds = &dom.geometry.mirror;
         let side = |id| {
             bounds
@@ -211,6 +218,7 @@ impl ViewState {
             dom.layout.container_pass,
             &mut events,
         );
+        let scrolls = dom.styles.motion.scrolls;
         let mut images = HashMap::new();
         if let Some(gpu) = state.graphics.get_mut(&self.id) {
             for &id in &dom.layout.cull.canvases {
@@ -637,7 +645,9 @@ impl ViewState {
             window.rebuild();
         }
         if !events.is_empty() {
-            if self.reflowing.get() {
+            // Events of scroll-driven animations at the first frames of a page stalled its frames when they ran
+            // inside the frame, so pages with scroll timelines run them after it.
+            if self.reflowing.get() || scrolls {
                 let runtime = self.runtime.clone();
                 cx.defer(move |cx| runtime.animation_events(events, cx));
             } else {

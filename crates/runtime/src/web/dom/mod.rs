@@ -82,6 +82,18 @@ pub fn call(
             id()?;
             css::font_check(args, state)
         }
+        "dom.timeline" => {
+            let id = id()?;
+            let styles = state.restyle(doc, viewport);
+            let scroll = crate::css::value::timeline::Scroll::of(
+                None,
+                args.as_array().map_or(&[][..], |args| &args[1..]),
+            );
+            let (tree, geometry) = (&state.tree, &state.geometry);
+            let timelines =
+                crate::render::frame::timeline::Timelines::new(doc, &styles, tree, geometry);
+            Ok(timelines.read(id, &scroll))
+        }
         "dom.scrollEvents" => geometry::scroll_events(state),
         "dom.hitTest" => geometry::hit_test(args, doc, state, viewport),
         "dom.scrolled" => geometry::scrolled(id()?, state),

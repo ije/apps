@@ -366,6 +366,7 @@ impl Scripted {
                 composite: keyword(&COMPOSITES, composite).unwrap_or(1),
                 pseudo,
                 tracks: Vec::new(),
+                scroll: None,
             },
             base: None,
             playback: Playback {

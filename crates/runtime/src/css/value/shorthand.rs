@@ -222,6 +222,9 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
         out.push((alias.into(), value.into()));
         return true;
     }
+    if super::timeline::expand(key, value, out) {
+        return true;
+    }
     if key == "contain-intrinsic-size" {
         // An `auto` belongs to the length after it: `auto 10px auto 20px` is two values.
         let split = value

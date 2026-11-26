@@ -178,6 +178,18 @@ pub(crate) fn resolved(
                 .collect();
             return layers.join(", ");
         }
+        // Like Chrome, a scroll-driven animation has no shorthand.
+        "animation"
+            if [
+                "animation-timeline",
+                "animation-range-start",
+                "animation-range-end",
+            ]
+            .into_iter()
+            .any(|name| get(name) != initial(name).unwrap_or_default()) =>
+        {
+            return String::new();
+        }
         "transition" | "animation" => {
             let defining = if name == "transition" {
                 "property"
@@ -450,6 +462,12 @@ pub(crate) fn resolved(
         return String::new();
     };
     let initial = initial(name);
+    // The values of scroll-driven animations compute to their declared form.
+    if name.contains("timeline") || name.starts_with("animation-range") {
+        return (style.get(prop))
+            .and_then(|value| super::timeline::specified(name, value))
+            .unwrap_or_else(|| initial.unwrap_or_default().into());
+    }
     let shorthand = |shorthand: Prop, key: &str| {
         let list = components(style.get(shorthand)?, ',');
         let parts: Vec<_> = list
@@ -464,6 +482,7 @@ pub(crate) fn resolved(
                             && units
                                 .math(part, f32::NAN, &[])
                                 .is_some_and(|(_, kind)| kind == Kind::Time);
+                    let time = time || *part == "auto" && times == 0;
                     times += usize::from(time);
                     match key {
                         "duration" => time && times == 1,
@@ -538,6 +557,11 @@ pub(crate) fn resolved(
             _ => None,
         }
         .unwrap_or_else(|| initial.unwrap_or_default().to_owned()),
+    };
+    // Like Chrome, `auto` computes to `0s`.
+    let value = match name {
+        "animation-duration" => value.replace("auto", "0s"),
+        _ => value,
     };
     // Empty `var()` references leave their spaces, which Chrome's tokens don't keep.
     let value = if (value.contains("  ") || value.starts_with(' ') || value.ends_with(' '))
