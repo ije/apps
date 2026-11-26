@@ -63,6 +63,7 @@ pub(super) struct Cx<'a> {
     pub(super) first_content: Option<usize>,
     pub(super) last_content: Option<usize>,
     pub(super) run_texts: RefCell<rustc_hash::FxHashMap<usize, Option<Rc<InlineText>>>>,
+    pub(super) layers: RefCell<crate::render::inline::Layers>,
     pub(super) rtl: bool,
     pub(super) line_justify: Option<renderer::AlignContent>,
     pub(super) line_align: Option<renderer::AlignItems>,
@@ -472,7 +473,13 @@ impl Cx<'_> {
                     // The text marks the static place of an out-of-flow box.
                     || !self.multicol
                         && crate::render::inline::static_place(own)
-                        && !crate::render::inline::layered_after(doc, styles, id, child)
+                        && !crate::render::inline::layered_after(
+                            doc,
+                            styles,
+                            id,
+                            child,
+                            &mut self.layers.borrow_mut(),
+                        )
                     // A float in a spliced box goes beside the line that holds its place.
                     || floated(child)
                         && !cuts.is_empty()

@@ -223,6 +223,10 @@ pub(crate) fn static_after(styles: &ComputedStyles, id: usize) -> bool {
     })
 }
 
+/// For each parent, the index of its last child that paints in a layer, and the index where its last child search
+/// ended. Callers ask for children in order, so the next search starts there.
+pub(crate) type Layers = rustc_hash::FxHashMap<usize, (Option<usize>, usize)>;
+
 // Whether a box after `child` in the paragraph of `id` paints in a layer of its own, like a positioned box. It must
 // paint above `child`, which the paragraph builds after its text. `child` can be inside inline boxes of the paragraph.
 pub(crate) fn layered_after(
@@ -230,8 +234,8 @@ pub(crate) fn layered_after(
     styles: &ComputedStyles,
     id: usize,
     child: usize,
+    layers: &mut Layers,
 ) -> bool {
-    let mut pending: Vec<usize> = Vec::new();
     // A `display: contents` box is not in the child list of its parent, but its children are, so the list can
     // hold a lower node of the chain.
     let (mut at, mut listed) = (child, child);
@@ -239,15 +243,34 @@ pub(crate) fn layered_after(
         && let Some(parent) = doc.nodes[at].parent
     {
         let children = &doc.nodes[parent].children;
-        if let Some(index) = children
+        let (last, cursor) = layers.entry(parent).or_insert_with(|| {
+            let last = children
+                .iter()
+                .rposition(|&node| layered(doc, styles, node));
+            (last, 0)
+        });
+        let found = |&node: &usize| node == at || node == listed;
+        let start = (*cursor).min(children.len());
+        if let Some(index) = children[start..]
             .iter()
-            .position(|&node| node == at || node == listed)
+            .position(found)
+            .map(|index| index + start)
+            .or_else(|| children[..start].iter().position(found))
         {
+            *cursor = index;
             listed = children[index];
-            pending.extend_from_slice(&children[index + 1..]);
+            if last.is_some_and(|last| last > index) {
+                return true;
+            }
         }
         at = parent;
     }
+    false
+}
+
+// Whether `node` or a box in it paints in a layer of its own.
+fn layered(doc: &Document, styles: &ComputedStyles, node: usize) -> bool {
+    let mut pending = vec![node];
     while let Some(node) = pending.pop() {
         let style = &styles.values[node];
         if doc.nodes[node].tag.starts_with('#')
@@ -975,6 +998,7 @@ pub(crate) fn inline_text(
     // Out-of-flow boxes in the paragraph that its element builds beside it: nodes, or `::before` (1) and `::after`
     // (2) of inline boxes.
     let mut lifted: Vec<(usize, u8)> = Vec::new();
+    let mut layers = Layers::default();
     let parts: [Option<(String, bool)>; 2] = [0, 1].map(|index| {
         let pseudo = &styles.generated(id).filter(|_| atomic_allowed)?[index];
         let content = drawn(pseudo, parent)?;
@@ -1222,14 +1246,15 @@ pub(crate) fn inline_text(
             if atomic_allowed
                 && (node.parent == Some(id) || markers)
                 && placed_out_of_flow(style)
-                && !layered_after(doc, styles, id, child)
+                && !layered_after(doc, styles, id, child, &mut layers)
             {
                 if node.parent != Some(id) {
                     lifted.push((child, 0));
                 }
                 continue 'nodes;
             }
-            if markers && static_place(style) && !layered_after(doc, styles, id, child) {
+            if markers && static_place(style) && !layered_after(doc, styles, id, child, &mut layers)
+            {
                 lifted.push((child, 0));
                 marks.push(mark(
                     child,

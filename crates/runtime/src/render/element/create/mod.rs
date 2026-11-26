@@ -549,6 +549,7 @@ pub(super) fn create(
         first_content: None,
         last_content: None,
         run_texts: RefCell::default(),
+        layers: RefCell::default(),
         rtl,
         line_justify,
         line_align,
