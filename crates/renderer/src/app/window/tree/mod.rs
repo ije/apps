@@ -1058,7 +1058,10 @@ fn chances_in(
                 out.push((y, y, if kept { AVOID } else { 0 }));
             }
         }
-        let (content, bottom) = (start + height, top + size.height);
+        let (content, bottom) = (
+            start + height,
+            top + size.height - border.bottom - padding.bottom,
+        );
         if bottom > content + 0.01 && !avoid {
             out.push((content, bottom, SLICE));
         }
@@ -1111,9 +1114,15 @@ fn chances_in(
             out[at].2 = AVOID;
         }
     }
-    // Like Chrome, a box taller than its content breaks anywhere below it.
+    // Like Chrome, a box taller than its content breaks anywhere below it, but not in its padding and border.
     let content = last.map_or(top, |(bottom, _)| bottom);
-    let bottom = top + slot.layout.size.height;
+    let Layout {
+        size,
+        border,
+        padding,
+        ..
+    } = slot.layout;
+    let bottom = top + size.height - border.bottom - padding.bottom;
     if bottom > used + 0.01 && !avoid {
         out.push((used, bottom, SLICE));
     }

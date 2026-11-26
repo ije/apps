@@ -630,7 +630,8 @@ impl LayoutTree<'_> {
             let width = match style.size.width.maybe_resolve(Some(inner), calc) {
                 None => (line - (margin.left + margin.right))
                     .max(0.)
-                    .maybe_clamp(min, max),
+                    .maybe_clamp(min, max)
+                    .max(sides.width),
                 Some(width) => width.maybe_clamp(min, max).max(sides.width),
             };
             let (grow, shrink, styled) = (

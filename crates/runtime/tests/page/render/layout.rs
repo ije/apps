@@ -2036,3 +2036,17 @@ fn lines_beside_a_float_move_when_it_changes_sides() {
         )],
     );
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn nested_column_boxes_lay_out_the_same_each_time() {
+    run_hidden(
+        r#"
+        await load('cols.html');
+        await win.webContents.capturePage();
+        await run("const h = document.getElementById('h'); let s = 'word word'; for (let i = 0; i < 6; i++) s = '<div style=\"border:1px solid;columns:2;height:calc-size(auto, size)\">' + s + '</div>'; h.innerHTML = s; h.offsetHeight; 0");
+        await win.webContents.capturePage();
+        "#,
+        &[("cols.html", "<div id=h></div>")],
+    );
+}
