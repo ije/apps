@@ -157,9 +157,12 @@ impl Scene {
                     [start, stop]: [u32; 2],
                     name: i64| {
             for instance in &layer.instances[first as usize..end as usize] {
-                let instance = moved.map_or(*instance, |(by, old, now)| {
+                let mut instance = moved.map_or(*instance, |(by, old, now)| {
                     moved_instance(instance, by, &old, &now)
                 });
+                // Only the part of a clip that cuts the instance counts. A clip that equaled the mask of the last
+                // paint takes the mask of the copy, so an inner clip that the old mask hid can't come back.
+                instance.clip = instance.reach().to_array();
                 // Fields as floats, so the check can allow the rounding of moved copies.
                 let fields: Vec<f32> = bytes(slice::from_ref(&instance))
                     .as_chunks::<4>()
@@ -176,6 +179,10 @@ impl Scene {
                 let moved = Nested {
                     at: nested.at - first,
                     layer: 0,
+                    clip: Clip {
+                        bounds: nested.reach(),
+                        ..nested.clip
+                    },
                     ..nested
                 };
                 out.push(format!("{name} nested {} {moved:?}", shift(nested.layer)));

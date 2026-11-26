@@ -322,6 +322,34 @@ fn moved_spans_carry_their_layers_and_inner_clips() {
 }
 
 #[test]
+fn moved_spans_draw_like_their_paint_where_the_old_mask_hid_an_inner_clip() {
+    // The box clips its content at 120, and the mask of the last paint cut it at 100: its clip was the mask.
+    let (cut, open) = (
+        Clip::from(bounds([0., 0., 200., 100.])),
+        Clip::from(bounds([0., 0., 200., 200.])),
+    );
+    let mut scene = Scene::default();
+    scene.begin_paint(1, &mut Vec::new());
+    let mark = scene.mark();
+    scene.push(Instance::new(BOX, bounds([10., 60., 10., 10.]), cut));
+    let span = scene.span(mark).unwrap();
+    assert_eq!(scene.plain(&span, &cut), Some(bounds([10., 60., 10., 10.])));
+    scene.clear();
+    scene.begin_paint(2, &mut Vec::new());
+    let moved = scene
+        .replay_moved(&span, point(0., -8.), &cut, &open)
+        .unwrap();
+    // A paint at the new place clips at the moved edge of the box, which draws the same.
+    let mut fresh = Scene::default();
+    fresh.begin_paint(3, &mut Vec::new());
+    let mark = fresh.mark();
+    let inner = Clip::from(bounds([0., 0., 200., 112.]));
+    fresh.push(Instance::new(BOX, bounds([10., 52., 10., 10.]), inner));
+    let painted = fresh.records(&fresh.span(mark).unwrap(), false, None);
+    assert_eq!(scene.records(&moved, false, None), painted);
+}
+
+#[test]
 fn native_glass_can_overlap_but_cannot_cover_gpu_overlays() {
     let pill = bounds([12., 12., 236., 52.]);
     let close = bounds([10., 10., 18., 18.]);
