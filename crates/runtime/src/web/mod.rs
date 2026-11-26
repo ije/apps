@@ -27,6 +27,13 @@ static NETWORK: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static TLS: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
 static ROOTS: OnceLock<Arc<NativeRoots>> = OnceLock::new();
 
+// Boxed, so all network tasks share one compiled task.
+pub(crate) fn boxed(
+    future: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(future)
+}
+
 pub(crate) fn network() -> Result<&'static tokio::runtime::Runtime> {
     if NETWORK.get().is_none() {
         let mut builder = tokio::runtime::Builder::new_current_thread();
@@ -508,7 +515,7 @@ impl State {
                 let (upload, upload_rx) = mpsc::channel::<Option<bytes::Bytes>>(16);
                 let mut upload_rx = (args[0]["stream"] == true).then_some(upload_rx);
                 let wake = crate::jsc::Waker::current();
-                let task = network.spawn(async move {
+                let task = network.spawn(boxed(async move {
                     let result: Result<()> = async {
                         if upload_rx.is_some() { for _ in 0..16 { if events_tx.send(json!({"kind":"upload"}).into()).await.is_err() { return Ok(()); } } wake.wake(); }
                         let mut redirects = 0;
@@ -595,7 +602,7 @@ impl State {
                         Ok(())
                     }.await;
                     if let Err(error) = result { let _ = events_tx.send(json!({"kind": "error", "message": format!("{error:#}")}).into()).await; wake.wake(); }
-                });
+                }));
                 self.next_id += 1;
                 self.fetches.insert(
                     self.next_id,

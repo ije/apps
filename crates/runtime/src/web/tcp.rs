@@ -451,7 +451,7 @@ impl State {
         let (paused, pausing) = watch::channel(false);
         let (output, events) = mpsc::channel(64);
         let wake = crate::jsc::Waker::current();
-        let task = crate::web::network()?.spawn(async move {
+        let task = crate::web::network()?.spawn(crate::web::boxed(async move {
             let result =
                 async { run(future.await?, incoming, pausing, output.clone(), &wake).await }.await;
             let failed = result.is_err();
@@ -462,7 +462,7 @@ impl State {
                 .send(json!({"kind":"close","hadError":failed}).into())
                 .await;
             wake.wake();
-        });
+        }));
         self.next_id += 1;
         self.connections.insert(
             self.next_id,
@@ -625,7 +625,7 @@ impl State {
                 let accepting = listener.clone();
                 let (sender, events) = mpsc::channel(64);
                 let wake = crate::jsc::Waker::current();
-                let task = runtime.spawn(async move {
+                let task = runtime.spawn(crate::web::boxed(async move {
                     loop {
                         let accepted =
                             std::future::poll_fn(|cx| match accepting.lock().as_deref() {
@@ -649,7 +649,7 @@ impl State {
                             Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
                         }
                     }
-                });
+                }));
                 self.next_id += 1;
                 self.servers.insert(
                     self.next_id,

@@ -117,7 +117,7 @@ impl State {
                 ))));
                 let (stop, stopping) = watch::channel(false);
                 let accepting = listener.clone();
-                let task = network.spawn(async move {
+                let task = network.spawn(crate::web::boxed(async move {
                     let _closed = crate::jsc::WakeOnDrop(wake.clone());
                     let next_id = Arc::new(AtomicU64::new(0));
                     let mut connections = JoinSet::new();
@@ -170,7 +170,7 @@ impl State {
                                     // `poll` only sees a dropped reply, so wake it when the client goes away.
                                     let _closed = crate::jsc::WakeOnDrop(wake.clone());
                                     let (failed, failure) = oneshot::channel();
-                                    tokio::spawn(async move {
+                                    tokio::spawn(crate::web::boxed(async move {
                                       let (mut buffer, mut wanted, mut ended) = (Vec::new(), false, false);
                                       loop {
                                         tokio::select! {
@@ -195,7 +195,7 @@ impl State {
                                             if done { break; }
                                         }
                                       }
-                                    });
+                                    }));
                                     tokio::pin!(result);
                                     let response=tokio::select! {
                                         response=&mut result=>response,
@@ -220,7 +220,7 @@ impl State {
                         });
                     }
                     while connections.join_next().await.is_some() {}
-                });
+                }));
                 self.next_id += 1;
                 self.servers.insert(
                     self.next_id,

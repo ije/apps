@@ -135,7 +135,7 @@ impl State {
         let written = Arc::new(AtomicUsize::new(0));
         let counter = written.clone();
         let wake = crate::jsc::Waker::current();
-        let task = crate::web::network()?.spawn(async move {
+        let task = crate::web::network()?.spawn(crate::web::boxed(async move {
             let result = async {
                 let (socket, protocol) = open.await?;
                 let _ = event_tx
@@ -151,7 +151,7 @@ impl State {
                     .await;
                 wake.wake();
             }
-        });
+        }));
         self.next_id += 1;
         self.sockets.insert(
             self.next_id,
