@@ -8,7 +8,8 @@ runs:
   steps:
     - if: runner.os == 'Linux'
       shell: bash
-      run: sudo apt-get update && sudo apt-get install -y clang-19 ninja-build ruby nasm libicu-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev libfreetype6-dev libasound2-dev libudev-dev libglib2.0-dev libwebkit2gtk-4.1-dev libvulkan-dev libva-dev xvfb xauth
+      # The build tools install only when a library must be built.
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libicu-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev libfreetype6-dev libasound2-dev libudev-dev libglib2.0-dev libwebkit2gtk-4.1-dev libvulkan-dev libva-dev xvfb xauth
 
     # Each cache is saved right after its build, so a later failure of the job doesn't lose it.
     # The caches hold only the build results. The source and build folders stay out.
@@ -26,6 +27,7 @@ runs:
       run: |
         case $RUNNER_OS in
           Linux)
+            sudo apt-get install -y --no-install-recommends clang-19 ninja-build ruby
             # The runtime library stays on Clang 19. build-jsc.sh uses Clang 21 for --aot when it is installed.
             if [[ '${{ inputs.aot }}' == true ]] && ! command -v clang-21 >/dev/null; then
               curl -fsSL https://apt.llvm.org/llvm.sh -o "$RUNNER_TEMP/llvm.sh"
@@ -91,6 +93,7 @@ runs:
       shell: bash
       run: |
         [[ $RUNNER_OS-$RUNNER_ARCH != macOS-X64 ]] || brew install nasm
+        [[ $RUNNER_OS != Linux ]] || sudo apt-get install -y --no-install-recommends nasm
         bash scripts/build-ffmpeg.sh
     - if: steps.ffmpeg.outputs.cache-hit != 'true'
       uses: actions/cache/save@v4
