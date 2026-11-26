@@ -900,3 +900,44 @@ fn review_cases_follow_chrome() {
         assert!(out.is_empty(), "{value}");
     }
 }
+
+#[test]
+fn text_emphasis_expands_inherits_and_makes_marks_like_chrome() {
+    let doc = Document::parse(
+        r#"<p id="p" style="text-emphasis: red open; text-emphasis-position: left under"><b id="b">x</b></p>
+        <i id="i" style="writing-mode: vertical-lr; text-emphasis: filled; color: blue">y</i>
+        <u id="u" style="-webkit-text-emphasis: 'ab' green">z</u><s id="s" style="text-emphasis: 'x'; text-emphasis: none">w</s>"#,
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let at = |selector| element(&doc, selector);
+    let b = &computed.values[at("#b")];
+    assert_eq!(b.get(Prop::TEXT_EMPHASIS_STYLE), Some("open"));
+    assert_eq!(b.get(Prop::TEXT_EMPHASIS_POSITION), Some("under left"));
+    let mark = |selector| {
+        text_run(
+            &computed.values[at(selector)],
+            &Lengths::new(16., 800., 600.),
+            1,
+        )
+        .emphasis
+        .map(|mark| (mark.mark.to_string(), mark.under, mark.color))
+    };
+    assert_eq!(
+        mark("#b"),
+        Some(("◦".into(), true, renderer::Color::hex(0xff0000ff)))
+    );
+    assert_eq!(
+        mark("#i"),
+        Some(("﹅".into(), false, renderer::Color::hex(0x0000ffff)))
+    );
+    assert_eq!(mark("#u").map(|mark| mark.0), Some("ab".into()));
+    assert_eq!(mark("#s"), None);
+}

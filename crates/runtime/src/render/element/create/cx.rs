@@ -449,6 +449,17 @@ impl Cx<'_> {
             .clone()
     }
 
+    // Emphasis marks over the first line reach into the margins before it, so the box reads them.
+    pub(super) fn margin_room(&self, data: &InlineText, id: usize) -> f32 {
+        if !data.leads {
+            return 0.;
+        }
+        let room = crate::render::inline::margin_room(self.build.doc, self.build.styles, id);
+        self.build
+            .log(Query::Room(id as u32), 0, hashed(room.to_bits()));
+        room
+    }
+
     // Inline content between the blocks of a box, which lays out as one paragraph.
     pub(super) fn in_run(&self, child: usize) -> bool {
         let Build { doc, styles, .. } = *self.build;

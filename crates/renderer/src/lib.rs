@@ -35,11 +35,11 @@ pub use platform::{
 };
 pub use style::*;
 pub use text::{
-    AdjustMetric, Caps, Decoration, DecorationStyle, Embedding, FaceRules, Font, FontId, FontStyle,
-    FontWeight, Glyph, GlyphId, Hyphen, Hyphenation, Indent, InlineEdges, Line, Paragraph, Part,
-    SOFT_HYPHEN, SUBPIXEL_STEPS, SharedString, SizeAdjust, TextAlign, TextLine, TextOverrides,
-    TextRun, TextStyle, TextSystem, TextWrap, WhiteSpace, WordBreak, Wrapping, reorders,
-    right_to_left, warm, widest_piece,
+    AdjustMetric, Caps, Decoration, DecorationStyle, Embedding, Emphasis, FaceRules, Font, FontId,
+    FontStyle, FontWeight, Glyph, GlyphId, Hyphen, Hyphenation, Indent, InlineEdges, Line,
+    Paragraph, Part, SOFT_HYPHEN, SUBPIXEL_STEPS, SharedString, SizeAdjust, TextAlign, TextLine,
+    TextOverrides, TextRun, TextStyle, TextSystem, TextWrap, WhiteSpace, WordBreak, Wrapping,
+    reorders, right_to_left, warm, widest_piece,
 };
 
 /// True when images can be surfaces.

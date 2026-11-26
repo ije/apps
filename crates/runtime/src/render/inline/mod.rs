@@ -29,7 +29,7 @@ pub(crate) struct InlineText {
     pub line_heights: Vec<(usize, LineHeight)>,
     /// The `::before` and `::after` that are in the text, as runs or atoms.
     pub pseudos: [bool; 2],
-    /// A run has another font, size or line height than the block, so rows can grow around it.
+    /// A run has another font, size or line height than the block, or emphasis marks, so rows can grow around it.
     pub mixed: bool,
     /// Like Chromium, `break-spaces` and a `::first-line` style turn balance and pretty off.
     pub greedy: bool,
@@ -37,6 +37,8 @@ pub(crate) struct InlineText {
     /// first node of the run, which keys the parts.
     pub cuts: Box<[usize]>,
     pub key: usize,
+    /// The text has emphasis marks and starts its block, so its first row can reach into the margins before it.
+    pub leads: bool,
     fallback: std::cell::OnceCell<bool>,
 }
 
@@ -704,6 +706,9 @@ pub(crate) fn splits(style: &Rc<Style>, parent: &Rc<Style>) -> bool {
                         | Prop::FONT_SIZE_ADJUST
                         | Prop::FONT_STRETCH
                         | Prop::TEXT_UNDERLINE_POSITION
+                        | Prop::TEXT_EMPHASIS_STYLE
+                        | Prop::TEXT_EMPHASIS_COLOR
+                        | Prop::TEXT_EMPHASIS_POSITION
                         | Prop::FONT_KERNING
                         | Prop::FONT_SYNTHESIS
                         | Prop::FONT_OPTICAL_SIZING
@@ -1554,6 +1559,10 @@ pub(crate) fn inline_text(
                         }
                     }
                     run.stroke = run.stroke.map(|(width, color)| (width, color.fade(faded)));
+                    if let Some(emphasis) = &mut run.emphasis {
+                        let emphasis = std::rc::Rc::make_mut(emphasis);
+                        emphasis.color = emphasis.color.fade(faded);
+                    }
                 }
                 let size = units.font.em;
                 if (size - styles.lengths[id].font.em).abs() > 0.01 {
@@ -1768,14 +1777,16 @@ pub(crate) fn inline_text(
     let (root, height) = (font(parent), line_height(parent));
     let mixed = runs
         .iter()
-        .any(|run| run.font_size.is_some() || run.font != root)
+        .any(|run| run.font_size.is_some() || run.font != root || run.emphasis.is_some())
         || line_heights.iter().any(|(_, kind)| *kind != height);
     let greedy = break_spaces || pseudos.is_some_and(|pseudos| pseudos[2].is_some());
+    let leads = ends[0] && runs.iter().any(|run| run.emphasis.is_some());
     Some(InlineText {
         mixed,
         greedy,
         cuts: cuts.iter().map(|&(cut, _)| cut).collect(),
         key: run.first().copied().unwrap_or(id),
+        leads,
         fallback: Default::default(),
         text: text.into(),
         runs: runs.into(),
@@ -1799,6 +1810,81 @@ pub(crate) fn inline_text(
             ))
         }),
     })
+}
+
+/// The margins that collapse before the first line of `id`, where emphasis marks over that line can reach, as in
+/// Chrome. They go through the blocks that start with the line, and end at a block that starts a formatting context
+/// around it. Percentages are of the viewport width here.
+pub(crate) fn margin_room(doc: &Document, styles: &ComputedStyles, id: usize) -> f32 {
+    let flows = |at: usize| {
+        let style = &styles.values[at];
+        let parent = doc.nodes[at].parent.map(|up| &styles.values[up]);
+        matches!(style.get(Prop::DISPLAY), Some("block" | "list-item"))
+            && style
+                .get(Prop::OVERFLOW_X)
+                .is_none_or(|value| value == "visible")
+            && style.get(Prop::FLOAT).is_none_or(|value| value == "none")
+            && style.get(Prop::CLEAR).is_none_or(|value| value == "none")
+            && !style
+                .get(Prop::POSITION)
+                .is_some_and(|value| matches!(value, "absolute" | "fixed"))
+            && parent.is_none_or(|parent| {
+                parent
+                    .get(Prop::COLUMN_COUNT)
+                    .is_none_or(|value| value == "auto")
+                    && parent
+                        .get(Prop::COLUMN_WIDTH)
+                        .is_none_or(|value| value == "auto")
+                    && !parent
+                        .get(Prop::DISPLAY)
+                        .is_some_and(|value| value.contains("flex") || value.contains("grid"))
+            })
+    };
+    let length = |at: usize, prop: Prop| {
+        let units = &styles.lengths[at];
+        (styles.values[at].get(prop)).map_or(0., |value| {
+            units.resolve(value, units.viewport[0]).unwrap_or(0.)
+        })
+    };
+    let mut room = [0f32; 2];
+    let mut add = |margin: f32| match margin < 0. {
+        true => room[1] = room[1].min(margin),
+        false => room[0] = room[0].max(margin),
+    };
+    let mut at = match doc.nodes[id].tag == "#text" {
+        true => doc.nodes[id].parent,
+        false => Some(id),
+    };
+    while let Some(block) = at {
+        if !flows(block) {
+            return 0.;
+        }
+        add(length(block, Prop::MARGIN_TOP));
+        let up = doc.nodes[block].parent;
+        let siblings = up.map_or(&[][..], |up| &doc.nodes[up].children[..]);
+        let before = siblings[..siblings.iter().position(|&kid| kid == block).unwrap_or(0)]
+            .iter()
+            .rev()
+            .find(|&&kid| {
+                let style = &styles.values[kid];
+                !doc.nodes[kid].tag.starts_with('#')
+                    && style.get(Prop::DISPLAY) != Some("none")
+                    && style.get(Prop::FLOAT).is_none_or(|value| value == "none")
+                    && !style
+                        .get(Prop::POSITION)
+                        .is_some_and(|value| matches!(value, "absolute" | "fixed"))
+            });
+        if let Some(&before) = before {
+            add(length(before, Prop::MARGIN_BOTTOM));
+            break;
+        }
+        at = up.filter(|&up| {
+            !doc.nodes[up].tag.starts_with('#')
+                && length(up, Prop::PADDING_TOP) == 0.
+                && length(up, Prop::BORDER_TOP_WIDTH) == 0.
+        });
+    }
+    (room[0] + room[1]).max(0.)
 }
 
 #[cfg(test)]

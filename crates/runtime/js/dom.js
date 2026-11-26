@@ -1092,6 +1092,7 @@
     // Like Chrome: position, image, type, without their initial values.
     if (name === 'list-style') { const [type, position, image] = values, kept = [position, image, type].filter((value, index) => value !== ['outside', 'none', 'disc'][index]); return kept.join(' ') || (image === 'none' && type === 'none' ? 'none' : type); }
     if (name === 'font-variant') return values.filter(value => value !== 'normal').join(' ') || 'normal';
+    if (name === 'text-emphasis' && values[0] !== values[1]) return values.filter(value => value !== 'initial').join(' ');
     if (name === 'text-decoration') { const kept = values.filter((value, index) => index === 0 || !['solid', 'currentcolor', 'auto'].includes(value)); return (kept.length ? kept : values.slice(0, 1)).join(' '); }
     const grid = parts.every(part => /^grid-.*-(start|end)$/.test(part));
     if (/^grid(-template)?$/.test(name)) return '';

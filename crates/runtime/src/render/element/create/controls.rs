@@ -250,6 +250,7 @@ pub(super) fn controls(
             clear: 0,
             tab_size: 8.,
             stroke: None,
+            emphasis: None,
         };
         if !single_line && style.get(Prop::FIELD_SIZING) == Some("content") {
             // The full width of the content box, so the text wraps as in the field.

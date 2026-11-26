@@ -239,6 +239,14 @@ pub(crate) fn paint_text(
         let mut run_end = runs.first().map_or(0, |run| run.len);
         let mut spaced = (usize::MAX, 0, 0.);
         let (mut face, mut glyph_box) = (None, Rect::default());
+        let (mut cluster, mut marks) = (usize::MAX, (usize::MAX, None));
+        // Like Chrome, marks keep their color in selected text, unless the selection holds the whole line.
+        let whole = highlights
+            .iter()
+            .find(|part| {
+                part.range.start <= offset && part.range.end >= offset + line.len && !part.tight
+            })
+            .and_then(|part| part.color);
         for (at, glyph) in line.glyphs.iter().enumerate().skip(from) {
             if face.replace((glyph.font, glyph.size)) != Some((glyph.font, glyph.size)) {
                 glyph_box = window.text_system().glyph_box(glyph.font, glyph.size);
@@ -293,6 +301,57 @@ pub(crate) fn paint_text(
                 origin.x + shift(wrap) + glyph.x - left + gap,
                 origin.y + line_height * wrap + baseline + drop(wrap),
             );
+            if let Some(mark) = &runs[text_run].emphasis
+                && std::mem::replace(&mut cluster, index) != index
+                // The text of the line, which has the ellipsis of truncated text.
+                && let shown = &*text_line.text
+                && let at = glyph.index as usize
+                && shown.get(at..).and_then(|text| text.chars().next()).is_some_and(|c| {
+                    // A character joined to the one before it is in its grapheme cluster.
+                    let mut before = shown[..at].chars().rev();
+                    let flag = |c: Option<char>| c.is_some_and(|c| ('\u{1f1e6}'..='\u{1f1ff}').contains(&c));
+                    let joined = match before.next() {
+                        Some('\u{200d}') => true,
+                        last if flag(Some(c)) && flag(last) => !flag(before.next()),
+                        _ => false,
+                    };
+                    !joined && emphasized(c)
+                })
+            {
+                if marks.0 != text_run {
+                    marks = (
+                        text_run,
+                        emphasis_glyph(&runs[text_run], mark, line.font_size, window),
+                    );
+                }
+                if let Some((mark_glyph, center, rise)) = marks.1 {
+                    // Like Chrome, the middle of the cluster's own advance, without letter spacing.
+                    let last = (at + 1..line.glyphs.len())
+                        .take_while(|&next| line.glyphs[next].index == glyph.index)
+                        .last()
+                        .unwrap_or(at);
+                    let mut advance = line.right_of(last) - glyph.x - runs[text_run].letter_spacing;
+                    // The padding of inline boxes that end the run or start the next one.
+                    let end = line
+                        .glyphs
+                        .get(last + 1)
+                        .map_or(line.len, |next| next.index as usize);
+                    if offset + end == run_end {
+                        advance -= runs[text_run].inset[1]
+                            + runs.get(text_run + 1).map_or(px(0.), |next| next.inset[0]);
+                    }
+                    let middle = advance / 2.;
+                    window.draw_glyph(
+                        point(position.x + middle - center, position.y + rise),
+                        mark_glyph.font,
+                        mark_glyph.id,
+                        mark_glyph.size,
+                        ink.or(whole).unwrap_or(mark.color),
+                        mark_glyph.emoji,
+                        px(0.),
+                    );
+                }
+            }
             // The font box has y up from the baseline. A miter of the stroke reaches twice its width past the outline.
             let reach = stroke.map_or(px(0.), |(width, _)| width * 2.);
             if !Rect::new(
@@ -614,6 +673,61 @@ pub(crate) fn paint_text(
     row_parts(1, window);
     paint_glyphs(window);
     row_parts(2, window);
+}
+
+// The glyph of an emphasis mark at half the size of the text, the middle of its ink, and its baseline from the
+// baseline of the text. Like Chrome, it is the first glyph of the mark text, beyond the ascent or descent of the text.
+fn emphasis_glyph(
+    run: &renderer::TextRun,
+    mark: &renderer::Emphasis,
+    font_size: Pixels,
+    window: &Window,
+) -> Option<(renderer::Glyph, Pixels, Pixels)> {
+    let system = window.text_system();
+    let size = run.font_size.unwrap_or(font_size);
+    let shape = renderer::TextRun {
+        len: mark.mark.len(),
+        font: run.font.clone(),
+        ..Default::default()
+    };
+    let mut glyph = *system
+        .shape_line(&mark.mark, size, &shape)
+        .line
+        .glyphs
+        .first()?;
+    glyph.size = size / 2.;
+    let scale = window.scale_factor();
+    let [ascent, descent, _] = system.line_metrics(system.face(&run.font), size * scale);
+    let em = system.metrics(glyph.font).em_ascent * f32::from(glyph.size) * scale;
+    let rise = match mark.under {
+        true => (descent.0 + em).ceil(),
+        false => (-ascent.0 - (f32::from(glyph.size) * scale - em)).floor(),
+    };
+    let center = system
+        .glyph_bounds(glyph.font, glyph.id, glyph.size)
+        .map_or(0., |[left, right, ..]| (left + right) / 2.);
+    Some((glyph, px(center), px(rise / scale)))
+}
+
+// Like Chrome, emphasis marks skip spaces, controls, combining marks and punctuation, except the signs that the CSS
+// standard keeps.
+fn emphasized(c: char) -> bool {
+    matches!(
+        c,
+        '#' | '%' | '&' | '@' | '§' | '¶' | '‰' | '‱' | '※' | '⁂' | '＃' | '％' | '＆' | '＠'
+    ) || !(c.is_whitespace()
+        || c.is_control()
+        || c.is_ascii_punctuation()
+            && !matches!(c, '$' | '+' | '<' | '=' | '>' | '^' | '`' | '|' | '~')
+        || matches!(c, '\u{a1}' | '\u{ab}' | '\u{ad}' | '\u{b7}' | '\u{bb}' | '\u{bf}'
+            | '\u{300}'..='\u{36f}' | '\u{1ab0}'..='\u{1aff}' | '\u{1dc0}'..='\u{1dff}' | '\u{20d0}'..='\u{20ff}'
+            | '\u{fe00}'..='\u{fe0f}' | '\u{fe20}'..='\u{fe2f}' | '\u{1f3fb}'..='\u{1f3ff}' | '\u{e0000}'..='\u{e007f}'
+            | '\u{200b}'..='\u{2027}' | '\u{202a}'..='\u{202e}' | '\u{2030}'..='\u{205e}' | '\u{2060}'..='\u{2064}'
+            | '\u{3001}'..='\u{3003}' | '\u{3008}'..='\u{3011}' | '\u{3014}'..='\u{301f}' | '\u{30fb}'
+            | '\u{fe10}'..='\u{fe19}' | '\u{fe30}'..='\u{fe4f}' | '\u{feff}' | '\u{fffc}'
+            | '\u{ff01}'..='\u{ff03}' | '\u{ff05}'..='\u{ff0a}' | '\u{ff0c}'..='\u{ff0f}' | '\u{ff1a}' | '\u{ff1b}'
+            | '\u{ff1f}' | '\u{ff20}' | '\u{ff3b}'..='\u{ff3d}' | '\u{ff3f}' | '\u{ff5b}' | '\u{ff5d}'
+            | '\u{ff5f}'..='\u{ff65}'))
 }
 
 // Like Chrome, lines don't skip the ink of these characters.
@@ -954,6 +1068,8 @@ pub(crate) struct InlineText {
     pub(crate) rtl: bool,
     /// The lines go from the bottom, like in `vertical-lr`.
     pub(crate) reversed: bool,
+    /// The margins before the block, where emphasis marks over the first row can reach.
+    pub(crate) room: f32,
     pub(crate) shaped: std::cell::RefCell<Option<(renderer::Paragraph, Rc<[renderer::TextRun]>)>>,
     pub(crate) prepainted: std::cell::RefCell<Prepainted>,
 }
@@ -1085,6 +1201,7 @@ type MeasuredSize = ((bool, Option<Pixels>), renderer::Size<Pixels>);
 
 struct Measured {
     data: Rc<crate::render::inline::InlineText>,
+    margins: f32,
     atoms: Box<[([f32; 3], Option<AlignItems>)]>,
     styled: std::cell::RefCell<Option<renderer::TextStyle>>,
     measured: std::cell::Cell<[Pixels; 2]>,
@@ -1096,7 +1213,9 @@ struct Measured {
 
 impl PartialEq for Measured {
     fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.data, &other.data) && self.atoms == other.atoms
+        Rc::ptr_eq(&self.data, &other.data)
+            && self.atoms == other.atoms
+            && self.margins == other.margins
     }
 }
 
@@ -1110,6 +1229,7 @@ impl From<InlineText> for renderer::Node {
             .measure(
                 Measured {
                     data: data.clone(),
+                    margins: text.room,
                     atoms: text
                         .atoms
                         .iter()
@@ -1124,6 +1244,7 @@ impl From<InlineText> for renderer::Node {
                 |kept, style, known, available, window| {
                     let Measured {
                         data,
+                        margins,
                         atoms,
                         styled,
                         measured,
@@ -1229,6 +1350,7 @@ impl From<InlineText> for renderer::Node {
                         strut,
                         &system,
                         scale,
+                        *margins,
                     );
                     for [above, below] in &extents {
                         size.height += *above + *below;
@@ -1554,6 +1676,7 @@ impl renderer::Hooks for InlineText {
             (strut, style.font_size, layout.line_height()),
             window.text_system(),
             window.scale_factor(),
+            self.room,
         );
         let view = &*self.view;
         let mut lead_styles = None;
@@ -1690,7 +1813,10 @@ impl renderer::Hooks for InlineText {
         if self.reversed {
             let line = layout.line_height();
             for (index, row) in rows.iter_mut().enumerate() {
-                row.drop = bounds.size.height - line * (2 * index + 1) as f32 - row.drop;
+                let below = extents.get(index).map_or(px(0.), |row| row[1]);
+                row.drop = bounds.size.height - line * (2 * index + 1) as f32 - row.drop
+                    + row.above
+                    - below;
             }
         }
         let rows: crate::render::layout::Rows = rows.into();
@@ -2527,6 +2653,7 @@ impl renderer::Hooks for InlineText {
                         run.color = Color::TRANSPARENT;
                         run.background_color = None;
                         run.stroke = None;
+                        run.emphasis = None;
                         for line in [
                             &mut run.underline,
                             &mut run.strikethrough,

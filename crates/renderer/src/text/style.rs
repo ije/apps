@@ -61,6 +61,15 @@ pub struct TextRun {
     pub tab_size: f32,
     /// `-webkit-text-stroke`: the width and color of a line centered on the glyph outlines.
     pub stroke: Option<(Pixels, Color)>,
+    pub emphasis: Option<Rc<Emphasis>>,
+}
+
+/// `text-emphasis`: the text of the mark over or under each letter, and its color.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Emphasis {
+    pub mark: Rc<str>,
+    pub color: Color,
+    pub under: bool,
 }
 
 impl TextRun {
@@ -221,6 +230,7 @@ impl TextStyle {
             clear: 0,
             tab_size: 8.,
             stroke: None,
+            emphasis: None,
         }
     }
 }

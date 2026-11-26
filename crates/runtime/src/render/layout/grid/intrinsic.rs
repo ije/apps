@@ -493,7 +493,8 @@ fn measure(
             let ceiled = leaf_ceil(width + padding, measured.pixel_ratio);
             content = [ceiled, ceiled, height];
         }
-    } else if let Some((source, mut runs, atoms, heights, mixed, pseudos)) = match alt {
+    } else if let Some((source, mut runs, atoms, heights, mixed, pseudos, margin_room)) = match alt
+    {
         Some(alt) => Some((
             renderer::SharedString::from(alt.clone()),
             vec![style::text_run(style, units, alt.len())],
@@ -501,6 +502,7 @@ fn measure(
             Vec::new(),
             false,
             [false; 2],
+            0.,
         )),
         None => measured
             .texts
@@ -518,6 +520,10 @@ fn measure(
                     inline.line_heights.clone(),
                     inline.mixed(text),
                     inline.pseudos,
+                    match inline.leads {
+                        true => crate::render::inline::margin_room(doc, styles, id),
+                        false => 0.,
+                    },
                 )
             }),
     } {
@@ -650,6 +656,7 @@ fn measure(
                 strut,
                 text,
                 measured.pixel_ratio,
+                margin_room,
             )
             .into_iter()
             .enumerate()

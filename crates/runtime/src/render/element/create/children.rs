@@ -629,6 +629,7 @@ pub(super) fn children(
                     justify,
                     last,
                     reversed: style.get(Prop::WRITING_MODE) == Some("vertical-lr"),
+                    room: cx.margin_room(&data, id),
                 });
                 // Text keeps its box when runs come before it, so it can stay a scroll anchor.
                 paragraph = paragraph.id(("text", data.key));

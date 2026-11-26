@@ -1288,11 +1288,20 @@ fn text_and_font_values_parse_and_compute_like_chrome() {
         ("text-underline-position", "under left", true),
         ("text-underline-position", "left right", false),
         ("text-decoration-skip-ink", "none", true),
-        ("text-emphasis", "dot", false),
+        ("text-emphasis", "filled red", true),
+        ("text-emphasis", "red open circle", true),
+        ("text-emphasis", "filled red dot", false),
+        ("text-emphasis", "red blue", false),
+        ("text-emphasis-style", "'x'", true),
+        ("text-emphasis-style", "filled 'x'", false),
+        ("text-emphasis-style", "dot circle", false),
+        ("text-emphasis-position", "left under", true),
+        ("text-emphasis-position", "left", false),
+        ("-webkit-text-emphasis-color", "red", true),
     ] {
         assert_eq!(
             crate::css::value::grammar::supports(name, value),
-            (name != "text-emphasis").then_some(supported),
+            Some(supported),
             "{name}: {value}"
         );
     }

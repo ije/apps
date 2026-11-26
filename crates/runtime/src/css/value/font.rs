@@ -102,6 +102,7 @@ pub(crate) fn ordered(name: &str, value: &str) -> Option<Option<String>> {
         name,
         "hyphenate-character" | "font-size-adjust" | "text-underline-position" | "text-indent"
     ) && !name.starts_with("font-variant")
+        && !name.starts_with("text-emphasis")
     {
         return None;
     }
@@ -145,6 +146,13 @@ pub(crate) fn ordered(name: &str, value: &str) -> Option<Option<String>> {
                     .then(|| parts.into_iter().flatten().collect::<Vec<_>>().join(" "))
             }
         },
+        "text-emphasis" => emphasis(value).map(|parts| parts.join(" ")),
+        "text-emphasis-style" => emphasis_style(&tokens),
+        "text-emphasis-position" => {
+            let parts = [pick(&["over", "under"]), pick(&["right", "left"])];
+            (parts[0].is_some() && count(&parts))
+                .then(|| parts.into_iter().flatten().collect::<Vec<_>>().join(" "))
+        }
         "text-indent" => {
             let keywords = [pick(&["hanging"]), pick(&["each-line"])];
             let mut lengths =
@@ -164,6 +172,56 @@ pub(crate) fn ordered(name: &str, value: &str) -> Option<Option<String>> {
         }
         _ => return None,
     })
+}
+
+/// `text-emphasis` as its style and color, `initial` for the one it leaves out, or `None` when it is invalid.
+#[cold]
+pub(crate) fn emphasis(value: &str) -> Option<[String; 2]> {
+    let tokens = components(value, ' ');
+    let style = |token: &&str| emphasis_style(&[token]).is_some();
+    let (color, styles) = match tokens.iter().position(|token| !style(token)) {
+        None => (None, &tokens[..]),
+        Some(0) => (Some(tokens[0]), &tokens[1..]),
+        Some(at) if at + 1 == tokens.len() => (Some(tokens[at]), &tokens[..at]),
+        _ => return None,
+    };
+    let lower = color.map(str::to_ascii_lowercase);
+    if lower
+        .as_ref()
+        .is_some_and(|color| !crate::css::value::grammar::syntax_matches("<color>", color))
+    {
+        return None;
+    }
+    let initial = || "initial".to_owned();
+    let style = match styles {
+        [] if color.is_some() => initial(),
+        styles => emphasis_style(styles)?,
+    };
+    Some([style, color.map_or_else(initial, str::to_owned)])
+}
+
+/// `text-emphasis-style` as Chrome writes it: the fill before the shape.
+fn emphasis_style(tokens: &[&str]) -> Option<String> {
+    let kind = |token: &str| match token.to_ascii_lowercase().as_str() {
+        "filled" | "open" => Some(0),
+        "dot" | "circle" | "double-circle" | "triangle" | "sesame" => Some(1),
+        "none" => Some(2),
+        _ if token.len() > 1 && token.starts_with(['"', '\'']) => Some(2),
+        _ => None,
+    };
+    let text = |token: &str| match kind(token) {
+        Some(2) => token.to_owned(),
+        _ => token.to_ascii_lowercase(),
+    };
+    match *tokens {
+        [one] => kind(one).map(|_| text(one)),
+        [a, b] => match (kind(a)?, kind(b)?) {
+            (0, 1) => Some(format!("{} {}", text(a), text(b))),
+            (1, 0) => Some(format!("{} {}", text(b), text(a))),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// `font-variant` from its longhands, when it can express them.

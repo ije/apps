@@ -2,6 +2,7 @@ use crate::style;
 use renderer::{AlignItems, Pixels, px};
 
 // How far each line of a paragraph reaches above and below its baseline, with its inline boxes and the strut.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn row_extents<'a>(
     lines: impl IntoIterator<Item = &'a renderer::TextLine>,
     runs: &[renderer::TextRun],
@@ -10,6 +11,7 @@ pub(crate) fn row_extents<'a>(
     strut: (renderer::FontId, Pixels, Pixels),
     system: &renderer::TextSystem,
     scale: f32,
+    room: f32,
 ) -> Vec<[Pixels; 2]> {
     let inline = |font, size: Pixels, line: Option<f32>| {
         let [ascent, descent, gap] = system.line_metrics(font, size * scale).map(f32::from);
@@ -25,7 +27,10 @@ pub(crate) fn row_extents<'a>(
             Some(*end)
         })
         .collect();
+    let marked = runs.iter().any(|run| run.emphasis.is_some());
     let mut rows = Vec::new();
+    // How far the emphasis marks and the glyphs of each row reach over and under its baseline.
+    let mut marks: Vec<[f32; 4]> = Vec::new();
     let mut edges = Vec::new();
     let mut offset = 0;
     for line in lines {
@@ -33,6 +38,9 @@ pub(crate) fn row_extents<'a>(
         let ends: Vec<usize> = (1..line.rows()).map(|row| line.row_index(row)).collect();
         let first = rows.len();
         rows.resize(first + ends.len() + 1, root);
+        if marked {
+            marks.resize(rows.len(), [0.; 4]);
+        }
         // Glyphs of one face and size measure once per row, line height and source run.
         let mut last = None;
         for glyph in &layout.glyphs {
@@ -56,6 +64,21 @@ pub(crate) fn row_extents<'a>(
                     rows[row][1].max(if below - root[1] < 1. { 0. } else { below }),
                 ];
                 continue;
+            }
+            // Like Chrome, glyphs count only inside their em box, and an emphasis mark is half the font size beyond them.
+            if marked && let Some(run) = runs.get(run_ends.partition_point(|&end| end <= at)) {
+                let size = f32::from(run.font_size.unwrap_or(layout.font_size)) * scale;
+                let em = system.metrics(glyph.font).em_ascent;
+                let line = system.line_metrics(glyph.font, px(size)).map(f32::from);
+                let edges = [line[0].min(size * em), line[1].min(size * (1. - em))];
+                let kept = &mut marks[row];
+                for side in 0..2 {
+                    kept[side + 2] = kept[side + 2].max(edges[side].ceil());
+                }
+                if let Some(mark) = &run.emphasis {
+                    let side = usize::from(mark.under);
+                    kept[side] = kept[side].max((edges[side] + size / 2.).ceil());
+                }
             }
             let kind = heights
                 .get(heights.partition_point(|(end, _)| *end <= at))
@@ -91,6 +114,23 @@ pub(crate) fn row_extents<'a>(
             *above = above.max(height - *below);
         } else {
             *below = below.max(height - *above);
+        }
+    }
+    // Like Chrome, marks that overflow a row move it down, less the room that the row before leaves below its glyphs,
+    // and marks under the glyphs move the next row down, less the room above its glyphs.
+    // The first row can reach into the margin before its block.
+    let (mut overflow, mut room) = (0f32, room * scale);
+    for (row, [over, under, top, bottom]) in marks.iter().enumerate() {
+        let [above, below] = rows[row];
+        let lift = (over - above).max(0.);
+        rows[row][0] += match overflow > 0. {
+            true => lift + overflow - overflow.min((above - top).max(0.)),
+            false => (lift - room).max(0.),
+        };
+        overflow = (under - below).max(0.);
+        room = (below - bottom).max(0.);
+        if row + 1 == marks.len() {
+            rows[row][1] += overflow;
         }
     }
     rows.into_iter()

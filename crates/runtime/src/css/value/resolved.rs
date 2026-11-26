@@ -1115,25 +1115,26 @@ pub(crate) fn resolved(
             "dense"
         }
         .to_owned(),
-        "text-emphasis" => {
-            let (mut fill, mut shape, mut color) = (None, None, "currentcolor");
-            for part in components(&value, ' ') {
-                match part {
-                    "filled" | "open" => fill = Some(part),
-                    "none" | "dot" | "circle" | "double-circle" | "triangle" | "sesame" => {
-                        shape = Some(part)
-                    }
-                    _ if part.starts_with(['"', '\'']) => shape = Some(part),
-                    _ => color = part,
-                }
-            }
-            let style = match (fill, shape) {
-                (None, None) => "none".to_owned(),
-                (Some("open"), shape) => format!("open {}", shape.unwrap_or("dot")),
-                (_, shape) => shape.unwrap_or("dot").to_owned(),
+        // Like Chrome, a fill alone has the dot, or the sesame in vertical text, and `filled` goes without a shape.
+        "text-emphasis-style" => {
+            let shape = match style.get(Prop::WRITING_MODE) {
+                Some(mode) if mode.starts_with('v') || mode.starts_with('s') => "sesame",
+                _ => "dot",
             };
-            format!("{style} {}", paint(color))
+            match value.strip_prefix(['\'', '"']) {
+                Some(text) => {
+                    let text = &text[..text.len().saturating_sub(1)];
+                    let text = crate::css::selector::unescape(text, |_| false).0;
+                    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+                }
+                None => match value.as_str() {
+                    "filled" => shape.into(),
+                    "open" => format!("open {shape}"),
+                    _ => value.trim_start_matches("filled ").to_owned(),
+                },
+            }
         }
+        "text-emphasis-position" => value.trim_end_matches(" right").to_owned(),
         "font-stretch" => match value.as_str() {
             "ultra-condensed" => "50%",
             "extra-condensed" => "62.5%",

@@ -106,7 +106,8 @@ impl Line {
                 .is_some_and(|before| self.glyphs[before].index > index)
     }
 
-    fn right_of(&self, at: usize) -> Pixels {
+    /// Where the glyph at visual place `at` ends, before the edges of inline boxes after it.
+    pub fn right_of(&self, at: usize) -> Pixels {
         match self.rights.get(at) {
             Some(&right) => right,
             None => self.glyphs.get(at + 1).map_or(self.width, |next| next.x),

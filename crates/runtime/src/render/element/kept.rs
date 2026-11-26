@@ -40,6 +40,8 @@ pub(crate) enum Query {
     Definite(u32),
     Shrinks(u32),
     Spliced(u32),
+    // The margins before the first line of the node, where its emphasis marks can reach.
+    Room(u32),
 }
 
 impl Query {
@@ -62,6 +64,7 @@ impl Query {
             Query::Definite(node) => Query::Definite(at(node)?),
             Query::Shrinks(node) => Query::Shrinks(at(node)?),
             Query::Spliced(node) => Query::Spliced(at(node)?),
+            Query::Room(node) => Query::Room(at(node)?),
             query => query,
         })
     }

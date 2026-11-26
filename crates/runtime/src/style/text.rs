@@ -353,6 +353,45 @@ pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::
                 let color = style.get(Prop::WEBKIT_TEXT_STROKE_COLOR).and_then(color);
                 (renderer::px(width), color.map_or(ink, rgba))
             }),
+        emphasis: style
+            .get(Prop::TEXT_EMPHASIS_STYLE)
+            .filter(|value| !matches!(*value, "none" | "\"\"" | "''"))
+            .map(|value| {
+                let mode = style.get(Prop::WRITING_MODE).unwrap_or("h");
+                let left =
+                    (style.get(Prop::TEXT_EMPHASIS_POSITION)).is_some_and(|at| at.contains("left"));
+                let mark = match value.strip_prefix(['"', '\'']) {
+                    Some(text) => {
+                        crate::css::selector::unescape(&text[..text.len() - 1], |_| false)
+                            .0
+                            .into()
+                    }
+                    None => {
+                        let shape = ["dot", "double-circle", "circle", "triangle", "sesame"]
+                            .iter()
+                            .position(|shape| value.ends_with(shape))
+                            .unwrap_or(if mode.starts_with('h') { 0 } else { 4 });
+                        let open = usize::from(value.starts_with("open"));
+                        "•◦◉◎●○▲△﹅﹆"
+                            .chars()
+                            .nth(shape * 2 + open)
+                            .unwrap_or('•')
+                            .to_string()
+                            .into()
+                    }
+                };
+                Rc::new(renderer::Emphasis {
+                    mark,
+                    color: (style.get(Prop::TEXT_EMPHASIS_COLOR).and_then(color)).map_or(ink, rgba),
+                    // Vertical lines lay out turned, with their top at the right, or at the left in `sideways-lr`.
+                    under: match mode {
+                        "horizontal-tb" | "h" => style
+                            .get(Prop::TEXT_EMPHASIS_POSITION)
+                            .is_some_and(|at| at.starts_with("under")),
+                        _ => left != (mode == "sideways-lr"),
+                    },
+                })
+            }),
     }
 }
 

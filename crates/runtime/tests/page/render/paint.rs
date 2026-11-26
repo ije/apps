@@ -343,6 +343,43 @@ fn text_strokes_draw_hollow_glyphs_like_chrome() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn emphasis_marks_draw_over_letters_and_grow_the_line_like_chrome() {
+    run_hidden(
+        r#"
+        await load('marks.html');
+        await win.webContents.capturePage();
+        const bytes = (await win.webContents.capturePage({ x: 0, y: 0, width: 200, height: 200 })).toBitmap();
+        // The capture has device pixels.
+        const scale = Math.round(Math.sqrt(bytes.length / 160000));
+        const pixel = (x, y) => [2, 1, 0].map(at => bytes[(y * scale * 200 * scale + x * scale) * 4 + at]);
+        // Runs of marks in the row with the most of them, in a band of rows.
+        const marks = (from, to, ink) => {
+            let best = '';
+            for (let y = from; y < to; y++) {
+                const row = Array.from({ length: 200 }, (_, x) => ink(...pixel(x, y)) ? 'm' : 'w').join('').replace(/(.)\1*/g, '$1');
+                if (row.length > best.length) best = row;
+            }
+            return best;
+        };
+        const red = (r, g, b) => r > 200 && g < 80 && b < 80, blue = (r, g, b) => b > 200 && r < 80 && g < 80;
+        // Two letters with a space between them get two marks, over the text in a line that grew for them.
+        if (marks(0, 20, red) !== 'wmwmw') fail('marks over: ' + marks(0, 20, red));
+        if (marks(30, 60, red) !== 'w') fail('marks inside the line: ' + marks(30, 60, red));
+        if (marks(100, 150, blue) !== 'wmwmw') fail('marks under: ' + marks(100, 150, blue));
+        const height = await win.webContents.executeJavaScript('document.getElementById("a").getBoundingClientRect().height');
+        if (height !== 59) fail('line height: ' + height);
+        "#,
+        &[(
+            "marks.html",
+            "<style>body{margin:0;background:#fff}div{font:40px/1 Helvetica;display:flow-root;padding-left:10px}</style>\
+             <div id=a style='text-emphasis:circle #f00'>I I</div>\
+             <div style='text-emphasis:circle #00f;text-emphasis-position:under'>I, I</div>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn focus_rings_paint_like_chrome() {
     run_hidden(
         r#"

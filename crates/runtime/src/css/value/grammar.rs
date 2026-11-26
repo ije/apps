@@ -618,6 +618,9 @@ const INITIAL: &[(&str, &str)] = &[
     ("text-decoration-skip-ink", "auto"),
     ("text-decoration-style", "solid"),
     ("text-decoration-thickness", "auto"),
+    ("text-emphasis-color", "currentcolor"),
+    ("text-emphasis-position", "over"),
+    ("text-emphasis-style", "none"),
     ("text-indent", "0px"),
     ("text-overflow", "clip"),
     ("text-rendering", "auto"),
@@ -658,6 +661,10 @@ const INITIAL: &[(&str, &str)] = &[
 ];
 
 pub(crate) const SHORTHANDS: &[(&str, &[&str])] = &[
+    (
+        "text-emphasis",
+        &["text-emphasis-style", "text-emphasis-color"],
+    ),
     (
         "-webkit-text-stroke",
         &["-webkit-text-stroke-width", "-webkit-text-stroke-color"],

@@ -474,7 +474,10 @@ props! {
     TEXT_DECORATION_SKIP_INK "text-decoration-skip-ink" inherited "auto|none",
     TEXT_DECORATION_STYLE "text-decoration-style" inherited "solid|double|dotted|dashed|wavy",
     TEXT_DECORATION_THICKNESS "text-decoration-thickness" inherited "auto|from-font|<length-percentage>",
-    TEXT_EMPHASIS "text-emphasis" inherited,
+    TEXT_EMPHASIS "text-emphasis" "*",
+    TEXT_EMPHASIS_COLOR "text-emphasis-color" inherited "<color>",
+    TEXT_EMPHASIS_POSITION "text-emphasis-position" inherited "*",
+    TEXT_EMPHASIS_STYLE "text-emphasis-style" inherited "*",
     TEXT_INDENT "text-indent" inherited "*",
     TEXT_ORIENTATION "text-orientation" inherited,
     TEXT_OVERFLOW "text-overflow" "clip|ellipsis",
@@ -600,7 +603,7 @@ impl Prop {
 
     // The standard property that Chrome also takes under this `-webkit-` name.
     pub(crate) fn unprefixed(name: &str) -> Option<&str> {
-        const ALIASES: &str = "hyphenate-character align-content align-items align-self background-origin background-size animation animation-delay animation-direction animation-duration animation-fill-mode animation-iteration-count animation-name animation-play-state animation-timing-function appearance backface-visibility border-bottom-left-radius border-bottom-right-radius border-radius border-top-left-radius border-top-right-radius box-shadow box-sizing clip-path column-count column-gap column-rule column-rule-color column-rule-style column-rule-width column-span column-width columns filter flex flex-basis flex-direction flex-flow flex-grow flex-shrink flex-wrap justify-content mask mask-image mask-origin mask-position mask-repeat mask-size order perspective perspective-origin transform transform-origin transform-style transition transition-delay transition-duration transition-property transition-timing-function user-select";
+        const ALIASES: &str = "hyphenate-character align-content align-items align-self background-origin background-size animation animation-delay animation-direction animation-duration animation-fill-mode animation-iteration-count animation-name animation-play-state animation-timing-function appearance backface-visibility border-bottom-left-radius border-bottom-right-radius border-radius border-top-left-radius border-top-right-radius box-shadow box-sizing clip-path column-count column-gap column-rule column-rule-color column-rule-style column-rule-width column-span column-width columns filter flex flex-basis flex-direction flex-flow flex-grow flex-shrink flex-wrap justify-content mask mask-image mask-origin mask-position mask-repeat mask-size order perspective perspective-origin text-emphasis text-emphasis-color text-emphasis-position text-emphasis-style transform transform-origin transform-style transition transition-delay transition-duration transition-property transition-timing-function user-select";
         let base = name.strip_prefix("-webkit-")?;
         ALIASES
             .split(' ')

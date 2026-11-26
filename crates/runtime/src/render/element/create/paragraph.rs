@@ -163,6 +163,7 @@ pub(super) fn paragraph(
         justify,
         last,
         reversed: style.get(Prop::WRITING_MODE) == Some("vertical-lr"),
+        room: cx.margin_room(&data, id),
     });
     let alone = el.kids().is_empty()
         && placed.is_empty()

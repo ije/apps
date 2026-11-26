@@ -128,6 +128,7 @@ pub fn line(
         clear: 0,
         tab_size: 8.,
         stroke: None,
+        emphasis: None,
     };
     let font_size = size
         .split_whitespace()

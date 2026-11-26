@@ -233,6 +233,9 @@ impl<'a> Build<'a> {
             )),
             Query::LineBase(node) => hashed(definite_line(doc, styles, node as usize)),
             Query::Shrinks(node) => hashed(shrinks_around(doc, styles, node as usize)),
+            Query::Room(node) => {
+                hashed(crate::render::inline::margin_room(doc, styles, node as usize).to_bits())
+            }
         };
         if now == read.value {
             Replay::Same

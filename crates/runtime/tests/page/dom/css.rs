@@ -601,7 +601,7 @@ fn css_global_supports_escape_and_register_property() {
         "<html><head><style>.x{width:var(--w)}</style></head><body><div class=x id=x><p id=c></p></div></body></html>",
     );
     engine.eval(r#"
-        if (!CSS.supports('display', 'grid') || CSS.supports('width', 'bogus') || !CSS.supports('(filter: blur(1px)) and (not (display: nonsense))') || !CSS.supports('display: flex') || CSS.supports('text-emphasis', 'dot') || !CSS.supports('word-break', 'break-all')) throw Error('supports');
+        if (!CSS.supports('display', 'grid') || CSS.supports('width', 'bogus') || !CSS.supports('(filter: blur(1px)) and (not (display: nonsense))') || !CSS.supports('display: flex') || !CSS.supports('text-emphasis', 'dot') || !CSS.supports('word-break', 'break-all')) throw Error('supports');
         if (!CSS.supports('selector(:has(a))') || CSS.supports('selector(::nonsense(')) throw Error('selector()');
         if (CSS.escape('1a b') !== '\\31 a\\ b' || CSS.escape('-') !== '\\-' || CSS.escape('a#b') !== 'a\\#b') throw Error('escape ' + CSS.escape('1a b'));
         CSS.registerProperty({ name: '--w', syntax: '<length>', inherits: false, initialValue: '12px' });

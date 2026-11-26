@@ -419,6 +419,7 @@ pub(crate) fn widest_option(
                     clear: 0,
                     tab_size: 8.,
                     stroke: None,
+                    emphasis: None,
                 };
                 let line = text.shape_line(&label, px(em), &run).line;
                 widest = widest.max(f32::from(line.width));

@@ -578,6 +578,12 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
             .into(),
             4,
         ),
+        "text-emphasis" => (
+            ["text-emphasis-style", "text-emphasis-color"]
+                .map(String::from)
+                .into(),
+            16,
+        ),
         "-webkit-text-stroke" => (
             ["width", "color"]
                 .map(|part| format!("{key}-{part}"))
@@ -984,6 +990,10 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
             };
             values
         }
+        16 => match crate::css::value::font::emphasis(value) {
+            Some(values) => values.into(),
+            None => return true,
+        },
         15 => match variants(&value.to_ascii_lowercase()) {
             Some(values) => values.into(),
             None => return true,
