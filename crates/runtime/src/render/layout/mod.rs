@@ -226,9 +226,9 @@ impl Layout {
     }
 
     pub(crate) fn forget_all(&mut self, gone: &rustc_hash::FxHashSet<usize>) {
-        self.measurements
-            .sizes
-            .retain(|(node, ..), _| !gone.contains(node));
+        for node in gone {
+            self.measurements.boxes.remove(node);
+        }
     }
 
     pub(crate) fn trim(&mut self, len: usize) {

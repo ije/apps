@@ -552,8 +552,9 @@ pub(super) fn remeasure(
     fresh: &mut Option<Vec<usize>>,
 ) {
     dom.layout.measurements.noted.clear();
+    dom.layout.measurements.lines.clear();
     if dom.layout.cull.frame != cx.frame {
-        dom.layout.measurements.retain(|_| false);
+        dom.layout.measurements.boxes.clear();
         // Text keeps the fonts that it resolved, so a font load must build it again.
         dom.layout.measurements.texts.clear();
         dom.layout.grids.clear();
@@ -576,17 +577,16 @@ pub(super) fn remeasure(
             }
         }
         let measured = &mut dom.layout.measurements;
-        measured.retain(|id| !nodes.contains(&id));
         let (mut walked, mut adjoined) =
             (cx.view.walked.borrow_mut(), cx.view.adjoined.borrow_mut());
         for id in &nodes {
+            measured.boxes.remove(id);
             measured.texts.remove(id);
             dom.layout.grids.remove(id);
             walked.remove(id);
             adjoined.remove(id);
         }
     }
-    let mut stale = false;
     let mut around = rustc_hash::FxHashSet::default();
     let mut regridded = rustc_hash::FxHashSet::default();
     for &id in changed {
@@ -598,6 +598,7 @@ pub(super) fn remeasure(
             let mut node = Some(id);
             while let Some(id) = node.filter(|&id| around.insert(id)) {
                 info[id].flags |= cull::GEOMETRY_CHANGED;
+                dom.layout.measurements.boxes.remove(&id);
                 fresh.iter_mut().for_each(|fresh| fresh.push(id));
                 node = dom.tree.flat_parent(cx.doc, &styles.children, id);
             }
@@ -609,14 +610,7 @@ pub(super) fn remeasure(
                     .then(|| dom.tree.flat_parent(cx.doc, &styles.children, id))
                     .flatten();
             }
-            stale = true;
         }
-    }
-    if stale {
-        dom.layout.measurements.retain(|id| {
-            info.get(id)
-                .is_none_or(|info| info.flags & cull::GEOMETRY_CHANGED == 0)
-        });
     }
     dom.layout.text_layouts.clear();
 }

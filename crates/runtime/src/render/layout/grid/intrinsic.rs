@@ -115,7 +115,7 @@ pub(crate) fn keyword_size(
         0 => (id, RAW, None, true),
         _ => (id, width.map(f32::to_bits), RAW, true),
     };
-    let [min, max, ..] = measured.sizes.get(&key).copied()?;
+    let [min, max, ..] = measured.size(key)?;
     let room = (space[axis] - outer).max(0.);
     let auto = match (axis, fills) {
         // The automatic minimum is 0, also for flex items, whose own one layout adds.
@@ -163,8 +163,8 @@ pub(crate) fn intrinsic(
         .unwrap_or_default();
     }
     let key = (id, width.map(f32::to_bits), height.map(f32::to_bits));
-    if let Some(value) = measured.sizes.get(&(key.0, key.1, key.2, false)) {
-        return *value;
+    if let Some(value) = measured.size((key.0, key.1, key.2, false)) {
+        return value;
     }
     if super::super::size::turned(doc, styles, id).is_some() {
         let units = &styles.lengths[id];
@@ -180,11 +180,9 @@ pub(crate) fn intrinsic(
             block + across,
             inline + along,
         ];
-        measured.sizes.insert((key.0, key.1, key.2, false), result);
+        measured.set_size((key.0, key.1, key.2, false), result);
         let own = |value: f32| [value.max(0.), value.min(0.)];
-        measured
-            .margins
-            .insert(key, [own(margin[0]), own(margin[2])]);
+        measured.set_margins(key, [own(margin[0]), own(margin[2])]);
         return result;
     }
     measure(doc, id, styles, width, height, text, measured, key)
@@ -204,8 +202,8 @@ pub(crate) fn frame_size(
     measured: &mut Measurements,
 ) -> [f32; 2] {
     let key = (id, inline.map(f32::to_bits), Some(FRAME));
-    let [_, widest, _, height] = match measured.sizes.get(&(key.0, key.1, key.2, false)) {
-        Some(value) => *value,
+    let [_, widest, _, height] = match measured.size((key.0, key.1, key.2, false)) {
+        Some(value) => value,
         None => measure(doc, id, styles, inline, None, text, measured, key),
     };
     [widest, height]
@@ -223,8 +221,8 @@ fn measure(
     key: (usize, Option<u32>, Option<u32>),
 ) -> [f32; 4] {
     // Clear before this measure, so the lead that it records stays with its size.
-    if measured.sizes.len() > 65536 {
-        measured.retain(|_| false);
+    if measured.boxes.len() > 32768 {
+        measured.boxes.clear();
     }
     let node = &doc.nodes[id];
     let style = &styles.values[id];
@@ -322,7 +320,7 @@ fn measure(
     // Content-sized widths measure the content without a width first.
     if let Some(width) = width.filter(|_| keywords.get()[0]) {
         intrinsic(doc, id, styles, None, None, text, measured);
-        let raw = measured.sizes.get(&(id, RAW, None, true)).copied();
+        let raw = measured.size((id, RAW, None, true));
         let [min, max, ..] = raw.unwrap_or_default();
         let room = (width - outer[0]).max(0.);
         let shrinks = display.starts_with("inline")
@@ -495,40 +493,43 @@ fn measure(
             let ceiled = leaf_ceil(width + padding, measured.pixel_ratio);
             content = [ceiled, ceiled, height];
         }
-    } else if let Some((source, mut runs, atoms, heights, mixed, pseudos, margin_room)) = match alt
+    } else if let Some((source, mut runs, atoms, heights, mixed, pseudos, margin_room, inline)) =
+        match alt {
+            Some(alt) => Some((
+                renderer::SharedString::from(alt.clone()),
+                vec![style::text_run(style, units, alt.len())],
+                Vec::new(),
+                Vec::new(),
+                false,
+                [false; 2],
+                0.,
+                None,
+            )),
+            None => measured
+                .texts
+                .entry(id)
+                .or_insert_with(|| {
+                    crate::render::inline::inline_text(doc, styles, id, &[], &[], [true; 2])
+                        .map(std::rc::Rc::new)
+                })
+                .clone()
+                .map(|inline| {
+                    (
+                        inline.text.clone(),
+                        inline.runs.to_vec(),
+                        inline.atoms.clone(),
+                        inline.line_heights.clone(),
+                        inline.mixed(text),
+                        inline.pseudos,
+                        match inline.leads {
+                            true => crate::render::inline::margin_room(doc, styles, id),
+                            false => 0.,
+                        },
+                        Some(inline),
+                    )
+                }),
+        }
     {
-        Some(alt) => Some((
-            renderer::SharedString::from(alt.clone()),
-            vec![style::text_run(style, units, alt.len())],
-            Vec::new(),
-            Vec::new(),
-            false,
-            [false; 2],
-            0.,
-        )),
-        None => measured
-            .texts
-            .entry(id)
-            .or_insert_with(|| {
-                crate::render::inline::inline_text(doc, styles, id, &[], &[], [true; 2])
-                    .map(std::rc::Rc::new)
-            })
-            .clone()
-            .map(|inline| {
-                (
-                    inline.text.clone(),
-                    inline.runs.to_vec(),
-                    inline.atoms.clone(),
-                    inline.line_heights.clone(),
-                    inline.mixed(text),
-                    inline.pseudos,
-                    match inline.leads {
-                        true => crate::render::inline::margin_room(doc, styles, id),
-                        false => 0.,
-                    },
-                )
-            }),
-    } {
         taken = pseudos;
         let mut boxes = Vec::with_capacity(atoms.len());
         for atom in &atoms {
@@ -600,24 +601,19 @@ fn measure(
         );
         let indent =
             crate::render::element::query::row_indents(style, units, available.unwrap_or(0.));
-        let shape = |runs: &[renderer::TextRun]| {
-            text.shape_text(
-                &source,
-                renderer::px(units.font.em),
-                runs,
-                &renderer::Wrapping {
-                    width: available.filter(|_| wrap).map(renderer::px),
-                    max_lines: style
-                        .get(Prop::WEBKIT_LINE_CLAMP)
-                        .or_else(|| style.get(Prop::LINE_CLAMP))
-                        .and_then(|value| value.parse::<usize>().ok())
-                        .map(|lines| lines.max(1)),
-                    word_break,
-                    indent,
-                    ..Default::default()
-                },
-            )
+        let wrapping = renderer::Wrapping {
+            width: available.filter(|_| wrap).map(renderer::px),
+            max_lines: style
+                .get(Prop::WEBKIT_LINE_CLAMP)
+                .or_else(|| style.get(Prop::LINE_CLAMP))
+                .and_then(|value| value.parse::<usize>().ok())
+                .map(|lines| lines.max(1)),
+            word_break,
+            indent,
+            ..Default::default()
         };
+        let em = renderer::px(units.font.em);
+        let shape = |runs: &[renderer::TextRun]| text.shape_text(&source, em, runs, &wrapping);
         let float = if alt.is_some() { 16. } else { 0. };
         let beside = alt
             .is_some()
@@ -633,7 +629,23 @@ fn measure(
                     .is_none_or(|(width, line)| f32::from(line.first_row_end()) <= width + 0.01)
             });
         let top = if beside.is_none() { float } else { 0. };
-        let lines = beside.unwrap_or_else(|| shape(&runs));
+        // Text that does not wrap shapes the same for each width that it is measured at.
+        let lines = match (beside, inline.filter(|_| atoms.is_empty())) {
+            (Some(lines), _) => std::rc::Rc::new(lines),
+            (None, Some(inline)) => match measured.lines.get(&id).filter(|entry| {
+                std::rc::Rc::ptr_eq(&entry.0, &inline) && entry.1 == em && entry.2 == wrapping
+            }) {
+                Some(entry) => entry.3.clone(),
+                None => {
+                    let lines = std::rc::Rc::new(shape(&runs));
+                    measured
+                        .lines
+                        .insert(id, (inline, em, wrapping, lines.clone()));
+                    lines
+                }
+            },
+            (None, None) => std::rc::Rc::new(shape(&runs)),
+        };
         let mut opening = Vec::new();
         let mut at = 0;
         for run in &*runs {
@@ -651,7 +663,7 @@ fn measure(
                 renderer::px(units.font.lh),
             );
             for (row, [above, below]) in super::super::line::row_extents(
-                &lines,
+                lines.iter(),
                 &runs,
                 &heights,
                 &boxes,
@@ -716,7 +728,7 @@ fn measure(
         if !wrap {
             content[0] = content[1] - float;
         }
-        measured.leads.insert(key, lead + top);
+        measured.set_lead(key, lead + top);
         let ceil = |width: f32| leaf_ceil(width, measured.pixel_ratio);
         content = [
             ceil(content[0].max(float)),
@@ -730,13 +742,13 @@ fn measure(
     {
         let mut extent = |width: Option<f32>, height: Option<f32>| {
             let key = (id, width.map(f32::to_bits), height.map(f32::to_bits), true);
-            if let Some(&[columns, rows, captions, _]) = measured.sizes.get(&key) {
+            if let Some([columns, rows, captions, _]) = measured.size(key) {
                 return [columns, rows, captions];
             }
             let grid = layout(doc, id, styles, width, height, None, None, text, measured);
             let [columns, rows] = [0, 1].map(|axis| grid.extent(axis));
             let captions = grid.captions[0] + grid.captions[1];
-            measured.sizes.insert(key, [columns, rows, captions, 0.]);
+            measured.set_size(key, [columns, rows, captions, 0.]);
             [columns, rows, captions]
         };
         let [min, ..] = extent(Some(0.), None);
@@ -1002,7 +1014,7 @@ fn measure(
                     intrinsic(doc, child, styles, available, None, text, measured);
                 content = [content[0].max(min), content[1].max(max), content[2]];
                 let key = (child, available.map(f32::to_bits), None);
-                let [above, below] = measured.margins.get(&key).copied().unwrap_or_default();
+                let [above, below] = measured.margins(key).unwrap_or_default();
                 // Flex children keep their margins apart. Like Chrome, block children collapse adjoining ones.
                 if flex {
                     content[2] += height + gap[1];
@@ -1374,9 +1386,7 @@ fn measure(
     let mut bounds = [fixed; 2];
     if keywords.get()[0] {
         if width.is_none() {
-            measured
-                .sizes
-                .insert((id, RAW, None, true), [content[0], content[1], 0., 0.]);
+            measured.set_size((id, RAW, None, true), [content[0], content[1], 0., 0.]);
         }
         for (end, bounds) in bounds.iter_mut().enumerate() {
             let ends = [content[0], content[1]];
@@ -1437,9 +1447,7 @@ fn measure(
         });
     if keywords.get()[1] {
         let size = ratio.unwrap_or(content[2]);
-        measured
-            .sizes
-            .insert((id, key.1, RAW, true), [size, size, 0., 0.]);
+        measured.set_size((id, key.1, RAW, true), [size, size, 0., 0.]);
         let props = [Prop::HEIGHT, Prop::MIN_HEIGHT, Prop::MAX_HEIGHT];
         let room = height.map(|height| (height - outer[1]).max(0.));
         let base = height.unwrap_or(0.);
@@ -1477,7 +1485,7 @@ fn measure(
         && !matches!(node.tag.as_str(), "svg" | "input" | "select" | "textarea")
     {
         // The measure of the wrapped content reads the content sizes.
-        measured.sizes.insert((key.0, key.1, key.2, false), result);
+        measured.set_size((key.0, key.1, key.2, false), result);
         result[3] = intrinsic(
             doc,
             id,
@@ -1488,13 +1496,13 @@ fn measure(
             measured,
         )[3];
         let at = (id, Some((max + outer[0]).to_bits()), key.2);
-        sets = measured.margins.get(&at).copied().unwrap_or(sets);
-        if let Some(&lead) = measured.leads.get(&at) {
-            measured.leads.insert(key, lead);
+        sets = measured.margins(at).unwrap_or(sets);
+        if let Some(lead) = measured.lead(at) {
+            measured.set_lead(key, lead);
         }
     }
-    measured.sizes.insert((key.0, key.1, key.2, false), result);
-    measured.margins.insert(key, sets);
+    measured.set_size((key.0, key.1, key.2, false), result);
+    measured.set_margins(key, sets);
     result
 }
 
@@ -1603,8 +1611,8 @@ pub(super) fn first_baseline(
         return None;
     }
     if node.tag.starts_with('#') || measured.texts.get(&id).is_some_and(Option::is_some) {
-        let lead = measured.leads.get(&(id, width.map(f32::to_bits), None));
-        return Some(top + lead.copied().unwrap_or(0.) + strut(measured));
+        let lead = measured.lead((id, width.map(f32::to_bits), None));
+        return Some(top + lead.unwrap_or(0.) + strut(measured));
     }
     let display = style.get(Prop::DISPLAY).unwrap_or("");
     let flex = matches!(display, "flex" | "inline-flex");

@@ -331,9 +331,9 @@ pub(crate) fn reskip(
 ) {
     dom.layout.cull.reskipped = true;
     let measured = &mut dom.layout.measurements;
-    measured.retain(|node| !nodes.contains(&node));
     let mut kept = view.kept.borrow_mut();
     for node in nodes {
+        measured.boxes.remove(node);
         measured.texts.remove(node);
         dom.layout.grids.remove(node);
         kept.remove(node);

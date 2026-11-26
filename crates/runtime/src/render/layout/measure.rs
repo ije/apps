@@ -2,22 +2,40 @@ use crate::css;
 use crate::dom::Document;
 use crate::style::ComputedStyles;
 
+type Key = (usize, Option<u32>, Option<u32>);
+
+// The measures of a box for one width and height key.
+#[derive(Default)]
+pub(crate) struct Measure {
+    key: (Option<u32>, Option<u32>),
+    // The intrinsic sizes, and apart from them the column and row extents of a grid layout.
+    sizes: [Option<[f32; 4]>; 2],
+    // The top and bottom margins of the box, as [positive, negative] after they collapse with the margins of
+    // children that they adjoin.
+    margins: Option<[[f32; 2]; 2]>,
+    // How far the first line of a text box reaches above its strut.
+    lead: Option<f32>,
+}
+
 #[derive(Default)]
 pub(crate) struct Measurements {
-    // The last key field marks the column and row extents of a grid layout, which intrinsic sizes repeat.
-    #[allow(clippy::type_complexity)]
-    pub(crate) sizes: rustc_hash::FxHashMap<(usize, Option<u32>, Option<u32>, bool), [f32; 4]>,
-    // The top and bottom margins of each measured box, as [positive, negative] after they collapse with the
-    // margins of children that they adjoin.
-    #[allow(clippy::type_complexity)]
-    pub(crate) margins: rustc_hash::FxHashMap<(usize, Option<u32>, Option<u32>), [[f32; 2]; 2]>,
-    // How far the first line of a text box reaches above its strut, by the keys of `sizes`.
-    #[allow(clippy::type_complexity)]
-    pub(crate) leads: rustc_hash::FxHashMap<(usize, Option<u32>, Option<u32>), f32>,
+    // By node, so a changed node forgets its measures without a walk over all of them.
+    pub(crate) boxes: rustc_hash::FxHashMap<usize, Vec<Measure>>,
     pub(crate) pixel_ratio: f32,
     pub(crate) naturals: rustc_hash::FxHashMap<usize, [f32; 2]>,
     pub(crate) texts:
         rustc_hash::FxHashMap<usize, Option<std::rc::Rc<crate::render::inline::InlineText>>>,
+    // The last lines that a measure shaped from each text of `texts`, for one build.
+    #[allow(clippy::type_complexity)]
+    pub(crate) lines: rustc_hash::FxHashMap<
+        usize,
+        (
+            std::rc::Rc<crate::render::inline::InlineText>,
+            renderer::Pixels,
+            renderer::Wrapping,
+            std::rc::Rc<Vec<renderer::TextLine>>,
+        ),
+    >,
     // The text nodes in runs of more than one in flex and grid containers: `None` for a later node, which the
     // first builds, and for the first, whether the run has text other than white space.
     pub(crate) joined: rustc_hash::FxHashMap<usize, Option<bool>>,
@@ -39,11 +57,58 @@ pub(crate) struct Measurements {
 }
 
 impl Measurements {
-    /// Keeps the measured sizes, margins and leads of the boxes that `keep` takes.
-    pub(crate) fn retain(&mut self, keep: impl Fn(usize) -> bool) {
-        self.sizes.retain(|&(id, ..), _| keep(id));
-        self.margins.retain(|&(id, ..), _| keep(id));
-        self.leads.retain(|&(id, ..), _| keep(id));
+    fn find(&self, (id, width, height): Key) -> Option<&Measure> {
+        let list = self.boxes.get(&id)?;
+        list.iter().find(|measure| measure.key == (width, height))
+    }
+
+    fn find_mut(&mut self, (id, width, height): Key) -> &mut Measure {
+        let list = self.boxes.entry(id).or_default();
+        let at = match list
+            .iter()
+            .position(|measure| measure.key == (width, height))
+        {
+            Some(at) => at,
+            None => {
+                list.push(Measure {
+                    key: (width, height),
+                    ..Measure::default()
+                });
+                list.len() - 1
+            }
+        };
+        &mut list[at]
+    }
+
+    pub(crate) fn size(
+        &self,
+        (id, width, height, extent): (usize, Option<u32>, Option<u32>, bool),
+    ) -> Option<[f32; 4]> {
+        self.find((id, width, height))?.sizes[usize::from(extent)]
+    }
+
+    pub(crate) fn set_size(
+        &mut self,
+        (id, width, height, extent): (usize, Option<u32>, Option<u32>, bool),
+        size: [f32; 4],
+    ) {
+        self.find_mut((id, width, height)).sizes[usize::from(extent)] = Some(size);
+    }
+
+    pub(crate) fn margins(&self, key: Key) -> Option<[[f32; 2]; 2]> {
+        self.find(key)?.margins
+    }
+
+    pub(crate) fn set_margins(&mut self, key: Key, margins: [[f32; 2]; 2]) {
+        self.find_mut(key).margins = Some(margins);
+    }
+
+    pub(crate) fn lead(&self, key: Key) -> Option<f32> {
+        self.find(key)?.lead
+    }
+
+    pub(crate) fn set_lead(&mut self, key: Key, lead: f32) {
+        self.find_mut(key).lead = Some(lead);
     }
 
     /// Like CSS, each run of text nodes in a flex or grid container is one anonymous item. Its first node builds it
