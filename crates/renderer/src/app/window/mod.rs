@@ -1774,6 +1774,19 @@ impl Window {
         self.content_masks.pop();
     }
 
+    /// Clips what `f` paints to `mask` inside the content mask. A mask with radii takes the place of the radii of
+    /// the content mask.
+    pub fn with_content_mask<R>(
+        &mut self,
+        mask: Clip<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.push_content_mask(mask.intersect(&self.content_mask()));
+        let result = f(self);
+        self.pop_content_mask();
+        result
+    }
+
     /// Clips what `f` paints, also the out-of-flow boxes that escape the clips around them, as `clip-path`.
     pub fn with_group_clip<R>(&mut self, clip: Clip<Pixels>, f: impl FnOnce(&mut Self) -> R) -> R {
         self.group_clips.push(clip);

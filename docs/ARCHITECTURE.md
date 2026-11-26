@@ -252,6 +252,8 @@ The runtime reuses data across frames and releases temporary resources after act
 - macOS startup sets `MallocSpaceEfficient=1`. A global allocator caches small blocks per thread and returns them during idle cleanup.
 - After about one second without frames, a window releases spare GPU resources. Its last frame remains visible.
 - An inline SVG rasters at the size that its transforms show, and keeps its raster while that size stays within half of it, so an animated transform doesn't raster it in each frame. Boxes with the same mask inputs and size share one mask image.
+- A smooth CSS gradient rasters with fewer pixels, as far as the GPU's linear filtering stays within two color levels of the full raster. Hard stops and tile edges keep full pixels.
+- The box tree keeps the paint chunks of its boxes in one shared list and rarely used fields in a box of their own, so a box takes about 1 KB.
 
 The allocator belongs to `apps-runtime`, so a Rust app cannot define another global allocator. Memory policy lives in [malloc.rs](crates/runtime/src/malloc.rs), [jsc/mod.rs](crates/runtime/src/jsc/mod.rs), and the platform renderer.
 

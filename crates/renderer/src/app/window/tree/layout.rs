@@ -44,7 +44,7 @@ impl Tree {
             let slot = &tree.slots[index as usize];
             if slot.live
                 && slot.held
-                && let Some(inputs) = slot.inputs
+                && let Some(inputs) = slot.inputs()
             {
                 tree.compute(NodeId::from(index as usize), inputs, None);
             }
@@ -59,9 +59,11 @@ impl Tree {
                 return false;
             };
             let escape = slot.style.escape & Escape::PLACED;
-            let (Some(old), true, true) =
-                (slot.room, slot.live, escape != 0 && slot.parent != NONE)
-            else {
+            let (Some(old), true, true) = (
+                slot.cold.as_ref().and_then(|cold| cold.room),
+                slot.live,
+                escape != 0 && slot.parent != NONE,
+            ) else {
                 return false;
             };
             let Some(new) = room(tree.slots, slot.parent, escape, viewport_room) else {
