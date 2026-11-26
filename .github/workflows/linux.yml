@@ -1,0 +1,27 @@
+# The Linux checks, separate from ci.yml so they can be a required check of main.
+# They run for all changes, because a required check that never starts blocks a pull request.
+name: Linux
+on:
+  push:
+    branches: [main]
+  pull_request:
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/native
+      - run: bash scripts/check.sh
