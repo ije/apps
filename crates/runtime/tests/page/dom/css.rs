@@ -1134,3 +1134,39 @@ fn text_stroke_values_like_chrome() {
         if (getComputedStyle(document.body).outlineColor !== 'rgb(0, 95, 204)') throw Error('focus ring color value');
     "#, "test").unwrap();
 }
+
+#[test]
+fn typed_om_reads_and_writes_styles() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow().store.borrow_mut().pages.insert(1, Page {
+        doc: Document::parse("<html><style>#d{width:50%;transition-duration:1s,2s}</style><body><div id=d style='height:calc(10px + 2em);color:red;--x:a var(--y, 1px)'></div></body></html>"),
+        dirty: false, ..Default::default()
+    });
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    engine.eval(r#"
+        const check = (got, want) => { if (String(got) !== want) throw Error(`${got} !== ${want}`); };
+        const d = document.getElementById('d'), m = d.attributeStyleMap;
+        check(CSS.px(1).add(CSS.em(2)).sub(CSS.px(3)), 'calc(1px + 2em + -3px)');
+        check(CSS.px(6).div(CSS.px(3)).mul(2), 'calc(6px / 3px * 2)');
+        check(CSS.in(1).to('px'), '96px');
+        check(CSS.px(1).add(CSS.em(2), CSS.cm(1)).toSum('px', 'em'), 'calc(38.7953px + 2em)');
+        check(JSON.stringify(CSS.px(1).add(CSS.percent(5)).type()), '{"length":1,"percentHint":"length"}');
+        check(CSSNumericValue.parse('calc((1px + 2em) * 3)'), 'calc(3px + 6em)');
+        check(new CSSMathSum(CSS.px(1), new CSSMathNegate(CSS.em(2))), 'calc(1px - 2em)');
+        check(CSSStyleValue.parse('transform', 'translateX(1em) rotate(45deg)'), 'translate(1em, 0px) rotate(45deg)');
+        check(new CSSTranslate(CSS.px(1), CSS.px(2)).toMatrix(), 'matrix(1, 0, 0, 1, 1, 2)');
+        check(m.get('height').constructor.name + ' ' + m.get('height'), 'CSSMathSum calc(10px + 2em)');
+        check(m.get('color').constructor.name, 'CSSStyleValue');
+        check(m.get('--x')[1].fallback, ' 1px');
+        m.set('width', CSS.px(-5));
+        check(d.style.width, 'calc(-5px)');
+        let error; try { m.set('width', CSS.deg(1)); } catch (e) { error = e; }
+        check(error?.name, 'TypeError');
+        m.append('transition-duration', CSS.s(3));
+        check(d.style.transitionDuration, '3s');
+        check(d.computedStyleMap().get('opacity'), '1');
+        check(document.styleSheets[0].cssRules[0].styleMap.getAll('transition-duration').join(), '1s,2s');
+        m.clear();
+        check(m.size, '0');
+    "#, "test").unwrap();
+}

@@ -102,7 +102,8 @@ const WEB_SCRIPTS: [Source; 11] = [
     ("apps:wasm", || js!("web/wasm.js")),
     ("apps:file-system", || js!("web/file_system.js")),
 ];
-const PAGE_SCRIPTS: [Source; 2] = [
+const PAGE_SCRIPTS: [Source; 3] = [
+    ("apps:typed-om", || js!("typed_om.js")),
     ("apps:gpu", || js!("web/gpu.js")),
     ("apps:dom", || js!("dom.js")),
 ];

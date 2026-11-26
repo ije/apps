@@ -165,6 +165,18 @@ pub(super) fn aliases() -> Result<Value> {
     ))
 }
 
+// Whether a word is a keyword of a property, which Chrome writes in lowercase.
+pub(super) fn keyword(args: &Value) -> Result<Value> {
+    let word = args[0].as_str().unwrap_or_default();
+    Ok(json!(
+        css::value::grammar::computed_names()
+            .filter_map(|name| Prop::find(name)?.grammar())
+            .any(|grammar| grammar
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                .any(|part| part.eq_ignore_ascii_case(word)))
+    ))
+}
+
 pub(super) fn css_path(args: &Value) -> Result<Value> {
     Ok(json!(crate::render::raster::canvas::path::svg_path(
         args[0].as_str().unwrap_or_default()
@@ -624,6 +636,9 @@ pub(super) fn computed(
                 .flatten()
         })
         .or_else(|| pseudo_box.map(|rect| [rect[2], rect[3]]));
+    // Typed OM reads computed values, which keep `auto` and percentages, and transform functions.
+    let typed = args[3] == true;
+    let size = size.filter(|_| !typed);
     let registry = state.styles.cache.registry();
     let parent = start.map(|parent| &*styles.values[parent]);
     let flow = start.is_some_and(|parent| style::table_box(style::role(&styles, parent)))
@@ -640,6 +655,21 @@ pub(super) fn computed(
         let get =
             |name| css::value::resolved::resolved(style, &units, name, size, &container, &registry);
         let value = get(&name);
+        if typed && name != "display" {
+            return match &*name {
+                "transform" if let Some(list) = style.get(Prop::TRANSFORM) => {
+                    css::value::grammar::computed("<transform-list>", list, Some(&units)).0
+                }
+                "line-height"
+                    if let Some(number) = style
+                        .get(Prop::LINE_HEIGHT)
+                        .filter(|value| value.parse::<f64>().is_ok()) =>
+                {
+                    number.to_owned()
+                }
+                _ => value,
+            };
+        }
         match (&*name, value.as_str()) {
             ("display", display_value) if pseudo.is_empty() => {
                 display(&styles, id, display_value).to_owned()

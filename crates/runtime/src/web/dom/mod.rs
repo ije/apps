@@ -48,6 +48,7 @@ pub fn call(
         "dom.mediaMatches" => css::media_matches(args, state, viewport),
         "dom.properties" => css::properties(),
         "dom.aliases" => css::aliases(),
+        "dom.keyword" => css::keyword(args),
         "dom.path" => css::css_path(args),
         "dom.specified" => css::specified(args),
         "dom.popoverSource" => {

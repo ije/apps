@@ -3951,8 +3951,37 @@
     const id = node._id, kind = pseudo == null ? '' : String(pseudo);
     let names = null;
     // Container queries need sizes, so the first read of a page lays it out like Chrome does.
-    return declaration({ computed: name => { if (!laid || /^(width|height|min-|max-|margin|padding|inset|top|right|bottom|left|transform|perspective-origin|grid-template)/.test(name)) layout(); return call('dom.computed', id, name, kind); }, names: () => names ??= call('dom.computed', id, null, kind) });
+    return declaration({ computed: name => { relayout(name); return call('dom.computed', id, name, kind); }, names: () => names ??= call('dom.computed', id, null, kind) });
   };
+  const relayout = name => { if (!laid || /^(width|height|min-|max-|margin|padding|inset|top|right|bottom|left|transform|perspective-origin|grid-template)/.test(name)) layout(); };
+  // CSS Typed OM: its globals make the classes of typed_om.js on first use.
+  const typedOM = globalThis.__appsTypedOM; delete globalThis.__appsTypedOM;
+  let typedMade = null;
+  const typed = () => typedMade ??= (() => {
+    const made = typedOM.make({
+      property: name => { name = String(name); if (name.startsWith('--')) return name; name = name.toLowerCase(); if (name.startsWith('-webkit-') && (cssAliases ??= new Set(call('dom.aliases'))).has(name)) name = name.slice(8); return cssProperty(name) ? name : null; },
+      // A custom property takes the text only when nothing of it was dropped.
+      parse: (name, text) => { const parts = (shorthands ?? loadShorthands()).get(name), list = declare(name + ':' + text); return list.length && list.every(entry => !entry[2] && (parts ? parts.includes(entry[0]) : entry[0] === name && (!name.startsWith('--') || entry[1] === text.trim() && list.length === 1))) ? parts ? text.trim() : specified(name, list[0][1]) : null; },
+      layers, known: word => call('dom.keyword', word),
+      supports: (name, text) => call('dom.supports', name, text),
+      longhands: name => (shorthands ?? loadShorthands()).get(name),
+      computed: (node, name) => { relayout(name); return call('dom.computed', node._id, name, '', true); },
+      computedNames: node => call('dom.computed', node._id, null, ''),
+    });
+    // A name that the page set or deleted keeps what the page gave it.
+    for (const [target, values, enumerable] of [[globalThis, made.classes, false], [CSS, made.units, true]]) for (const [name, value] of Object.entries(values)) if (typedGetters.has(Object.getOwnPropertyDescriptor(target, name)?.get)) Object.defineProperty(target, name, { value, writable: true, enumerable, configurable: true });
+    return made;
+  })();
+  const typedGetters = new WeakSet(), styleMaps = new WeakMap(), computedMaps = new WeakMap();
+  const cached = (maps, owner, make) => { let map = maps.get(owner); if (!map) maps.set(owner, map = make()); return map; };
+  for (const [target, names, enumerable] of [[globalThis, typedOM.names, false], [CSS, typedOM.units, true]]) for (const name of names.split(/[ |]/)) {
+    const get = () => (target === CSS ? typed().units : typed().classes)[name];
+    typedGetters.add(get);
+    Object.defineProperty(target, name, { get, set(value) { Object.defineProperty(target, name, { value, writable: true, enumerable, configurable: true }); }, enumerable, configurable: true });
+  }
+  Object.defineProperty(Element.prototype, 'attributeStyleMap', { get() { return cached(styleMaps, this, () => typed().map(this)); }, enumerable: true, configurable: true });
+  Object.defineProperty(CSSStyleRule.prototype, 'styleMap', { get() { return cached(styleMaps, this, () => typed().map(this)); }, enumerable: true, configurable: true });
+  Element.prototype.computedStyleMap = function computedStyleMap() { return cached(computedMaps, this, () => typed().computed(this)); };
   const animationFrames = new Map(); let animationFrameId = 0, animationTimer, frameRequested = false;
   globalThis.__appsAnimationFrame = () => {
     animationTimer = undefined; frameRequested = false;
