@@ -35,6 +35,18 @@ impl PageState {
         self.window = window.window_state();
     }
 
+    // The units of a node as the last frame laid it out.
+    pub(crate) fn units(
+        &self,
+        styles: &crate::style::ComputedStyles,
+        id: usize,
+    ) -> crate::css::value::units::Lengths {
+        let animated = &self.styles.animating_units;
+        animated
+            .binary_search_by_key(&id, |(node, _)| *node)
+            .map_or(styles.lengths[id], |at| animated[at].1)
+    }
+
     pub(crate) fn theme(&self) -> u32 {
         crate::native::theme_state()
             | ((self.pixel_ratio.clamp(0., 600.) * 100.).round() as u32) << 16
@@ -202,7 +214,7 @@ impl PageState {
             Err(pending) => pending,
         };
         self.drop_removed(doc);
-        self.styles.update(
+        let new = self.styles.update(
             doc,
             pending,
             style::Page {
@@ -213,7 +225,20 @@ impl PageState {
                 text_system: self.fonts.system.as_deref(),
                 bounds: &mut self.geometry.mirror,
             },
-        )
+        );
+        // Like Chrome, a scroll box keeps its offset in CSS pixels when its zoom changes, and no anchor moves it.
+        let zooms = &mut self.geometry.scroll_zooms;
+        for (&id, handle) in &self.geometry.scroll {
+            let zoom = new.lengths.get(id).map_or(1., |units| units.font.zoom);
+            let k = zooms.insert(id, zoom).map_or(1., |old| zoom / old);
+            if k != 1. {
+                let at = handle.target();
+                let scaled = |value: renderer::Pixels| renderer::px(f32::from(value) * k);
+                handle.limit(renderer::point(scaled(at.x), scaled(at.y)));
+                self.styles.unanchored.push(id);
+            }
+        }
+        new
     }
 
     // Shows a new frame or image of node `id`, and returns the old one when it can be freed now.

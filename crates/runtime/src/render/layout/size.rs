@@ -14,6 +14,15 @@ pub(crate) fn pseudo_lengths(
     pixel_ratio: f32,
 ) -> css::value::units::Lengths {
     let mut lengths = *units;
+    if let Some(zoom) = pseudo.get(Prop::ZOOM) {
+        lengths.font = units
+            .font
+            .zoomed(css::value::units::Lengths::effective_zoom(
+                units.font.zoom * css::value::units::Lengths::zoom(zoom),
+            ));
+    }
+    let zoomed = lengths;
+    let units = &zoomed;
     let size = pseudo
         .get(Prop::FONT_SIZE)
         .and_then(|value| units.resolve(value, units.font.em))
@@ -40,7 +49,7 @@ pub(crate) fn pseudo_lengths(
         ex: metrics.x_height * size,
         cap: metrics.cap_height * size,
         ic: advance('\u{6c34}', 1.),
-        lh: match style::line_height(pseudo) {
+        lh: match style::line_height(pseudo, units.font.zoom) {
             style::LineHeight::Fixed(height) => height,
             style::LineHeight::Scale(scale) => scale * size,
             style::LineHeight::Normal => {
@@ -52,6 +61,7 @@ pub(crate) fn pseudo_lengths(
             }
         },
         absolute: units.font.absolute,
+        zoom: units.font.zoom,
     };
     lengths
 }

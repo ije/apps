@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 // Match the JS buffer layout: 4 header floats (stale, capacity, layout count, moved), 8 floats per node,
-// MIRROR_* bytes, then a count of bounds changes.
+// MIRROR_* bytes, then a count of bounds changes, a count of restyles and whether a node has a zoom.
 #[derive(Default)]
 pub struct LayoutMirror {
     memory: Option<Arc<MirrorMemory>>,
@@ -94,6 +94,12 @@ impl LayoutMirror {
         }
     }
 
+    pub(crate) fn zoomed(&mut self, on: bool) {
+        if self.memory.is_some() {
+            unsafe { *self.restyles().wrapping_add(1) = f32::from(u8::from(on)) };
+        }
+    }
+
     pub(crate) fn reserve(&mut self, id: usize) {
         if id >= self.capacity {
             self.resize((id + 1).next_power_of_two().max(1024));
@@ -108,7 +114,7 @@ impl LayoutMirror {
     }
 
     fn resize(&mut self, capacity: usize) {
-        let words = 4 + capacity * 8 + capacity / 4 + 2;
+        let words = 4 + capacity * 8 + capacity / 4 + 3;
         let memory = MirrorMemory::new(words);
         unsafe {
             *memory.at(1) = capacity as f32;
@@ -121,8 +127,9 @@ impl LayoutMirror {
                     kept,
                 );
                 *memory.at(2) = *old.at(2);
-                *memory.at(words - 2) = *self.changes();
-                *memory.at(words - 1) = *self.restyles();
+                *memory.at(words - 3) = *self.changes();
+                *memory.at(words - 2) = *self.restyles();
+                *memory.at(words - 1) = *self.restyles().wrapping_add(1);
                 // Pages keep reading the old buffer until they see this flag and fetch the new one.
                 *old.at(0) = 1.;
             }
@@ -282,7 +289,7 @@ impl LayoutMirror {
         let memory = self.memory.clone().expect("Layout memory");
         (
             memory.at(0).cast(),
-            (4 + self.capacity * 8) * 4 + self.capacity + 8,
+            (4 + self.capacity * 8) * 4 + self.capacity + 12,
             Arc::into_raw(memory).cast_mut().cast(),
         )
     }

@@ -18,7 +18,7 @@ impl Lengths {
             }
             style
                 .get(width)
-                .map_or(Some(3.), |width| self.resolve(width, base))
+                .map_or(Some(3. * self.font.zoom), |width| self.resolve(width, base))
                 .unwrap_or(0.)
                 .max(0.)
         })
@@ -34,6 +34,8 @@ pub(crate) struct FontUnits {
     pub ic: f32,
     pub lh: f32,
     pub absolute: bool,
+    // The effective zoom of the node. The metrics include it, and absolute lengths take it.
+    pub zoom: f32,
 }
 
 impl FontUnits {
@@ -46,13 +48,34 @@ impl FontUnits {
             ic: em,
             lh: em * 1.2,
             absolute: false,
+            zoom: 1.,
         }
     }
 
-    pub fn bits(self) -> [u32; 7] {
-        let [em, ch, ex, cap, ic, lh] =
-            [self.em, self.ch, self.ex, self.cap, self.ic, self.lh].map(f32::to_bits);
-        [em, ch, ex, cap, ic, lh, u32::from(self.absolute)]
+    pub fn bits(self) -> [u32; 8] {
+        let [em, ch, ex, cap, ic, lh, zoom] = [
+            self.em, self.ch, self.ex, self.cap, self.ic, self.lh, self.zoom,
+        ]
+        .map(f32::to_bits);
+        [em, ch, ex, cap, ic, lh, u32::from(self.absolute), zoom]
+    }
+
+    // The metrics at another zoom.
+    pub fn zoomed(self, zoom: f32) -> Self {
+        if zoom == self.zoom {
+            return self;
+        }
+        let k = zoom / self.zoom;
+        Self {
+            em: self.em * k,
+            ch: self.ch * k,
+            ex: self.ex * k,
+            cap: self.cap * k,
+            ic: self.ic * k,
+            lh: self.lh * k,
+            absolute: self.absolute,
+            zoom,
+        }
     }
 }
 
@@ -101,6 +124,39 @@ impl Lengths {
         };
         let value = parser.atom()?;
         (parser.rest.trim().is_empty() && !value.0.is_nan()).then_some(value)
+    }
+
+    // The factor of a `zoom` value. Like Chrome, 0 is 1.
+    pub fn zoom(value: &str) -> f32 {
+        let zoom = match Self::new(16., 0., 0.).math_unclamped(value, 100., &[]) {
+            Some((zoom, Kind::Number)) => zoom as f32,
+            Some((percent, Kind::Length)) => percent as f32 / 100.,
+            _ => 1.,
+        };
+        if zoom > 0. { zoom } else { 1. }
+    }
+
+    // The computed text of a `zoom` value, as Chrome prints it.
+    pub fn zoom_text(zoom: f32) -> String {
+        let mut text = String::new();
+        match zoom.is_finite() {
+            true => crate::css::value::tokens::write_printed(f64::from(zoom), &mut text),
+            false => text.push_str("infinity"),
+        }
+        text
+    }
+
+    // Like Chrome, an effective zoom stays in a range that layout can hold.
+    pub fn effective_zoom(zoom: f32) -> f32 {
+        zoom.clamp(5e-7, 5e5)
+    }
+
+    // The lengths in CSS pixels of the node, as computed values hold them.
+    pub fn unzoomed(&self) -> Self {
+        Self {
+            font: self.font.zoomed(1.),
+            ..*self
+        }
     }
 
     pub fn resolve(&self, source: &str, base: f32) -> Option<f32> {
@@ -353,8 +409,9 @@ impl Math<'_> {
             unit
         };
         let font = self.units.font;
-        let root = self.units.root;
-        let [vw, vh] = self.units.viewport;
+        let zoom = font.zoom;
+        let root = self.units.root.zoomed(zoom);
+        let [vw, vh] = self.units.viewport.map(|size| size * zoom);
         let (scale, kind) = match unit {
             "" => (1., Kind::Number),
             "deg" => (1., Kind::Angle),
@@ -366,7 +423,7 @@ impl Math<'_> {
             "%" => (f64::from(self.base) / 100., Kind::Length),
             _ => {
                 let scale = match unit {
-                    "px" => 1.,
+                    "px" => zoom,
                     "em" => font.em,
                     "rem" => root.em,
                     "ch" => font.ch,
@@ -401,12 +458,12 @@ impl Math<'_> {
                     }
                     "vmin" | "svmin" | "lvmin" | "dvmin" => vw.min(vh) / 100.,
                     "vmax" | "svmax" | "lvmax" | "dvmax" => vw.max(vh) / 100.,
-                    "in" => 96.,
-                    "cm" => 96. / 2.54,
-                    "mm" => 96. / 25.4,
-                    "q" => 96. / 101.6,
-                    "pt" => 96. / 72.,
-                    "pc" => 16.,
+                    "in" => 96. * zoom,
+                    "cm" => 96. / 2.54 * zoom,
+                    "mm" => 96. / 25.4 * zoom,
+                    "q" => 96. / 101.6 * zoom,
+                    "pt" => 96. / 72. * zoom,
+                    "pc" => 16. * zoom,
                     _ => return None,
                 };
                 (f64::from(scale), Kind::Length)

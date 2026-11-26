@@ -310,7 +310,9 @@ impl StyleCache {
                                 kind => (
                                     style
                                         .get(width)
-                                        .map_or(Some(3.), |value| lengths[id].resolve(value, 0.))
+                                        .map_or(Some(3.), |value| {
+                                            lengths[id].unzoomed().resolve(value, 0.)
+                                        })
                                         .unwrap_or(0.)
                                         .max(0.),
                                     match kind {

@@ -157,7 +157,7 @@ pub(crate) fn resolve_keywords(
                         "0px".into()
                     }
                     _ => units
-                        .and_then(|units| pixels(inherited, units))
+                        .and_then(|units| pixels(inherited, &units.unzoomed()))
                         .map_or_else(|| inherited.clone(), Rc::from),
                 };
                 true

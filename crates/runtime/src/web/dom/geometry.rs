@@ -186,11 +186,24 @@ pub(super) fn client(
         Some(last) => last,
         None => state.restyle(doc, viewport),
     };
-    let (style, units) = (&computed.values[id], &computed.lengths[id]);
+    let (style, units) = (&computed.values[id], &state.units(&computed, id));
     let tag = doc.nodes[id].tag.as_str();
     if (style::ROW..=style::FOOTER).contains(&style::role(&computed, id)) {
         return Ok(json!([
-            0., 0., rect[2], rect[3], 0., 0., 0., 0., rect[2], rect[3], 0., 0., 0.
+            0.,
+            0.,
+            rect[2],
+            rect[3],
+            0.,
+            0.,
+            0.,
+            0.,
+            rect[2],
+            rect[3],
+            0.,
+            0.,
+            0.,
+            units.font.zoom
         ]));
     }
     if tag.starts_with('#')
@@ -200,7 +213,20 @@ pub(super) fn client(
     {
         // The last value says that the box is inline, so it has no client box.
         return Ok(json!([
-            0., 0., 0., 0., 0., 0., 0., 0., rect[2], rect[3], 0., 0., 1.
+            0.,
+            0.,
+            0.,
+            0.,
+            0.,
+            0.,
+            0.,
+            0.,
+            rect[2],
+            rect[3],
+            0.,
+            0.,
+            1.,
+            units.font.zoom
         ]));
     }
     let shared = style::role(&computed, id) == style::CELL
@@ -272,7 +298,8 @@ pub(super) fn client(
         size[1],
         shift[0],
         shift[1],
-        0.
+        0.,
+        units.font.zoom
     ]))
 }
 

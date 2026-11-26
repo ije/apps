@@ -1242,6 +1242,7 @@ mod tests {
                 ic: 20.,
                 lh: 30.,
                 absolute: false,
+                zoom: 1.,
             },
             root: FontUnits {
                 em: 24.,
@@ -1251,6 +1252,7 @@ mod tests {
                 ic: 24.,
                 lh: 36.,
                 absolute: false,
+                zoom: 1.,
             },
             viewport: [1200., 800.],
         };

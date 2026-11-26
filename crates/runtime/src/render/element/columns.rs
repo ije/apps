@@ -44,7 +44,9 @@ pub(super) fn columns(
         .filter(|kind| !matches!(*kind, "none" | "hidden"))
         .map(|kind| {
             let width = rule_width
-                .map_or(Some(3.), |value| units.resolve(value, width))
+                .map_or(Some(3. * units.font.zoom), |value| {
+                    units.resolve(value, width)
+                })
                 .unwrap_or(0.);
             let color = rule_color
                 .or_else(|| style.get(Prop::COLOR))

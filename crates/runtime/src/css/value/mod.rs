@@ -106,7 +106,7 @@ pub(crate) fn area_cells(row: &str) -> Vec<&str> {
     cells
 }
 
-type ShadowMemo = rustc_hash::FxHashMap<u64, (Box<str>, bool, [u32; 18], Vec<renderer::BoxShadow>)>;
+type ShadowMemo = rustc_hash::FxHashMap<u64, (Box<str>, bool, [u32; 20], Vec<renderer::BoxShadow>)>;
 
 thread_local! {
     static SHADOWS: std::cell::RefCell<ShadowMemo> = Default::default();
@@ -120,10 +120,10 @@ pub(crate) fn box_shadows(sizes: &Lengths, value: &str, inset: bool) -> Vec<rend
     let [cw, ch] = sizes
         .container
         .map_or([u32::MAX; 2], |size| size.map(f32::to_bits));
-    let mut units = [0; 18];
-    units[..7].copy_from_slice(&sizes.font.bits());
-    units[7..14].copy_from_slice(&sizes.root.bits());
-    units[14..].copy_from_slice(&[vw, vh, cw, ch]);
+    let mut units = [0; 20];
+    units[..8].copy_from_slice(&sizes.font.bits());
+    units[8..16].copy_from_slice(&sizes.root.bits());
+    units[16..].copy_from_slice(&[vw, vh, cw, ch]);
     let hash = {
         use std::hash::{Hash, Hasher};
         let mut hasher = rustc_hash::FxHasher::default();

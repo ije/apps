@@ -371,7 +371,8 @@ fn measure(
         .then(|| {
             super::super::size::natural_size(doc, id, measured.naturals.get(&id).copied(), style)
         })
-        .flatten();
+        .flatten()
+        .map(|(size, ratio)| (size.map(|side| side * units.font.zoom), ratio));
     let skipped = matches!(style.get(Prop::CONTENT_VISIBILITY), Some("hidden" | "auto"))
         && super::super::cull::skips(
             u32::from(super::super::cull::skippable(&node.tag, style)) * super::super::cull::SKIPS,
@@ -393,7 +394,7 @@ fn measure(
                         && style.get([Prop::WIDTH, Prop::HEIGHT][axis]).is_none()
                 })
                 .and_then(|v| super::super::size::dimension(v, false))
-                .map(|v| (v - if border_box { inner[axis] } else { 0. }).max(0.))
+                .map(|v| (v * units.font.zoom - if border_box { inner[axis] } else { 0. }).max(0.))
         });
         // Like layout, a video without a frame and with a CSS ratio has no natural size: it adds no width, and
         // the ratio gives its height from the width it gets.
@@ -418,6 +419,7 @@ fn measure(
                 node.attrs
                     .get(["width", "height"][axis])
                     .and_then(|v| super::super::size::dimension(v, false))
+                    .map(|v| v * units.font.zoom)
             })
         });
         let ratio = node.attrs.get("viewBox").and_then(|view| {

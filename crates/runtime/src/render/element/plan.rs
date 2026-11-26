@@ -49,7 +49,7 @@ impl Plan {
                 .and_then(|value| value.parse::<i32>().ok()),
             opacity: effects::opacity(style),
             face: style::font(style),
-            line_height: match style::line_height(style) {
+            line_height: match style::line_height(style, 1.) {
                 style::LineHeight::Fixed(_) => (units.font.lh * pixel_ratio * 64.).round(),
                 _ => (units.font.lh * pixel_ratio * 64.).floor(),
             } / 64.

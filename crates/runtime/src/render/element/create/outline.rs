@@ -26,13 +26,14 @@ pub(super) fn outline(
         // Like Chrome, a focus ring ignores the outline width: a 2px ring of the outline color, centered on the border
         // edge moved out by `outline-offset`, or 1px inside it with a border, above a 1px ring outside it of white, or
         // of #101010 in a dark scheme. Its corners follow the border radius, or else have a radius of 3px.
+        let z = units.font.zoom;
         let offset = style
             .get(Prop::OUTLINE_OFFSET)
             .and_then(|v| units.resolve(v, containing[0]))
             .unwrap_or(0.)
             .trunc()
-            - if borders.iter().all(|width| *width >= 1.) {
-                1.
+            - if borders.iter().all(|width| *width >= z) {
+                z
             } else {
                 0.
             };
@@ -50,7 +51,7 @@ pub(super) fn outline(
                 );
                 let corners = radius.resolve(outer.size).fit(outer.size);
                 let corners = if corners.is_zero() {
-                    renderer::Radii::from(px(3.))
+                    renderer::Radii::from(px(3. * z))
                 } else {
                     let grown = |radius: renderer::Pixels| (radius + px(offset)).max(px(0.));
                     renderer::Radii {
@@ -59,7 +60,7 @@ pub(super) fn outline(
                         shape: corners.shape,
                     }
                 };
-                for (at, color) in [(offset + 1., under), (offset, color)] {
+                for (at, color) in [(offset + z, under), (offset, color)] {
                     let path = Rect::between(
                         outer.origin - point(px(at), px(at)),
                         outer.bottom_right() + point(px(at), px(at)),
@@ -68,16 +69,16 @@ pub(super) fn outline(
                         continue;
                     }
                     let rect = Rect::between(
-                        path.origin - point(px(1.), px(1.)),
-                        path.bottom_right() + point(px(1.), px(1.)),
+                        path.origin - point(px(z), px(z)),
+                        path.bottom_right() + point(px(z), px(z)),
                     );
-                    let corners = corners.inset(px(-1.), px(-1.), px(-1.), px(-1.));
+                    let corners = corners.inset(px(-z), px(-z), px(-z), px(-z));
                     window.draw_box(
                         rect,
                         corners.fit(rect.size),
                         renderer::Color::TRANSPARENT,
                         renderer::Border {
-                            widths: renderer::Edges::all(px(2.)),
+                            widths: renderer::Edges::all(px(2. * z)),
                             color,
                             style: renderer::BorderStyle::Solid,
                             sides: 0,

@@ -1293,7 +1293,10 @@ pub(crate) fn inline_text(
                     };
                 }
                 runs.push(run);
-                line_heights.push((text.len(), line_height(style)));
+                line_heights.push((
+                    text.len(),
+                    line_height(style, styles.lengths[child].font.zoom),
+                ));
                 space = true;
                 continue 'nodes;
             }
@@ -1591,7 +1594,7 @@ pub(crate) fn inline_text(
                 led = boxes.len();
                 opening = 0.;
                 runs.push(run);
-                line_heights.push((text.len(), line_height(style)));
+                line_heights.push((text.len(), line_height(style, units.font.zoom)));
             }
         }
     }
@@ -1774,7 +1777,10 @@ pub(crate) fn inline_text(
                 })
                 .collect()
         });
-    let (root, height) = (font(parent), line_height(parent));
+    let (root, height) = (
+        font(parent),
+        line_height(parent, styles.lengths[id].font.zoom),
+    );
     let mixed = runs
         .iter()
         .any(|run| run.font_size.is_some() || run.font != root || run.emphasis.is_some())

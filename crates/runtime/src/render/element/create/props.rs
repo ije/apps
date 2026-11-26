@@ -787,7 +787,7 @@ pub(super) fn natural_box(
                     && !(broken && natural == [16., 16.])
             })
             .and_then(|value| dimension(value, false))
-            .map(|length| length + extra[axis])
+            .map(|length| length * units.font.zoom + extra[axis])
     });
     if let Some(width) = hint[0] {
         el = el.w(px(width));

@@ -521,7 +521,7 @@ props! {
     X "x" "<length-percentage>|<number>",
     Y "y" "<length-percentage>|<number>",
     Z_INDEX "z-index" "auto|<integer>",
-    ZOOM "zoom",
+    ZOOM "zoom" "normal|<non-negative-number>|<non-negative-percentage>",
 }
 
 thread_local! {

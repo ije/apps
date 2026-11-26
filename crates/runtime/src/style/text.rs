@@ -37,14 +37,17 @@ pub(crate) enum LineHeight {
     Fixed(f32),
 }
 
-pub(crate) fn line_height(style: &Style) -> LineHeight {
+// A fixed height is in pixels of the zoom.
+pub(crate) fn line_height(style: &Style, zoom: f32) -> LineHeight {
     // Like Chrome's layout units, a line is at most 2^25 px tall.
     const LIMIT: f32 = 33_554_431.;
     match style.get(Prop::LINE_HEIGHT) {
         Some(value) if value.ends_with("px") => value
             .trim_end_matches("px")
             .parse::<f32>()
-            .map_or(LineHeight::Normal, |px| LineHeight::Fixed(px.min(LIMIT))),
+            .map_or(LineHeight::Normal, |px| {
+                LineHeight::Fixed((px * zoom).min(LIMIT))
+            }),
         Some(value) => value.parse::<f32>().map_or(LineHeight::Normal, |scale| {
             let size = style
                 .get(Prop::FONT_SIZE)

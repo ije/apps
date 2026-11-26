@@ -58,7 +58,8 @@ pub(super) fn svg_box(
         .map(|(axis, (prop, attr))| {
             match style.get(prop) {
                 Some(value) => units.resolve(value, containing[axis]),
-                None => node.attrs.get(attr).and_then(|v| dimension(v, false)),
+                None => (node.attrs.get(attr).and_then(|v| dimension(v, false)))
+                    .map(|v| v * units.font.zoom),
             }
             .map(|size| if border_box { size - frame[axis] } else { size })
         })
@@ -120,10 +121,14 @@ pub(super) fn svg_box(
             let width = available() - frame[0];
             [width, width / ratio]
         }
-        _ => [width.unwrap_or(300.), height.unwrap_or(150.)],
+        _ => [
+            width.unwrap_or(300. * units.font.zoom),
+            height.unwrap_or(150. * units.font.zoom),
+        ],
     }
     .map(|value| value.clamp(1., 4096.));
-    let [inner_width, inner_height] = [width, height];
+    // The content is in CSS pixels, and the raster scales it to the zoomed box.
+    let [inner_width, inner_height] = [width, height].map(|side| side / units.font.zoom);
     let [width, height] = [width + frame[0], height + frame[1]];
     let mut scope = id;
     while let Some(parent) = doc.nodes[scope].parent {

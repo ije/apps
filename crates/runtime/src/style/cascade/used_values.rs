@@ -125,6 +125,21 @@ impl NodePass<'_> {
         }) {
             style.insert(Prop::FONT_FAMILY, family.as_str());
         }
+        // Like Chrome, zoom multiplies along the tree, and 0 is 1.
+        let own = match style.get(Prop::ZOOM) {
+            Some(value) => {
+                let zoom = Lengths::zoom(value);
+                let text = Lengths::zoom_text(zoom);
+                if value != text {
+                    style.insert(Prop::ZOOM, text);
+                }
+                zoom
+            }
+            None => 1.,
+        };
+        let zoom = Lengths::effective_zoom(parent.zoom * own);
+        // The font size is in CSS pixels, from the size of the parent without its zoom.
+        let parent = parent.zoomed(1.);
         let mut units = Lengths {
             font: parent,
             root: *root,
@@ -196,8 +211,10 @@ impl NodePass<'_> {
         } else {
             size
         };
-        units.font = FontUnits::new(size);
+        let em = (size * zoom).min(10_000.);
+        units.font = FontUnits::new(em);
         units.font.absolute = absolute;
+        units.font.zoom = zoom;
         if let Some(text) = text_system {
             let font = font(style);
             let (id, metrics) = font_metrics.entry(font.clone()).or_insert_with(|| {
@@ -213,16 +230,17 @@ impl NodePass<'_> {
                     ],
                 )
             });
-            let [ch, ex, cap, ic] = metrics.map(|value| value * size);
+            let [ch, ex, cap, ic] = metrics.map(|value| value * em);
             units.font = FontUnits {
-                em: size,
+                em,
                 absolute,
+                zoom,
                 ch,
                 ex,
                 cap,
                 ic,
                 lh: text
-                    .line_metrics(*id, renderer::px(size * scale))
+                    .line_metrics(*id, renderer::px(em * scale))
                     .into_iter()
                     .map(f32::from)
                     .sum::<f32>()
@@ -232,27 +250,27 @@ impl NodePass<'_> {
         let ratio = ((native_theme >> 16) as f32).max(100.) / 100.;
         if let Some(text) = style.get(Prop::LINE_HEIGHT) {
             let mut line_units = units;
-            line_units.font.lh = parent.lh;
+            line_units.font.lh = parent.lh * zoom;
             if node.tag == "html" {
                 line_units.root = units.font;
-                line_units.root.lh = parent.lh;
+                line_units.root.lh = parent.lh * zoom;
             }
-            if let Some((value, dimensional)) = line_units.parse(text, size)
+            if let Some((value, dimensional)) = line_units.parse(text, em)
                 && value >= 0.
             {
                 units.font.lh =
-                    if dimensional { value } else { value * size }.min(33_554_431. / ratio);
+                    if dimensional { value } else { value * em }.min(33_554_431. / ratio);
                 style.insert(
                     Prop::LINE_HEIGHT,
                     // Like Chrome, whose layout units count device pixels, a length is at most 2^25 device
                     // pixels, and a number gives at most the f32 range in device pixels.
                     if dimensional {
-                        format!("{}px", value.min(33_554_432. / ratio))
+                        format!("{}px", value.min(33_554_432. / ratio) / zoom)
                     } else if value >= 33_554_428. {
                         units
                             .math_unclamped(text, f32::NAN, &[])
                             .map_or(value, |(number, _)| {
-                                (number as f32).min(f32::MAX / ratio / size)
+                                (number as f32).min(f32::MAX / ratio / em)
                             })
                             .to_string()
                     } else {
@@ -282,7 +300,7 @@ impl NodePass<'_> {
                     .is_ok_and(|number| (number * ratio).fract() == 0.)
             };
             if matches!(value, "0" | "thin" | "medium" | "thick")
-                || value.strip_suffix("px").is_some_and(whole)
+                || zoom == 1. && value.strip_suffix("px").is_some_and(whole)
             {
                 continue;
             }
@@ -295,7 +313,7 @@ impl NodePass<'_> {
                 _ => device.trunc(),
             } / ratio;
             if snapped != width {
-                style.insert(prop, format!("{}px", number(f64::from(snapped))));
+                style.insert(prop, format!("{}px", number(f64::from(snapped / zoom))));
             }
         }
         if id == 0 || node.tag == "html" {
@@ -309,7 +327,8 @@ impl NodePass<'_> {
                 .iter()
                 .position(|name| *name == value)
         }) {
-            let width = units.font.em * (index * 2 + 1) as f32 / 24.;
+            // Chrome takes them from the zoomed font size.
+            let width = em * (index * 2 + 1) as f32 / 24.;
             style.insert(Prop::WEBKIT_TEXT_STROKE_WIDTH, format!("{width}px"));
         }
         // Children inherit these lengths, not their units.
@@ -321,7 +340,10 @@ impl NodePass<'_> {
             Prop::WEBKIT_TEXT_STROKE_WIDTH,
             Prop::TEXT_SHADOW,
         ] {
-            if let Some(value) = style.get(prop).and_then(|value| pixels(value, &units)) {
+            if let Some(value) = style
+                .get(prop)
+                .and_then(|value| pixels(value, &units.unzoomed()))
+            {
                 style.insert(prop, value);
             }
         }

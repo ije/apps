@@ -79,7 +79,7 @@
   const pending = () => { scrolled &&= geometry[2] === scrolledAt; return changes() || scrolled; };
   const layout = () => {
     if ((pending() || geometry[3]) && !observing) { stale = scrolled = false; laid = true; call('dom.reflow'); }
-    if (geometry[0]) { const buffer = host('dom.layout', true), capacity = new F32(buffer, 0, 4)[1]; limit = 4 + capacity * 8; geometry = new F32(buffer, 0, limit); marks = new U8(buffer, limit * 4, capacity); moves = new F32(buffer, limit * 4 + capacity, 2); }
+    if (geometry[0]) { const buffer = host('dom.layout', true), capacity = new F32(buffer, 0, 4)[1]; limit = 4 + capacity * 8; geometry = new F32(buffer, 0, limit); marks = new U8(buffer, limit * 4, capacity); moves = new F32(buffer, limit * 4 + capacity, 3); }
     return geometry;
   };
   // Text that the last layout did not place, like text far from the view, gets a layout when a script reads it.
@@ -103,19 +103,24 @@
   const scrollTo = (node, left, top, behavior = null, by = null) => {
     const fresh = !rootElement(node) && !(marks?.[node._id] & 2);
     if (fresh) layout();
+    if (moves[2]) { const z = zoomOf(node); if (left !== null) left *= z; if (top !== null) top *= z; }
     const offset = call('dom.scroll', node._id, left, top, behavior, by);
     if (fresh) layout();
     return offset;
   };
   // Do not cache client boxes from observer reads: they use the previous frame's styles.
-  const client = node => { if (slot(node) < 0) return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; if (observing) return call('dom.client', node._id, true); const cached = node._client; if (cached?.[13] === geometry[2] && cached[14] === version) return cached; return node._client = [...call('dom.client', node._id), geometry[2], version]; };
+  const client = node => { if (slot(node) < 0) return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; if (observing) return call('dom.client', node._id, true); const cached = node._client; if (cached?.[14] === geometry[2] && cached[15] === version) return cached; return node._client = [...call('dom.client', node._id), geometry[2], version]; };
   // Only scroll boxes have a scroll range, so other boxes take the border boxes of their children as their
   // scrollable overflow, then their end padding.
+  // Layout is in zoomed pixels, and the offset, client and scroll values of a box in CSS pixels of its zoom.
+  const zoomOf = node => moves[2] && !rootElement(node) ? client(node)[13] || 1 : 1;
+  // Like Chrome, a zoomed scroll offset is whole CSS pixels.
+  const unzoom = (node, offset) => { const z = zoomOf(node); return z === 1 ? offset : Math.round(offset / z); };
   const extent = (node, axis) => {
-    const box = client(node), i = slot(node);
-    if (i < 0 || marks[node._id] & 2) return Math.round(box[2 + axis] + (i < 0 ? 0 : geometry[i + 6 + axis]));
+    const box = client(node), i = slot(node), z = zoomOf(node);
+    if (i < 0 || marks[node._id] & 2) return Math.round((box[2 + axis] + (i < 0 ? 0 : geometry[i + 6 + axis])) / z);
     // The bounds of the children of a scaled box are scaled too, so its own size is used.
-    if (marks[node._id] & 128 && (box[8] !== geometry[i + 2] || box[9] !== geometry[i + 3])) return Math.round(box[2 + axis]);
+    if (marks[node._id] & 128 && (box[8] !== geometry[i + 2] || box[9] !== geometry[i + 3])) return Math.round(box[2 + axis] / z);
     if (!box[2] && !box[3] && !box[4] && !box[5] && !box[6] && !box[7] && /^(inline|contents)$/.test(getComputedStyle(node).display)) return 0;
     const start = geometry[i + axis] + box[axis], pending = [...(node._m.shadow ?? node._m).kids];
     // A right-to-left box overflows to its left, so its width counts from its right side.
@@ -127,7 +132,7 @@
       if (geometry[j + 2] || geometry[j + 3]) end = Math.max(end, right === null ? geometry[j + axis] + geometry[j + 2 + axis] - start : right - geometry[j]);
       else if (kid.tag[0] !== '#') pending.push(...(kid.shadow ?? kid).kids);
     }
-    return Math.round(Math.max(box[2 + axis], end && end + box[5 + axis]));
+    return Math.round(Math.max(box[2 + axis], end && end + box[5 + axis]) / z);
   };
   const offset = (node, axis) => {
     if (slot(node) < 0 || node === document.body) return 0;
@@ -135,9 +140,9 @@
     // Offsets are layout positions, so the scroll offsets of the boxes up to the offset parent don't count.
     let scrolled = 0;
     for (let p = node.parentElement; p && p !== parent; p = p.parentElement) if (marks[p._id] & 2) scrolled += metric(p, 4 + axis);
-    if (!parent || parent.localName === 'body' && !(marks[parent._id] & 8)) return Math.round(start + metric(document, 4 + axis) + scrolled);
+    if (!parent || parent.localName === 'body' && !(marks[parent._id] & 8)) return Math.round((start + metric(document, 4 + axis) + scrolled) / zoomOf(node));
     if (marks[parent._id] & 2) scrolled += metric(parent, 4 + axis);
-    return Math.round(start - parent.getBoundingClientRect()[axis ? 'top' : 'left'] - client(parent)[axis] + scrolled);
+    return Math.round((start - parent.getBoundingClientRect()[axis ? 'top' : 'left'] - client(parent)[axis] + scrolled) / zoomOf(node));
   };
   const owned = (doc, node) => { if (doc !== document) node._owner = doc; return node; };
   const rootElement = node => node._m.tag === 'html' && node._m.up === records[0];
@@ -1275,26 +1280,26 @@
     }
     getBoundingClientRect() { const i = slot(this), m = geometry; return i < 0 ? new DOMRect() : new DOMRect(m[i], m[i + 1], m[i + 2], m[i + 3]); }
     getClientRects() { if (slot(this) < 0) return listOf(DOMRectList, []); const parts = call('dom.fragments', this._id); return listOf(DOMRectList, parts ? parts.map(part => new DOMRect(...part)) : [this.getBoundingClientRect()]); }
-    get clientWidth() { return rootElement(this) ? Math.round(viewSize()[0]) : Math.round(client(this)[2]); } get clientHeight() { return rootElement(this) ? Math.round(viewSize()[1]) : Math.round(client(this)[3]); }
-    get clientLeft() { return Math.round(client(this)[0]); } get clientTop() { return Math.round(client(this)[1]); }
-    get scrollTop() { return scrollOf(this, 5); } set scrollTop(value) { scrollTo(this, null, Number(value)); }
-    get scrollLeft() { return scrollOf(this, 4); } set scrollLeft(value) { scrollTo(this, Number(value), null); }
+    get clientWidth() { return rootElement(this) ? Math.round(viewSize()[0]) : Math.round(client(this)[2] / zoomOf(this)); } get clientHeight() { return rootElement(this) ? Math.round(viewSize()[1]) : Math.round(client(this)[3] / zoomOf(this)); }
+    get clientLeft() { return Math.round(client(this)[0] / zoomOf(this)); } get clientTop() { return Math.round(client(this)[1] / zoomOf(this)); }
+    get scrollTop() { return unzoom(this, scrollOf(this, 5)); } set scrollTop(value) { scrollTo(this, null, Number(value)); }
+    get scrollLeft() { return unzoom(this, scrollOf(this, 4)); } set scrollLeft(value) { scrollTo(this, Number(value), null); }
     get scrollWidth() { return rootElement(this) ? Math.round(viewSize()[0] + metric(document, 6)) : extent(this, 0); } get scrollHeight() { return rootElement(this) ? Math.round(viewSize()[1] + metric(document, 7)) : extent(this, 1); }
     scrollTo(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); scrollTo(this, left ?? null, top ?? null, behavior); }
     scroll(left, top) { this.scrollTo(left, top); }
     scrollBy(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); scrollTo(this, this.scrollLeft + (Number(left) || 0), this.scrollTop + (Number(top) || 0), behavior, 'by'); }
     scrollIntoView(options = {}) {
       if (typeof options === 'boolean') options = { block: options ? 'start' : 'end' };
-      const target = this.getBoundingClientRect(), own = getComputedStyle(this), margin = side => parseFloat(own['scrollMargin' + side]) || 0;
+      const target = this.getBoundingClientRect(), own = getComputedStyle(this), zoom = zoomOf(this), margin = side => (parseFloat(own['scrollMargin' + side]) || 0) * zoom;
       let left = target.left - margin('Left'), top = target.top - margin('Top');
       const width = target.width + margin('Left') + margin('Right'), height = target.height + margin('Top') + margin('Bottom');
       for (let p = this.assignedSlot ?? this.parentElement ?? this.getRootNode().host; p; p = p.assignedSlot ?? p.parentElement ?? p.getRootNode().host) {
-        const style = getComputedStyle(p), root = p === document.documentElement, bounds = root ? new DOMRect() : p.getBoundingClientRect(), [viewWidth, viewHeight] = root ? viewSize() : [], to = [null, null]; let scrollable = false;
-        const padding = (side, extent) => { const value = style['scrollPadding' + side]; return value.endsWith('%') ? parseFloat(value) / 100 * extent : parseFloat(value) || 0; };
+        const style = getComputedStyle(p), root = p === document.documentElement, z = zoomOf(p), bounds = root ? new DOMRect() : p.getBoundingClientRect(), [viewWidth, viewHeight] = root ? viewSize() : [], to = [null, null]; let scrollable = false;
+        const padding = (side, extent) => { const value = style['scrollPadding' + side]; return value.endsWith('%') ? parseFloat(value) / 100 * extent : (parseFloat(value) || 0) * z; };
         for (const [axis, align, start, size, edge, client, near, far] of [
-          ['Y', options.block ?? 'start', top, height, root ? 0 : bounds.top + p.clientTop, root ? viewHeight : p.clientHeight, 'Top', 'Bottom'],
+          ['Y', options.block ?? 'start', top, height, root ? 0 : bounds.top + p.clientTop * z, root ? viewHeight : p.clientHeight * z, 'Top', 'Bottom'],
           // `start` and `end` are logical, so in a right-to-left box `end` is its left side.
-          ['X', style.direction === 'rtl' ? { start: 'end', end: 'start' }[options.inline] ?? options.inline ?? 'nearest' : options.inline ?? 'nearest', left, width, root ? 0 : bounds.left + p.clientLeft, root ? viewWidth : p.clientWidth, 'Left', 'Right'],
+          ['X', style.direction === 'rtl' ? { start: 'end', end: 'start' }[options.inline] ?? options.inline ?? 'nearest' : options.inline ?? 'nearest', left, width, root ? 0 : bounds.left + p.clientLeft * z, root ? viewWidth : p.clientWidth * z, 'Left', 'Right'],
         ]) {
           // The root always scrolls the page, as the viewport.
           if (!root && !['auto','scroll','hidden'].includes(style['overflow' + axis] || style.overflow)) continue;
@@ -1305,11 +1310,11 @@
           // `focus()` centers a box that is out of view and moves a box that is partly in view to the nearest edge, as Chrome does.
           if (align === 'if-needed' && (before + size <= 0 || after - size >= 0)) delta = (before + after) / 2;
           else if (align === 'nearest' || align === 'if-needed') delta = before < 0 && after > 0 ? 0 : before < 0 ? (size <= extent ? before : after) : after > 0 ? (size <= extent ? after : before) : 0;
-          if (delta) to[axis === 'Y' ? 1 : 0] = (axis === 'Y' ? p.scrollTop : p.scrollLeft) + delta;
+          if (delta) to[axis === 'Y' ? 1 : 0] = (axis === 'Y' ? p.scrollTop : p.scrollLeft) * z + delta;
         }
         // Like Chrome, a box that does not move can still snap to another area, like one with the focus.
         if (scrollable) {
-          const previous = [p.scrollLeft, p.scrollTop], next = call('dom.scroll', p._id, to[0], to[1], options.behavior ?? null, 'into');
+          const previous = [p.scrollLeft * z, p.scrollTop * z], next = call('dom.scroll', p._id, to[0], to[1], options.behavior ?? null, 'into');
           if (next) { left -= next[0] - previous[0]; top -= next[1] - previous[1]; }
         }
         if (scrollable && options.container === 'nearest') break;
@@ -1362,7 +1367,7 @@
   const adjacent = (element, position, node) => { position = String(position).toLowerCase(); if (position === 'beforebegin' || position === 'afterend') { if (!element.parentNode) return null; if (position === 'beforebegin') element.before(node); else element.after(node); } else if (position === 'afterbegin') element.prepend(node); else if (position === 'beforeend') element.append(node); else throw new DOMException('Invalid insertion position', 'SyntaxError'); return node; };
   const attributeReaction = (node, name, oldValue, value) => { const Type = definitions.get(node._m.tag); if (Type && node instanceof Type && !node._failed && defined.get(Type).observed.has(name)) enqueue(node, ['attributeChangedCallback', name, oldValue, value]); };
   class HTMLElement extends Element {
-    get offsetWidth() { const i = slot(this); return i < 0 ? 0 : Math.round(marks[this._id] & 128 ? client(this)[8] : geometry[i + 2]); } get offsetHeight() { const i = slot(this); return i < 0 ? 0 : Math.round(marks[this._id] & 128 ? client(this)[9] : geometry[i + 3]); }
+    get offsetWidth() { const i = slot(this); return i < 0 ? 0 : Math.round((marks[this._id] & 128 ? client(this)[8] : geometry[i + 2]) / zoomOf(this)); } get offsetHeight() { const i = slot(this); return i < 0 ? 0 : Math.round((marks[this._id] & 128 ? client(this)[9] : geometry[i + 3]) / zoomOf(this)); }
     get offsetParent() {
       if (this.localName === 'body' || rootElement(this) || slot(this) < 0) return null;
       call('dom.layout', false, true); layout();
@@ -2101,8 +2106,8 @@
     }
     get x() { return this.clientX; } get y() { return this.clientY; }
     get pageX() { return this.clientX + scrollX; } get pageY() { return this.clientY + scrollY; }
-    get offsetX() { const target = this.target, x = eventState(this).x ?? this.clientX, offset = target?.getBoundingClientRect ? x - target.getBoundingClientRect().left - target.clientLeft : x; return this instanceof PointerEvent && !/^(click|auxclick|contextmenu)$/.test(this.type) ? offset : Math.round(offset); }
-    get offsetY() { const target = this.target, y = eventState(this).y ?? this.clientY, offset = target?.getBoundingClientRect ? y - target.getBoundingClientRect().top - target.clientTop : y; return this instanceof PointerEvent && !/^(click|auxclick|contextmenu)$/.test(this.type) ? offset : Math.round(offset); }
+    get offsetX() { const target = this.target, x = eventState(this).x ?? this.clientX, offset = target?.getBoundingClientRect ? x - target.getBoundingClientRect().left - target.clientLeft * zoomOf(target) : x; return this instanceof PointerEvent && !/^(click|auxclick|contextmenu)$/.test(this.type) ? offset : Math.round(offset); }
+    get offsetY() { const target = this.target, y = eventState(this).y ?? this.clientY, offset = target?.getBoundingClientRect ? y - target.getBoundingClientRect().top - target.clientTop * zoomOf(target) : y; return this instanceof PointerEvent && !/^(click|auxclick|contextmenu)$/.test(this.type) ? offset : Math.round(offset); }
     get which() { return eventState(this).which ?? this.button + 1; }
     // Like Chrome, relative to the nearest positioned box, or to the page.
     get layerX() { return layerOffset(this, 0); } get layerY() { return layerOffset(this, 1); }
@@ -3605,8 +3610,8 @@
   const canvasSize = (value, fallback) => { const digits = /^[\t\n\f\r ]*\+?(\d+)/.exec(value ?? '')?.[1], size = digits ? Number(digits) : NaN; return size <= 2147483647 ? size : fallback; };
   let webglWarned = false;
   class HTMLCanvasElement extends HTMLElement {
-    get clientWidth(){const width=this.getBoundingClientRect().width;if(width)return width;const value=getComputedStyle(this).width;return /^\d+(?:\.\d+)?px$/.test(value)?parseFloat(value):this.width;}
-    get clientHeight(){const height=this.getBoundingClientRect().height;if(height)return height;const value=getComputedStyle(this).height;return /^\d+(?:\.\d+)?px$/.test(value)?parseFloat(value):this.height;}
+    get clientWidth(){const width=this.getBoundingClientRect().width;if(width)return width/zoomOf(this);const value=getComputedStyle(this).width;return /^\d+(?:\.\d+)?px$/.test(value)?parseFloat(value):this.width;}
+    get clientHeight(){const height=this.getBoundingClientRect().height;if(height)return height/zoomOf(this);const value=getComputedStyle(this).height;return /^\d+(?:\.\d+)?px$/.test(value)?parseFloat(value):this.height;}
     get width() { return canvasSize(this.getAttribute('width'), 300); } set width(v) { if (this._offscreen) throw transferred(); this.setAttribute('width', Number(v) >>> 0); }
     get height() { return canvasSize(this.getAttribute('height'), 150); } set height(v) { if (this._offscreen) throw transferred(); this.setAttribute('height', Number(v) >>> 0); }
     setAttribute(name, value) { super.setAttribute(name, value); if (name === 'width' || name === 'height') this._context?._resize(); }
@@ -4589,9 +4594,10 @@
       if (target instanceof SVGElement && !(target instanceof SVGSVGElement)) { const box = target.getBBox(); top = left = 0; borderWidth = width = box.width; borderHeight = height = box.height; } else if (!atomicTags.test(target.localName)) { if (inline) top = left = borderWidth = borderHeight = width = height = 0; }
       // An atomic inline box like `<math>` has no client box, so its content box comes from its border box.
       else if (!clientWidth && !clientHeight && (borderWidth || borderHeight)) { const s = getComputedStyle(target), side = name => parseFloat(s['padding' + name]) + parseFloat(s['border' + name + 'Width']); left = parseFloat(s.paddingLeft); top = parseFloat(s.paddingTop); width = Math.max(0, borderWidth - side('Left') - side('Right')); height = Math.max(0, borderHeight - side('Top') - side('Bottom')); }
+      const z = zoomOf(target); if (z !== 1) [top, left, borderWidth, borderHeight, width, height] = [top, left, borderWidth, borderHeight, width, height].map(value => value / z);
       // Sizes are in 1/64 pixels, like Chrome's layout units, so float noise reports no change.
       const unit = value => Math.round(value * 64) / 64; [borderWidth, borderHeight, width, height] = [borderWidth, borderHeight, width, height].map(unit);
-      const value = observer._boxes?.get(target) === 'border-box' ? borderWidth + ':' + borderHeight : width + ':' + height; observer.targets.set(key, [rect.width, rect.height, at, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: borderWidth, blockSize: borderHeight }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) try { observer.callback(entries, observer); } catch (error) { report(error); } }
+      const value = observer._boxes?.get(target) === 'border-box' ? borderWidth + ':' + borderHeight : width + ':' + height; observer.targets.set(key, [rect.width, rect.height, at, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: borderWidth, blockSize: borderHeight }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: Math.round(width * z * devicePixelRatio), blockSize: Math.round(height * z * devicePixelRatio) }] }); } } } finally { observing = false; } if (entries.length) try { observer.callback(entries, observer); } catch (error) { report(error); } }
     // Resize observers measure the last frame before scroll listeners change the page, so its styles are still computed.
     // `scrollend` fires when a box has not scrolled for 100 ms and is not on the way to a snap area, and only pages that listen for it pay for the timers.
     for (const event of call('dom.scrollEvents')) {

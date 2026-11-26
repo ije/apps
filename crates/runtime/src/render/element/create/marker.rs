@@ -135,7 +135,7 @@ pub(super) fn list_marker(cx: &Cx<'_>, fr: &Frame, mut el: renderer::Node) -> re
         let metrics = text
             .line_metrics(face, px(size * pixel_ratio))
             .map(f32::from);
-        let line = match marker_style.map(style::line_height) {
+        let line = match marker_style.map(|marker| style::line_height(marker, units.font.zoom)) {
             Some(style::LineHeight::Fixed(line)) => line,
             Some(style::LineHeight::Scale(scale)) => scale * size,
             Some(style::LineHeight::Normal) => metrics.iter().sum::<f32>() / pixel_ratio,
@@ -175,6 +175,7 @@ pub(super) fn list_marker(cx: &Cx<'_>, fr: &Frame, mut el: renderer::Node) -> re
                 .advance(face, px(size), ' ')
                 .map_or(size / 4., f32::from);
             let look = crate::render::paint::control::Look {
+                zoom: units.font.zoom,
                 control: crate::render::paint::control::Control::Disclosure,
                 checked: kind == "disclosure-open",
                 ink: marker_style

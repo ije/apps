@@ -43,7 +43,7 @@ impl SvgSource<'_> {
     ) -> Vec<(&'static str, String)> {
         let (doc, root) = (self.doc, self.root);
         let own = &self.styles.values[element];
-        let units = &self.styles.lengths[element];
+        let units = &self.styles.lengths[element].unzoomed();
         let tag = doc.nodes[element].tag.as_str();
         let mut attrs = Vec::new();
         if element != root {

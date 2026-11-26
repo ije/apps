@@ -1033,8 +1033,8 @@ pub(crate) fn resolved(
             tracks(&value, units, &mut out);
             out
         }
-        "zoom" if value == "normal" => "1".to_owned(),
-        "rotate" | "translate" | "scale" | "zoom" if value != "none" => {
+        "zoom" => Lengths::zoom_text(Lengths::zoom(&value)),
+        "rotate" | "translate" | "scale" if value != "none" => {
             let mut parts: Vec<String> = components(&value, ' ')
                 .into_iter()
                 .map(|part| match units.math(part, f32::NAN, &[]) {

@@ -927,7 +927,10 @@ fn place(context: Option<(&Cx, usize, &Block)>, spec: &Spec, seen: [f32; 2]) -> 
             area.is_some() || wide.is_some(),
         ),
         Len::Anchor(text) => {
-            let text = resolved(text, &mut |found| function(found, side, axis));
+            let zoom = units.font.zoom;
+            let text = resolved(text, &mut |found| {
+                function(found, side, axis).map(|value| value / zoom)
+            });
             (
                 text.and_then(|text| units.resolve(&text, extent[base])),
                 true,
@@ -1053,7 +1056,10 @@ fn place(context: Option<(&Cx, usize, &Block)>, spec: &Spec, seen: [f32; 2]) -> 
         room,
         outer: [0, 1].map(|axis| margins[axis] + padding[axis] + spec.borders[axis]),
         target: default.map(|target| target.node),
-        used: Used { axes, ..used },
+        used: Used {
+            axes,
+            ..used.unzoomed(units.font.zoom)
+        },
     })
 }
 

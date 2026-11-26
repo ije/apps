@@ -1319,3 +1319,85 @@ fn text_and_font_values_parse_and_compute_like_chrome() {
     assert_eq!(get("i", "font-variant-caps").as_deref(), Some("normal"));
     assert_eq!(get("i", "text-indent").as_deref(), Some("20px each-line"));
 }
+
+#[test]
+fn zoom_multiplies_along_the_tree_and_scales_lengths() {
+    let doc = Document::parse(
+        r#"<style>
+            #a { zoom: 200%; font-size: 10px; line-height: 12px; }
+            #b { zoom: 1.5; font-size: 2em; }
+            #c { zoom: 0; }
+        </style><div id="a"><div id="b"><div id="c"></div></div></div>"#,
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let (a, b, c) = (
+        element(&doc, "#a"),
+        element(&doc, "#b"),
+        element(&doc, "#c"),
+    );
+    let style = |id: usize, prop| computed.values[id].get(prop);
+    assert_eq!(style(a, Prop::ZOOM), Some("2"));
+    assert_eq!(style(c, Prop::ZOOM), Some("1"));
+    assert_eq!(style(a, Prop::FONT_SIZE), Some("10px"));
+    assert_eq!(style(a, Prop::LINE_HEIGHT), Some("12px"));
+    assert_eq!(style(b, Prop::FONT_SIZE), Some("20px"));
+    let units = |id: usize| computed.lengths[id];
+    assert_eq!(units(a).font.em, 20.);
+    assert_eq!(units(a).font.lh, 24.);
+    assert_eq!(units(b).font.em, 60.);
+    assert_eq!(units(c).font.zoom, 3.);
+    assert_eq!(units(b).resolve("10px", 0.), Some(30.));
+    assert_eq!(units(b).resolve("1rem", 0.), Some(48.));
+    assert_eq!(units(b).resolve("50%", 100.), Some(50.));
+    assert_eq!(units(b).unzoomed().resolve("1em", 0.), Some(20.));
+}
+
+#[test]
+fn zoom_takes_non_negative_numbers_and_percentages() {
+    for (value, valid) in [
+        ("normal", true),
+        ("0", true),
+        ("1.5", true),
+        ("50%", true),
+        ("calc(2)", true),
+        ("-1", false),
+        ("-50%", false),
+        ("reset", false),
+        ("1px", false),
+        ("auto", false),
+    ] {
+        assert_eq!(supports("zoom", value), Some(valid), "{value}");
+    }
+}
+
+#[test]
+fn zoom_prints_like_chrome_and_inherits_css_pixels() {
+    let doc = Document::parse(
+        r#"<style>
+            #a { zoom: 2; font-size: 10px; width: 3em; }
+            #b { width: inherit; }
+            #c { zoom: 1e20; }
+        </style><div id="a"><div id="b"></div></div><div id="c"><div id="d"></div></div>"#,
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let style = |selector| &computed.values[element(&doc, selector)];
+    assert_eq!(style("#b").get(Prop::WIDTH), Some("30px"));
+    assert_eq!(style("#c").get(Prop::ZOOM), Some("1e+20"));
+    assert_eq!(computed.lengths[element(&doc, "#d")].font.zoom, 5e5);
+}

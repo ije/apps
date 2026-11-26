@@ -26,6 +26,8 @@ pub struct Geometry {
     pub(crate) pieces: rustc_hash::FxHashMap<usize, Vec<(usize, [f32; 4])>>,
     pub scroll: rustc_hash::FxHashMap<usize, renderer::ScrollRef>,
     pub(crate) scroll_offsets: rustc_hash::FxHashMap<usize, renderer::Point<renderer::Pixels>>,
+    // The zoom of each scroll box as of the last style pass.
+    pub(crate) scroll_zooms: rustc_hash::FxHashMap<usize, f32>,
     // The scroll offsets that the mirror shows, as of the last prepaint, the moves of the mirror for user scrolls
     // since then, and whether the boxes in each scroll move as a whole, by style epoch and walk.
     pub(crate) mirror_offsets: rustc_hash::FxHashMap<usize, renderer::Point<renderer::Pixels>>,
@@ -309,6 +311,7 @@ impl Geometry {
         self.scroll.remove(&id);
         self.snaps.remove(&id);
         self.scroll_offsets.remove(&id);
+        self.scroll_zooms.remove(&id);
         self.drawn.remove(&id);
     }
 }

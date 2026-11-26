@@ -2050,3 +2050,38 @@ fn nested_column_boxes_lay_out_the_same_each_time() {
         &[("cols.html", "<div id=h></div>")],
     );
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn zoom_scales_layout_and_reads_like_chrome() {
+    let page = "<head><style>body{margin:0;font:16px Helvetica}\
+         #a{zoom:2;width:100px;height:20px;padding:5px;border:3px solid red;margin:4px;font-size:10px}\
+         #c{zoom:1.5;width:2rem;height:10px}#d{zoom:2;width:50px;height:30px;overflow:scroll}#e{height:100px;width:200px}</style></head>\
+         <body><div id=a><div id=c></div></div><div id=d><div id=e></div></div><script>\
+         for (const el of document.querySelectorAll('[id]')) globalThis[el.id] = el;\
+         globalThis.at = el => { const r = el.getBoundingClientRect(); return [r.x, r.y, r.width, r.height].join(' '); };\
+         </script></body>";
+    let text = run_hidden(
+        r#"
+        await load('zoom.html');
+        const step = async (name, code) => console.log('ZOOM ' + name + ' ' + await run(code));
+        await step('rect', "at(a)");
+        await step('offset', "[a.offsetLeft, a.offsetTop, a.offsetWidth, a.clientWidth].join()");
+        await step('style', "const s = getComputedStyle(a); [s.width, s.padding, s.fontSize, s.zoom].join()");
+        await step('nested', "[at(c), getComputedStyle(c).width, getComputedStyle(c).height].join()");
+        await step('scroll', "d.scrollTop = 20; [d.scrollTop, d.scrollHeight, d.clientHeight, at(e)].join()");
+        await step('dynamic', "a.style.zoom = '1'; at(a)");
+        "#,
+        &[("zoom.html", page)],
+    );
+    for line in [
+        "rect 8 8 232 72",
+        "offset 4,4,116,110",
+        "style 100px,5px,10px,2",
+        "nested 24 24 96 30,32px,10px",
+        "scroll 20,100,30,0 48 400 200",
+        "dynamic 4 4 116 36",
+    ] {
+        assert!(text.contains(&format!("ZOOM {line}\n")), "{line}: {text}");
+    }
+}

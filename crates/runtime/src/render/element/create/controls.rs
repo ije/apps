@@ -303,6 +303,7 @@ pub(super) fn controls(
                 room = width;
                 let dark = cx.dark();
                 let look = crate::render::paint::control::Look {
+                    zoom: units.font.zoom,
                     control: match input.is_some_and(|kind| kind.eq_ignore_ascii_case("time")) {
                         true => crate::render::paint::control::Control::Time,
                         false => crate::render::paint::control::Control::Date,

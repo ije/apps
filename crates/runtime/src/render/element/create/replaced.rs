@@ -170,6 +170,7 @@ pub(super) fn replaced(
                         .attrs
                         .get(name)
                         .and_then(|value| dimension(value, false))
+                        .map(|length| length * units.font.zoom)
                 {
                     el = if horizontal {
                         el.w(px(length))

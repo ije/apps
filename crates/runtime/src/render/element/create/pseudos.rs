@@ -155,7 +155,7 @@ pub(super) fn pseudo_elements(
             }
             _ => {}
         }
-        match style::line_height(pseudo) {
+        match style::line_height(pseudo, pseudo_units.font.zoom) {
             style::LineHeight::Fixed(height) => decoration = decoration.line_height(px(height)),
             style::LineHeight::Scale(scale) => {
                 decoration = decoration.line_height(px(scale * pseudo_units.font.em))

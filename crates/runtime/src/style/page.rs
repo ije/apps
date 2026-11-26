@@ -38,6 +38,8 @@ pub(crate) struct Styles {
     pub(crate) animated: HashMap<usize, Style>,
     pub(crate) animating: HashMap<usize, Rc<Style>>,
     pub(crate) animating_pseudos: HashMap<usize, Rc<[Style; 2]>>,
+    // The units of the last frame where animated font sizes or zoom changed them.
+    pub(crate) animating_units: Vec<(usize, crate::css::value::units::Lengths)>,
     pub(crate) recolored: Vec<usize>,
     // The nodes whose style moved or sized them since the last frame, which suppress scroll anchoring.
     pub(crate) unanchored: Vec<usize>,
@@ -494,6 +496,7 @@ impl Styles {
                 }
             }
         }
+        page.bounds.zoomed(result.lengths.zoomed);
         if animating {
             let result = Rc::new(result);
             self.select_base = (Rc::as_ptr(&result) as usize, subject, serial, flatten);
@@ -501,6 +504,7 @@ impl Styles {
         }
         self.animating.clear();
         self.animating_pseudos.clear();
+        self.animating_units.clear();
         self.epoch += 1;
         page.bounds.restyled();
         self.key = key;

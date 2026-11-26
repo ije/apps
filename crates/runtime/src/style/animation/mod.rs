@@ -986,6 +986,7 @@ impl Motion {
             !values.vars().is_empty()
                 || values.contains(Prop::FONT_SIZE)
                 || values.contains(Prop::LINE_HEIGHT)
+                || values.contains(Prop::ZOOM)
         }) {
             frame.custom = animated
                 .iter()

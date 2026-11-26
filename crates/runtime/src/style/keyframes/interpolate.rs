@@ -188,7 +188,7 @@ pub(crate) fn computed<'a>(
             .or_else(|| registry.get(&prop)?.2.as_deref());
     }
     style.get(prop).or(match key {
-        "opacity" | "flex-shrink" => Some("1"),
+        "opacity" | "flex-shrink" | "zoom" => Some("1"),
         "flex-grow" => Some("0"),
         "transform" | "translate" | "rotate" | "scale" | "box-shadow" | "text-shadow"
         | "filter" | "backdrop-filter" | "max-width" | "max-height" => Some("none"),

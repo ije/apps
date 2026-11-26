@@ -890,6 +890,7 @@ pub(crate) fn syntax_matches(syntax: &str, value: &str) -> bool {
                     "<non-negative-length>" => ("<length>", true),
                     "<non-negative-length-percentage>" => ("<length-percentage>", true),
                     "<non-negative-number>" => ("<number>", true),
+                    "<non-negative-percentage>" => ("<percentage>", true),
                     kind => (kind, false),
                 };
                 if sign && value.starts_with('-') {

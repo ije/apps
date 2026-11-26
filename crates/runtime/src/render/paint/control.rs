@@ -110,6 +110,7 @@ pub(crate) struct Look {
     pub accent: u32,
     pub ink: u32,
     pub value: f32,
+    pub zoom: f32,
 }
 
 pub(crate) fn layer(id: usize, look: Look, view: Rc<super::super::ViewState>) -> Child {
@@ -127,7 +128,7 @@ pub(crate) fn layer(id: usize, look: Look, view: Rc<super::super::ViewState>) ->
             let key = (id, usize::MAX - look.control as usize);
             let seen = [width, height, scale].map(f32::to_bits);
             if drawn.replace(seen) != seen || !backgrounds.contains_key(&key) {
-                let Some(source) = svg(&look, width, height) else {
+                let Some(source) = svg(&look, width / look.zoom, height / look.zoom) else {
                     return;
                 };
                 let limit = super::super::raster::RASTER_MAX as f32;
@@ -513,6 +514,7 @@ mod tests {
             (true, true, true, "#3b3b3b", "#6e6e6e"),
         ] {
             let look = super::Look {
+                zoom: 1.,
                 control: super::Control::Progress,
                 hover,
                 active,

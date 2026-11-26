@@ -597,6 +597,7 @@ pub(super) fn restore(
         dom.styles.animating.extend(restore);
         dom.styles.animating_pseudos.extend(restore_pseudos);
     }
+    dom.styles.animating_units = lengths;
 }
 
 #[cfg(test)]

@@ -25,7 +25,7 @@ pub(super) fn frame(style: &css::properties::Style, units: &Lengths, base: f32) 
         } else {
             style
                 .get(size)
-                .map_or(Some(3.), |v| units.resolve(v, base))
+                .map_or(Some(3. * units.font.zoom), |v| units.resolve(v, base))
                 .unwrap_or(0.)
         };
         margin[side] + padding[side] + border.max(0.)

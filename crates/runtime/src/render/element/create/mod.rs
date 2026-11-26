@@ -731,6 +731,9 @@ pub(super) fn create(
             &mut picture,
         );
     }
+    if let Some(size) = natural.as_mut().filter(|_| units.font.zoom != 1.) {
+        *size = size.map(|side| side * units.font.zoom);
+    }
     if node.tag == "svg" {
         el = svg_box(&cx, el, &mut content_layers);
     }
@@ -1310,7 +1313,7 @@ pub(super) fn create(
         el.style().corner_radii = radius;
     }
     if native.as_ref().is_some_and(|look| look.boxed) {
-        el.style().corner_radii = renderer::Corners::all(px(2.).into()).into();
+        el.style().corner_radii = renderer::Corners::all(px(2. * units.font.zoom).into()).into();
     }
     let mut inner_shadows = Vec::new();
     if hit.is_some()
@@ -1705,7 +1708,9 @@ pub(super) fn create(
     let overscroll = overscroll(style);
     let handle = {
         let mut store = view.store.borrow_mut();
-        let scroll = &mut store.state(view.id).geometry.scroll;
+        let geometry = &mut store.state(view.id).geometry;
+        geometry.scroll_zooms.entry(id).or_insert(units.font.zoom);
+        let scroll = &mut geometry.scroll;
         if scrolls.contains(&true)
             || overflow.contains(&renderer::Overflow::Hidden)
                 && (overscroll != renderer::Point::default()

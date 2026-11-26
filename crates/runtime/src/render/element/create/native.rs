@@ -132,6 +132,7 @@ pub(super) fn native_control(
                 },
             };
             crate::render::paint::control::Look {
+                zoom: units.font.zoom,
                 control,
                 boxed,
                 plain,
@@ -180,9 +181,10 @@ pub(super) fn native_control(
     if let Some(look) = &native {
         if look.boxed {
             let (edge, fill) = crate::render::paint::control::box_colors(look);
+            let zoom = units.font.zoom;
             for side in 0..4 {
-                padding[side] += (borders[side] - 1.).max(0.);
-                borders[side] = borders[side].min(1.);
+                padding[side] += (borders[side] - zoom).max(0.);
+                borders[side] = borders[side].min(zoom);
                 border_kinds[side] = "solid";
                 if let Some(edge) = edge {
                     border_colors[side] = Color::hex(edge << 8 | 0xff);
@@ -203,8 +205,8 @@ pub(super) fn native_control(
                 + borders[2]));
         }
         if look.control == crate::render::paint::control::Control::Menu {
-            padding[1] += 12.;
-            padding[3] += 4.;
+            padding[1] += 12. * units.font.zoom;
+            padding[3] += 4. * units.font.zoom;
             if style.get(Prop::WIDTH).is_none_or(|value| value == "auto") {
                 let widest = widest_option(doc, id, &parsed.face, units.font.em, text);
                 el = el.min_w(px((widest * pixel_ratio).ceil() / pixel_ratio
@@ -225,7 +227,7 @@ pub(super) fn native_control(
                     .line_metrics(face, px(units.font.em * pixel_ratio))
                     .map(f32::from);
                 let height = px((ascent + descent) / pixel_ratio
-                    + 2.
+                    + 2. * units.font.zoom
                     + padding[0]
                     + padding[2]
                     + borders[0]
@@ -268,6 +270,7 @@ pub(super) fn control_layer(
     let resizer = (node.tag == "textarea"
         && style.get(Prop::RESIZE).is_none_or(|value| value != "none"))
     .then_some(crate::render::paint::control::Look {
+        zoom: units.font.zoom,
         control: crate::render::paint::control::Control::Resizer,
         ..Default::default()
     });

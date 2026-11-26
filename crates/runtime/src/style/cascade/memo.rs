@@ -28,14 +28,14 @@ impl<T: ?Sized> std::hash::Hash for StyleRef<T> {
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub(crate) struct Inputs {
     pub(crate) parent: Option<(StyleRef, bool)>,
-    pub(crate) units: [u32; 14],
+    pub(crate) units: [u32; 16],
 }
 
 impl Inputs {
     pub(crate) fn new(font: FontUnits, root: FontUnits) -> Self {
-        let mut units = [0; 14];
-        units[..7].copy_from_slice(&font.bits());
-        units[7..].copy_from_slice(&root.bits());
+        let mut units = [0; 16];
+        units[..8].copy_from_slice(&font.bits());
+        units[8..].copy_from_slice(&root.bits());
         Self {
             parent: None,
             units,

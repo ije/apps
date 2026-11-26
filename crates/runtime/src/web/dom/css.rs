@@ -480,7 +480,14 @@ pub(super) fn computed(
             json!([])
         }));
     };
-    let mut units = styles.lengths[id];
+    let mut units = state.units(&styles, id);
+    if let Some(zoom) = style.get(Prop::ZOOM).filter(|_| !pseudo.is_empty()) {
+        units.font = units
+            .font
+            .zoomed(css::value::units::Lengths::effective_zoom(
+                units.font.zoom * css::value::units::Lengths::zoom(zoom),
+            ));
+    }
     // Container units: the width of the nearest container, the height of the nearest size container.
     let mut sizes = [None, None];
     let queried =
@@ -517,7 +524,9 @@ pub(super) fn computed(
                 {
                     *edge += style
                         .get(width)
-                        .map_or(Some(3.), |width| units.resolve(width, base))
+                        .map_or(Some(3. * units.font.zoom), |width| {
+                            units.resolve(width, base)
+                        })
                         .unwrap_or(0.)
                         .max(0.);
                 }
@@ -582,7 +591,6 @@ pub(super) fn computed(
     .flatten()
     .and_then(|grid| state.layout.grid_area(grid, id));
     let block = area.map_or(block, |[width, height]| [block[0], block[1], width, height]);
-    let container = || [block[2], block[3]];
     let inline = !doc.nodes[id].tag.starts_with('#')
         && style
             .get(Prop::DISPLAY)
@@ -636,6 +644,24 @@ pub(super) fn computed(
                 .flatten()
         })
         .or_else(|| pseudo_box.map(|rect| [rect[2], rect[3]]));
+    // Layout is in zoomed pixels, and computed values are in CSS pixels of the element.
+    let zoom = units.font.zoom;
+    let unzoom = |rect: &mut [f32]| rect.iter_mut().for_each(|value| *value /= zoom);
+    let (mut block, mut size, mut pseudo_box) = (block, size, pseudo_box);
+    if zoom != 1. {
+        unzoom(&mut block);
+        size.iter_mut().for_each(|size| unzoom(size));
+        pseudo_box.iter_mut().for_each(|rect| unzoom(rect));
+        units = units.unzoomed();
+    }
+    let container = || [block[2], block[3]];
+    let mirror = |node| {
+        state
+            .geometry
+            .mirror
+            .get(&node)
+            .map(|rect| rect.map(|v| v / zoom))
+    };
     // Typed OM reads computed values, which keep `auto` and percentages, and transform functions.
     let typed = args[3] == true;
     let size = size.filter(|_| !typed);
@@ -710,10 +736,7 @@ pub(super) fn computed(
                         .collect();
                     view_box.get(2 + axis).copied()
                 });
-                let viewport = viewport.or_else(|| {
-                    svg.and_then(|svg| state.geometry.mirror.get(&svg))
-                        .map(|rect| rect[2 + axis])
-                });
+                let viewport = viewport.or_else(|| svg.and_then(mirror).map(|rect| rect[2 + axis]));
                 match viewport.and_then(|base| units.resolve(given, base)) {
                     Some(length) => {
                         format!("{}px", css::value::tokens::number(f64::from(length)))
@@ -745,16 +768,12 @@ pub(super) fn computed(
                 }
                 let corner = if generated {
                     // The layout place of the pseudo-element is from the border box of its element.
-                    let (Some([x, y, ..]), Some(&[left, top, ..])) =
-                        (pseudo_box, state.geometry.mirror.get(&id))
-                    else {
+                    let (Some([x, y, ..]), Some([left, top, ..])) = (pseudo_box, mirror(id)) else {
                         return value;
                     };
                     [left + x, top + y]
                 } else {
-                    let (Some(&[x, y, width, height]), Some(size)) =
-                        (state.geometry.mirror.get(&id), size)
-                    else {
+                    let (Some([x, y, width, height]), Some(size)) = (mirror(id), size) else {
                         return value;
                     };
                     // The bounds hold the transformed box, whose center is the transformed center of the box.
@@ -910,7 +929,7 @@ pub(super) fn computed(
                 let mut used = used.iter().map(|&track| {
                     format!(
                         "{}px",
-                        css::value::tokens::number(f64::from((track * 64.).round() / 64.))
+                        css::value::tokens::number(f64::from((track / zoom * 64.).round() / 64.))
                     )
                 });
                 // `repeat()` with a count gives its tracks and names that many times.

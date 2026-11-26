@@ -210,6 +210,8 @@ pub(crate) struct NodeLengths {
     pub(crate) ids: Chunked<u32>,
     pub(crate) list: Vec<Lengths>,
     pub(crate) last: u32,
+    // Whether a node may have a zoom.
+    pub(crate) zoomed: bool,
 }
 
 impl NodeLengths {
@@ -219,6 +221,7 @@ impl NodeLengths {
         self.list.clear();
         self.list.push(lengths);
         self.last = 0;
+        self.zoomed = false;
     }
 
     pub(crate) fn set(&mut self, id: usize, lengths: Lengths) {
@@ -228,6 +231,7 @@ impl NodeLengths {
             self.last = match newest.find(|(_, old)| **old == lengths) {
                 Some((index, _)) => index as u32,
                 None => {
+                    self.zoomed |= lengths.font.zoom != 1.;
                     self.list.push(lengths);
                     self.list.len() as u32 - 1
                 }
@@ -319,6 +323,17 @@ pub(crate) struct Used {
 }
 
 impl Used {
+    // The values in CSS pixels of the box, as the style holds them.
+    pub(crate) fn unzoomed(mut self, zoom: f32) -> Self {
+        if zoom != 1. {
+            let unzoom = |value: &mut Option<f32>| *value = value.map(|value| value / zoom);
+            self.insets.iter_mut().flatten().for_each(unzoom);
+            self.shown.iter_mut().flatten().for_each(unzoom);
+            self.lengths.iter_mut().for_each(|(_, value)| unzoom(value));
+        }
+        self
+    }
+
     // Puts the values into a style, for layout or for scripts.
     pub(crate) fn apply(&self, style: &mut Style, shown: bool) {
         if let Some(own) = &self.own {
