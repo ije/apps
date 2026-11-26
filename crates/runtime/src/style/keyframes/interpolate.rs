@@ -871,6 +871,23 @@ impl Lerp {
                 Self::new(property, from, &identity)
             };
         }
+        if matches!(property, "translate" | "scale") {
+            let lists = [from, to].map(|value| components(value, ' '));
+            let count = lists[0].len().max(lists[1].len());
+            if lists[0].len() != lists[1].len() && lists.iter().all(|list| !list.is_empty()) {
+                let [a, b] = lists.map(|mut list| {
+                    for index in list.len()..count {
+                        list.push(match (property, index) {
+                            ("scale", 1) => list[0],
+                            ("scale", _) => "1",
+                            _ => "0px",
+                        });
+                    }
+                    list.join(" ")
+                });
+                return Self::new(property, &a, &b);
+            }
+        }
         if let (Some(a), Some(b)) = (color(from), color(to)) {
             // As in browsers, colors interpolate in sRGB only when both are legacy sRGB colors.
             return Some(

@@ -212,7 +212,7 @@ globalThis.__appsNet = (call, EventEmitter, streams, Buffer, { decode }) => {
     getDefaultAutoSelectFamily: () => autoSelect, setDefaultAutoSelectFamily: value => { autoSelect = !!value; },
     getDefaultAutoSelectFamilyAttemptTimeout: () => autoSelectTimeout, setDefaultAutoSelectFamilyAttemptTimeout: value => { autoSelectTimeout = Math.max(10, Number(value)); },
     isIP: value => call('web.tcp.ip', String(value)), isIPv4: value => call('web.tcp.ip', String(value)) === 4, isIPv6: value => call('web.tcp.ip', String(value)) === 6 };
-  return { api, tls, normalize, port, failure,
+  return { api, tls, normalize, port, failure, adopt(socket, id) { socket._socket = id; sockets.set(id, socket); },
     poll() {
       if (!sockets.size && !servers.size) return;
       for (const event of call('web.tcp.poll')) {

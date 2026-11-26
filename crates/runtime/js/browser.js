@@ -1,11 +1,11 @@
-globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = () => {}, nativeImage) => {
+globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = () => {}, nativeImage, newIpc) => {
   const contents = new Map(), pending = new Map(), partitions = new Map(), layouts = new WeakMap(), owners = new WeakMap();
   const safe = { nodeIntegration: false, nodeIntegrationInWorker: false, nodeIntegrationInSubFrames: false, contextIsolation: true, sandbox: true, webSecurity: true, webviewTag: false, allowRunningInsecureContent: false, experimentalFeatures: false };
   const eventOf = (fields = {}) => ({ ...fields, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } });
   const failure = text => { const match = /^(\w*Error): ([\s\S]*)$/.exec(text ?? ''); return match ? Object.assign(new Error(match[2]), { name: match[1] }) : new Error(text); };
   let nextRequest = 0;
   class Contents extends EventEmitter {
-    ipc = Object.assign(new EventEmitter(), { handle() {}, handleOnce() {}, removeHandler() {} });
+    get ipc() { return this._ipc ??= newIpc(); }
     isLoadingMainFrame() { return this.isLoading(); }
     reloadIgnoringCache() { this.reload(); }
     setUserAgent() {}
@@ -77,7 +77,7 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
       return this._request('capture', rect ? { rect } : {}).then(image => nativeImage.createFromBuffer(Uint8Array.fromBase64(image.png)));
     }
     get session() { return session.fromPartition(this.#partition ?? 'persist:default'); }
-    get mainFrame() { const contents = this; return { get url() { return contents.getURL(); }, get top() { return this; }, parent: null, frames: [], framesInSubtree: [], processId: 0, routingId: 1, frameTreeNodeId: this.id, visibilityState: 'visible', detached: false, executeJavaScript: code => contents.executeJavaScript(code), send() {}, isDestroyed: () => contents.isDestroyed() }; }
+    get mainFrame() { const contents = this; return { get url() { return contents.getURL(); }, get top() { return this; }, get ipc() { return contents.ipc; }, parent: null, frames: [], framesInSubtree: [], processId: 0, routingId: 1, frameTreeNodeId: this.id, visibilityState: 'visible', detached: false, executeJavaScript: code => contents.executeJavaScript(code), send() {}, isDestroyed: () => contents.isDestroyed() }; }
     get focusedFrame() { return this.mainFrame; }
     get navigationHistory() { const contents = this; return { canGoBack: () => contents.canGoBack(), canGoForward: () => contents.canGoForward(), goBack: () => contents.goBack(), goForward: () => contents.goForward(), canGoToOffset: () => false, goToOffset() {}, goToIndex() {}, clear() {}, getActiveIndex: () => 0, length: () => 1, getEntryAtIndex: () => ({ url: contents.getURL(), title: contents.getTitle() }), getAllEntries: () => [{ url: contents.getURL(), title: contents.getTitle() }] }; }
     get debugger() { return this.#debugger ??= new Debugger(this); }
@@ -305,7 +305,7 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
     #contents() { if (!partitions.has(this.#partition)) partitions.set(this.#partition, new WebContents({ partition: this.#partition })); return partitions.get(this.#partition); }
     get storagePath() { return null; }
     get availableSpellCheckerLanguages() { return []; }
-    clearStorageData() { return partitions.has(this.#partition) ? this.#contents()._request('clearStorage', {}) : Promise.resolve(); }
+    clearStorageData() { return this.#contents()._request('clearStorage', {}); }
     clearCache() { return this.clearStorageData(); }
     clearAuthCache() { return Promise.resolve(); }
     clearHostResolverCache() { return Promise.resolve(); }

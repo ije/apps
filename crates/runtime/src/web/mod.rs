@@ -658,7 +658,10 @@ impl State {
                 .into()),
             _ => match op.split_once('.') {
                 Some(("platform", op)) => self.platform.call(op, args),
-                Some(("serve", op)) => self.servers.call(op, args, &mut self.sockets),
+                Some(("serve", op)) => {
+                    self.servers
+                        .call(op, args, &mut self.sockets, &mut self.tcp)
+                }
                 Some(("socket", op)) => self.sockets.call(op, args, self.renderer),
                 Some(("crypto", op)) => crate::web::crypto::call(op, args),
                 Some(("worker", op)) => self.workers.call(op, args),

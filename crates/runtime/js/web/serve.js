@@ -29,7 +29,7 @@ globalThis.__appsServe = call => {
         },
         stop(force = false) { call('web.serve.stop', address.id, !!force); if (force && servers.delete(address.id)) close(); return closed; },
       });
-      servers.set(address.id, { handler, server, close });
+      servers.set(address.id, { handler, server, close, connect: options.connect });
       return server;
     },
     poll() {
@@ -48,6 +48,11 @@ globalThis.__appsServe = call => {
           else if(event.done){upload.controller.close();uploads.delete(key);}
           else upload.controller.enqueue(decode(event.bytes));
           upload.resolve?.();upload.resolve=null;continue;
+        }
+        if (event.method === 'CONNECT') {
+          const tunnel = (head, address) => call('web.serve.tunnel', event.server, event.id, head, address);
+          if (state.connect) state.connect({ authority: event.url.slice(7, -1), headers: event.headers, peer: event.peer }, tunnel); else tunnel({ status: 405, headers: [['connection', 'close']], body: [] });
+          continue;
         }
         (async () => {
           let response, upload;

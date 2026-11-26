@@ -74,7 +74,7 @@ These parts differ from browsers. The ones that don't work show an error in the 
 | `<legend>` | In a `<fieldset>` with rounded corners, the legend is drawn inside the border instead of on it |
 | Registered custom properties | `@property` values compute to their canonical form, like `rgb()` for colors. Relative lengths like `2em` compute when scripts read them, so an inherited `2em` resolves with the font size of the element that uses it. `light-dark()`, system colors, images and URLs keep their written form |
 | Transform animations | Lists that don't match function by function interpolate as matrices only when their lengths are in `px` and they have no `perspective()`. Other such lists switch halfway |
-| Other animated values | `font-style` from `normal` to an `oblique` angle, and `translate` and `scale` with another number of values at each end switch halfway, where Chrome interpolates them |
+| Other animated values | `font-style` from `normal` to an `oblique` angle switches halfway, where Chrome interpolates it |
 | Scroll-driven animations | Not supported: `animation-timeline`, `animation-range`, `scroll-timeline`, `view-timeline` and `timeline-scope` are rejected |
 | Animations and `!important` | CSS and script animations of pseudo-elements override `!important` declarations, where browsers keep the important value |
 | Animations out of view | Animations and transitions that only paint and can't move the box (rotate, scale, opacity, colors, shadows) pause while the box is outside the window or clipped away. They go on at the current time when the box comes into view, and fire no `animationiteration` events meanwhile |

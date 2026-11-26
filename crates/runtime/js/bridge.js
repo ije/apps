@@ -98,7 +98,8 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     const id=sourceId(source),sender=hooks.contents?.(id)??null,processId=globalThis.process?.pid??0;
     return{sender,senderFrame:{url:sender?.getURL?.()??'',processId,routingId:1,send:(channel,...args)=>sender?.send(channel,...args)},processId,frameId:1,ports:[],reply:(channel,...args)=>send(source,{kind:'event',channel,args:encode(args,source)}),returnValue:undefined};
   };
-  const emit=(channel,...args)=>emitter.listenerCount(channel)>0&&emitter.emit(channel,...args);
+  // As in Electron, a message goes to the `ipc` of its web contents first, then to `ipcMain`.
+  const emit=(channel,event,...args)=>{for(const target of[event.sender?._ipc,emitter])if(target?.listenerCount(channel)>0)target.emit(channel,event,...args);};
   const report=error=>(hooks.report??console.error)(error);
   // Events, invoke handlers and replies of one peer keep their send order, as they do over one Electron IPC channel.
   const drain=()=>{for(const message of queue.splice(0)){try{if(typeof message==='function')message();else emit(message.channel,event(message.sender),...decode(message.args,message.sender));}catch(error){report(error);}}};
@@ -106,10 +107,10 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
   const settle=(message,request=pending.get(message.id))=>{if(!request||request.recipient!==peer(message.sender))return;pending.delete(message.id);try{if(message.error)request.reject(decode(message.error,message.sender));else request.resolve(decode(message.value,message.sender));}catch(error){request.reject(error);}};
   const invoke=message=>{
     const fail=(error,log=true)=>{if(log)console.error(`Error occurred in handler for '${message.channel}':`,error);return{thrown:encode(new Error(`Error invoking remote method '${message.channel}': ${error}`),message.sender)};};
-    const action=handlers.get(message.channel);
+    const eventObject=event(message.sender),action=eventObject.sender?._ipc?._handlers.get(message.channel)??handlers.get(message.channel);
     if(!action)return fail(new Error(`No handler registered for '${message.channel}'`),false);
     let value;
-    try{value=action(event(message.sender),...decode(message.args,message.sender));if(!value||typeof value.then!=='function')return{immediate:encode(value,message.sender)};}catch(error){return fail(error);}
+    try{value=action(eventObject,...decode(message.args,message.sender));if(!value||typeof value.then!=='function')return{immediate:encode(value,message.sender)};}catch(error){return fail(error);}
     Promise.resolve(value).then(value=>{let encoded;try{encoded=encode(value,message.sender);}catch(error){return reply(message,fail(error));}reply(message,{immediate:encoded});},error=>reply(message,fail(error)));
     return{pending:true};
   };
@@ -164,7 +165,8 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     call('bridge.expose',name,encode(value,page,false,true));try{send(page,{kind:'expose'});}catch{}
   }};
   const ipcMain=emitter;
-  if(role==='main')Object.assign(ipcMain,{handle(channel,fn){if(handlers.has(channel))throw new Error(`Attempted to register a second handler for '${channel}'`);handlers.set(channel,fn);},handleOnce(channel,fn){this.handle(channel,(...args)=>{handlers.delete(channel);return fn(...args);});},removeHandler:channel=>handlers.delete(channel)});
+  const ipc=(target,handlers)=>Object.assign(target,{_handlers:handlers,handle(channel,fn){if(handlers.has(channel))throw new Error(`Attempted to register a second handler for '${channel}'`);handlers.set(channel,fn);},handleOnce(channel,fn){this.handle(channel,(...args)=>{handlers.delete(channel);return fn(...args);});},removeHandler:channel=>handlers.delete(channel)});
+  if(role==='main'){ipc(ipcMain,handlers);hooks.ipc=()=>ipc(new EventEmitter(),new Map());}
   const ipcRenderer=emitter;
   if(preload){
     Object.assign(ipcRenderer,{invoke:(channel,...args)=>{const result=new Promise(resolve=>resolve(rpc('main',{kind:'invoke',channel,args:encode(args,'main')})));return queue.length?new Promise(resolve=>enqueue(()=>resolve(result))):result;},send:(channel,...args)=>send('main',{kind:'event',channel,args:encode(args,'main')}),sendSync:(channel,...args)=>decode(send('main',{kind:'sync',channel,args:encode(args,'main')}),'main')});

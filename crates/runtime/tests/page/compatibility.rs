@@ -864,6 +864,10 @@ fn node_http_classes_ports_and_errors() {
         const streamed=await fetch({path:'/stream'});assert.deepStrictEqual([streamed.data,streamed.headers['x-a']],['ab','1, 2']);
         assert.strictEqual((await fetch({path:'/patched'})).data,'patched:yes');
         assert.deepStrictEqual(await fetch({path:'/204'}).then(r=>[r.status,r.data]),[204,'']);
+        const tunnel=text=>new Promise(resolve=>{let data='';const socket=net.connect(port,'127.0.0.1',()=>socket.write('CONNECT a.test:443 HTTP/1.1\r\nHost: a.test:443\r\n\r\n'));socket.setEncoding('latin1');socket.on('data',chunk=>{if(!data&&text)socket.write(text);data+=chunk;});socket.on('close',()=>resolve(data.replace(/date:[^\r]*\r\n/,'')));});
+        assert.strictEqual(await tunnel(),'HTTP/1.1 405 Method Not Allowed\r\nconnection: close\r\ncontent-length: 0\r\n\r\n');
+        server.on('connect',(req,socket)=>{socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');socket.on('data',chunk=>socket.end(req.url+':'+chunk));});
+        assert.strictEqual(await tunnel('ping'),'HTTP/1.1 200 Connection Established\r\n\r\na.test:443:ping');
         const busy=http.createServer().listen({port:String(port),host:'127.0.0.1'}),inUse=await new Promise(resolve=>busy.on('error',resolve));
         assert.strictEqual(inUse.message,`listen EADDRINUSE: address already in use 127.0.0.1:${port}`);assert.ok(inUse.code==='EADDRINUSE'&&inUse.syscall==='listen'&&inUse.port===port);
         await new Promise(resolve=>server.close(resolve));

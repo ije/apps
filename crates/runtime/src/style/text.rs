@@ -414,6 +414,11 @@ pub(crate) fn spacing(style: &Style, units: &Lengths, prop: Prop) -> renderer::P
 pub(crate) fn pseudo_content(doc: &Document, id: usize, pseudo: &Style, content: &str) -> String {
     let node = &doc.nodes[id];
     let mut text = String::new();
+    // The text after `/` is for assistive tools only.
+    let content = components(content, '/')
+        .first()
+        .copied()
+        .unwrap_or_default();
     for part in components(content, ' ') {
         if let Some(name) = part.strip_prefix("attr(").and_then(|v| v.strip_suffix(')')) {
             text.push_str(node.attrs.get(name.trim()).map_or("", String::as_str));

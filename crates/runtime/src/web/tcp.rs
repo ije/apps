@@ -174,6 +174,47 @@ impl Transport for tokio::net::UnixStream {
     }
 }
 
+// The connection of an HTTP CONNECT request, after its response.
+struct Tunnel(hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>, Value);
+impl AsyncRead for Tunnel {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+impl AsyncWrite for Tunnel {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+impl Transport for Tunnel {
+    fn control(&self) -> std::io::Result<socket2::Socket> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+    fn address(&self) -> Value {
+        self.1.clone()
+    }
+}
+
 type Failure = (std::io::Error, &'static str, Value);
 
 fn failure((error, syscall, mut details): Failure) -> Value {
@@ -214,7 +255,11 @@ async fn run(
     if !events(json!({"kind":"connect","address":stream.address()}).into()).await {
         return Ok(());
     }
-    let control = stream.control().map_err(io("connect"))?;
+    // A tunnel has no socket of its own to set options on.
+    let control = match stream.control() {
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
+        control => Some(control.map_err(io("connect"))?),
+    };
     loop {
         let (mut reader, mut writer) = tokio::io::split(stream);
         let upgrading = tokio::sync::Notify::new();
@@ -264,9 +309,12 @@ async fn run(
                         break;
                     }
                     Command::NoDelay(value) => {
-                        let _ = control.set_tcp_nodelay(value);
+                        let _ = control
+                            .as_ref()
+                            .map(|control| control.set_tcp_nodelay(value));
                     }
                     Command::KeepAlive(value, delay) => {
+                        let Some(control) = &control else { continue };
                         let _ = control.set_keepalive(value);
                         if value && delay > 0 {
                             let _ = control.set_tcp_keepalive(
@@ -388,6 +436,17 @@ impl State {
         &mut self,
         future: impl std::future::Future<Output = Result<Accepted, Failure>> + Send + 'static,
     ) -> Result<u64> {
+        // Boxed, so the task below is compiled once for all kinds of sockets.
+        let future: std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>> =
+            Box::pin(future);
+        self.spawn(future)
+    }
+    fn spawn(
+        &mut self,
+        future: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Accepted, Failure>> + Send>,
+        >,
+    ) -> Result<u64> {
         let (commands, incoming) = mpsc::unbounded_channel();
         let (paused, pausing) = watch::channel(false);
         let (output, events) = mpsc::channel(64);
@@ -415,6 +474,21 @@ impl State {
             },
         );
         Ok(self.next_id)
+    }
+    /// Makes the connection of an answered CONNECT request a socket. `address` is what its `connect` event reports.
+    pub(crate) fn adopt(
+        &mut self,
+        upgrade: hyper::upgrade::OnUpgrade,
+        address: Value,
+    ) -> Result<u64> {
+        self.start(async move {
+            match upgrade.await {
+                Ok(stream) => {
+                    Ok(Box::new(Tunnel(hyper_util::rt::TokioIo::new(stream), address)) as Accepted)
+                }
+                Err(error) => Err((std::io::Error::other(error), "connect", json!({}))),
+            }
+        })
     }
     pub(crate) fn call(&mut self, op: &str, args: &Value) -> Result<Value> {
         match op {

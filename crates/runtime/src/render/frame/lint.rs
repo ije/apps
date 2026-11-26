@@ -84,12 +84,7 @@ pub(super) fn lint(
                         || css::value::grammar::initial(name) == Some(value)
                         || name.ends_with("text-size-adjust")
                         || name.ends_with("print-color-adjust")
-                        || name.starts_with("page-break-")
-                        || name.starts_with("break-")
-                        || matches!(
-                            name,
-                            "orphans" | "widows" | "speak" | "forced-color-adjust" | "touch-action"
-                        ) =>
+                        || matches!(name, "speak" | "forced-color-adjust" | "touch-action") =>
                     {
                         continue;
                     }

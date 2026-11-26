@@ -49,6 +49,9 @@ pub(crate) fn supports(name: &str, value: &str) -> Option<bool> {
     {
         return Some(false);
     }
+    if matches!(name, "orphans" | "widows") && value.parse::<f64>().is_ok_and(|lines| lines < 1.) {
+        return Some(false);
+    }
     // `<position>` has no three-value form, unlike `<bg-position>`.
     if matches!(name, "object-position" | "perspective-origin") && components(value, ' ').len() == 3
     {
@@ -435,6 +438,9 @@ const INITIAL: &[(&str, &str)] = &[
     ("bottom", "auto"),
     ("box-shadow", "none"),
     ("box-sizing", "content-box"),
+    ("break-after", "auto"),
+    ("break-before", "auto"),
+    ("break-inside", "auto"),
     ("caption-side", "top"),
     ("caret-animation", "auto"),
     ("caret-color", "auto"),
@@ -543,6 +549,7 @@ const INITIAL: &[(&str, &str)] = &[
     ("offset-rotate", "auto"),
     ("opacity", "1"),
     ("order", "0"),
+    ("orphans", "2"),
     ("outline-color", "currentcolor"),
     ("outline-offset", "0px"),
     ("outline-style", "none"),
@@ -558,6 +565,9 @@ const INITIAL: &[(&str, &str)] = &[
     ("padding-left", "0px"),
     ("padding-right", "0px"),
     ("padding-top", "0px"),
+    ("page-break-after", "auto"),
+    ("page-break-before", "auto"),
+    ("page-break-inside", "auto"),
     ("perspective", "none"),
     ("perspective-origin", "50% 50%"),
     ("pointer-events", "auto"),
@@ -635,6 +645,7 @@ const INITIAL: &[(&str, &str)] = &[
     ("view-transition-name", "none"),
     ("visibility", "visible"),
     ("white-space", "normal"),
+    ("widows", "2"),
     ("width", "auto"),
     ("will-change", "auto"),
     ("word-break", "normal"),

@@ -361,6 +361,9 @@ pub(crate) struct State {
     codecs: HashMap<u64, (Codec, bool)>,
     pub(crate) children: child_process::State,
     pub(crate) pty: pty::State,
+    // Whether this context gets the signals of the process.
+    #[cfg(unix)]
+    signals: bool,
 }
 impl Default for State {
     fn default() -> Self {
@@ -375,6 +378,8 @@ impl Default for State {
             codecs: HashMap::new(),
             children: child_process::State::default(),
             pty: pty::State::default(),
+            #[cfg(unix)]
+            signals: false,
         }
     }
 }
@@ -546,7 +551,7 @@ impl State {
                     ])
                 }))
             }
-            "tty.watch" => {
+            "signal.watch" => {
                 #[cfg(unix)]
                 {
                     use std::sync::atomic::{AtomicI32, Ordering::Relaxed};
@@ -554,11 +559,24 @@ impl State {
                         mpsc::Sender<crate::jsc::payload::Payload>,
                         crate::jsc::Waker,
                     );
-                    // The handler may only write to a non-blocking pipe; a thread turns each byte into `resize` events.
+                    // The handler may only write to a non-blocking pipe; a thread turns each byte into a `signal` event.
                     static PIPE: AtomicI32 = AtomicI32::new(-1);
                     static SUBSCRIBERS: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
-                    extern "C" fn resized(_: libc::c_int) {
-                        unsafe { libc::write(PIPE.load(Relaxed), [1u8].as_ptr().cast(), 1) };
+                    extern "C" fn caught(signal: libc::c_int) {
+                        unsafe {
+                            libc::write(PIPE.load(Relaxed), [signal as u8].as_ptr().cast(), 1)
+                        };
+                    }
+                    let name = args[0].as_str().context("Expected signal name")?;
+                    let signal = SIGNALS
+                        .iter()
+                        .find(|(known, _)| *known == name)
+                        .map(|(_, signal)| *signal)
+                        .filter(|signal| ![libc::SIGKILL, libc::SIGSTOP].contains(signal))
+                        .with_context(|| format!("Can't listen for {name}"))?;
+                    if args[1] == false {
+                        unsafe { libc::signal(signal, libc::SIG_DFL) };
+                        return Ok(Value::Null);
                     }
                     let mut subscribers = SUBSCRIBERS.lock().unwrap();
                     if PIPE.load(Relaxed) < 0 {
@@ -579,26 +597,36 @@ impl State {
                                     match unsafe { libc::read(fds[0], (&raw mut byte).cast(), 1) } {
                                         0 => break,
                                         1 => {
+                                            let Some((name, _)) = SIGNALS
+                                                .iter()
+                                                .find(|(_, signal)| *signal == i32::from(byte))
+                                            else {
+                                                continue;
+                                            };
                                             SUBSCRIBERS.lock().unwrap().retain(|(sender, wake)| {
                                                 let open = sender
-                                                    .send(json!({"resize":true}).into())
+                                                    .send(
+                                                        json!({"signal":name,"number":byte}).into(),
+                                                    )
                                                     .is_ok();
                                                 wake.wake();
                                                 open
                                             });
                                             #[cfg(target_os = "macos")]
-                                            crate::malloc::flush();
+                                            if i32::from(byte) == libc::SIGWINCH {
+                                                crate::malloc::flush();
+                                            }
                                         }
                                         _ => {}
                                     }
                                 }
                             })?;
                         PIPE.store(fds[1], Relaxed);
-                        unsafe {
-                            libc::signal(libc::SIGWINCH, resized as *const () as libc::sighandler_t)
-                        };
                     }
-                    subscribers.push((self.sender.clone(), crate::jsc::Waker::current()));
+                    unsafe { libc::signal(signal, caught as *const () as libc::sighandler_t) };
+                    if !std::mem::replace(&mut self.signals, true) {
+                        subscribers.push((self.sender.clone(), crate::jsc::Waker::current()));
+                    }
                 }
                 Ok(Value::Null)
             }

@@ -432,7 +432,7 @@
   const ptyModule = once(() => pty = installPty(call));
   // Like Node.js, main has `fetch` but no `XMLHttpRequest`, and libraries look for it to detect a browser.
   for (const name of ['FileReader', 'ProgressEvent', 'XMLHttpRequest', 'XMLHttpRequestEventTarget', 'XMLHttpRequestUpload']) delete globalThis[name];
-  browsers = globalThis.__appsBrowser(call, events.EventEmitter, () => ready, contents => app.emit('web-contents-created', event(), contents), electron.nativeImage);
+  browsers = globalThis.__appsBrowser(call, events.EventEmitter, () => ready, contents => app.emit('web-contents-created', event(), contents), electron.nativeImage, () => hooks.ipc());
   delete globalThis.__appsBrowser;
   nativeShell = globalThis.__appsNativeShell(call, events.EventEmitter, role !== 'main', electron.nativeImage);
   delete globalThis.__appsNativeShell;
@@ -498,6 +498,7 @@
     loadEnvFile() {},
   });
   process.hrtime.bigint = () => BigInt(Math.floor(performance.now() * 1e6));
+  if (role === 'main' && workers.api.isMainThread) node.signals(process);
   Object.defineProperty(process, 'ppid', { get: () => node.details().ppid ?? 0, enumerable: true });
   if (role === 'main' && env.NODE_CHANNEL_FD && env.NODE_CHANNEL_SERIALIZATION_MODE !== 'advanced') {
     const fd = +env.NODE_CHANNEL_FD, port = env.APPS_PARENT_PORT;

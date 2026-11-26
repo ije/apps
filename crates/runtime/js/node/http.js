@@ -67,7 +67,7 @@ globalThis.__appsHTTP = (serve, stream, EventEmitter, net) => {
       if(options.path!==undefined)throw fail(Error,'ERR_INVALID_ARG_VALUE','HTTP servers can only listen on a TCP port');
       const port=options.port==null?0:net.port(options.port,'options.port'),hostname=options.host||'0.0.0.0';
       if(callback)this.once('listening',callback);
-      try{this._server=serve({port,hostname,fetch:(request,server)=>this._handle(request,server)});}
+      try{this._server=serve({port,hostname,fetch:(request,server)=>this._handle(request,server),connect:(request,tunnel)=>this._connect(request,tunnel)});}
       catch(error){queueMicrotask(()=>this.emit('error',net.failure({code:error.code??'EIO',syscall:'listen',description:error.message.replace(/ \(os error \d+\)$/,'').replace(/^./,c=>c.toLowerCase()),address:hostname,port})));return this;}
       this.listening=true;queueMicrotask(()=>this.emit('listening'));return this;
     }
@@ -80,6 +80,22 @@ globalThis.__appsHTTP = (serve, stream, EventEmitter, net) => {
       socket._upgrade=options=>{const ws=server.upgrade(request,options);res._started=true;resolve(undefined);return ws;};
       if(request.headers.get('upgrade')?.toLowerCase()==='websocket'&&this.listenerCount('upgrade')){req.upgrade=true;this.emit('upgrade',req,socket,Buffer.alloc(0));}else this.emit('request',req,res);
     });}
+    // The listener answers on the socket, as in Node.js. The head of that answer goes out through the HTTP server, and the socket takes the connection after it.
+    _connect({authority,headers,peer},tunnel){
+      if(!this.listenerCount('connect'))return tunnel({status:405,headers:[['connection','close']],body:[]});
+      const socket=Object.assign(new net.api.Socket(),{remoteAddress:peer.address,remotePort:peer.port,remoteFamily:peer.family}),req=Object.assign(headersOf(headers,new IncomingMessage(socket)),{method:'CONNECT',url:authority,upgrade:true}),write=socket._write,local=this.address();
+      let head=Buffer.alloc(0);
+      socket._write=(chunk,encoding,callback)=>{
+        head=Buffer.concat([head,chunk]);const end=head.indexOf('\r\n\r\n');if(end<0)return callback();
+        const[line,...fields]=head.toString('latin1',0,end).split('\r\n'),[,status,statusText]=/^HTTP\/1\.[01] (\d{3}) ?(.*)$/.exec(line)??[],rest=head.subarray(end+4),open=status>=200&&status<300;
+        head=null;socket._write=write;
+        let id;try{id=tunnel({status:+status||500,statusText,headers:fields.map(field=>{const at=field.indexOf(':');return[field.slice(0,at),field.slice(at+1).trim()];}),body:open?[]:rest},{localAddress:local.address,localPort:local.port,remoteAddress:peer.address,remotePort:peer.port,remoteFamily:peer.family});}catch(error){return callback(error);}
+        if(id==null){callback();socket.destroy();return;}
+        net.adopt(socket,id);if(rest.length)write(rest,encoding,callback);else callback();
+      };
+      socket.once('close',()=>{if(head)try{tunnel({status:500,headers:[['connection','close']],body:[]});}catch{}});
+      this.emit('connect',req,socket,Buffer.alloc(0));
+    }
     address(){return this.listening?{address:this._server.hostname,family:this._server.hostname.includes(':')?'IPv6':'IPv4',port:this._server.port}:null;}
     close(callback){if(!this.listening){if(callback)queueMicrotask(()=>callback(fail(Error,'ERR_SERVER_NOT_RUNNING','Server is not running.')));return this;}this.listening=false;this._server.stop().then(()=>{this.emit('close');callback?.();});return this;}
     closeAllConnections(){for(const socket of this._active)socket.destroy();}

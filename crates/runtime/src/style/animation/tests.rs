@@ -190,6 +190,16 @@ fn values_interpolate_by_type() {
         "5px 10px"
     );
     assert_eq!(
+        mix("translate", "100px", "200px 100px", 0.5).unwrap(),
+        "150px 50px"
+    );
+    assert_eq!(
+        mix("translate", "10px 20px 30px", "110px", 0.5).unwrap(),
+        "60px 10px 15px"
+    );
+    assert_eq!(mix("scale", "1", "2 3", 0.5).unwrap(), "1.5 2");
+    assert_eq!(mix("scale", "2", "1 1 3", 0.5).unwrap(), "1.5 1.5 2");
+    assert_eq!(
         mix("transform", "rotate(10deg)", "scale(2)", 0.5).unwrap(),
         "matrix(1.49429, 0.130734, -0.130734, 1.49429, 0, 0)"
     );

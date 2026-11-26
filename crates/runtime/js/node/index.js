@@ -723,7 +723,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     return entry;
   };
   files.unwatchFile = (value, listener) => { const file = pathArg(value), entry = polls.get(file); if (!entry) return; if (listener) entry.off('change', listener); else entry.removeAllListeners('change'); if (!entry.listenerCount('change')) { clearInterval(entry.timer); polls.delete(file); } };
-  const poll = () => { if (!pending.size && !watchers.size && !resizing.size) return; for (const event of sync('poll')) { if (event.resize) { for (const stream of resizing) stream.emit('resize'); } else if (event.watch) { const watcher = watchers.get(event.id); if (!watcher) continue; if (event.error) watcher.emit('error', new Error(event.error)); else for (const p of event.paths) watcher.emit('change', event.event, p); } else { const item = pending.get(event.id); pending.delete(event.id); if (item) { if (event.error) item.reject(Object.assign(new Error(event.error), { code: event.code ?? undefined })); else item.resolve(event.value); } } } };
+  const poll = () => { if (!pending.size && !watchers.size && !signaled) return; for (const event of sync('poll')) { if (event.signal) { if (event.signal === 'SIGWINCH') for (const stream of resizing) stream.emit('resize'); signaled.emit?.(event.signal, event.signal, event.number); } else if (event.watch) { const watcher = watchers.get(event.id); if (!watcher) continue; if (event.error) watcher.emit('error', new Error(event.error)); else for (const p of event.paths) watcher.emit('change', event.event, p); } else { const item = pending.get(event.id); pending.delete(event.id); if (item) { if (event.error) item.reject(Object.assign(new Error(event.error), { code: event.code ?? undefined })); else item.resolve(event.value); } } } };
   poll.pending = () => { if (pending.size) return true; for (const watcher of watchers.values()) if (watcher._ref) return true; return false; };
 
   const os = {
@@ -1229,8 +1229,11 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     return { ReadStream, WriteStream };
   })())[name];
   const tty = { isatty: fd => Number.isInteger(fd) && sync('isatty', fd), get ReadStream() { return ttyStream('ReadStream'); }, get WriteStream() { return ttyStream('WriteStream'); } };
-  const resizing = new Set(), resizable = stream => stream.on('newListener', name => { if (name !== 'resize' || resizing.has(stream)) return; if (!resizing.size) sync('tty.watch'); resizing.add(stream); });
+  const resizing = new Set(), resizable = stream => stream.on('newListener', name => { if (name !== 'resize' || resizing.has(stream)) return; if (!resizing.size) { sync('signal.watch', 'SIGWINCH', true); signaled ||= true; } resizing.add(stream); });
+  // The signals with a listener on `process` go to the listeners, and the others keep their default action.
+  let signaled = false;
+  const signals = process => { signaled = process.on('newListener', name => { if (name in constants.signals && !process.listenerCount(name)) sync('signal.watch', name, true); }).on('removeListener', name => { if (name in constants.signals && name !== 'SIGWINCH' && !process.listenerCount(name)) sync('signal.watch', name, false); }); };
   let streams;
   const terminal = (stream, modules) => { streams = modules; return resizable(Object.setPrototypeOf(stream, tty.WriteStream.prototype)); };
-  return { Buffer, buffer, fs: files, path, os, util, url, string_decoder: { StringDecoder }, assert, querystring, get dns() { return dnsModule(); }, tty, details, sync, asyncCall, poll, terminal };
+  return { Buffer, buffer, fs: files, path, os, util, url, string_decoder: { StringDecoder }, assert, querystring, get dns() { return dnsModule(); }, tty, details, sync, asyncCall, poll, terminal, signals };
 };

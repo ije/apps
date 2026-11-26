@@ -29,6 +29,35 @@ type RequestEvent = (
     Option<(Reply, mpsc::Sender<()>)>,
 );
 
+// The status line and the headers of a response from JavaScript.
+fn head(value: &Value) -> Result<hyper::http::response::Builder> {
+    let status = value["status"].as_u64().context("Expected status")?;
+    ensure!((200..=599).contains(&status), "Invalid response status");
+    let headers: Vec<(String, String)> = serde_json::from_value(value["headers"].clone())?;
+    let mut response = Response::builder().status(status as u16);
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            continue;
+        }
+        let value = value
+            .chars()
+            .map(|c| u8::try_from(c as u32))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        response = response.header(name, value);
+    }
+    if let Some(reason) = value["statusText"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+    {
+        let bytes = reason
+            .chars()
+            .map(|c| u8::try_from(c as u32))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        response = response.extension(hyper::ext::ReasonPhrase::try_from(bytes)?);
+    }
+    Ok(response)
+}
+
 fn full(bytes: Bytes) -> Body {
     Full::new(bytes)
         .map_err(|never| match never {})
@@ -67,6 +96,7 @@ impl State {
         op: &str,
         args: &Value,
         sockets: &mut crate::web::websocket::State,
+        tcp: &mut crate::web::tcp::State,
     ) -> Result<Value> {
         match op {
             "start" => {
@@ -120,7 +150,7 @@ impl State {
                                 let wake = wake.clone();
                                 let id = next_id.fetch_add(1, Ordering::Relaxed);
                                 async move {
-                                    let upgrade = request.headers().get("upgrade").is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket")).then(|| hyper::upgrade::on(&mut request));
+                                    let upgrade = (request.method() == hyper::Method::CONNECT || request.headers().get("upgrade").is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))).then(|| hyper::upgrade::on(&mut request));
                                     let (parts, mut body) = request.into_parts();
                                     let has_body = !hyper::body::Body::is_end_stream(&body);
                                     let authority = parts.uri.authority().map(|value| value.as_str())
@@ -287,32 +317,8 @@ impl State {
                     return Ok(Value::Null);
                 }
                 let value = &args[2];
-                let status = value["status"].as_u64().context("Expected status")?;
-                ensure!((200..=599).contains(&status), "Invalid response status");
                 let body = crate::web::bytes(&value["body"])?;
-                let headers: Vec<(String, String)> =
-                    serde_json::from_value(value["headers"].clone())?;
-                let mut response = Response::builder().status(status as u16);
-                for (name, value) in headers {
-                    if name.eq_ignore_ascii_case("transfer-encoding") {
-                        continue;
-                    }
-                    let value = value
-                        .chars()
-                        .map(|c| u8::try_from(c as u32))
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
-                    response = response.header(name, value);
-                }
-                if let Some(reason) = value["statusText"]
-                    .as_str()
-                    .filter(|value| !value.is_empty())
-                {
-                    let bytes = reason
-                        .chars()
-                        .map(|c| u8::try_from(c as u32))
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
-                    response = response.extension(hyper::ext::ReasonPhrase::try_from(bytes)?);
-                }
+                let response = head(value)?;
                 let body = if value["stream"] == true {
                     let (sender, receiver) = mpsc::channel::<Option<Bytes>>(16);
                     let full = Arc::new(AtomicBool::new(false));
@@ -407,6 +413,28 @@ impl State {
                 server.sockets.push(socket);
                 let _ = reply.send(response);
                 Ok(json!(socket))
+            }
+            // Answers a CONNECT request. With a 2xx status the connection becomes a TCP socket of `tcp`.
+            "tunnel" => {
+                let server = self
+                    .servers
+                    .get_mut(&args[0].as_u64().context("Expected server ID")?)
+                    .context("Server is closed")?;
+                let id = args[1].as_u64().context("Expected request ID")?;
+                let response = head(&args[2])?;
+                let body = crate::web::bytes(&args[2]["body"])?;
+                let (reply, upgrade) = server
+                    .replies
+                    .remove(&id)
+                    .context("Request is no longer pending")?;
+                let upgrade = upgrade.context("Request is not a CONNECT request")?;
+                let response = response.body(full(Bytes::from(body)))?;
+                let open = response.status().is_success();
+                let _ = reply.send(response);
+                if !open {
+                    return Ok(Value::Null);
+                }
+                Ok(json!(tcp.adopt(upgrade, args[3].clone())?))
             }
             "stop" => {
                 let id = args[0].as_u64().context("Expected server ID")?;
