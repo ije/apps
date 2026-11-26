@@ -381,13 +381,12 @@ impl TextSystem {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use crate::px;
 
     #[test]
-    #[cfg(target_os = "macos")]
     fn added_faces_match_by_their_rules_and_combine_by_range() {
         let text = TextSystem::new();
         let bytes = |name: &str| {

@@ -493,7 +493,10 @@ impl Config {
                 #[cfg(target_os = "macos")]
                 return crate::style::ua::GLASS_SHEET.with(|glass| Rc::ptr_eq(glass, sheet));
                 #[cfg(not(target_os = "macos"))]
-                return false;
+                return {
+                    let _ = sheet;
+                    false
+                };
             };
             let sheets = sheets
                 .iter()
