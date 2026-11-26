@@ -3,7 +3,6 @@
 mod entities;
 #[path = "../../scripts/napi_exports.rs"]
 mod napi_exports;
-#[allow(dead_code)]
 #[path = "src/style/tailwind/text.rs"]
 mod tailwind;
 
