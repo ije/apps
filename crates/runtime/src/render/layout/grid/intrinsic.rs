@@ -353,6 +353,25 @@ fn measure(
         .or(width.map(|width| width - outer[0]))
         .or(fixed[0])
         .map(|width| clamp(width, used).max(0.));
+    // As in layout, the bars and gutters that show whatever the content leave less room to the content.
+    let full = available;
+    let scrolls = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+        .into_iter()
+        .any(|prop| {
+            style
+                .get(prop)
+                .is_some_and(|v| !matches!(v, "visible" | "clip"))
+        });
+    let bars = match turn.is_none() && scrolls {
+        true => {
+            let extras = styles.extras(id);
+            let handle = Default::default();
+            let room = crate::render::paint::scrollbar::room(style, extras, units, &handle, true);
+            room[1] + room[3]
+        }
+        false => 0.,
+    };
+    let available = available.map(|width| (width - bars).max(0.));
     let mut vertical = sizes(upright, height);
     let floated = |child: usize| {
         !matches!(display, "flex" | "inline-flex" | "grid" | "inline-grid")
@@ -1443,7 +1462,7 @@ fn measure(
             !(value.contains("auto") && natural.is_some_and(|(_, ratio)| ratio.is_some()))
         })
         .and_then(super::super::size::aspect_ratio)
-        .zip(available)
+        .zip(full)
         .map(|(ratio, width)| {
             let height = if border_box {
                 (width + inner[0]) / ratio - inner[1]
@@ -1482,7 +1501,7 @@ fn measure(
     let mut result = [
         min + outer[0],
         max + outer[0],
-        available.unwrap_or(max) + outer[0],
+        full.unwrap_or(max) + outer[0],
         clamp(vertical[0].or(ratio).unwrap_or(content[2]), vertical)
             + inner[1]
             + sets
@@ -1934,4 +1953,30 @@ pub(crate) fn pseudo_atom(
     };
     let percent = available.is_some() && pseudo.get(Prop::WIDTH).is_some_and(|v| v.contains('%'));
     Some([if percent { used } else { max }, height, baseline])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_scroll_bars_leave_the_content_less_room() {
+        let text = renderer::TextSystem::new();
+        let mut doc = Document::parse(
+            "<style>.s{overflow-y:scroll}.s::-webkit-scrollbar,.g::-webkit-scrollbar{width:40px}.g{overflow-y:hidden;scrollbar-gutter:stable both-edges}</style><div class=s>aaa aaa aaa</div><div class=g>aaa aaa aaa</div><div class=s style='scrollbar-width:none'>aaa aaa aaa</div>",
+        );
+        let mut state = crate::render::PageState::default();
+        let styles = state.restyle(&mut doc, [800., 600.]);
+        let divs: Vec<usize> = (0..doc.nodes.len())
+            .filter(|&id| doc.nodes[id].tag == "div")
+            .collect();
+        let mut measured = Measurements::default();
+        let mut size =
+            |id, width| intrinsic(&doc, id, &styles, Some(width), None, &text, &mut measured);
+        let [line, lines] = [500., 70.].map(|width| size(divs[2], width)[3]);
+        assert!(lines > line);
+        assert_eq!(size(divs[0], 110.)[2..], [110., lines]);
+        assert_eq!(size(divs[1], 150.)[3], lines);
+        assert_eq!(size(divs[2], 110.)[3], line);
+    }
 }
