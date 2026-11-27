@@ -339,8 +339,19 @@ fn bridge_preload_calls_main_and_publishes_events() {
     );
     let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
     let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
-    main.eval("__apps.ipcMain.handle('sum',(_e,a,b)=>a+b);__apps.ipcMain.handle('double',(_e,v)=>v.map(x=>x*2));__apps.ipcMain.on('version',e=>e.returnValue='v1')","test").unwrap();
-    preload.eval("__apps.contextBridge.exposeInMainWorld('desktop',{sum:(a,b)=>__apps.ipcRenderer.invoke('sum',a,b),double:v=>__apps.ipcRenderer.invoke('double',v),version:__apps.ipcRenderer.sendSync('version'),subscribe:callback=>{const listener=(_event,data)=>callback(data);__apps.ipcRenderer.on('change',listener);return()=>__apps.ipcRenderer.off('change',listener);}});","test").unwrap();
+    main.eval("__apps.ipcMain.on('ready',e=>globalThis.preload=e);__apps.ipcMain.handle('sum',(_e,a,b)=>a+b);__apps.ipcMain.handle('double',(_e,v)=>v.map(x=>x*2));__apps.ipcMain.on('version',e=>e.returnValue='v1')","test").unwrap();
+    preload.eval("__apps.contextBridge.exposeInMainWorld('desktop',{sum:(a,b)=>__apps.ipcRenderer.invoke('sum',a,b),double:v=>__apps.ipcRenderer.invoke('double',v),version:__apps.ipcRenderer.sendSync('version'),subscribe:callback=>{const listener=(_event,data)=>callback(data);__apps.ipcRenderer.on('change',listener);return()=>__apps.ipcRenderer.off('change',listener);}});__apps.ipcRenderer.send('ready');","test").unwrap();
+    for context in [&main, &preload] {
+        assert_eq!(
+            context
+                .eval(
+                    "['bindApp','poll','rpc','send'].filter(name=>name in __apps).join()",
+                    "test"
+                )
+                .unwrap(),
+            ""
+        );
+    }
     let page = JsContext::new(api, host, Role::Renderer(1)).unwrap();
     assert_eq!(page.eval("desktop.version", "test").unwrap(), "v1");
     page.eval(
@@ -356,13 +367,13 @@ fn bridge_preload_calls_main_and_publishes_events() {
     assert_eq!(page.eval("result", "test").unwrap(), "7");
     assert_eq!(page.eval("bytes", "test").unwrap(), "Float32Array:3,-4,0.5");
     page.eval("globalThis.observed=[];globalThis.unsubscribe=desktop.subscribe(value=>observed.push(value));if(typeof unsubscribe!=='function')throw Error('unsubscribe must be synchronous');", "test").unwrap();
-    main.eval("__apps.send(1,'change',{value:42});", "test")
+    main.eval("preload.reply('change',{value:42});", "test")
         .unwrap();
     assert_eq!(page.eval("observed.length", "test").unwrap(), "0");
     preload.tick().unwrap();
     assert_eq!(page.eval("observed[0].value", "test").unwrap(), "42");
     page.eval("unsubscribe();", "test").unwrap();
-    main.eval("__apps.send(1,'change',{value:43});", "test")
+    main.eval("preload.reply('change',{value:43});", "test")
         .unwrap();
     preload.tick().unwrap();
     assert_eq!(page.eval("observed.length", "test").unwrap(), "1");

@@ -1284,6 +1284,7 @@
   if (info.node) globalThis.__appsFinish = () => { process.emit('beforeExit', Number(process.exitCode ?? 0) | 0); return __appsAlive() ? -1 : finish(); };
   const main = role === 'main' ? { app, BrowserWindow, View: browsers.View, WebContentsView: browsers.WebContentsView, session: browsers.session, webContents, protocol: electron.protocol, autoUpdater: electron.autoUpdater, desktopCapturer: electron.desktopCapturer } : {};
   const apps = Object.defineProperties({ ...main, nativeImage: electron.nativeImage, ClipboardItem: electron.ClipboardItem, webFrame, ...nativeShell, ...bridge, ipcMain: role === 'main' ? bridge.ipcMain : undefined, ipcRenderer: role === 'main' ? undefined : bridge.ipcRenderer, terminal: typeof role === 'object' && 'preload' in role ? Object.freeze({ Session }) : undefined, serve: servers.serve }, Object.getOwnPropertyDescriptors(modules));
+  for (const name of ['bindApp', 'poll', 'rpc', 'send']) delete apps[name];
   Object.defineProperty(apps, 'net', { value: electronNet, enumerable: true, writable: true, configurable: true });
   apps.module = builtins.module;
   lazy(apps, 'pty', () => ptyModule().api);
