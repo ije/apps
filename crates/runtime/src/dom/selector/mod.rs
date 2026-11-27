@@ -64,6 +64,8 @@ const WITHIN: usize = 12;
 // the node holds results of its own.
 const BESIDE: u8 = 8;
 const BELOW: u8 = 16;
+// A `watched` bit: another node read the style attribute of the node.
+const STYLED: u8 = 32;
 
 #[derive(Default)]
 pub(crate) struct Named {
@@ -152,8 +154,19 @@ impl SelectorCache {
 
     fn record(&mut self, mut changes: Vec<u32>, quiet: Vec<u32>) {
         for &change in &changes {
-            let place = matches!(change as usize % KINDS, 2 | EDGE..=INDEX);
-            self.mark(change as usize / KINDS, place);
+            let (node, kind) = (change as usize / KINDS, change as usize % KINDS);
+            // Other nodes read a style attribute only through `[style]` selectors, so a new one restyles the
+            // node, and its children only by inheritance.
+            if kind == 6
+                && self
+                    .watched
+                    .get(node)
+                    .is_some_and(|watched| watched & STYLED == 0)
+            {
+                self.dirty[node] = true;
+                continue;
+            }
+            self.mark(node, matches!(kind, 2 | EDGE..=INDEX));
         }
         for &change in &quiet {
             if let Some(dirty) = self.dirty.get_mut(change as usize / KINDS) {
@@ -275,6 +288,12 @@ impl SelectorCache {
             .chunk_by(|a, b| a.0 as usize / KINDS == b.0 as usize / KINDS)
         {
             let node = group[0].0 as usize / KINDS;
+            if node != id
+                && group.iter().any(|&(kind, _)| kind as usize % KINDS == 6)
+                && let Some(watched) = self.watched.get_mut(node)
+            {
+                *watched |= STYLED;
+            }
             let place = |&(kind, _): &Dependency| matches!(kind as usize % KINDS, 2 | EDGE..=INDEX);
             let lists = if group.iter().any(place) {
                 &mut self.children

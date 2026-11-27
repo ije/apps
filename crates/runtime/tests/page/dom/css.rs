@@ -129,7 +129,7 @@ fn custom_elements_shadow_styles_and_lifecycle() {
 fn computed_styles_follow_random_tree_changes() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><head><style>body{color:rgb(1, 1, 1)} p + p{color:rgb(6, 6, 6)} .a{color:rgb(2, 2, 2)} li:first-child{color:rgb(4, 4, 4)} li:nth-child(3n){color:rgb(5, 5, 5)} div:empty{color:rgb(7, 7, 7)} [inert] span{color:rgb(8, 8, 8)} td:last-child{color:rgb(9, 9, 9)} .a > .b{color:rgb(3, 3, 3)} .flat{display:contents} span ~ p{background-color:rgb(1, 0, 0)} div:has(+ div){background-color:rgb(2, 0, 0)} li:last-child{background-color:rgb(3, 0, 0)} li:only-child{background-color:rgb(4, 0, 0)} li:nth-last-child(2){background-color:rgb(5, 0, 0)} li:has(> .a){background-color:rgb(6, 0, 0)} td:has(~ .a){background-color:rgb(7, 0, 0)} ul:has(.b) p{background-color:rgb(8, 0, 0)} body:has(.flat) td{background-color:rgb(9, 0, 0)}</style></head><body><ul id='list'></ul><table><tbody id='rows'></tbody></table><div id='box' class='a'></div></body></html>"),
+        doc: Document::parse("<html><head><style>body{color:rgb(1, 1, 1)} p + p{color:rgb(6, 6, 6)} .a{color:rgb(2, 2, 2)} li:first-child{color:rgb(4, 4, 4)} li:nth-child(3n){color:rgb(5, 5, 5)} div:empty{color:rgb(7, 7, 7)} [inert] span{color:rgb(8, 8, 8)} td:last-child{color:rgb(9, 9, 9)} .a > .b{color:rgb(3, 3, 3)} .flat{display:contents} span ~ p{background-color:rgb(1, 0, 0)} div:has(+ div){background-color:rgb(2, 0, 0)} li:last-child{background-color:rgb(3, 0, 0)} li:only-child{background-color:rgb(4, 0, 0)} li:nth-last-child(2){background-color:rgb(5, 0, 0)} li:has(> .a){background-color:rgb(6, 0, 0)} td:has(~ .a){background-color:rgb(7, 0, 0)} ul:has(.b) p{background-color:rgb(8, 0, 0)} body:has(.flat) td{background-color:rgb(9, 0, 0)} body [style] p{background-color:rgb(10, 0, 0)}</style></head><body><ul id='list'></ul><table><tbody id='rows'></tbody></table><div id='box' class='a'></div></body></html>"),
         dirty: false, ..Default::default()
     });
     let engine = JsContext::new(
@@ -146,7 +146,7 @@ fn computed_styles_follow_random_tree_changes() {
             else for (let i = rules.length; i--;) if (el.matches(rules[i][0])) return rules[i][1];
             return up(el) ? expected(up(el)) : 'rgb(0, 0, 0)';
         };
-        const places = [['span ~ p', 'rgb(1, 0, 0)'], ['div:has(+ div)', 'rgb(2, 0, 0)'], ['li:last-child', 'rgb(3, 0, 0)'], ['li:only-child', 'rgb(4, 0, 0)'], ['li:nth-last-child(2)', 'rgb(5, 0, 0)'], ['li:has(> .a)', 'rgb(6, 0, 0)'], ['td:has(~ .a)', 'rgb(7, 0, 0)'], ['ul:has(.b) p', 'rgb(8, 0, 0)'], ['body:has(.flat) td', 'rgb(9, 0, 0)']];
+        const places = [['span ~ p', 'rgb(1, 0, 0)'], ['div:has(+ div)', 'rgb(2, 0, 0)'], ['li:last-child', 'rgb(3, 0, 0)'], ['li:only-child', 'rgb(4, 0, 0)'], ['li:nth-last-child(2)', 'rgb(5, 0, 0)'], ['li:has(> .a)', 'rgb(6, 0, 0)'], ['td:has(~ .a)', 'rgb(7, 0, 0)'], ['ul:has(.b) p', 'rgb(8, 0, 0)'], ['body:has(.flat) td', 'rgb(9, 0, 0)'], ['body [style] p', 'rgb(10, 0, 0)']];
         let seed = 12345, step = 0, slotted = 0;
         const random = below => (seed = Math.imul(seed, 1103515245) + 12345 >>> 0, (seed >>> 8) % below);
         const list = document.getElementById('list'), rows = document.getElementById('rows'), box = document.getElementById('box');
@@ -158,6 +158,14 @@ fn computed_styles_follow_random_tree_changes() {
         const host = () => { const all = hosts(); return all[random(all.length)]; };
         const names = ['', 'x', 'y', 'z'];
         for (let i = 0; i < 12; i++) list.append(item());
+        const addHost = () => {
+            const el = make('div'), root = el.attachShadow({ mode: 'open' }), named = document.createElement('slot'), inner = make('div');
+            named.name = names[1 + random(3)];
+            inner.append(document.createElement('slot'), make('span', 'deep'));
+            root.append(make('style', 'slot[name=x]{color:rgb(11, 11, 11)}'), make('span', 'shadow'), named, inner);
+            for (let i = random(4); i--;) { const p = make('p', 'light'); p.slot = names[random(4)]; el.append(p); }
+            holder().append(el);
+        };
         const steps = [
             () => list.insertBefore(item(), list.children[random(list.children.length + 1)] ?? null),
             () => list.children[random(list.children.length)]?.remove(),
@@ -172,15 +180,9 @@ fn computed_styles_follow_random_tree_changes() {
             () => { const el = holder(); if (el !== box && !el.contains(box)) box.append(el); },
             () => { const style = document.head.querySelector('style + style'); style ? style.remove() : document.head.append(make('style', '.none{color:rgb(10, 10, 10)}')); },
             () => { const el = holder(); if (el.id || el.children.length > 20) return; const wrap = make('div'); el.replaceWith(wrap); wrap.append(el); },
-            () => steps[14](),
-            () => {
-                const el = make('div'), root = el.attachShadow({ mode: 'open' }), named = document.createElement('slot'), inner = make('div');
-                named.name = names[1 + random(3)];
-                inner.append(document.createElement('slot'), make('span', 'deep'));
-                root.append(make('style', 'slot[name=x]{color:rgb(11, 11, 11)}'), make('span', 'shadow'), named, inner);
-                for (let i = random(4); i--;) { const p = make('p', 'light'); p.slot = names[random(4)]; el.append(p); }
-                holder().append(el);
-            },
+            () => { const el = holder(); if (el.hasAttribute('style')) el.removeAttribute('style'); else el.style.outlineOffset = '1px'; },
+            addHost,
+            addHost,
             () => { const el = host()?.children[0]; if (el) el.slot = names[random(4)]; },
             () => { const slot = host()?.shadowRoot.querySelectorAll('slot')[random(3)]; if (slot) slot.name = names[random(4)]; },
             () => { const el = host(); if (el) el.shadowRoot.querySelectorAll('div, span')[random(3)]?.append(document.createElement('slot')); },
