@@ -218,10 +218,12 @@ struct Live {
     mouse: Mouse,
     // Compositors decline moves, activation and selections without the serial of a recent press.
     press: Option<(u32, WlSurface)>,
+    // Selections also take the serial of the keyboard focus, so code without a press can copy.
+    focused: Option<u32>,
     device: Option<wl_data_device::WlDataDevice>,
     offers: Vec<Offer>,
     selection: Option<WlDataOffer>,
-    copied: Option<String>,
+    copied: Vec<(String, Vec<u8>)>,
     pasted: Option<String>,
     drag: Drag,
     startup: Option<String>,
@@ -284,6 +286,16 @@ fn later(calls: Option<Callbacks>, event: Event) {
 }
 
 impl Client {
+    fn receive(&self, offer: &WlDataOffer, kind: &str) -> Option<Vec<u8>> {
+        let (pipe, writer) = std::io::pipe().ok()?;
+        offer.receive(kind.to_owned(), writer.as_fd());
+        drop(writer);
+        let _ = self.conn.flush();
+        input::read_pipe(pipe)
+            .inspect_err(|error| eprintln!("apps: clipboard: {error:#}"))
+            .ok()
+    }
+
     pub fn connect(needs_decorations: bool) -> Result<Rc<Self>> {
         let conn = Connection::connect_to_env().context("connecting to the Wayland compositor")?;
         let (list, queue) =
@@ -374,10 +386,11 @@ impl Client {
             typing: Typing::default(),
             mouse,
             press: None,
+            focused: None,
             device,
             offers: Vec::new(),
             selection: None,
-            copied: None,
+            copied: Vec::new(),
             pasted: None,
             drag: Drag::default(),
             startup,
@@ -783,14 +796,18 @@ impl Client {
                     _ => eprintln!("apps: the Wayland keymap can't be read"),
                 }
             }
-            Kb::Enter { surface, .. } => {
+            Kb::Enter {
+                surface, serial, ..
+            } => {
                 live.focus = Some(surface.id());
+                live.focused = Some(serial);
                 if let Some(window) = live.window(live.focus.as_ref()) {
                     window.focus(true);
                 }
             }
             Kb::Leave { surface, .. } => {
                 live.focus = None;
+                live.focused = None;
                 live.keys.repeat += 1;
                 if let Some(composer) = &mut live.keys.composer {
                     composer.reset();
@@ -1118,6 +1135,13 @@ impl Client {
             }),
             Dev::Selection { id } => {
                 live.pasted = None;
+                // The compositor tells of a new selection later than a copy, so the copy counts as ours until then.
+                if !id
+                    .as_ref()
+                    .is_some_and(|offer| live.types(offer).contains(&self.own_type))
+                {
+                    live.copied.clear();
+                }
                 live.selection = id;
                 live.prune();
             }
@@ -1204,9 +1228,14 @@ impl Client {
         _: &(),
     ) {
         match message {
-            wl_data_source::Event::Send { fd, .. } => {
-                if let Some(copied) = self.live.borrow().copied.clone() {
-                    send(fd, copied.into_bytes());
+            wl_data_source::Event::Send { fd, mime_type } => {
+                let kind = match TEXT_TYPES.contains(&mime_type.as_str()) {
+                    true => "text/plain",
+                    false => &mime_type,
+                };
+                let live = self.live.borrow();
+                if let Some((_, data)) = live.copied.iter().find(|(own, _)| own == kind) {
+                    send(fd, data.clone());
                 }
             }
             wl_data_source::Event::Cancelled => source.destroy(),
@@ -1276,41 +1305,96 @@ impl Display for Client {
 
     fn read_clipboard(&self) -> Option<String> {
         let live = self.live.borrow();
-        let offer = live.selection.clone()?;
-        let types = live.types(&offer);
-        if types.contains(&self.own_type) {
-            return live.copied.clone();
+        let types = live
+            .selection
+            .as_ref()
+            .map_or(&[][..], |offer| live.types(offer));
+        if !live.copied.is_empty() || types.contains(&self.own_type) {
+            let text = live.copied.iter().find(|(kind, _)| kind == "text/plain");
+            return text.map(|(_, data)| String::from_utf8_lossy(data).into_owned());
         }
         if let Some(pasted) = &live.pasted {
             return Some(pasted.clone());
         }
+        let offer = live.selection.clone()?;
         let kind = TEXT_TYPES
             .iter()
             .find(|kind| types.iter().any(|offered| offered == *kind))?;
-        let (pipe, writer) = std::io::pipe().ok()?;
-        offer.receive((*kind).to_owned(), writer.as_fd());
-        drop((writer, live));
-        let _ = self.conn.flush();
-        let read =
-            input::read_pipe(pipe).inspect_err(|error| eprintln!("apps: clipboard: {error:#}"));
-        let text = String::from_utf8(read.ok()?).ok()?.replace("\r\n", "\n");
+        drop(live);
+        let text = String::from_utf8(self.receive(&offer, kind)?).ok()?;
+        let text = text.replace("\r\n", "\n");
         self.live.borrow_mut().pasted = Some(text.clone());
         Some(text)
     }
 
-    fn write_clipboard(&self, text: &str) {
+    fn clipboard_types(&self) -> Vec<String> {
+        let live = self.live.borrow();
+        let types = live
+            .selection
+            .as_ref()
+            .map_or(&[][..], |offer| live.types(offer));
+        if !live.copied.is_empty() || types.contains(&self.own_type) {
+            return live.copied.iter().map(|(kind, _)| kind.clone()).collect();
+        }
+        let mut kinds: Vec<String> = Vec::new();
+        for kind in types {
+            let kind = match TEXT_TYPES.contains(&kind.as_str()) {
+                true => "text/plain",
+                false => kind,
+            };
+            if kind.contains('/') && !kinds.iter().any(|seen| seen == kind) {
+                kinds.push(kind.to_owned());
+            }
+        }
+        kinds
+    }
+
+    fn read_clipboard_data(&self, kind: &str) -> Option<Vec<u8>> {
+        let live = self.live.borrow();
+        let types = live
+            .selection
+            .as_ref()
+            .map_or(&[][..], |offer| live.types(offer));
+        if !live.copied.is_empty() || types.contains(&self.own_type) {
+            let item = live.copied.iter().find(|(own, _)| own == kind);
+            return item.map(|(_, data)| data.clone());
+        }
+        if kind == "text/plain" {
+            drop(live);
+            return self.read_clipboard().map(String::into_bytes);
+        }
+        let offer = live.selection.clone()?;
+        if !types.iter().any(|offered| offered == kind) {
+            return None;
+        }
+        drop(live);
+        self.receive(&offer, kind)
+    }
+
+    fn write_clipboard(&self, items: Vec<(String, Vec<u8>)>) {
         let mut live = self.live.borrow_mut();
-        let (Some(manager), Some(device), Some((serial, _))) =
-            (&self.globals.devices, &live.device, &live.press)
+        let serial = live
+            .press
+            .as_ref()
+            .map(|(serial, _)| *serial)
+            .max(live.focused);
+        let (Some(manager), Some(device), Some(serial)) =
+            (&self.globals.devices, &live.device, serial)
         else {
             return;
         };
         let source = manager.create_data_source(&self.qh, ());
-        for kind in TEXT_TYPES.into_iter().chain([self.own_type.as_str()]) {
-            source.offer(kind.to_owned());
+        for (kind, _) in &items {
+            match kind.as_str() {
+                "text/plain" => TEXT_TYPES
+                    .iter()
+                    .for_each(|kind| source.offer((*kind).into())),
+                kind => source.offer(kind.to_owned()),
+            }
         }
-        device.set_selection(Some(&source), *serial);
-        live.copied = Some(text.to_owned());
+        source.offer(self.own_type.clone());
+        device.set_selection(Some(&source), serial);
+        live.copied = items;
     }
 
     fn set_cursor(&self, cursor: Cursor) {

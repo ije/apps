@@ -26,13 +26,13 @@ pub(crate) use gpu::scene::Scene;
 pub use gpu::scene::{Backdrop, BlendMode, ColorMatrix, Glass, PaintEffect, Space};
 pub use gpu::scene::{Planes, RenderImage, Surface};
 pub use input::*;
-#[cfg(target_os = "linux")]
-pub use platform::PREFER_X11;
 pub use platform::{
     CARET_BLINK, Timer, WindowChange, WindowControl, WindowId, WindowOptions, WindowState,
     activate, before_exit, control_size, native, post_main, post_main_after, prewarm, quit,
     sync_main,
 };
+#[cfg(target_os = "linux")]
+pub use platform::{PREFER_X11, clipboard};
 pub use style::*;
 pub use text::{
     AdjustMetric, Caps, Decoration, DecorationStyle, Embedding, Emphasis, FaceRules, Font, FontId,

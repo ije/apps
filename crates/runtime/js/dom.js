@@ -5338,12 +5338,12 @@
   globalThis.__appsFilesPicked=(id,files)=>{const input=picks.get(id);picks.delete(id);if(!input)return;if(!files){dispatch(input,new Event('cancel',{bubbles:true}));return;}input._files=fileList(files.map(({name,lastModified,data})=>new File([Uint8Array.fromBase64(data)],name,{lastModified,type:fileType(name)})));showFiles(input);dispatch(input,new Event('input',{bubbles:true,composed:true}));dispatch(input,new Event('change',{bubbles:true}));};
   const pickOption=(select,option)=>{if(option._current)return;for(const other of options(select))other._selected=other===option;select._none=false;selectedness(select);revalidate(select);dispatch(select,trusted(new Event('input',{bubbles:true,composed:true})));interacted(select);dispatch(select,trusted(new Event('change',{bubbles:true})));};
   openSelect=select=>{
-    if(!native||!navigator.platform.includes('Mac')||select.multiple||select.size>1||disabled(select))return;
+    if(!native||select.multiple||select.size>1||disabled(select))return;
     const id=++nextPick,list=[],items=[],rect=select.getBoundingClientRect();let selected=-1;
     const add=(option,group)=>{if(option.hidden)return;if(option._current)selected=items.length;list[items.length]=option;items.push([(group?'  ':'')+option.label,+disabled(option)]);};
     selectedness(select);
     for(const kid of select.children){if(kid.localName==='option')add(kid);else if(kid.localName==='hr')items.push(null);else if(kid.localName==='optgroup'&&!kid.hidden){items.push([kid.label,1]);for(const option of kid.children)if(option.localName==='option')add(option,true);}}
-    picks.set(id,[select,list]);call('dom.selectPopup',{id,x:rect.x,y:rect.y,width:rect.width,selected,items});
+    picks.set(id,[select,list]);const scheme=getComputedStyle(select).colorScheme;call('dom.selectPopup',{id,x:rect.x,y:rect.y,width:rect.width,height:rect.height,selected,items,dark:scheme.includes('dark')&&(!scheme.includes('light')||matchMedia('(prefers-color-scheme: dark)').matches)});
   };
   // The menu takes the pointerup of the press that opened it.
   globalThis.__appsSelectPicked=(id,index)=>{const [select,list]=picks.get(id)??[];picks.delete(id);if(press&&select?.contains(press.target)){press=null;pointers.delete(1);call('dom.active',[]);}if(list?.[index]&&select.isConnected)pickOption(select,list[index]);};

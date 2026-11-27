@@ -40,6 +40,10 @@ pub(crate) trait Pages {
     fn queue_layout(self: Rc<Self>, window: &mut Window);
     fn animation_events(&self, events: Vec<(usize, &'static str, String, f64)>, cx: &mut App);
     fn lint(&self, warnings: Vec<String>);
+    // A box that the window draws above the page, like the list of a `<select>`.
+    fn popup(self: Rc<Self>) -> Option<renderer::Node> {
+        None
+    }
 }
 
 pub(crate) struct ViewState {

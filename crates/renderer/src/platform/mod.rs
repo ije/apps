@@ -17,7 +17,7 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::*;
 #[cfg(target_os = "linux")]
-pub use linux::{PREFER_X11, WindowControl};
+pub use linux::{PREFER_X11, WindowControl, clipboard};
 
 pub mod native;
 
