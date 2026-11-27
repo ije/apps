@@ -16,8 +16,8 @@ jobs:
           # Bun's AOT sources need the Clang 21 of this image. The Clang 17 of macos-15 rejects them.
           - { target: darwin-arm64, os: macos-26, aot: true }
           - { target: darwin-x64, os: macos-15-intel }
-          - { target: linux-x64, os: ubuntu-24.04 }
-          - { target: linux-arm64, os: ubuntu-24.04-arm }
+          - { target: linux-x64, os: ubuntu-24.04, aot: true }
+          - { target: linux-arm64, os: ubuntu-24.04-arm, aot: true }
           - { target: win32-x64, os: windows-2025 }
           - { target: win32-arm64, os: windows-11-arm }
     runs-on: ${{ matrix.os }}
@@ -44,6 +44,9 @@ jobs:
       # The packed runtime must also start that app. CI doesn't run --check on Windows yet, so it is left out there.
       - if: runner.os != 'Windows'
         run: packages/apps-${{ matrix.target }}/bin/apps-runtime "$(dirname "$(find target/smoke -name app.bundle)")" --check
+      # The packed AOT libraries must compile that app.
+      - if: matrix.aot
+        run: packages/apps-${{ matrix.target }}/bin/apps build examples/serve/main.ts --aot --out-dir target/smoke-aot
       - run: |
           mkdir npm
           npm pack ./packages/apps-${{ matrix.target }} --pack-destination npm

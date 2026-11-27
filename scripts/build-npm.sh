@@ -66,9 +66,9 @@ jscs=("${lib}JavaScriptCore$ext" JavaScriptCore.LICENSE)
 [[ $os != linux ]] && files+=("${lib}apps_webgpu$ext")
 # Linux loads the system web view from its own library.
 [[ $os == linux ]] && files+=(libapps_webview.so)
-# build-jsc.sh --aot writes these. Linux packages include them when that build has been run.
+# build-jsc.sh --aot writes these.
 [[ $os-$cpu == darwin-arm64 ]] && jscs+=(libJavaScriptCoreAOT.dylib libJavaScriptCoreCompiler.dylib libapps_aot.dylib)
-[[ $os == linux && -f $jsc/libJavaScriptCoreAOT.so ]] && jscs+=(libJavaScriptCoreAOT.so libJavaScriptCoreCompiler.so libapps_aot.so)
+[[ $os == linux ]] && jscs+=(libJavaScriptCoreAOT.so libJavaScriptCoreCompiler.so libapps_aot.so)
 rm -rf "$bin"
 mkdir -p "$bin"
 for file in "${files[@]}"; do cp "target/release/$file" "$bin/"; done
