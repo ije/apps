@@ -288,7 +288,7 @@ pub(super) fn finish(
     let ends = fr
         .turn
         .is_none()
-        .then(|| bounded_end(reader, id, containing[0]))
+        .then(|| bounded_end(reader, id, containing[0], units.container))
         .flatten();
     if ends.is_some() && !el.style_ref().fits {
         el.style().fits = true;

@@ -827,6 +827,30 @@ fn bounded_heights_pass_the_last_margin_only_at_the_content_height_like_chrome()
     }
 }
 
+// The passed margin brings a scroll bar that narrows the page, so the box cuts its content and holds the margin,
+// and then the bar goes again.
+#[test]
+#[ignore = "requires the macOS window server"]
+fn a_bounded_end_that_moves_a_scroll_bar_settles() {
+    let text = "x".repeat(100);
+    run_hidden(
+        r#"
+        await load('page.html');
+        const state = "[document.getElementById('x').getBoundingClientRect().height, document.documentElement.scrollHeight, document.documentElement.clientWidth].join()";
+        const seen = [];
+        for (let i = 0; i < 6; i++) { await win.webContents.capturePage(); seen.push(await run(state)); }
+        if (new Set(seen.slice(2)).size !== 1) fail('flips: ' + seen.join(' '));
+        "#,
+        &[(
+            "page.html",
+            &format!(
+                "<style>::-webkit-scrollbar{{width:100px}}body{{margin:0;font:13px/20px monospace}}#x{{max-height:40px}}</style>\
+                 <div style='height:200px'></div><div id=x><div style='margin-bottom:100px;word-break:break-all'>{text}</div></div>"
+            ),
+        )],
+    );
+}
+
 #[test]
 #[ignore = "requires the macOS window server"]
 fn hidden_table_rows_and_cells_leave_the_width_of_their_rows() {

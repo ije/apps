@@ -966,7 +966,8 @@ pub(super) fn create(
     );
     if slot.is_none() {
         // The style of a box of `bounded_end` differs.
-        let bounded = super::margin::bounded_end(build, id, containing[0]).is_some();
+        let bounded =
+            super::margin::bounded_end(build, id, containing[0], units.container).is_some();
         reader.log(
             Query::Margins,
             depth,

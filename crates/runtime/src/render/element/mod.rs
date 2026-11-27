@@ -128,7 +128,7 @@ impl<'a> Build<'a> {
                 hashed((
                     margins(self, id, &units, width, self.flex_parent, cell.is_some())
                         .map(f32::to_bits),
-                    bounded_end(self, id, width).is_some(),
+                    bounded_end(self, id, width, Some(container)).is_some(),
                 ))
             }
             Query::Parent(prop) => hashed(parent_style(doc, styles, id, prop)),

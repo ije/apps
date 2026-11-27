@@ -92,8 +92,9 @@ pub(super) fn margins(
     let walked = build.walks.borrow().get(&parent).cloned();
     let walked = walked.unwrap_or_else(|| {
         let collapses = container(build, parent);
-        let mut open =
-            [0, 2].map(|side| collapses && margin_collapses_through(build, parent, side, width));
+        let mut open = [0, 2].map(|side| {
+            collapses && margin_collapses_through(build, parent, side, width, units.container)
+        });
         // Like Chrome, a content height is without the last margin, also where it doesn't pass on.
         let sized = |prop| {
             build.styles.values[parent]
@@ -101,11 +102,11 @@ pub(super) fn margins(
                 .is_some_and(css::value::content_size)
         };
         open[1] |= collapses
-            && (bounded_end(build, parent, width).is_some()
+            && (bounded_end(build, parent, width, units.container).is_some()
                 || [Prop::HEIGHT, Prop::MIN_HEIGHT, Prop::MAX_HEIGHT]
                     .into_iter()
                     .any(sized)
-                    && margin_collapses_through(build, parent, 3, width));
+                    && margin_collapses_through(build, parent, 3, width, units.container));
         // Skip animated boxes. Clear walks when fonts or the viewport change: the key excludes them.
         let key = (
             build.info[parent].revision,
@@ -325,9 +326,10 @@ pub(super) fn margin_collapses_through(
     id: usize,
     side: usize,
     width: f32,
+    around: Option<[f32; 2]>,
 ) -> bool {
     if side == 2
-        && let Some(ends) = bounded_end(build, id, width)
+        && let Some(ends) = bounded_end(build, id, width, around)
     {
         return ends;
     }
@@ -355,21 +357,29 @@ fn min_free(build: &Build<'_>, id: usize, width: f32) -> bool {
 
 // For a box whose `min-height` or `max-height` can change its auto height: whether the last margin in it passes out.
 // Like Chrome, it does when the height is the content height, which the last layout found, see `NodeCx::fits`.
-pub(super) fn bounded_end(build: &Build<'_>, id: usize, width: f32) -> Option<bool> {
+pub(super) fn bounded_end(
+    build: &Build<'_>,
+    id: usize,
+    width: f32,
+    around: Option<[f32; 2]>,
+) -> Option<bool> {
     let style = &build.styles.values[id];
     let min = min_free(build, id, width);
+    // Without a margin at the end, the answer changes nothing.
     (!(min
         && style
             .get(Prop::MAX_HEIGHT)
             .is_none_or(|value| value == "none"))
         && style.get(Prop::HEIGHT).is_none_or(css::value::auto_size)
-        && open(build, id, 2, width))
-    .then(|| {
-        let store = build.view.store.borrow();
-        (store.page_state(build.view.id))
-            .and_then(|dom| dom.layout.ends.get(&id).copied())
-            .unwrap_or(min)
-    })
+        && open(build, id, 2, width)
+        && container(build, id)
+        && edge_set(build, &flow(build, id), true, width, around) != [0.; 2])
+        .then(|| {
+            let store = build.view.store.borrow();
+            (store.page_state(build.view.id))
+                .and_then(|dom| dom.layout.ends.get(&id).map(|ends| ends.0))
+                .unwrap_or(min)
+        })
 }
 
 fn open(build: &Build<'_>, id: usize, side: usize, width: f32) -> bool {
@@ -723,6 +733,43 @@ pub(super) fn percent_bound(
     Some(renderer::Length::Bound(index))
 }
 
+// The margins of the children that adjoin the first edge of a box, or the last when `last`.
+fn edge_set(
+    build: &Build<'_>,
+    children: &[usize],
+    last: bool,
+    width: f32,
+    around: Option<[f32; 2]>,
+) -> [f32; 2] {
+    let mut set = [0f32; 2];
+    for index in 0..children.len() {
+        let child = children[if last {
+            children.len() - 1 - index
+        } else {
+            index
+        }];
+        if !block(build, child) {
+            if crate::render::inline::makes_no_line(build.doc, build.styles, child) {
+                continue;
+            }
+            break;
+        }
+        let (child_top, child_bottom, empty) = adjoining(build, child, width, around);
+        let sides = if last {
+            [child_bottom, child_top]
+        } else {
+            [child_top, child_bottom]
+        };
+        for adjoining in sides.into_iter().take(if empty { 2 } else { 1 }) {
+            set = [set[0].max(adjoining[0]), set[1].min(adjoining[1])];
+        }
+        if !empty {
+            break;
+        }
+    }
+    set
+}
+
 // `around` is the size of the container around the box, for container units.
 pub(super) fn adjoining(
     build: &Build<'_>,
@@ -761,46 +808,20 @@ pub(super) fn adjoining(
     let deep = (&raw const marker as usize) < STACK_LIMIT.with(|limit| *limit);
     let blocks = container(build, id) && !deep;
     let [first, last] =
-        [0, 2].map(|side| margin_collapses_through(build, id, side, width) && blocks);
+        [0, 2].map(|side| blocks && margin_collapses_through(build, id, side, width, around));
     let children = if first || last {
         flow(build, id)
     } else {
         Vec::new()
     };
     for (open, set, order) in [(first, &mut top, false), (last, &mut bottom, true)] {
-        if !open {
-            continue;
-        }
-        for index in 0..children.len() {
-            let child = children[if order {
-                children.len() - 1 - index
-            } else {
-                index
-            }];
-            if !block(build, child) {
-                if crate::render::inline::makes_no_line(build.doc, build.styles, child) {
-                    continue;
-                }
-                break;
-            }
-            let (child_top, child_bottom, empty) = adjoining(build, child, width, around);
-            for adjoining in if order {
-                [child_bottom, child_top]
-            } else {
-                [child_top, child_bottom]
-            }
-            .into_iter()
-            .take(if empty { 2 } else { 1 })
-            {
-                *set = [set[0].max(adjoining[0]), set[1].min(adjoining[1])];
-            }
-            if !empty {
-                break;
-            }
+        if open {
+            let edge = edge_set(build, &children, order, width, around);
+            *set = [set[0].max(edge[0]), set[1].min(edge[1])];
         }
     }
     let empty = first
-        && (last || blocks && margin_collapses_through(build, id, 3, width))
+        && (last || blocks && margin_collapses_through(build, id, 3, width, around))
         && style.get(Prop::HEIGHT).is_none_or(|value| {
             css::value::auto_size(value) || units.resolve(value, width) == Some(0.)
         })

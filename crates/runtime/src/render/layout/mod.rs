@@ -74,8 +74,9 @@ pub struct Layout {
     pub(in crate::render) paint_inputs: u64,
     pub(in crate::render) layout_revision: u64,
     pub(in crate::render) containers: rustc_hash::FxHashMap<usize, [f32; 2]>,
-    // Whether the last margin passes out of each box of `bounded_end`, as its last layout found.
-    pub(in crate::render) ends: rustc_hash::FxHashMap<usize, bool>,
+    // Whether the last margin passes out of each box of `bounded_end`, as its last layout found, its flips while the
+    // document stays the same, and the document revision of the last.
+    pub(in crate::render) ends: rustc_hash::FxHashMap<usize, (bool, u8, u64)>,
     pub(in crate::render) atoms: rustc_hash::FxHashMap<usize, [f32; 3]>,
     // The rendered `::before` and `::after` boxes that scripts can read, by their atom key: the place of the border
     // box from the border box of the element in layout, its size, then the padding plus border of each side.

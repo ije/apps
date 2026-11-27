@@ -1318,6 +1318,15 @@ impl Hooks for DomBox {
             let view = &*self.view;
             let flags = {
                 let mut store = view.store.borrow_mut();
+                let latest = (self.ends.is_some())
+                    .then(|| {
+                        store
+                            .pages
+                            .get(&view.id)
+                            .map(|page| page.doc.nodes.latest())
+                    })
+                    .flatten()
+                    .unwrap_or_default();
                 let dom = store.state(view.id);
                 // Grid tracks are sized before transforms, so they compare with the untransformed box.
                 if let Some(axes) = dom.layout.flexed_grids.get(&self.id)
@@ -1362,12 +1371,18 @@ impl Hooks for DomBox {
                 view.reaching
                     .borrow_mut()
                     .push(([f32::INFINITY, f32::NEG_INFINITY], self.plans));
+                // Warning: the answer can move a scroll bar that changes it back, so a box flips at most twice
+                // while the document stays the same.
                 if let (Some(ends), Some(fits)) = (self.ends, fits)
                     && ends != fits
                 {
-                    dom.layout.ends.insert(self.id, fits);
-                    dom.layout.relayout(self.id);
-                    window.redraw();
+                    let (_, flips, at) = dom.layout.ends.get(&self.id).copied().unwrap_or_default();
+                    let flips = if at == latest { flips + 1 } else { 1 };
+                    if flips <= 2 {
+                        dom.layout.ends.insert(self.id, (fits, flips, latest));
+                        dom.layout.relayout(self.id);
+                        window.redraw();
+                    }
                 }
                 if dom
                     .layout
