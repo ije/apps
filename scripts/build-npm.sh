@@ -43,7 +43,20 @@ for (const pattern of [/(\[workspace\.package\]\nversion = )"[^"]*"/, /(apps-run
 }
 fs.writeFileSync("Cargo.toml", cargo)' "$version"
 
-cargo build --release --workspace
+# Panic messages keep source paths. Make the paths of dependencies and std relative to save about 36 KB.
+# Cargo passes them as absolute paths, so read them from cargo metadata to get the form of this machine.
+flags=$(cargo metadata --format-version 1 --locked | node -e '
+const path = require("path"), meta = JSON.parse(require("fs").readFileSync(0, "utf8"))
+const flags = (process.env.RUSTFLAGS || "").split(/\s+/).filter(Boolean)
+const roots = new Set([path.join(process.argv[1], "lib", "rustlib", "src", "rust")])
+for (const { source, manifest_path } of meta.packages) {
+  if (!source) continue
+  const dir = path.dirname(path.dirname(manifest_path))
+  roots.add(source.startsWith("git+") ? dir.slice(0, dir.indexOf(`${path.sep}checkouts${path.sep}`) + 10) : dir)
+}
+for (const root of roots) flags.push(`--remap-path-prefix=${root}=`)
+process.stdout.write(flags.join("\x1f"))' "$(rustc --print sysroot)")
+CARGO_ENCODED_RUSTFLAGS=$flags cargo build --release --workspace
 
 bin=packages/apps-$os-$cpu/bin
 files=("apps$exe" "apps-runtime$exe" "${lib}apps_media$ext" "${lib}ffmpeg$ext" FFmpeg.LICENSE "${lib}apps_devtools$ext" "${lib}Ghostty$ext" Ghostty.LICENSE)
