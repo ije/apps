@@ -69,8 +69,8 @@ struct Entry {
     used: Cell<u32>,
 }
 
-// A tile at the place of a freed one: (color page, page, texels).
-pub(crate) type Fresh = (bool, u32, Rect<i32>);
+// The texels of a tile: (color page, page, texels).
+pub(crate) type Texels = (bool, u32, Rect<i32>);
 
 // The area that freed tiles held on each page, with the frame of the last free there.
 type Freed = FxHashMap<(bool, u32), (Rect<i32>, u32)>;
@@ -84,11 +84,11 @@ pub(crate) struct Atlas<B> {
     pub(crate) pages: RefCell<B>,
     // The freed areas, and the new tiles there since `take_fresh`. `None` when all pages changed.
     freed: RefCell<Freed>,
-    fresh: RefCell<Option<Vec<Fresh>>>,
+    fresh: RefCell<Option<Vec<Texels>>>,
     // Tiles that a copy of the last paint can read were freed.
     evicted: Cell<bool>,
     // Tiles removed since the last paint: (color page, page, texels).
-    removed: RefCell<Vec<(bool, u32, Rect<i32>)>>,
+    removed: RefCell<Vec<Texels>>,
 }
 
 pub(crate) type Build<'a> = dyn FnMut() -> Result<Option<Raster<Cow<'a, [u8]>>>> + 'a;
@@ -121,7 +121,7 @@ impl<B: PageStore> Atlas<B> {
     // that read them paint again. Many removals stop all copies. Returns true when tiles that copies read were
     // freed.
     // `into` gets the list, and the atlas keeps the cleared buffer of `into` for later removals.
-    pub(crate) fn take_removed(&self, into: &mut Vec<(bool, u32, Rect<i32>)>) -> bool {
+    pub(crate) fn take_removed(&self, into: &mut Vec<Texels>) -> bool {
         into.clear();
         mem::swap(into, &mut self.removed.borrow_mut());
         if into.len() > 64 {
@@ -132,7 +132,7 @@ impl<B: PageStore> Atlas<B> {
     }
 
     // Instances that read new pixels in the place of old ones look the same, so they must draw again.
-    pub fn take_fresh(&self) -> Option<Vec<Fresh>> {
+    pub fn take_fresh(&self) -> Option<Vec<Texels>> {
         self.fresh.replace(Some(Vec::new()))
     }
 

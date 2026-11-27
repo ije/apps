@@ -985,3 +985,21 @@ fn main_answers_pages_with_data_for_fixed_functions() {
         assert!(crate::host::window::route(&args).is_err(), "{args}");
     }
 }
+
+#[test]
+fn web_contents_load_until_their_last_load_ends() {
+    let code = "globalThis.log=[];__apps.app.whenReady().then(()=>{globalThis.win=new __apps.BrowserWindow();win.webContents.on('did-stop-loading',()=>log.push(win.webContents.isLoading()))})";
+    let mut desktop = app(code, &[], std::path::PathBuf::new());
+    let eval = |desktop: &Desktop, script: &str| desktop.js().eval(script, "test").unwrap();
+    eval(
+        &desktop,
+        "win.load('<p>first</p>').catch(()=>{});win.load('<p>second</p>').then(()=>log.push('resolved'))",
+    );
+    desktop.pump(None, None).unwrap();
+    assert_eq!(eval(&desktop, "log.join('|')"), "true|false|resolved");
+    eval(
+        &desktop,
+        "win.load('<p>third</p>').catch(()=>{});win.destroy()",
+    );
+    assert_eq!(eval(&desktop, "win.webContents.isLoading()"), "false");
+}

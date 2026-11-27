@@ -9,21 +9,7 @@ use std::{cell::Cell, rc::Rc};
 #[inline(never)]
 pub(super) fn patch(build: &Build, window: &mut Window) {
     let view = build.view;
-    let changed: Vec<usize> = view
-        .patches
-        .borrow()
-        .iter()
-        .filter(|&(&id, patch)| {
-            patch.value != element::kept::hashed(&build.doc.nodes[id].value)
-                && build.tree.contains(id)
-        })
-        .map(|(&id, _)| id)
-        .collect();
-    for id in changed {
-        let Some(patch) = view.patches.borrow_mut().remove(&id) else {
-            continue;
-        };
-        let old = view.kept.borrow_mut().remove(&id);
+    let rebuild = |id: usize, patch: element::kept::Patch| {
         let mark = build.reads.borrow().len();
         let field = Build {
             ancestors: patch.ancestors,
@@ -56,18 +42,35 @@ pub(super) fn patch(build: &Build, window: &mut Window) {
             None => child,
         };
         #[cfg(debug_assertions)]
-        {
-            if let (Some(old), Some(new)) = (&old, view.kept.borrow().get(&id)) {
-                assert!(
-                    old.call == new.call && old.reads == new.reads && old.print == new.print,
-                    "patched field {id} builds otherwise"
-                );
-            }
-            field.prints.borrow_mut().truncate(printed);
+        field.prints.borrow_mut().truncate(printed);
+        build.reads.borrow_mut().truncate(mark);
+        child
+    };
+    let changed: Vec<usize> = view
+        .patches
+        .borrow()
+        .iter()
+        .filter(|&(&id, patch)| {
+            patch.value != element::kept::hashed(&build.doc.nodes[id].value)
+                && build.tree.contains(id)
+        })
+        .map(|(&id, _)| id)
+        .collect();
+    for id in changed {
+        let Some(patch) = view.patches.borrow_mut().remove(&id) else {
+            continue;
+        };
+        let old = view.kept.borrow_mut().remove(&id);
+        let child = rebuild(id, patch);
+        #[cfg(debug_assertions)]
+        if let (Some(old), Some(new)) = (&old, view.kept.borrow().get(&id)) {
+            assert!(
+                old.call == new.call && old.reads == new.reads && old.print == new.print,
+                "patched field {id} builds otherwise"
+            );
         }
         #[cfg(not(debug_assertions))]
         drop(old);
-        build.reads.borrow_mut().truncate(mark);
         if let renderer::Child::Node(node) = child {
             window.patch(*node);
         }
@@ -105,55 +108,22 @@ pub(super) fn patch(build: &Build, window: &mut Window) {
         ) else {
             continue;
         };
-        let mark = build.reads.borrow().len();
-        let inner = Build {
-            ancestors: patch.ancestors.clone(),
-            flex_parent: patch.flex_parent,
-            columned: patch.columned,
-            space: patch.space,
-            perspective: patch.perspective,
-            zone: None,
-            #[cfg(debug_assertions)]
-            extra: Default::default(),
-            #[cfg(debug_assertions)]
-            plan: Default::default(),
-            ..*build
-        };
+        let ancestors = patch.ancestors.clone();
+        let child = rebuild(id, patch);
         #[cfg(debug_assertions)]
-        let printed = inner.prints.borrow().len();
-        let bounds = patch.slot.as_ref().map(|(bounds, _)| *bounds);
-        let child = element(&inner, id, patch.containing, patch.container, patch.slot);
-        let child = match bounds {
-            Some(bounds) => {
-                let mut units = build.styles.lengths[id];
-                units.container = Some(patch.container);
-                let margin = units.edges(
-                    &build.styles.values[id],
-                    css::properties::MARGIN,
-                    patch.containing[0],
-                );
-                layout::size::place(child, margin, inner.pixel_ratio, bounds)
-            }
-            None => child,
-        };
-        #[cfg(debug_assertions)]
-        {
-            inner.prints.borrow_mut().truncate(printed);
-            if let Some(new) = view.kept.borrow().get(&id) {
-                new.seen.set(old.seen.get());
-            }
+        if let Some(new) = view.kept.borrow().get(&id) {
+            new.seen.set(old.seen.get());
         }
-        build.reads.borrow_mut().truncate(mark);
         // The records of the boxes around hold the reads of the boxes in this one, so other reads build
         // them again.
         if view
             .kept
             .borrow()
             .get(&id)
-            .is_none_or(|new| !new.same_reads(&old))
+            .is_none_or(|new| new.reads != old.reads)
         {
             let mut kept = view.kept.borrow_mut();
-            for ancestor in patch.ancestors.iter() {
+            for ancestor in ancestors.iter() {
                 kept.remove(ancestor);
             }
         }

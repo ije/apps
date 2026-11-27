@@ -11,7 +11,7 @@ use super::single::Task;
 use crate::{Cursor, Pixels, Point, Rect, Scene, Size, WindowChange, WindowOptions};
 use crate::{
     WindowState,
-    platform::{Callbacks, events},
+    platform::{Callbacks, events, lock},
 };
 use anyhow::Result;
 pub(crate) use gpu::Atlas;
@@ -20,23 +20,16 @@ use raw_window_handle::RawWindowHandle;
 use rustc_hash::FxHashMap;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock};
 use std::{cell::Cell, cell::RefCell, collections::BTreeMap, collections::VecDeque};
 use std::{rc::Rc, rc::Weak, time::Duration, time::Instant};
 pub(crate) use video::SURFACES;
-
-// A window that stops drawing releases its spare GPU resources after this.
-const QUIET: Duration = Duration::from_secs(1);
 
 type Job = Box<dyn FnOnce()>;
 type Watcher = Box<dyn FnMut() -> bool>;
 
 static INBOX: Mutex<Vec<Task>> = Mutex::new(vec![]);
 static BELL: OnceLock<OwnedFd> = OnceLock::new();
-
-fn inbox() -> MutexGuard<'static, Vec<Task>> {
-    INBOX.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 #[derive(Default)]
 struct Turn {
@@ -112,7 +105,7 @@ pub(crate) fn run_after(delay: Duration, f: impl FnOnce() + 'static) {
 }
 
 pub(crate) fn native_post(task: Task) {
-    inbox().push(task);
+    lock(&INBOX).push(task);
     if let Some(bell) = BELL.get() {
         let one = 1u64;
         // SAFETY: an eventfd takes 8 bytes. A full counter still wakes the loop, so the result doesn't matter.
@@ -159,8 +152,7 @@ trait Native {
     fn state(&self) -> WindowState;
     fn active(&self) -> bool;
     fn want_frames(&self);
-    fn draw(&self, scene: &Scene, capture: bool) -> Capture;
-    fn take_snapshots(&self) -> Vec<crate::Snapshot>;
+    fn draw(&self, scene: &Scene, capture: bool, snapshots: &mut Vec<crate::Snapshot>) -> Capture;
     fn release(&self);
     fn act(&self, action: Action);
     fn handle(&self) -> RawWindowHandle;
@@ -218,7 +210,7 @@ impl Platform {
         TURN.with(|turn| {
             loop {
                 // Bound first: a temporary in a `for` header lives through the loop, and tasks post and queue more.
-                let posted = std::mem::take(&mut *inbox());
+                let posted = std::mem::take(&mut *lock(&INBOX));
                 for task in posted {
                     task();
                 }
@@ -241,7 +233,7 @@ impl Platform {
                 if turn.done.get() || !display.prepare() {
                     break;
                 }
-                let busy = !turn.soon.borrow().is_empty() || !inbox().is_empty();
+                let busy = !turn.soon.borrow().is_empty() || !lock(&INBOX).is_empty();
                 let next = turn
                     .due
                     .borrow()
@@ -425,15 +417,13 @@ impl Window {
         if self.quiet.replace(Some(true)).is_none() {
             self.wait();
         }
-        (
-            self.native.draw(scene, capture),
-            self.native.take_snapshots(),
-        )
+        let mut snapshots = Vec::new();
+        (self.native.draw(scene, capture, &mut snapshots), snapshots)
     }
 
     fn wait(&self) {
         let calls = self.calls;
-        crate::platform::timer(QUIET, move || events().release(calls)).detach();
+        run_after(crate::platform::QUIET, move || events().release(calls));
     }
 
     pub fn release(&self, _: &Scene) {
@@ -477,7 +467,7 @@ impl WindowControl {
 
     pub fn change(&self, change: WindowChange) {
         match change {
-            WindowChange::Show(_) | WindowChange::Restore => self.act(Action::Raise),
+            WindowChange::Show(_) => self.act(Action::Raise),
             WindowChange::Parent(parent, _) => self.act(Action::Parent(parent)),
             WindowChange::CancelComposition => self.act(Action::CancelComposition),
             _ => {}

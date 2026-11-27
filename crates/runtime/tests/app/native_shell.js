@@ -30,7 +30,8 @@
   throws(() => systemPreferences.setUserDefault('key', 'integer', 1.5), 'Unable to convert value to: integer', 'User default values');
   systemPreferences.setUserDefault('key', 'array', [1, 'two']);
   assert(JSON.stringify(last('native.prefs.setDefault')) === JSON.stringify({ key: 'key', type: 'array', value: [1, 'two'] }), 'Set user defaults');
-  assert(!shell.pending(), 'Blockers and preferences do not keep the event loop polling');
+  shell.poll();
+  assert(!calls.some(call => call[0] === 'native.poll'), 'Blockers and preferences do not keep the event loop polling');
   globalThis.nativeShellAsync = [];
   systemPreferences.askForMediaAccess('camera').then(value => nativeShellAsync.push(value));
   systemPreferences.promptTouchID('Unlock').catch(error => nativeShellAsync.push(error.message));

@@ -15,6 +15,14 @@ type Bitmaps = HashMap<String, Arc<renderer::RenderImage>>;
 pub(crate) type Decoding = Arc<Mutex<Option<renderer::RenderImage>>>;
 // A decoded image, and for SVG its tree and whether its view box keeps its ratio.
 pub(crate) type Source = (Arc<renderer::RenderImage>, Option<(usvg::Tree, bool)>);
+// The natural size of a background image file, known after its first load.
+#[derive(Clone, Copy)]
+enum Natural {
+    Unknown,
+    Ready([f32; 2]),
+    // The file has no image, so it loads no more.
+    Broken,
+}
 // The slice and target of a border image part on one axis, and its first tile, step, tile count and tile size.
 type Part = [([f32; 4], (f32, f32, usize, f32)); 2];
 
@@ -86,7 +94,7 @@ pub(crate) fn load(
                     let kept = text.contains("viewBox")
                         && !text.contains("AspectRatio=\"none")
                         && !text.contains("AspectRatio='none");
-                    Ok((super::super::raster::svg::svg_tree(&text, false)?, kept))
+                    Ok((super::super::raster::svg::svg_tree(&text)?, kept))
                 })
                 .inspect_err(|error| eprintln!("apps: CSS image {file}: {error}"))
                 .ok()
@@ -327,7 +335,7 @@ pub(crate) fn css_background(
             if let Some(path) = path.clone() {
                 let file = path.to_string_lossy().into_owned();
                 let view = view.clone();
-                let natural = std::cell::Cell::new(None::<[f32; 2]>);
+                let natural = std::cell::Cell::new(Natural::Unknown);
                 // The tiles of the last size, which most frames draw again.
                 type Tiles = (
                     [f32; 2],
@@ -355,14 +363,7 @@ pub(crate) fn css_background(
                             (&mut dom.rasters.backgrounds, &mut dom.rasters.bitmaps, &mut dom.rasters.layer_sources);
                         let scale = window.scale_factor();
                         let key = (id, slot * 64 + raster);
-                        let words: Vec<&str> = repeat.split_whitespace().collect();
-                        let modes = match words.as_slice() {
-                            ["repeat-x"] => ["repeat", "no-repeat"],
-                            ["repeat-y"] => ["no-repeat", "repeat"],
-                            [one] => [*one, *one],
-                            [x, y, ..] => [*x, *y],
-                            [] => ["repeat", "repeat"],
-                        };
+                        let modes = super::super::effects::gradient::repeat_modes(&repeat);
                         let limit = super::super::raster::RASTER_MAX as f32;
                         let tiles = |natural: [f32; 2]| {
                             let extent = [width + area[2], height + area[3]];
@@ -454,29 +455,38 @@ pub(crate) fn css_background(
                                             != cell
                             })
                         };
-                        let bitmap = if natural.get().is_none_or(|natural| {
-                            let (.., cell, source) = layout(natural);
-                            stale(backgrounds, bitmaps, &source, cell)
-                        }) {
+                        let load_now = match natural.get() {
+                            Natural::Unknown => true,
+                            Natural::Ready(natural) => {
+                                let (.., cell, source) = layout(natural);
+                                stale(backgrounds, bitmaps, &source, cell)
+                            }
+                            Natural::Broken => return,
+                        };
+                        let bitmap = if load_now {
                             let Some((bitmap, tree)) = load(view, bitmaps, id, &file, &path, window)
                             else {
                                 return;
                             };
-                            if natural.get().is_none() {
-                    natural.set(Some(match &tree {
+                            if let Natural::Unknown = natural.get() {
+                                let size = match &tree {
                                     Some((tree, _)) => [tree.size().width(), tree.size().height()],
                                     None => {
                                         [bitmap.size().width, bitmap.size().height]
                                             .map(|side| side as f32 / resolution)
                                     }
-                                }));
+                                };
+                                natural.set(if size[0] > 0. && size[1] > 0. {
+                                    Natural::Ready(size)
+                                } else {
+                                    Natural::Broken
+                                });
                             }
                             Some((bitmap, tree))
                         } else {
                             None
                         };
-                        let Some(natural) = natural.get().filter(|[w, h]| *w > 0. && *h > 0.)
-                        else {
+                        let Natural::Ready(natural) = natural.get() else {
                             return;
                         };
                         let (
@@ -674,7 +684,6 @@ pub(crate) fn css_background(
                                     ),
                                     radii,
                                     image.clone(),
-                                    false,
                                     pixelated,
                                 );
                             }
@@ -696,13 +705,7 @@ pub(crate) fn css_background(
             continue;
         };
         let strip = super::super::effects::gradient::gradient_axis(&kind, &body, &units);
-        let modes = match repeat.split_whitespace().collect::<Vec<_>>().as_slice() {
-            ["repeat-x"] => ["repeat", "no-repeat"],
-            ["repeat-y"] => ["no-repeat", "repeat"],
-            [one] => [*one; 2],
-            [a, b, ..] => [*a, *b],
-            [] => ["repeat"; 2],
-        };
+        let modes = super::super::effects::gradient::repeat_modes(&repeat);
         let repeats = modes.map(|mode| mode == "repeat");
         let plain = modes
             .iter()
@@ -939,7 +942,7 @@ pub(crate) fn css_background(
                                 renderer::size(px(cw), px(ch)),
                             );
                             let square = renderer::Radii::<renderer::Pixels>::default();
-                            window.draw_image(clip, target, square, image.clone(), false, false);
+                            window.draw_image(clip, target, square, image.clone(), false);
                             if !repeats[0] {
                                 break;
                             }
@@ -968,7 +971,7 @@ pub(crate) fn css_background(
                     ),
                     None => bounds,
                 };
-                window.draw_image(bounds, target, radii, image.clone(), false, false);
+                window.draw_image(bounds, target, radii, image.clone(), false);
             }
         })));
         indexes.push((index, *share));
@@ -1454,7 +1457,6 @@ pub(crate) fn border_image(
                             whole,
                             renderer::Radii::default(),
                             image.clone(),
-                            false,
                             pixelated,
                         );
                     }

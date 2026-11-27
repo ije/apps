@@ -177,10 +177,7 @@ struct ScrollState {
     snaps: Option<Rc<ScrollSnaps>>,
     // The areas that the box is at on each axis.
     snapped: [Option<u64>; 2],
-    // A gesture moves the box, which snaps when it ends.
-    grabbed: bool,
-    // The box snaps when it comes to rest.
-    settling: bool,
+    phase: SnapPhase,
     // The areas of the last `scrollsnapchange` and `scrollsnapchanging`. A new box has none.
     reported: Option<[Option<u64>; 2]>,
     aimed: Option<[Option<u64>; 2]>,
@@ -195,6 +192,16 @@ struct ScrollState {
     swept: [bool; 2],
     // The events to fire, in order over all boxes.
     events: Vec<(u64, ScrollEvent)>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum SnapPhase {
+    #[default]
+    Free,
+    // A gesture moves the box, which snaps when it ends.
+    Grabbed,
+    // The box snaps when it comes to rest.
+    Settling,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -423,8 +430,7 @@ impl ScrollState {
     }
 
     fn busy(&self) -> bool {
-        self.grabbed
-            || self.settling
+        self.phase != SnapPhase::Free
             || self.animation.is_some()
             || self.stretch != Point::default()
             || (self.glide.as_ref()).is_some_and(|glide| glide.to != self.offset)
@@ -526,8 +532,9 @@ impl ScrollState {
                 .glide
                 .as_ref()
                 .is_none_or(|glide| glide.to == self.offset);
-        if self.settling && resting && idle && self.stretch == Point::default() {
-            self.settling = false;
+        if self.phase == SnapPhase::Settling && resting && idle && self.stretch == Point::default()
+        {
+            self.phase = SnapPhase::Free;
             self.snap();
             moved = true;
         }
@@ -677,7 +684,7 @@ impl ScrollRef {
             return to;
         };
         let (found, ids) = snaps.find(to, snap, scroll.snapped, scroll.range);
-        (scroll.snapped, scroll.grabbed, scroll.settling) = (ids, false, false);
+        (scroll.snapped, scroll.phase) = (ids, SnapPhase::Free);
         scroll.swept = [false; 2];
         found
     }
@@ -698,7 +705,10 @@ impl ScrollRef {
         }
         let Some(snaps) = snaps.map(Rc::new) else {
             scroll.fire(ScrollEvent::Change([None; 2]));
-            (scroll.snaps, scroll.snapped, scroll.settling) = (None, [None; 2], false);
+            (scroll.snaps, scroll.snapped) = (None, [None; 2]);
+            if scroll.phase == SnapPhase::Settling {
+                scroll.phase = SnapPhase::Free;
+            }
             (scroll.reported, scroll.aimed) = (None, None);
             return false;
         };
@@ -707,7 +717,9 @@ impl ScrollRef {
             *id = id.filter(|&id| snaps.areas.iter().any(|area| area.id == id));
         }
         if scroll.busy() {
-            scroll.settling |= !scroll.grabbed;
+            if scroll.phase == SnapPhase::Free {
+                scroll.phase = SnapPhase::Settling;
+            }
             return false;
         }
         let (to, ids) = snaps.find(scroll.offset, Snap::Keep, scroll.snapped, scroll.range);
@@ -733,7 +745,10 @@ impl ScrollRef {
     /// A box without a layout snaps to nothing, which is no event.
     pub fn forget_snaps(&self) {
         let scroll = &mut *self.0.borrow_mut();
-        (scroll.snaps, scroll.settling, scroll.scrolled) = (None, false, false);
+        (scroll.snaps, scroll.scrolled) = (None, false);
+        if scroll.phase == SnapPhase::Settling {
+            scroll.phase = SnapPhase::Free;
+        }
         (scroll.snapped, scroll.reported, scroll.aimed) = Default::default();
     }
 
@@ -741,7 +756,7 @@ impl ScrollRef {
     pub fn take_events(&self) -> (Vec<(u64, ScrollEvent)>, bool) {
         let scroll = &mut *self.0.borrow_mut();
         if let Some(snaps) = &scroll.snaps {
-            if scroll.grabbed || scroll.settling {
+            if scroll.phase != SnapPhase::Free {
                 let snap = scroll.settled();
                 let ids = snaps
                     .find(scroll.end(), snap, scroll.snapped, scroll.range)
@@ -803,15 +818,17 @@ impl ScrollRef {
     pub fn grab(&self) {
         let scroll = &mut *self.0.borrow_mut();
         scroll.scrolled = true;
-        (scroll.grabbed, scroll.settling) = (true, false);
+        scroll.phase = SnapPhase::Grabbed;
     }
 
     /// The user let the box go, so it snaps when it comes to rest.
     pub fn settle(&self, window: &mut Window) {
         {
             let scroll = &mut *self.0.borrow_mut();
-            scroll.grabbed = false;
-            scroll.settling = scroll.snaps.is_some();
+            scroll.phase = match scroll.snaps {
+                Some(_) => SnapPhase::Settling,
+                None => SnapPhase::Free,
+            };
             scroll.scrolled = true;
         }
         self.drive(window);
@@ -851,7 +868,7 @@ impl ScrollRef {
             animation.duration = Duration::from_secs_f32(seconds);
             animation.slope = point(slope(to.x - from.x, speed.x), slope(to.y - from.y, speed.y));
         }
-        (scroll.snapped, scroll.grabbed, scroll.settling) = (ids, false, false);
+        (scroll.snapped, scroll.phase) = (ids, SnapPhase::Free);
         scroll.swept = [false; 2];
         true
     }
@@ -935,7 +952,7 @@ impl ScrollRef {
             let busy = scroll.animation.is_some()
                 || scroll.spring.is_some()
                 || scroll.loose
-                || scroll.settling
+                || scroll.phase == SnapPhase::Settling
                 || gliding;
             if scroll.driven || !busy {
                 return;

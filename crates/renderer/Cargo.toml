@@ -18,7 +18,7 @@ libc.workspace = true
 block2.workspace = true
 core-foundation-sys.workspace = true
 dispatch2 = { workspace = true, features = ["block2"] }
-flate2 = { version = "1.1.11", default-features = false, features = ["zlib-rs"] }
+flate2.workspace = true
 objc2.workspace = true
 objc2-app-kit = { workspace = true, features = ["NSTextInputContext", "NSVisualEffectView"] }
 objc2-core-foundation = { workspace = true, features = [
@@ -131,9 +131,9 @@ xim = { version = "0.6.0", default-features = false, features = ["x11rb-xcb", "x
 xkbcommon = { workspace = true, features = ["x11", "wayland"] }
 
 [dev-dependencies]
-naga = { version = "30.0.1", features = ["wgsl-in"] }
+naga = { workspace = true, features = ["wgsl-in"] }
 
 # The build script runs on the host, and only a macOS host builds Metal shaders.
 [target.'cfg(target_os = "macos")'.build-dependencies]
-miniz_oxide = "0.9.1"
-naga = { version = "30.0.1", features = ["wgsl-in", "msl-out"] }
+miniz_oxide.workspace = true
+naga = { workspace = true, features = ["wgsl-in", "msl-out"] }

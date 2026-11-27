@@ -432,10 +432,6 @@ impl Process {
         Ok(Some(process))
     }
 
-    fn unref(&mut self, unreferenced: bool) {
-        self.unreferenced = unreferenced;
-    }
-
     // Pauses, resumes or closes the reader of an output stream.
     fn gate(&self, stream: &Value, next: u8) {
         if let Some((_, state, reader)) = self.readers.iter().find(|(name, ..)| stream == *name) {
@@ -656,7 +652,16 @@ impl State {
                     .filter(|v| *v > 0)
                     .map(|v| Instant::now() + Duration::from_millis(v));
                 let limit = config["maxBuffer"].as_u64().unwrap_or(1024 * 1024) as usize;
-                let signal = config["killSignal"].as_str().unwrap_or("SIGTERM");
+                let signal = config["killSignal"]
+                    .as_str()
+                    .or_else(|| {
+                        let number = config["killSignal"].as_i64()?;
+                        crate::node::SIGNALS
+                            .iter()
+                            .find(|(_, signal)| i64::from(*signal) == number)
+                            .map(|(name, _)| *name)
+                    })
+                    .unwrap_or("SIGTERM");
                 let process = state.child(id)?;
                 let (stdout, stderr, error) = process.wait(deadline, limit, signal)?;
                 let output = |data: Vec<u8>, index: usize| {
@@ -675,7 +680,7 @@ impl State {
             "unref" => {
                 // A child that failed to spawn has no ID.
                 if let Some(process) = args[0].as_u64().and_then(|id| self.children.get_mut(&id)) {
-                    process.unref(args[1] == true);
+                    process.unreferenced = args[1] == true;
                 }
                 Ok(Value::Null)
             }

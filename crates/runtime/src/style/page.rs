@@ -17,8 +17,7 @@ pub(crate) struct Styles {
     pub(crate) editable: Vec<usize>,
     pub(crate) inert: Vec<usize>,
     pub(crate) select_marks: Vec<u8>,
-    // The pass that made the marks: its styles, modal subject and walk, and whether it flattened children.
-    pub(crate) select_base: (usize, Option<usize>, u64, bool),
+    pub(crate) select_base: MarkBase,
     pub(crate) shadow_walk: Rc<ShadowWalk>,
     pub(crate) epoch: u64,
     pub(crate) sheets: HashMap<Rc<str>, Rc<Stylesheet>>,
@@ -71,7 +70,17 @@ pub(crate) struct Page<'a> {
     pub(crate) bounds: &'a mut LayoutMirror,
 }
 
-type Key = ([f32; 2], Option<f32>, bool, u32);
+// The pass that made the selection marks. Freed styles can leave their address to others, so `pass` must match too.
+#[derive(Default)]
+pub(crate) struct MarkBase {
+    styles: usize,
+    pass: u64,
+    subject: Option<usize>,
+    serial: u64,
+    flattened: bool,
+}
+
+type Key = ([f32; 2], Option<f32>, u32);
 
 // A pass that `begin` found to be needed.
 pub(crate) struct Pending {
@@ -89,11 +98,6 @@ impl Styles {
         if let Some(computed) = self.computed.take() {
             self.previous = Some(computed);
         }
-    }
-
-    // The styles of the last pass, which can be old.
-    pub(crate) fn latest(&self) -> Option<Rc<ComputedStyles>> {
-        self.computed.clone().or_else(|| self.previous.clone())
     }
 
     // A node joins the arena with `len` nodes.
@@ -117,7 +121,7 @@ impl Styles {
         scale: Option<f32>,
         bounds: &mut LayoutMirror,
     ) -> Result<Rc<ComputedStyles>, Pending> {
-        let key = (viewport, scale, theme & 32 != 0, theme);
+        let key = (viewport, scale, theme);
         let animated = std::mem::take(&mut self.animated);
         // Resize observers read content boxes, which these values change without a new border box.
         if animated.values().any(|style| {
@@ -148,7 +152,7 @@ impl Styles {
         Pending { key, animated }: Pending,
         page: Page,
     ) -> Rc<ComputedStyles> {
-        let (viewport, scale, reduced_motion, theme) = key;
+        let (viewport, scale, theme) = key;
         let animating = !animated.is_empty();
         if self.shadow_walk.tree != doc.nodes.tree() || self.shadow_walk.count != page.shadows.len()
         {
@@ -241,7 +245,6 @@ impl Styles {
         let shadow_walk = self.shadow_walk.clone();
         let context = super::StyleContext {
             shadows: shadow_walk.shadows.clone(),
-            reduced_motion,
             theme,
             scale: scale.unwrap_or(1.),
             aliases: page.font_aliases.clone(),
@@ -377,14 +380,15 @@ impl Styles {
         // The last pass gives the marks when it had the same lists, modal subject and, but for a patch, walk.
         // Then only nodes with other style flags or another place can change, and the nodes below them.
         let base = context.previous.as_deref().filter(|previous| {
-            self.select_base.0 == std::ptr::from_ref(*previous) as usize
-                && self.select_base.1 == subject
+            self.select_base.styles == std::ptr::from_ref(*previous) as usize
+                && self.select_base.pass == previous.pass
+                && self.select_base.subject == subject
                 && !relisted
                 && self.select_marks.len() <= doc.nodes.len()
         });
-        let touched = base.and_then(|_| match self.select_base.2 == walk.serial {
+        let touched = base.and_then(|_| match self.select_base.serial == walk.serial {
             true => Some(&[][..]),
-            false => walk.since(self.select_base.2),
+            false => walk.since(self.select_base.serial),
         });
         let mut marks = std::mem::take(&mut self.select_marks);
         let mut select = std::mem::take(&mut result.user_select);
@@ -420,7 +424,7 @@ impl Styles {
                     }
                 }
                 places.sort_unstable();
-                let mut flattened = self.select_base.3;
+                let mut flattened = self.select_base.flattened;
                 let (mut next, mut scan) = (0, 0);
                 let mut places = places.into_iter();
                 loop {
@@ -525,9 +529,15 @@ impl Styles {
             }
         }
         page.bounds.zoomed(result.lengths.zoomed);
+        let result = Rc::new(result);
+        self.select_base = MarkBase {
+            styles: Rc::as_ptr(&result) as usize,
+            pass: result.pass,
+            subject,
+            serial,
+            flattened: flatten,
+        };
         if animating {
-            let result = Rc::new(result);
-            self.select_base = (Rc::as_ptr(&result) as usize, subject, serial, flatten);
             return result;
         }
         self.animating.clear();
@@ -536,8 +546,6 @@ impl Styles {
         self.epoch += 1;
         page.bounds.restyled();
         self.key = key;
-        let result = Rc::new(result);
-        self.select_base = (Rc::as_ptr(&result) as usize, subject, serial, flatten);
         self.linted = false;
         self.computed = Some(result.clone());
         self.previous = None;

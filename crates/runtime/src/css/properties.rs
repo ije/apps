@@ -1057,20 +1057,19 @@ pub(crate) fn side(prop: Prop, rtl: bool, lines: Option<&str>) -> Prop {
     Prop::find(&name).unwrap_or(prop)
 }
 
-fn logical() -> &'static [u64; 16] {
-    static BITS: std::sync::OnceLock<[u64; 16]> = std::sync::OnceLock::new();
-    BITS.get_or_init(|| {
-        let mut bits = [0; 16];
-        for (Prop(prop, _), ..) in LOGICAL {
-            bits[prop as usize / 64] |= 1 << (prop % 64);
-        }
-        bits
-    })
-}
+const LOGICAL_SET: PropSet = {
+    let mut props = [LOGICAL[0].0; LOGICAL.len()];
+    let mut at = 0;
+    while at < LOGICAL.len() {
+        props[at] = LOGICAL[at].0;
+        at += 1;
+    }
+    PropSet::new(&props)
+};
 
 impl Prop {
     pub(crate) fn is_logical(self) -> bool {
-        (logical().get(self.0 as usize / 64)).is_some_and(|bits| bits >> (self.0 % 64) & 1 != 0)
+        LOGICAL_SET.contains(self)
     }
 }
 

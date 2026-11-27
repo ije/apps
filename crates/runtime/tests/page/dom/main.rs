@@ -12,21 +12,7 @@ fn offscreen_page(source: &str) -> (Rc<RefCell<Host>>, JsContext, String) {
     apps_runtime::jsc::Waker::install(move || {
         let _ = wake.send(());
     });
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse("<body><canvas id=shown width=8 height=8></canvas></body>"),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (host, engine) = css_page("<body><canvas id=shown width=8 height=8></canvas></body>");
     engine
         .eval(
             &format!(
@@ -58,21 +44,7 @@ fn offscreen_page(source: &str) -> (Rc<RefCell<Host>>, JsContext, String) {
 }
 
 fn checked_page(html: &str, script: &str) -> (Rc<RefCell<Host>>, JsContext) {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse(html),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (host, engine) = css_page(html);
     let result = engine
         .eval(
             &format!(
@@ -91,7 +63,6 @@ fn css_page(html: &str) -> (Rc<RefCell<Host>>, JsContext) {
         1,
         Page {
             doc: Document::parse(html),
-            dirty: false,
             ..Default::default()
         },
     );

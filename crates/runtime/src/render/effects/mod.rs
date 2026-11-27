@@ -44,7 +44,6 @@ pub(crate) fn index<'a>(ids: &'a Ids, doc: &Document) -> &'a FxHashMap<String, V
     })
 }
 
-// The matrix of a box moved by `[x, y]`: `translate(x, y) * matrix * translate(-x, -y)`, without the rounding of
 pub(crate) fn opacity(style: &css::properties::Style) -> f32 {
     style
         .get(Prop::OPACITY)
@@ -186,7 +185,8 @@ pub(crate) fn establishes(style: &Style) -> Establishes {
             Prop::WEBKIT_BACKDROP_FILTER,
         ])
         || style.get(Prop::TRANSFORM_STYLE) == Some("preserve-3d");
-    preserves &= !set(&[Prop::MASK, Prop::WEBKIT_MASK]);
+    let masked = set(&[Prop::MASK, Prop::WEBKIT_MASK]);
+    preserves &= !masked;
     Establishes {
         stacking: fixed
             || layer
@@ -197,7 +197,7 @@ pub(crate) fn establishes(style: &Style) -> Establishes {
                 && style
                     .get(Prop::Z_INDEX)
                     .is_some_and(|value| value.parse::<i32>().is_ok())
-            || set(&[Prop::MASK, Prop::WEBKIT_MASK])
+            || masked
             || opacity(style) < 1.,
         absolute: fixed || will_position || position != "static",
         fixed,

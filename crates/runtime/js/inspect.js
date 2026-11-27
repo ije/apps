@@ -374,25 +374,29 @@ globalThis.__appsInspect = (() => {
       return true;
     }
     memo ??= new Map();
-    if (memo.get(a) === b) return true;
+    const outer = memo.get(a);
+    if (outer === b) return true;
+    // The pair counts as equal only while it is compared, so a failed or finished pair can't answer a later compare.
     memo.set(a, b);
-    const find = (list, match) => { for (const other of list) if (typeof other === 'object' && other !== null && match(other)) return true; return false; };
-    if (kind === 'Map') {
-      if (a.size !== b.size) return false;
-      for (const [k, v] of a) {
-        if (b.has(k)) { if (!deepEqual(v, b.get(k), strict, memo)) return false; }
-        else if (typeof k !== 'object' || k === null || !find(b.keys(), other => deepEqual(k, other, strict, memo) && deepEqual(v, b.get(other), strict, memo))) return false;
+    try {
+      const used = kind === 'Map' || kind === 'Set' ? new Set() : null, find = (list, match) => { for (const other of list) if (typeof other === 'object' && other !== null && !a.has(other) && !used.has(other) && match(other)) { used.add(other); return true; } return false; };
+      if (kind === 'Map') {
+        if (a.size !== b.size) return false;
+        for (const [k, v] of a) {
+          if (b.has(k)) { if (!deepEqual(v, b.get(k), strict, memo)) return false; }
+          else if (typeof k !== 'object' || k === null || !find(b.keys(), other => deepEqual(k, other, strict, memo) && deepEqual(v, b.get(other), strict, memo))) return false;
+        }
       }
-    }
-    if (kind === 'Set') {
-      if (a.size !== b.size) return false;
-      for (const v of a) if (!b.has(v) && (typeof v !== 'object' || v === null || !find(b, other => deepEqual(v, other, strict, memo)))) return false;
-    }
-    const keys = value => strict ? [...Object.keys(value), ...Object.getOwnPropertySymbols(value).filter(symbol => Object.prototype.propertyIsEnumerable.call(value, symbol))] : Object.keys(value);
-    const left = keys(a), right = keys(b);
-    if (left.length !== right.length) return false;
-    for (const name of left) if (!Object.prototype.propertyIsEnumerable.call(b, name) || !deepEqual(a[name], b[name], strict, memo)) return false;
-    return true;
+      if (kind === 'Set') {
+        if (a.size !== b.size) return false;
+        for (const v of a) if (!b.has(v) && (typeof v !== 'object' || v === null || !find(b, other => deepEqual(v, other, strict, memo)))) return false;
+      }
+      const keys = value => strict ? [...Object.keys(value), ...Object.getOwnPropertySymbols(value).filter(symbol => Object.prototype.propertyIsEnumerable.call(value, symbol))] : Object.keys(value);
+      const left = keys(a), right = keys(b);
+      if (left.length !== right.length) return false;
+      for (const name of left) if (!Object.prototype.propertyIsEnumerable.call(b, name) || !deepEqual(a[name], b[name], strict, memo)) return false;
+      return true;
+    } finally { if (outer === undefined) memo.delete(a); else memo.set(a, outer); }
   };
   return { inspect, format: (...args) => formatWithOptions({}, ...args), formatWithOptions, deepEqual };
 })();

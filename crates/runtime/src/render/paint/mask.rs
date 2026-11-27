@@ -75,7 +75,8 @@ pub(crate) fn mask(
             renderer::size(renderer::px(width), renderer::px(height)),
         );
         let scale = window.scale_factor();
-        let raster = [width, height].map(|extent| (extent * scale).ceil().clamp(1., 4096.) as u32);
+        let max = super::super::raster::RASTER_MAX as f32;
+        let raster = [width, height].map(|extent| (extent * scale).ceil().clamp(1., max) as u32);
         let masks = &mut dom.rasters.masks;
         if masks.get(&key).is_none_or(|(old, image)| {
             *old != inputs
@@ -147,7 +148,7 @@ pub(crate) fn mask(
                     ),
                     (None, None) => return None,
                 };
-                let mut options = super::super::raster::svg::svg_options(false, false);
+                let mut options = super::super::raster::svg::svg_options(false);
                 options.image_href_resolver.resolve_string = Box::new(move |href, _| {
                     kinds.get(href.strip_prefix("apps-mask:")?.parse::<usize>().ok()?)?.clone()
                 });
@@ -453,6 +454,8 @@ pub(crate) fn mask_svg<'a>(
 mod tests {
     use super::*;
 
+    // The SVG draws the two parts of `exclude` one over the other, so it matches the XOR of the standard only
+    // where alpha is 0 or 1.
     #[test]
     fn axis_masks_draw_as_their_svg() {
         let units = css::value::units::Lengths::new(16., 800., 600.);
@@ -499,7 +502,7 @@ mod tests {
             let source = format!(
                 "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"50\">{layers}</svg>"
             );
-            let tree = crate::render::raster::svg::svg_tree(&source, false).unwrap();
+            let tree = crate::render::raster::svg::svg_tree(&source).unwrap();
             let slow = crate::render::raster::svg::svg_pixels(&tree, 100, 50, None).unwrap();
             let fast = fast.unwrap_or_else(|| vec![255; 100 * 50 * 4]);
             let worst = fast

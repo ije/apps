@@ -5,7 +5,7 @@ mod span;
 use crate::{
     Clip, Color, Pixels, Point, Radii, Rect, Size,
     geometry::{region, transform_bounds},
-    gpu::atlas::Tile,
+    gpu::atlas::{Texels, Tile},
     gpu::{Instance, SHADOW, bytes, rect},
     point,
 };
@@ -41,7 +41,7 @@ pub struct Scene {
     pub(crate) reads: Vec<(Rect<f32>, u32)>,
     // Atlas tiles removed since the last paint: (color page, page, texels). A span of `last` that reads one
     // can't be copied, but its box can paint again while other boxes copy theirs.
-    removed: Vec<(bool, u32, Rect<i32>)>,
+    removed: Vec<Texels>,
     entries: Vec<Entry>,
     maps: Vec<Map>,
     // Layers that patches changed since the last diff, so `maps` doesn't place what they hold.
@@ -49,15 +49,12 @@ pub struct Scene {
     prior: Vec<Entry>,
     prior_maps: Vec<Map>,
     // `prior` holds what the window shows, and `entries` this scene since `diff`.
-    drawn: bool,
-    // `Some` after `clear`, and true after `diff`.
-    diffed: Option<bool>,
+    prior_shows: Prior,
+    stage: Stage,
     // Paint that the content mask cut away: instances outside their clip, or content that paint skipped.
     culled: u32,
     // Patched regions since the last diff, which the prior entries don't know.
     patched: Damage,
-    // A frame drew patches without a diff, so the prior entries don't show the window.
-    undiffed: bool,
     salt: u64,
     // The content of scroll containers in the window layer, in paint order, and those of the last painted scene.
     scrolls: Vec<Scroll>,
@@ -85,6 +82,25 @@ pub struct Scene {
     // The scroll of `under`, kept while frames don't move it, and the split of the last diff.
     under_scroll: Option<u64>,
     under_split: Option<[u32; 2]>,
+}
+
+// Where the scene is in this frame.
+#[derive(Clone, Copy, PartialEq)]
+enum Stage {
+    Painted,
+    Diffed,
+    // Drawn, or drawn again with patches.
+    Drawn,
+}
+
+// What the prior entries know of the window.
+#[derive(Clone, Copy, PartialEq)]
+enum Prior {
+    // The window shows a scene that was never diffed.
+    Stale,
+    Exact,
+    // A frame drew patches since, so `patched` stays for the next diff.
+    PlusPatches,
 }
 
 // The items of the window layer up to the end of a scroll's content, which a backend can keep drawn across frames, so
@@ -277,10 +293,9 @@ impl Default for Scene {
             moved: Vec::new(),
             prior: Vec::new(),
             prior_maps: Vec::new(),
-            drawn: false,
-            diffed: None,
+            prior_shows: Prior::Stale,
+            stage: Stage::Drawn,
             patched: Damage::default(),
-            undiffed: false,
             culled: 0,
             salt: 0,
             scrolls: Vec::new(),
@@ -326,7 +341,7 @@ impl Scene {
         self.damage.whole = true;
         self.shift = None;
         self.under = None;
-        self.diffed = Some(false);
+        self.stage = Stage::Painted;
         self.open.clear();
         self.held.clear();
         self.cutting.clear();
@@ -596,7 +611,7 @@ impl Scene {
     }
 
     // `removed` lists the atlas tiles removed since the last paint, and gets the buffer of the last list back.
-    pub(crate) fn begin_paint(&mut self, pass: u32, removed: &mut Vec<(bool, u32, Rect<i32>)>) {
+    pub(crate) fn begin_paint(&mut self, pass: u32, removed: &mut Vec<Texels>) {
         self.pass = Some(pass);
         mem::swap(&mut self.removed, removed);
     }

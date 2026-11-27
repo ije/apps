@@ -40,16 +40,7 @@ fn visibility_observers_option_lists_and_canvas_current_color_follow_chrome() {
 
 #[test]
 fn canvas_pixels_survive_partial_updates_and_clipping() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse("<html><body></body></html>"),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let (_, engine) = css_page("<html><body></body></html>");
     engine.eval(r#"
       const canvas=document.createElement('canvas');canvas.width=8;canvas.height=8;
       const ctx=canvas.getContext('2d');ctx.fillStyle='#ff0000';ctx.fillRect(0,0,8,8);
@@ -80,12 +71,9 @@ fn canvas_pixels_survive_partial_updates_and_clipping() {
 
 #[test]
 fn hostile_selectors_canvas_data_and_traversal() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><body><ul id='list'><li id='a'>1</li><li id=\"it's\">2</li><li id='c'>3</li></ul><svg><g><circle></circle></g><foreignObject><div id='html'></div></foreignObject></svg></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let (_, engine) = css_page(
+        "<html><body><ul id='list'><li id='a'>1</li><li id=\"it's\">2</li><li id='c'>3</li></ul><svg><g><circle></circle></g><foreignObject><div id='html'></div></foreignObject></svg></body></html>",
+    );
     engine.eval(r#"
         const deep=':not('.repeat(100000)+'li'+')'.repeat(100000);
         if(document.querySelector(deep)!==null||document.querySelector(':is(:not(#a))#c')?.id!=='c'||document.querySelectorAll('li:not(:first-child)').length!==2)throw Error('Selector nesting');
@@ -108,21 +96,7 @@ fn hostile_selectors_canvas_data_and_traversal() {
 
 #[test]
 fn shadow_cycles_child_access_release_and_retired_images() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse("<html><body><div id='box'></div></body></html>"),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (host, engine) = css_page("<html><body><div id='box'></div></body></html>");
     engine.eval(r#"
         const el = document.createElement('div'); document.body.append(el);
         const root = el.attachShadow({mode:'open'}), inner = document.createElement('span'); root.append(inner);
@@ -609,7 +583,6 @@ fn images_decode_on_workers_and_load_after_a_wake() {
         1,
         Page {
             doc: Document::parse("<body></body>"),
-            dirty: false,
             ..Default::default()
         },
     );

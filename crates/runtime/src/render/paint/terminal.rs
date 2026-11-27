@@ -487,14 +487,7 @@ impl Grid {
                         px(full.height as f32 * scale[1]),
                     ),
                 );
-                window.draw_image(
-                    shown.intersect(grid),
-                    whole,
-                    px(0.),
-                    image.clone(),
-                    false,
-                    false,
-                );
+                window.draw_image(shown.intersect(grid), whole, px(0.), image.clone(), false);
             }
         };
         // The program changed the background color (OSC 11).

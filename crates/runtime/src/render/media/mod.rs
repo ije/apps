@@ -46,8 +46,10 @@ pub struct Media {
     pub(crate) sources: std::cell::RefCell<rustc_hash::FxHashMap<usize, CanvasSource>>,
     pub images: rustc_hash::FxHashMap<usize, Arc<renderer::RenderImage>>,
     pub retired: Vec<Arc<renderer::RenderImage>>,
-    pub(crate) retired_canvases: HashSet<usize>,
+    // The nodes with a replaced image in `retired` or `recycled`. Each set resets when its list is empty.
+    pub(crate) retired_nodes: HashSet<usize>,
     pub(crate) recycled: Vec<(usize, Arc<renderer::RenderImage>)>,
+    pub(crate) recycled_nodes: HashSet<usize>,
     pub(crate) decoded: Arc<Mutex<Vec<(usize, u64, Decoded)>>>,
     pub(crate) frames: Frames,
     pub(crate) placeholders: rustc_hash::FxHashMap<usize, Placeholder>,
@@ -63,10 +65,10 @@ impl Media {
     // windows.
     pub(crate) fn retire(&mut self, id: usize, old: Option<Arc<renderer::RenderImage>>) {
         if self.retired.is_empty() {
-            self.retired_canvases.clear();
+            self.retired_nodes.clear();
         }
         if let Some(old) = old
-            && self.retired_canvases.insert(id)
+            && self.retired_nodes.insert(id)
         {
             self.retired.push(old);
         }
@@ -119,7 +121,7 @@ impl Media {
         let pixels = Rc::new(match (image, svg) {
             (Some(image), _) => raster::pixmap(image)?,
             (_, Some((source, _))) => raster::svg::svg_pixels(
-                &raster::svg::svg_tree(source, false).ok()?,
+                &raster::svg::svg_tree(source).ok()?,
                 size[0],
                 size[1],
                 None,
@@ -155,7 +157,7 @@ impl Media {
                 crate::render::raster::image::decode(&bytes)
                     .map(Ok)
                     .or_else(|error| {
-                        let options = crate::render::raster::svg::svg_options(false, false);
+                        let options = crate::render::raster::svg::svg_options(false);
                         let size = usvg::Tree::from_data(&bytes, &options)
                             .map_err(|_| error)?
                             .size();

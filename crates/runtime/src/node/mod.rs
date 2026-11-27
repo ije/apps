@@ -559,9 +559,17 @@ impl State {
                         mpsc::Sender<crate::jsc::payload::Payload>,
                         crate::jsc::Waker,
                     );
+                    struct Watch {
+                        subscribers: Vec<Subscriber>,
+                        // The disposition before the first install, like SIG_IGN for SIGPIPE, with its flags.
+                        previous: [Option<libc::sigaction>; 32],
+                    }
                     // The handler may only write to a non-blocking pipe; a thread turns each byte into a `signal` event.
                     static PIPE: AtomicI32 = AtomicI32::new(-1);
-                    static SUBSCRIBERS: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
+                    static WATCH: Mutex<Watch> = Mutex::new(Watch {
+                        subscribers: Vec::new(),
+                        previous: [None; 32],
+                    });
                     extern "C" fn caught(signal: libc::c_int) {
                         unsafe {
                             libc::write(PIPE.load(Relaxed), [signal as u8].as_ptr().cast(), 1)
@@ -574,11 +582,13 @@ impl State {
                         .map(|(_, signal)| *signal)
                         .filter(|signal| ![libc::SIGKILL, libc::SIGSTOP].contains(signal))
                         .with_context(|| format!("Can't listen for {name}"))?;
+                    let mut watch = WATCH.lock().unwrap();
                     if args[1] == false {
-                        unsafe { libc::signal(signal, libc::SIG_DFL) };
+                        if let Some(action) = watch.previous[signal as usize].take() {
+                            unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) };
+                        }
                         return Ok(Value::Null);
                     }
-                    let mut subscribers = SUBSCRIBERS.lock().unwrap();
                     if PIPE.load(Relaxed) < 0 {
                         let mut fds = [0; 2];
                         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -603,15 +613,18 @@ impl State {
                                             else {
                                                 continue;
                                             };
-                                            SUBSCRIBERS.lock().unwrap().retain(|(sender, wake)| {
-                                                let open = sender
-                                                    .send(
-                                                        json!({"signal":name,"number":byte}).into(),
-                                                    )
-                                                    .is_ok();
-                                                wake.wake();
-                                                open
-                                            });
+                                            WATCH.lock().unwrap().subscribers.retain(
+                                                |(sender, wake)| {
+                                                    let open = sender
+                                                        .send(
+                                                            json!({"signal":name,"number":byte})
+                                                                .into(),
+                                                        )
+                                                        .is_ok();
+                                                    wake.wake();
+                                                    open
+                                                },
+                                            );
                                             #[cfg(target_os = "macos")]
                                             if i32::from(byte) == libc::SIGWINCH {
                                                 crate::malloc::flush();
@@ -623,9 +636,19 @@ impl State {
                             })?;
                         PIPE.store(fds[1], Relaxed);
                     }
-                    unsafe { libc::signal(signal, caught as *const () as libc::sighandler_t) };
+                    let previous = unsafe {
+                        let mut action: libc::sigaction = std::mem::zeroed();
+                        action.sa_sigaction = caught as *const () as libc::sighandler_t;
+                        action.sa_flags = libc::SA_RESTART;
+                        let mut previous = std::mem::zeroed();
+                        libc::sigaction(signal, &action, &mut previous);
+                        previous
+                    };
+                    watch.previous[signal as usize].get_or_insert(previous);
                     if !std::mem::replace(&mut self.signals, true) {
-                        subscribers.push((self.sender.clone(), crate::jsc::Waker::current()));
+                        watch
+                            .subscribers
+                            .push((self.sender.clone(), crate::jsc::Waker::current()));
                     }
                 }
                 Ok(Value::Null)

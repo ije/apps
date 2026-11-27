@@ -310,8 +310,8 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
     clearAuthCache() { return Promise.resolve(); }
     clearHostResolverCache() { return Promise.resolve(); }
     flushStorageData() {}
-    setPermissionRequestHandler(handler) { this.permissionRequestHandler = handler; }
-    setPermissionCheckHandler(handler) { this.permissionCheckHandler = handler; }
+    setPermissionRequestHandler() {}
+    setPermissionCheckHandler() {}
     setDisplayMediaRequestHandler() {}
     setDevicePermissionHandler() {}
     setCertificateVerifyProc() {}
@@ -518,11 +518,9 @@ globalThis.__appsNativeShell = (call, EventEmitter, preload = false, nativeImage
       };
     }
   }
-  let interactive = false;
   const serialize = (menu, items) => menu.items.map(item => {
     item.menu = menu;
     items.set(++nextNativeID, item);
-    if (!item.submenu && item.type !== 'separator' && (!item.role || /^((force)?reload|resetzoom|zoomin|zoomout)$/i.test(item.role))) interactive = true;
     return { label: String(item.label), type: String(item.type), ...(item.role ? { role: item.role.toLowerCase() } : {}), ...(item.accelerator && item.registerAccelerator !== false ? { accelerator: String(item.accelerator) } : {}), ...(item.toolTip ? { toolTip: String(item.toolTip) } : {}), ...(item.sublabel ? { sublabel: String(item.sublabel) } : {}), ...(typeof item.icon === 'string' ? { icon: item.icon } : {}), enabled: !!item.enabled, visible: !!item.visible, checked: !!item.checked, click: nextNativeID, ...(item.submenu ? { submenu: serialize(item.submenu, items) } : {}) };
   });
   class Menu extends EventEmitter {
@@ -560,10 +558,9 @@ globalThis.__appsNativeShell = (call, EventEmitter, preload = false, nativeImage
     }
     static setApplicationMenu(menu) {
       if (menu != null && !(menu instanceof Menu)) throw new TypeError('Expected a Menu');
-      interactive = false;
       if (menuReady || nativeApp?.isReady()) { applicationItems = new Map(); native('menu.set', menu ? serialize(menu, applicationItems) : null); menuReady = true; }
       applicationMenu = menu ?? null;
-      menuActive = menuReady && interactive;
+      menuActive = menuReady && [...applicationItems.values()].some(item => !item.submenu && item.type !== 'separator' && (!item.role || /^((force)?reload|resetzoom|zoomin|zoomout)$/i.test(item.role)));
     }
     static getApplicationMenu() { return applicationMenu ?? null; }
     append(item) { this.insert(this.items.length, item); }
@@ -764,5 +761,5 @@ globalThis.__appsNativeShell = (call, EventEmitter, preload = false, nativeImage
       }
     }
   };
-  return { clipboard, shell, dialog, nativeTheme, safeStorage, Notification, Menu, MenuItem, Tray, globalShortcut, powerMonitor, screen, powerSaveBlocker, systemPreferences, bindApp, poll, pending: () => menuActive || popups.size > 0 || shortcuts.size > 0 || notifications.size > 0 || observePower || observeApp };
+  return { clipboard, shell, dialog, nativeTheme, safeStorage, Notification, Menu, MenuItem, Tray, globalShortcut, powerMonitor, screen, powerSaveBlocker, systemPreferences, bindApp, poll };
 };

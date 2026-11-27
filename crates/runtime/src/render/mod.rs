@@ -41,9 +41,7 @@ pub(crate) trait Pages {
     fn animation_events(&self, events: Vec<(usize, &'static str, String, f64)>, cx: &mut App);
     fn lint(&self, warnings: Vec<String>);
     // A box that the window draws above the page, like the list of a `<select>`.
-    fn popup(self: Rc<Self>) -> Option<renderer::Node> {
-        None
-    }
+    fn popup(self: Rc<Self>) -> Option<renderer::Node>;
 }
 
 pub(crate) struct ViewState {
@@ -67,7 +65,7 @@ pub(crate) struct ViewState {
     promote: Cell<Option<(std::time::Instant, bool)>>,
     pub(super) composited_transforms: RefCell<rustc_hash::FxHashMap<usize, CompositedTransform>>,
     reach: RefCell<Vec<[f32; 2]>>,
-    reaching: RefCell<Vec<([f32; 2], u8)>>,
+    reaching: RefCell<Vec<([f32; 2], paint::Reach)>>,
     caret: RefCell<Option<text::Blink>>,
     /// The drawing of each terminal session, kept from frame to frame.
     terminals: RefCell<rustc_hash::FxHashMap<u32, terminal::Drawn>>,

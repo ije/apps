@@ -593,9 +593,6 @@ float4 draw_fragment(Varyings v) : SV_Target {
         if ((flags & 2u) != 0u && pixel.a > 0.0) {
             pixel = float4(pixel.rgb / pixel.a, pixel.a);
         }
-        if ((flags & 1u) != 0u) {
-            pixel = float4((float3)dot(pixel.rgb, REC709), pixel.a);
-        }
         float alpha = pixel.a * v.info.z;
         if (any(v.rx != 0.0)) {
             alpha *= saturate(0.5 - box_distance(p, v.rect, v.rx, v.ry, v.shape.xy));

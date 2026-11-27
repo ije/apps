@@ -208,7 +208,7 @@ impl Anchored {
     pub(crate) fn hidden_around(dom: &PageState, doc: &Document, id: usize) -> bool {
         let Some(styles) = dom
             .styles
-            .latest()
+            .last()
             .filter(|_| !dom.layout.anchors.boxes.is_empty())
         else {
             return false;
@@ -1149,7 +1149,7 @@ pub(super) fn update(
     [first, live]: [bool; 2],
 ) -> bool {
     // A popover that left the top layer in this frame made the styles old.
-    let Some(styles) = dom.styles.latest() else {
+    let Some(styles) = dom.styles.last().cloned() else {
         return false;
     };
     let Some(nodes) = styles.anchors.clone() else {

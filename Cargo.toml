@@ -24,14 +24,23 @@ apps-runtime = { version = "0.0.0", path = "crates/runtime" }
 
 [workspace.dependencies]
 anyhow = "1.0.104"
+base64 = "0.23.1"
 bbtree = "0.2.1"
 block2 = "0.6.2"
+cc = "1.11.1"
 core-foundation = "0.10.1"
 core-foundation-sys = "0.8.7"
+cpal = "0.18.2"
 dispatch2 = { version = "0.3.1", default-features = false, features = ["std"] }
 etagere = "0.3.0"
+flate2 = { version = "1.1.11", default-features = false, features = ["zlib-rs"] }
+getrandom = "0.4.3"
 image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "webp"] }
 libc = "0.2.191"
+libloading = "0.9.0"
+miniz_oxide = "0.9.1"
+naga = "30.0.1"
+notify = "8.2.2"
 objc2 = "0.6.5"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSApplication",
@@ -77,8 +86,10 @@ raw-window-handle = "0.6.2"
 rustc-hash = "2.1.3"
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
+sha2 = "0.11.1"
 swash = "0.2.10"
 taffy = { version = "0.15.1", default-features = false }
+tempfile = "3.27.0"
 tiny-skia = "0.12.0"
 url = "2.5.8"
 usvg = { version = "0.49.0", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "svgz"] }

@@ -52,7 +52,7 @@ impl Damage {
                 };
                 let other = regions[at];
                 let joined = join(other, region);
-                if area(joined) <= area(other) + area(region) + 64 * 64 {
+                if area(joined) <= area(other) + area(region) + DAMAGE_SLACK as i64 {
                     regions.swap_remove(at);
                     pending.push(joined);
                     continue;
@@ -173,6 +173,59 @@ pub(super) struct Map {
 
 fn bits<const N: usize>(values: [f32; N]) -> [u32; N] {
     values.map(f32::to_bits)
+}
+
+// Hashes all that an effect draws but its transform. `rect` gives a rectangle its place.
+fn effect_hash<R: Hash>(
+    effect: &EffectState,
+    rect: impl Fn(Rect<f32>) -> R,
+    hasher: &mut impl Hasher,
+) {
+    (
+        effect.opacity.to_bits(),
+        effect.color_matrix.map(bits),
+        effect.blur.to_bits(),
+        effect.blend_mode as u32,
+        effect.shadow.map(|(by, sigma, color)| {
+            bits([by.x, by.y, sigma, color.r, color.g, color.b, color.a])
+        }),
+        effect
+            .clip
+            .map(|(bounds, radii)| (rect(bounds), bits(radii.to_array()), radii.shape)),
+    )
+        .hash(hasher);
+    (
+        effect.mask.as_ref().map(|(tile, bounds)| {
+            (
+                tile.page,
+                bits(tile.rect.map(|value| value as f32).to_array()),
+                tile.id,
+                rect(*bounds),
+            )
+        }),
+        effect.backdrop.as_ref().map(|backdrop| {
+            (
+                rect(backdrop.bounds),
+                bits(backdrop.corner_radii.to_array()),
+                backdrop.corner_radii.shape,
+                backdrop.blur.to_bits(),
+                backdrop.color_matrix.map(bits),
+            )
+        }),
+        effect.glass.as_ref().map(|glass| {
+            (
+                glass.key,
+                rect(glass.bounds),
+                glass.corner_radius.to_bits(),
+                glass
+                    .tint
+                    .map(|tint| bits([tint.r, tint.g, tint.b, tint.a])),
+                glass.clear,
+                glass.interactive,
+            )
+        }),
+    )
+        .hash(hasher);
 }
 
 fn place(origin: Point<f32>) -> u64 {
@@ -357,37 +410,8 @@ impl Scene {
             )
                 .hash(hasher);
             if let Some(effect) = &inner.effect {
-                (
-                    effect.transform.map(bits),
-                    effect.opacity.to_bits(),
-                    effect.color_matrix.map(bits),
-                    effect.blur.to_bits(),
-                    effect.blend_mode as u32,
-                )
-                    .hash(hasher);
-                (
-                    effect.shadow.map(|(by, sigma, color)| {
-                        bits([by.x, by.y, sigma, color.r, color.g, color.b, color.a])
-                    }),
-                    effect.clip.map(|(bounds, radii)| {
-                        (
-                            place(bounds.to_array()),
-                            bits(radii.to_array()),
-                            radii.shape,
-                        )
-                    }),
-                    effect.mask.as_ref().map(|(tile, bounds)| {
-                        (
-                            tile.page,
-                            bits(tile.rect.map(|value| value as f32).to_array()),
-                            place(bounds.to_array()),
-                        )
-                    }),
-                    effect.backdrop.as_ref().map(|backdrop| {
-                        (place(backdrop.bounds.to_array()), backdrop.blur.to_bits())
-                    }),
-                )
-                    .hash(hasher);
+                effect.transform.map(bits).hash(hasher);
+                effect_hash(effect, |rect| place(rect.to_array()), hasher);
                 if let Some(text) = effect.text_mask {
                     self.digest(text, region, hasher);
                 }
@@ -463,7 +487,7 @@ impl Scene {
             let mut layer = parent;
             while layer != 0 {
                 let effect = scene.layers[layer].effect.as_ref()?;
-                if scene.diffed == Some(false)
+                if scene.stage == Stage::Painted
                     || layer >= scene.maps.len()
                     || scene.moved.contains(&layer)
                     || effect.backdrop.is_some()
@@ -544,16 +568,14 @@ impl Scene {
         patched
     }
 
-    // The next diff finds the patches since the last one by itself, when the window shows the prior entries.
-    pub(crate) fn rediff_patches(&mut self) {
-        if !self.undiffed {
-            self.patched.clear();
-        }
-    }
-
     // Finds what changed since the drawn window, and the digest of each layer. `fresh` holds atlas tiles
     // that got new pixels in a place that another tile used before: (color page, page, texels).
-    pub(crate) fn diff(&mut self, fresh: Option<&[crate::gpu::atlas::Fresh]>) {
+    pub(crate) fn diff(&mut self, fresh: Option<&[Texels]>) {
+        // Patches of composited animations before a paint in the same frame can't place their damage, but the diff
+        // finds it when the window shows the prior entries.
+        if self.prior_shows != Prior::PlusPatches {
+            self.patched.clear();
+        }
         self.bake();
         let mut owners = mem::take(&mut self.owners);
         let window = &self.layers[0];
@@ -647,10 +669,10 @@ impl Scene {
             walk.reads,
             walk.owners,
         );
-        self.diffed = Some(true);
+        self.stage = Stage::Diffed;
         self.moved.clear();
         let mut damage = mem::take(&mut self.patched);
-        damage.whole |= !self.drawn;
+        damage.whole |= self.prior_shows == Prior::Stale;
         // Scrolls whose content moved since the drawn frame: (scroll, its prior one, how far).
         let mut moved: Vec<(usize, usize, Point<f32>)> = Vec::new();
         if !damage.whole {
@@ -1135,13 +1157,17 @@ impl Scene {
             under.damage.clear();
         }
         // A new scene without a diff leaves the prior entries behind.
-        self.drawn = self.diffed != Some(false);
-        self.undiffed = self.diffed.is_none();
-        if self.diffed.take() == Some(true) {
+        self.prior_shows = match self.stage {
+            Stage::Painted => Prior::Stale,
+            Stage::Diffed => Prior::Exact,
+            Stage::Drawn => Prior::PlusPatches,
+        };
+        if self.stage == Stage::Diffed {
             mem::swap(&mut self.prior, &mut self.entries);
             self.prior_maps.clone_from(&self.maps);
             self.prior_scrolls.clone_from(&self.scrolls);
         }
+        self.stage = Stage::Drawn;
     }
 }
 
@@ -1299,9 +1325,8 @@ impl Walk<'_> {
             let clip = (self.uncut.get(&(parent as u32, index as u32, true)))
                 .map_or(nested.clip.bounds, |clip| rect(*clip));
             let base = if parent == 0 { base - shift } else { base };
-            let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
             let rect = |rect: Rect<f32>| {
-                bits(&[
+                bits([
                     rect.origin.x - base.x,
                     rect.origin.y - base.y,
                     rect.size.width,
@@ -1310,51 +1335,28 @@ impl Walk<'_> {
             };
             let spreads = effect.blur != 0. || effect.shadow.is_some() || effect.backdrop.is_some();
             let mut hasher = rustc_hash::FxHasher::default();
-            (
-                effect.transform.map(|matrix| {
-                    let mut m = matrix;
+            effect
+                .transform
+                .map(|mut m| {
                     let [x, y] = [shift.x, shift.y];
                     m[12] += x - (m[0] * x + m[4] * y);
                     m[13] += y - (m[1] * x + m[5] * y);
                     m[14] -= m[2] * x + m[6] * y;
-                    bits(&m)
-                }),
-                effect.opacity.to_bits(),
-                effect.color_matrix.map(|matrix| bits(&matrix)),
-                effect.blur.to_bits(),
-                effect.blend_mode as u32,
-                effect.shadow.map(|(by, sigma, color)| {
-                    bits(&[by.x, by.y, sigma, color.r, color.g, color.b, color.a])
-                }),
-                effect
-                    .clip
-                    .map(|(bounds, radii)| (rect(bounds), bits(&radii.to_array()), radii.shape)),
-            )
+                    bits(m)
+                })
                 .hash(&mut hasher);
+            effect_hash(effect, rect, &mut hasher);
             (
-                effect
-                    .mask
-                    .as_ref()
-                    .map(|(tile, bounds)| (tile.page, tile.id, rect(*bounds))),
-                effect
-                    .backdrop
-                    .as_ref()
-                    .map(|backdrop| (rect(backdrop.bounds), backdrop.blur.to_bits())),
-                effect
-                    .glass
-                    .as_ref()
-                    .map(|glass| (glass.key, rect(glass.bounds))),
                 match spreads {
                     false => rect(unmasked(clip, scroll.viewport.bounds, nested.bounds)),
                     true => rect(clip.intersect(nested.bounds)),
                 },
                 (nested.clip.radii != Default::default()).then(|| {
-                    match nested.clip.rounded == scroll.viewport.rounded {
-                        true => Vec::new(),
-                        false => rect(nested.clip.rounded),
-                    }
+                    (nested.clip.rounded != scroll.viewport.rounded)
+                        .then(|| rect(nested.clip.rounded))
                 }),
-                bits(&nested.clip.radii.to_array()),
+                bits(nested.clip.radii.to_array()),
+                nested.clip.radii.shape,
                 scroll.id,
                 frame,
             )
@@ -1375,53 +1377,9 @@ impl Walk<'_> {
                 rect.size.height,
             ])
         };
+        effect.transform.map(bits).hash(&mut hasher);
+        effect_hash(effect, rect, &mut hasher);
         (
-            effect.transform.map(bits),
-            effect.opacity.to_bits(),
-            effect.color_matrix.map(bits),
-            effect.blur.to_bits(),
-            effect.blend_mode as u32,
-            effect.shadow.map(|(by, sigma, color)| {
-                bits([by.x, by.y, sigma, color.r, color.g, color.b, color.a])
-            }),
-            effect
-                .clip
-                .map(|(bounds, radii)| (rect(bounds), bits(radii.to_array()), radii.shape)),
-        )
-            .hash(&mut hasher);
-        (
-            effect.mask.as_ref().map(|(tile, bounds)| {
-                (
-                    tile.page,
-                    tile.rect
-                        .map(|value| value as f32)
-                        .to_array()
-                        .map(f32::to_bits),
-                    tile.id,
-                    rect(*bounds),
-                )
-            }),
-            effect.backdrop.as_ref().map(|backdrop| {
-                (
-                    rect(backdrop.bounds),
-                    bits(backdrop.corner_radii.to_array()),
-                    backdrop.corner_radii.shape,
-                    backdrop.blur.to_bits(),
-                    backdrop.color_matrix.map(bits),
-                )
-            }),
-            effect.glass.as_ref().map(|glass| {
-                (
-                    glass.key,
-                    rect(glass.bounds),
-                    glass.corner_radius.to_bits(),
-                    glass
-                        .tint
-                        .map(|tint| bits([tint.r, tint.g, tint.b, tint.a])),
-                    glass.clear,
-                    glass.interactive,
-                )
-            }),
             // A clip counts only where the layer reaches.
             rect(nested.clip.bounds.intersect(nested.bounds)),
             (nested.clip.radii != Default::default()).then(|| rect(nested.clip.rounded)),
@@ -1485,24 +1443,8 @@ impl Walk<'_> {
                 ])
             };
             let mut hasher = rustc_hash::FxHasher::default();
+            effect_hash(effect, rect, &mut hasher);
             (
-                effect.opacity.to_bits(),
-                effect.color_matrix.map(bits),
-                effect.blur.to_bits(),
-                effect.shadow.map(|(by, sigma, color)| {
-                    bits([by.x, by.y, sigma, color.r, color.g, color.b, color.a])
-                }),
-                effect
-                    .clip
-                    .map(|(bounds, radii)| (rect(bounds), bits(radii.to_array()), radii.shape)),
-                effect.mask.as_ref().map(|(tile, bounds)| {
-                    (
-                        tile.page,
-                        bits(tile.rect.map(|value| value as f32).to_array()),
-                        tile.id,
-                        rect(*bounds),
-                    )
-                }),
                 bits([nested.bounds.size.width, nested.bounds.size.height]),
                 (nested.clip.radii != Default::default()).then(|| rect(nested.clip.rounded)),
                 bits(nested.clip.radii.to_array()),

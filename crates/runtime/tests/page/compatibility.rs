@@ -1894,3 +1894,34 @@ send({ready:process.argv.slice(2),type:process.type??null,fd:process.env.NODE_CH
         bundle = serde_json::to_string(&bundle).unwrap(),
     ));
 }
+
+#[test]
+fn node_unzip_waits_for_the_whole_header() {
+    run(r#"
+        const {assert,zlib,stream}=__apps;
+        for(const packed of [zlib.gzipSync('split header'),zlib.deflateSync('split header')]){
+            const unzip=zlib.createUnzip();unzip.write(packed.subarray(0,1));unzip.end(packed.subarray(1));
+            assert.strictEqual(await stream.consumers.text(unzip),'split header');
+        }
+        const reset=zlib.createUnzip(),packed=zlib.gzipSync('after reset');reset.write(packed.subarray(0,1));reset.reset();reset.end(packed);
+        assert.strictEqual(await stream.consumers.text(reset),'after reset');
+    "#);
+}
+
+#[test]
+fn node_deep_equal_matches_each_object_of_sets_and_maps_once() {
+    run(r#"
+        const {assert,util:{isDeepStrictEqual:same}}=__apps;
+        const c={x:1},d={x:2},shared={c:d,n:9};
+        // The values are the results of Node 24.
+        assert.deepStrictEqual([
+            same(new Set([{x:1},{x:1}]),new Set([{x:1},{x:2}])),
+            same(new Map([[{k:1},1],[{k:1},1]]),new Map([[{k:1},1],[{k:2},1]])),
+            same(new Set([{c,n:1},shared]),new Set([shared,{c:d,n:1}])),
+            same(new Set([{x:1},{x:2}]),new Set([{x:2},{x:1}])),
+        ],[false,false,false,true]);
+        assert.throws(()=>assert.deepStrictEqual(new Set([{x:1},{x:1}]),new Set([{x:1},{x:2}])));
+        assert.throws(()=>assert.deepEqual(new Set([[{a:1}],[{a:1}]]),new Set([[{a:1}],[{a:2}]])));
+        const p={},q={};p.p=p;q.p=q;assert.ok(same(p,q));
+    "#);
+}

@@ -860,7 +860,6 @@ pub(crate) const CUT_FIRST: u8 = 1;
 pub(crate) const CUT_LAST: u8 = 2;
 pub(crate) const CUT_BEFORE: u8 = 4;
 pub(crate) const CUT_AFTER: u8 = 8;
-// Events of a run: a spliced inline box opens without its children, and closes.
 /// What the boxes around a node do to the order of their text.
 fn embedding(
     doc: &Document,
@@ -909,6 +908,7 @@ fn embedding(
     })
 }
 
+// Events of a run: a spliced inline box opens without its children, and closes.
 pub(crate) const OPEN: usize = usize::MAX;
 pub(crate) const CLOSE: usize = usize::MAX - 1;
 

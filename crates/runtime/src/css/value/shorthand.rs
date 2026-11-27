@@ -602,6 +602,39 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
         out.extend(names.into_iter().map(|name| (name, value.into())));
         return true;
     }
+    // Keywords match without case. Borders and backgrounds have no names, so all words outside functions and
+    // strings are keywords or colors.
+    let lower: String;
+    let value = if matches!(kind, 3 | 4) && value.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        let (mut depth, mut quote, mut escaped) = (0u32, None, false);
+        lower = value
+            .chars()
+            .map(|c| {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if quote == Some(c) {
+                    quote = None;
+                } else if quote.is_none() {
+                    match c {
+                        '"' | '\'' => quote = Some(c),
+                        '(' => depth += 1,
+                        ')' => depth = depth.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+                if depth == 0 && quote.is_none() {
+                    c.to_ascii_lowercase()
+                } else {
+                    c
+                }
+            })
+            .collect();
+        &lower
+    } else {
+        value
+    };
     let parts = components(value, ' ');
     let Some(&first) = parts.first() else {
         return true;
@@ -839,10 +872,17 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
             }
         }
         5 => {
-            let mut values = if matches!(
-                first,
-                "caption" | "icon" | "menu" | "message-box" | "small-caption" | "status-bar"
-            ) {
+            let mut values = if [
+                "caption",
+                "icon",
+                "menu",
+                "message-box",
+                "small-caption",
+                "status-bar",
+            ]
+            .iter()
+            .any(|name| first.eq_ignore_ascii_case(name))
+            {
                 vec![
                     "normal".into(),
                     "normal".into(),
@@ -855,7 +895,16 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
             } else {
                 let mut values = vec!["normal".to_owned(); 6];
                 let mut index = 0;
-                while let Some(&part) = parts.get(index) {
+                while let Some(part) = parts.get(index) {
+                    // Keywords match without case, the family keeps it.
+                    let lower;
+                    let part =
+                        if part.contains('(') || !part.bytes().any(|b| b.is_ascii_uppercase()) {
+                            part
+                        } else {
+                            lower = part.to_ascii_lowercase();
+                            &*lower
+                        };
                     match part {
                         // Like Chrome, a second weight makes the value invalid.
                         _ if values[2] != "normal"

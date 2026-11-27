@@ -93,9 +93,6 @@ pub(crate) trait WindowEvents: Sync {
     fn present_live(&self, at: Callbacks, visible: bool) -> Option<Present>;
     fn resized(&self, at: Callbacks, size: Size<Pixels>, scale_factor: f32);
     fn changed(&self, at: Callbacks);
-    #[cfg(target_os = "macos")]
-    fn will_change(&self, at: Callbacks, kind: &str, bounds: Rect) -> bool;
-    fn should_close(&self, at: Callbacks) -> bool;
     fn appearance_changed(&self, at: Callbacks);
     fn release(&self, at: Callbacks);
     /// The GPU device is gone, so all windows draw again.
@@ -255,6 +252,16 @@ pub enum WindowChange {
 }
 
 pub const CARET_BLINK: Duration = Duration::from_millis(500);
+
+// After this long without frames, a window gives back its spare GPU resources.
+pub(crate) const QUIET: Duration = Duration::from_secs(1);
+
+// A panic while a lock is held leaves its data usable here.
+pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 // On Windows and Linux one thread runs the app and every window.
 #[cfg(not(target_os = "macos"))]

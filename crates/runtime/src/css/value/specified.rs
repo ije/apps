@@ -201,7 +201,13 @@ pub(crate) fn specified(name: &str, value: &str) -> String {
             let mut times = 0;
             for part in parts {
                 let slot = match part {
-                    _ if numeric(part) && part.ends_with('s') || part == "auto" && times == 0 => {
+                    _ if numeric(part) && part.ends_with('s')
+                        || part == "auto" && times == 0
+                        || part.ends_with(')')
+                            && Lengths::new(16., 100., 100.)
+                                .math(part, f32::NAN, &[])
+                                .is_some_and(|(_, kind)| kind == Kind::Time) =>
+                    {
                         times += 1;
                         if times == 1 { 0 } else { 2 }
                     }

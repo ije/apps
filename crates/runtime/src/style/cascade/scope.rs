@@ -317,7 +317,6 @@ pub(crate) struct MediaBlock {
 pub(crate) struct Collect<'a> {
     pub(crate) width: f32,
     pub(crate) height: f32,
-    pub(crate) reduced_motion: bool,
     pub(crate) native_theme: u32,
     pub(crate) rules: Vec<Collected<'a>>,
     pub(crate) container: Option<ContainerQuery>,
@@ -331,11 +330,27 @@ pub(crate) struct Collect<'a> {
 }
 
 impl Collect<'_> {
+    pub(crate) fn new(width: f32, height: f32, native_theme: u32) -> Self {
+        Collect {
+            width,
+            height,
+            native_theme,
+            rules: Vec::new(),
+            container: None,
+            media: None,
+            blocks: Vec::new(),
+            layers: Vec::new(),
+            keyframes: HashMap::new(),
+            properties: Registry::default(),
+            layered: HashMap::new(),
+        }
+    }
+
     pub(crate) fn media(&self, queries: &[MediaQuery]) -> bool {
         MediaQuery::list(
             queries,
             [self.width, self.height],
-            self.reduced_motion,
+            self.native_theme & 32 != 0,
             self.native_theme,
         )
     }
@@ -390,7 +405,11 @@ impl<'a> Collect<'a> {
                     }
                 }
             }
-            Rule::Variant(..) | Rule::Utility(..) | Rule::FontFace(_) | Rule::Tailwind(_) => {}
+            Rule::CustomVariant(..)
+            | Rule::VariantBlock(..)
+            | Rule::Utility(..)
+            | Rule::FontFace(_)
+            | Rule::Tailwind(_) => {}
             Rule::Property(name, ..) | Rule::Keyframes(name, _) | Rule::PositionTry(name, _) => {
                 let path = |index: Option<usize>| {
                     index
@@ -541,23 +560,9 @@ impl StyleCache {
         fullscreen: bool,
         fast: &mut bool,
         [width, height]: [f32; 2],
-        reduced_motion: bool,
         native_theme: u32,
     ) -> (Vec<usize>, Option<Rc<str>>, Option<Rc<Style>>) {
-        let blank = || Collect {
-            width,
-            height,
-            reduced_motion,
-            native_theme,
-            rules: Vec::new(),
-            container: None,
-            media: None,
-            blocks: Vec::new(),
-            layers: Vec::new(),
-            keyframes: HashMap::new(),
-            properties: Registry::default(),
-            layered: HashMap::new(),
-        };
+        let blank = || Collect::new(width, height, native_theme);
         let user = |sheet: &Rc<Stylesheet>| {
             inserted
                 .iter()
@@ -611,15 +616,15 @@ impl StyleCache {
                     .get("media")
                     .filter(|media| !media.trim().is_empty())
                 {
-                    let source = format!("@media {media}{{}}");
-                    let query = match cache.get(source.as_str()) {
-                        Some(sheet) => sheet.clone(),
-                        None => {
-                            let sheet = Rc::new(Stylesheet::parse(&source));
-                            cache.insert(source.into(), sheet.clone());
-                            sheet
-                        }
-                    };
+                    let pass = self.pass;
+                    let (used, text, query) = self.media.entry(id).or_default();
+                    if text != media {
+                        (*text, *query) = (
+                            media.clone(),
+                            Stylesheet::parse(&format!("@media {media}{{}}")),
+                        );
+                    }
+                    *used = pass;
                     if !query.matches_media(width, height, native_theme) {
                         continue;
                     }

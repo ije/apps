@@ -400,7 +400,7 @@ impl Native for Surface {
         self.kick();
     }
 
-    fn draw(&self, scene: &Scene, capture: bool) -> Capture {
+    fn draw(&self, scene: &Scene, capture: bool, snapshots: &mut Vec<crate::Snapshot>) -> Capture {
         let Some(client) = self.client.upgrade() else {
             return capture.then(|| Err(anyhow::anyhow!("The display is gone")));
         };
@@ -420,7 +420,7 @@ impl Native for Surface {
             self.roles.surface.set_buffer_scale(scale);
         }
         let (drawn, capture) = match &mut *self.renderer.borrow_mut() {
-            Some(renderer) => renderer.draw(scene, capture),
+            Some(renderer) => renderer.draw(scene, capture, snapshots),
             None => (Drawn::Skipped, None),
         };
         let mut shape = self.shape.borrow_mut();
@@ -444,13 +444,6 @@ impl Native for Surface {
             events().appearance_changed(self.calls);
         }
         capture
-    }
-
-    fn take_snapshots(&self) -> Vec<crate::Snapshot> {
-        match &mut *self.renderer.borrow_mut() {
-            Some(renderer) => std::mem::take(&mut renderer.snapshots),
-            None => Vec::new(),
-        }
     }
 
     fn release(&self) {
@@ -606,7 +599,10 @@ impl Client {
             xdg_toplevel::Event::Close => {
                 let calls = window.calls;
                 soon(move || {
-                    events().should_close(calls);
+                    crate::native::window_event(
+                        calls.id,
+                        crate::native::WindowEvent::CloseRequested,
+                    )
                 });
             }
             _ => {}

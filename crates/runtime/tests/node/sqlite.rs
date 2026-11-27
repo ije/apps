@@ -194,3 +194,28 @@ fn sqlite_errors_match_node() {
         expect(() => insert.run('b'), 'Error|ERR_INVALID_STATE|statement has been finalized||');
     "#, "sqlite-errors").unwrap();
 }
+
+#[test]
+fn sqlite_statement_of_a_reopened_database_is_finalized() {
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        Rc::new(RefCell::new(Host::default())),
+        Role::Main,
+    )
+    .unwrap();
+    engine
+        .eval(
+            r#"
+        const db = new __apps.sqlite.DatabaseSync(':memory:');
+        const query = db.prepare('SELECT 1 AS x');
+        db.close();
+        db.open();
+        let code;
+        try { query.get(); } catch (error) { code = `${error.code}|${error.message}`; }
+        if (code !== 'ERR_INVALID_STATE|statement has been finalized') throw Error(code);
+        db.close();
+    "#,
+            "sqlite-reopen",
+        )
+        .unwrap();
+}

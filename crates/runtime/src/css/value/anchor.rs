@@ -80,7 +80,7 @@ impl<'a> Function<'a> {
 }
 
 pub(crate) fn has_function(value: &str) -> bool {
-    value.contains("nchor") && starts(value).next().is_some()
+    starts(value).next().is_some()
 }
 
 const PLACES: PropSet = PropSet::new(&[
@@ -817,5 +817,14 @@ mod tests {
         let mut turned = other.clone();
         flip(&["flip-inline"], false, &mut turned);
         assert_eq!(turned.get(Prop::TOP), Some("anchor(start)"));
+    }
+
+    #[test]
+    fn anchor_functions_take_any_case() {
+        assert_eq!(
+            crate::css::value::grammar::supports("left", "ANCHOR(--a right)"),
+            Some(true)
+        );
+        assert!(has_function("Anchor-Size(width)"));
     }
 }

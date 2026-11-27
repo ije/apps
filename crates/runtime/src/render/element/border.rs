@@ -35,25 +35,8 @@ pub(super) fn fieldset_border(
                     continue;
                 }
                 let raised = side == 0 || side == 3;
-                let (outer, inner) = match kinds[side].as_str() {
-                    "groove" => (
-                        shade_border(colors[side], raised),
-                        shade_border(colors[side], !raised),
-                    ),
-                    "ridge" => (
-                        shade_border(colors[side], !raised),
-                        shade_border(colors[side], raised),
-                    ),
-                    "inset" => (
-                        shade_border(colors[side], raised),
-                        shade_border(colors[side], raised),
-                    ),
-                    "outset" => (
-                        shade_border(colors[side], !raised),
-                        shade_border(colors[side], !raised),
-                    ),
-                    _ => (colors[side], colors[side]),
-                };
+                let (outer, inner) = bevel(&kinds[side], colors[side], raised, shade_border);
+                let inner = inner.unwrap_or(outer);
                 let half = px(widths[side] / 2.);
                 let halves = match side {
                     0 => [
@@ -102,6 +85,57 @@ pub(super) fn fieldset_border(
     .right(px(-widths[1]))
     .bottom(px(-widths[2]))
     .into()
+}
+
+// The outer color of a side and, for `groove` and `ridge`, its inner one. The top and left sides are `raised`.
+pub(super) fn bevel(
+    kind: &str,
+    color: renderer::Color,
+    raised: bool,
+    shade: impl Fn(renderer::Color, bool) -> renderer::Color,
+) -> (renderer::Color, Option<renderer::Color>) {
+    match kind {
+        "inset" => (shade(color, raised), None),
+        "outset" => (shade(color, !raised), None),
+        "groove" => (shade(color, raised), Some(shade(color, !raised))),
+        "ridge" => (shade(color, !raised), Some(shade(color, raised))),
+        _ => (color, None),
+    }
+}
+
+// The bands of a border canvas: a `groove` or `ridge` side draws its outer and inner halves in two bands.
+pub(super) fn bands(
+    borders: [f32; 4],
+    colors: [renderer::Color; 4],
+    kinds: [&str; 4],
+    shade: impl Fn(renderer::Color, bool) -> renderer::Color,
+) -> Vec<([f32; 4], [f32; 4], [renderer::Color; 4])> {
+    let mut bands = vec![([0.; 4], borders, colors)];
+    let split = kinds.iter().any(|kind| matches!(*kind, "groove" | "ridge"));
+    if split {
+        bands.push(([0.; 4], [0.; 4], [renderer::Color::TRANSPARENT; 4]));
+    }
+    for side in 0..4 {
+        let (outer, inner) = bevel(kinds[side], colors[side], side == 0 || side == 3, &shade);
+        bands[0].2[side] = outer;
+        if let Some(inner) = inner {
+            let half = borders[side] / 2.;
+            bands[0].1[side] = half;
+            bands[1].0[side] = half;
+            bands[1].1[side] = half;
+            bands[1].2[side] = inner;
+        }
+    }
+    if split {
+        bands[1].0 = std::array::from_fn(|side| {
+            if bands[1].1[side] > 0. {
+                bands[1].0[side]
+            } else {
+                borders[side]
+            }
+        });
+    }
+    bands
 }
 
 pub(super) fn shade_border(color: renderer::Color, dark: bool) -> renderer::Color {
@@ -154,9 +188,9 @@ pub(super) fn border_canvas(
                 ),
             );
             for (inset, widths, colors) in &bands {
-                // Pseudo-element borders paint on `outer`, box borders on the rect between the insets: the two
-                // differ by an ulp at fractional positions.
-                let bounds = if pseudo {
+                // Pseudo-element borders paint their outer band on `outer`, box borders on the rect between the
+                // insets: the two differ by an ulp at fractional positions.
+                let bounds = if pseudo && *inset == [0.; 4] {
                     outer
                 } else {
                     Rect::between(

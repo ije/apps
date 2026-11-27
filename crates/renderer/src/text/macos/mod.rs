@@ -173,7 +173,6 @@ impl Face {
         })
     }
 
-    /// `[min x, min y, max x, max y]` in font units.
     fn metrics(&self) -> FaceMetrics {
         let units = self.units();
         let per_em = units.per_em as f32;
@@ -225,6 +224,7 @@ impl Face {
         advance.width as f32 * units.per_point / units.per_em as f32
     }
 
+    /// `[min x, min y, max x, max y]` in font units.
     fn outline(&self, glyph: GlyphId) -> [f32; 4] {
         let mut id = glyph;
         // SAFETY: one glyph in, the overall rect out.

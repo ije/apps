@@ -2,17 +2,9 @@ use super::*;
 
 #[test]
 fn utility_classes_follow_dom_changes() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><head><style>@import 'tailwindcss';</style></head><body><div id='dot' class='h-4 w-4 flex'></div></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (host, engine) = css_page(
+        "<html><head><style>@import 'tailwindcss';</style></head><body><div id='dot' class='h-4 w-4 flex'></div></body></html>",
+    );
     engine.eval("const dot = document.getElementById('dot'); dot.setAttribute('class', 'h-' + 8 + ' w-' + 8 + ' bg-[#123456]');", "test").unwrap();
     {
         let host = host.borrow().store.clone();
@@ -46,17 +38,9 @@ fn utility_classes_follow_dom_changes() {
 
 #[test]
 fn media_queries_follow_viewport_changes() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><head><style>@media (min-width:40em) { #target { color:red; } }</style></head><body><div id='target'></div></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (host, engine) = css_page(
+        "<html><head><style>@media (min-width:40em) { #target { color:red; } }</style></head><body><div id='target'></div></body></html>",
+    );
     engine.eval(r#"
         const query = matchMedia('(min-width:40em)');
         if (!(query instanceof MediaQueryList) || !query.matches || query.media !== '(min-width:40em)') throw Error('Media query result');
@@ -93,9 +77,9 @@ fn media_queries_follow_viewport_changes() {
 
 #[test]
 fn custom_elements_shadow_styles_and_lifecycle() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page { doc: Document::parse("<html><body><div id='outside'>outside</div><test-existing></test-existing></body></html>"), dirty: false, ..Default::default() });
-    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let (_, engine) = css_page(
+        "<html><body><div id='outside'>outside</div><test-existing></test-existing></body></html>",
+    );
     engine.eval(r#"
       const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
       const path=document.createElementNS('http://www.w3.org/2000/svg','path');svg.append(path);
@@ -127,17 +111,9 @@ fn custom_elements_shadow_styles_and_lifecycle() {
 // that take other nodes and names.
 #[test]
 fn computed_styles_follow_random_tree_changes() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><head><style>body{color:rgb(1, 1, 1)} p + p{color:rgb(6, 6, 6)} .a{color:rgb(2, 2, 2)} li:first-child{color:rgb(4, 4, 4)} li:nth-child(3n){color:rgb(5, 5, 5)} div:empty{color:rgb(7, 7, 7)} [inert] span{color:rgb(8, 8, 8)} td:last-child{color:rgb(9, 9, 9)} .a > .b{color:rgb(3, 3, 3)} .flat{display:contents} span ~ p{background-color:rgb(1, 0, 0)} div:has(+ div){background-color:rgb(2, 0, 0)} li:last-child{background-color:rgb(3, 0, 0)} li:only-child{background-color:rgb(4, 0, 0)} li:nth-last-child(2){background-color:rgb(5, 0, 0)} li:has(> .a){background-color:rgb(6, 0, 0)} td:has(~ .a){background-color:rgb(7, 0, 0)} ul:has(.b) p{background-color:rgb(8, 0, 0)} body:has(.flat) td{background-color:rgb(9, 0, 0)} body [style] p{background-color:rgb(10, 0, 0)}</style></head><body><ul id='list'></ul><table><tbody id='rows'></tbody></table><div id='box' class='a'></div></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (_, engine) = css_page(
+        "<html><head><style>body{color:rgb(1, 1, 1)} p + p{color:rgb(6, 6, 6)} .a{color:rgb(2, 2, 2)} li:first-child{color:rgb(4, 4, 4)} li:nth-child(3n){color:rgb(5, 5, 5)} div:empty{color:rgb(7, 7, 7)} [inert] span{color:rgb(8, 8, 8)} td:last-child{color:rgb(9, 9, 9)} .a > .b{color:rgb(3, 3, 3)} .flat{display:contents} span ~ p{background-color:rgb(1, 0, 0)} div:has(+ div){background-color:rgb(2, 0, 0)} li:last-child{background-color:rgb(3, 0, 0)} li:only-child{background-color:rgb(4, 0, 0)} li:nth-last-child(2){background-color:rgb(5, 0, 0)} li:has(> .a){background-color:rgb(6, 0, 0)} td:has(~ .a){background-color:rgb(7, 0, 0)} ul:has(.b) p{background-color:rgb(8, 0, 0)} body:has(.flat) td{background-color:rgb(9, 0, 0)} body [style] p{background-color:rgb(10, 0, 0)}</style></head><body><ul id='list'></ul><table><tbody id='rows'></tbody></table><div id='box' class='a'></div></body></html>",
+    );
     engine.eval(r#"
         const rules = [['body', 'rgb(1, 1, 1)'], ['p + p', 'rgb(6, 6, 6)'], ['.a', 'rgb(2, 2, 2)'], ['li:first-child', 'rgb(4, 4, 4)'], ['li:nth-child(3n)', 'rgb(5, 5, 5)'], ['div:empty', 'rgb(7, 7, 7)'], ['[inert] span', 'rgb(8, 8, 8)'], ['td:last-child', 'rgb(9, 9, 9)'], ['.a > .b', 'rgb(3, 3, 3)']];
         const up = el => el.assignedSlot ?? el.parentElement ?? el.parentNode?.host ?? null;
@@ -216,12 +192,9 @@ fn computed_styles_follow_random_tree_changes() {
 // Release builds hash only the changed nodes, so this is a check of them.
 #[test]
 fn rules_added_later_follow_names_that_nodes_already_had() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html class='dark'><head><style>p{color:rgb(1, 1, 1)}</style></head><body><div data-on='1'><p class='x'>a</p></div></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let (_, engine) = css_page(
+        "<html class='dark'><head><style>p{color:rgb(1, 1, 1)}</style></head><body><div data-on='1'><p class='x'>a</p></div></body></html>",
+    );
     let styles = engine.eval(r#"
         const p = document.querySelector('p'), sheet = document.styleSheets[0], seen = [getComputedStyle(p).color];
         sheet.insertRule('.dark .x{color:rgb(2, 2, 2)}', 1);
@@ -240,12 +213,9 @@ fn rules_added_later_follow_names_that_nodes_already_had() {
 
 #[test]
 fn script_animations_leave_important_declarations() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><style>#d{opacity:0.5 !important}</style><body><div id=d></div><div id=e style='color:red !important'></div></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let (_, engine) = css_page(
+        "<html><style>#d{opacity:0.5 !important}</style><body><div id=d></div><div id=e style='color:red !important'></div></body></html>",
+    );
     engine.eval(r#"
         const d=document.getElementById('d'),e=document.getElementById('e');
         const a=d.animate([{opacity:0},{opacity:1}],{duration:1000,fill:'both'});a.pause();a.currentTime=250;
@@ -257,17 +227,9 @@ fn script_animations_leave_important_declarations() {
 
 #[test]
 fn computed_styles_follow_mutations_and_resize() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><style>.item {color:red} @media (min-width:900px) {.item {color:blue}}</style><body><div class='item'></div></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (host, engine) = css_page(
+        "<html><style>.item {color:red} @media (min-width:900px) {.item {color:blue}}</style><body><div class='item'></div></body></html>",
+    );
     engine.eval("const item=document.querySelector('.item');for(let i=0;i<3;i++)if(getComputedStyle(item).color!=='rgb(255, 0, 0)')throw Error('Initial style');", "test").unwrap();
     host.borrow()
         .store
@@ -294,12 +256,9 @@ fn computed_styles_follow_mutations_and_resize() {
 
 #[test]
 fn form_pseudo_classes_follow_script_state() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><body><form><input id=em type=email value=nope><input id=req required><input id=num type=number min=5 value=2><input id=plain><fieldset id=fs disabled><input id=in1 required></fieldset><select id=sel required><option value=''>-</option><option>a</option></select><input type=radio name=r id=r1 required><input type=radio name=r id=r2><input type=checkbox id=cb><textarea id=ta required></textarea></form><x-el id=x></x-el></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let (_, engine) = css_page(
+        "<html><body><form><input id=em type=email value=nope><input id=req required><input id=num type=number min=5 value=2><input id=plain><fieldset id=fs disabled><input id=in1 required></fieldset><select id=sel required><option value=''>-</option><option>a</option></select><input type=radio name=r id=r1 required><input type=radio name=r id=r2><input type=checkbox id=cb><textarea id=ta required></textarea></form><x-el id=x></x-el></body></html>",
+    );
     engine.eval(r#"
         const q=s=>[...document.querySelectorAll(s)].map(e=>e.id).join(),$=id=>document.getElementById(id);
         const expect=(s,v,step)=>{if(q(s)!==v)throw Error(step+': '+s+' = '+q(s));};
@@ -861,17 +820,9 @@ fn slotted_and_part_rules_cross_the_shadow_boundary() {
 
 #[test]
 fn web_animations_sample_commit_finish_and_replace() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><body><div id='a'></div><div id='b' style='opacity:0.5'></div></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (_, engine) = css_page(
+        "<html><body><div id='a'></div><div id='b' style='opacity:0.5'></div></body></html>",
+    );
     engine.eval(r#"
         const a = document.getElementById('a'), b = document.getElementById('b'), events = [];
         const check = (got, want) => { if (JSON.stringify(got) !== JSON.stringify(want)) throw Error(JSON.stringify(got) + ' != ' + JSON.stringify(want)); };
@@ -925,7 +876,7 @@ fn bundled_link_sheets_are_not_text() {
             doc: apps_runtime::bundle::page(
                 "<html><head><link rel='stylesheet' href='a.css' apps-sheet='p { color: red }'></head><body><p>x</p></body></html>",
             ),
-            dirty: false, ..Default::default()
+            ..Default::default()
         },
     );
     let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
@@ -1168,12 +1119,9 @@ fn border_images_parse_and_serialize_like_chrome() {
 
 #[test]
 fn text_stroke_values_like_chrome() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><head><style>body{font-size:16px}#a{-webkit-text-stroke:2px red}#b{-webkit-text-stroke:thin;color:blue}#c{-webkit-text-stroke:green 3px}#d{-webkit-text-stroke:-1px red}#e{-webkit-text-stroke-width:0.1em;font-size:20px}</style></head><body><div id=a><span id=a2>x</span></div><div id=b></div><div id=c></div><div id=d></div><div id=e></div></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let (_, engine) = css_page(
+        "<html><head><style>body{font-size:16px}#a{-webkit-text-stroke:2px red}#b{-webkit-text-stroke:thin;color:blue}#c{-webkit-text-stroke:green 3px}#d{-webkit-text-stroke:-1px red}#e{-webkit-text-stroke-width:0.1em;font-size:20px}</style></head><body><div id=a><span id=a2>x</span></div><div id=b></div><div id=c></div><div id=d></div><div id=e></div></body></html>",
+    );
     engine.eval(r#"
         const got = ['a', 'a2', 'b', 'c', 'd', 'e'].map(id => getComputedStyle(document.getElementById(id)).getPropertyValue('-webkit-text-stroke')).join('|');
         if (got !== '2px rgb(255, 0, 0)|2px rgb(255, 0, 0)|0.666667px rgb(0, 0, 255)|3px rgb(0, 128, 0)|0px rgb(0, 0, 0)|2px rgb(0, 0, 0)') throw Error(got);
@@ -1186,12 +1134,9 @@ fn text_stroke_values_like_chrome() {
 
 #[test]
 fn typed_om_reads_and_writes_styles() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><style>#d{width:50%;transition-duration:1s,2s}</style><body><div id=d style='height:calc(10px + 2em);color:red;--x:a var(--y, 1px)'></div></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let (_, engine) = css_page(
+        "<html><style>#d{width:50%;transition-duration:1s,2s}</style><body><div id=d style='height:calc(10px + 2em);color:red;--x:a var(--y, 1px)'></div></body></html>",
+    );
     engine.eval(r#"
         const check = (got, want) => { if (String(got) !== want) throw Error(`${got} !== ${want}`); };
         const d = document.getElementById('d'), m = d.attributeStyleMap;
@@ -1218,4 +1163,65 @@ fn typed_om_reads_and_writes_styles() {
         m.clear();
         check(m.size, '0');
     "#, "test").unwrap();
+}
+
+#[test]
+fn author_layers_before_the_import_are_kept_per_tree() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow().store.borrow_mut().pages.insert(1, Page {
+        doc: Document::parse("<html><style>@import 'tailwindcss';</style><body><p class='text-blue-500'></p><div id=host></div></body></html>"),
+        dirty: false, ..Default::default()
+    });
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    engine.eval(r#"
+        if (getComputedStyle(document.querySelector('p')).color !== 'oklch(0.623 0.214 259.815)') throw Error('light tree');
+        const root = document.getElementById('host').attachShadow({ mode: 'open' });
+        root.innerHTML = "<style>@layer reset; @import 'tailwindcss';</style><style>@layer reset { p { color: red } }</style><p class='text-blue-500'></p>";
+        const color = getComputedStyle(root.querySelector('p')).color;
+        if (color !== 'oklch(0.623 0.214 259.815)') throw Error('shadow tree: ' + color);
+    "#, "test").unwrap();
+}
+
+#[test]
+fn a_new_timeline_keeps_a_pending_pause() {
+    checked_page(
+        "<html><body><div id='a'></div></body></html>",
+        r#"
+        const animation = document.getElementById('a').animate({ opacity: [0, 1] }, { duration: 100000 });
+        __appsAnimationFrame();
+        animation.pause();
+        animation.timeline = new DocumentTimeline();
+        const before = [animation.playState, animation.pending].join();
+        __appsAnimationFrame();
+        check('pending pause: ' + before, () => before === 'paused,true');
+        check('settled pause: ' + [animation.playState, animation.pending], () => animation.playState === 'paused' && !animation.pending);
+        "#,
+    );
+}
+
+#[test]
+fn keyframes_append_rule_only_appends() {
+    let (_, engine) = css_page(
+        "<html><head><style id=s>@keyframes k{from{opacity:0}to{opacity:1}}</style></head><body></body></html>",
+    );
+    engine
+        .eval(
+            r#"
+        const keys = document.getElementById('s').sheet.cssRules[0];
+        for (const text of ['0', 'bad', '']) keys.appendRule(text);
+        if (keys.cssRules.length !== 2) throw Error('append ' + keys.cssRules.length);
+        keys.deleteRule('to');
+        if (keys.cssRules.length !== 1 || keys.cssRules[0].keyText !== '0%') throw Error('delete');
+        keys.appendRule('50%{opacity:.5}');
+        keys.deleteRule('50%');
+        keys.deleteRule('0%');
+        if (keys.cssRules.length !== 0) throw Error('delete all');
+        const constructed = new CSSStyleSheet();
+        constructed.replaceSync('@keyframes k{from{opacity:0}}');
+        constructed.cssRules[0].appendRule('bad');
+        if (constructed.cssRules[0].cssRules.length !== 1) throw Error('constructed');
+    "#,
+            "test",
+        )
+        .unwrap();
 }

@@ -1,7 +1,7 @@
 use crate::css::properties::Prop;
 use crate::dom::Document;
 use crate::render::{PageState, ViewState};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use renderer::{Hooks, NodeCx, Window};
 use rustc_hash::FxHashMap;
 use serde_json::{Value, json};
@@ -12,22 +12,36 @@ use std::rc::Rc;
 const OLD: u64 = 1 << 40;
 const NEW: u64 = 1 << 41;
 
-// The captures of a view transition. In mode 1 the page draws as before and its captures are read once. In
-// mode 2 the page draws only into its captures, which the pseudo-elements show. A new state is a new `Capture`.
-#[derive(Default)]
-pub(crate) struct Capture {
-    mode: u8,
-    // The captured nodes and their keys. The capture of the root is the whole page.
+// The state of a view transition. A new state is a new `Capture`.
+pub(crate) enum Capture {
+    // The update callback runs, and the window keeps the frame of the old state.
+    Hold,
+    // The page draws as before, and its captures are read once.
+    Old(Captures),
+    // The page draws only into its captures, which the image pseudo-elements show.
+    New {
+        captures: Captures,
+        // The image pseudo-elements, with the key of the capture that each shows and the size it has until then.
+        images: Vec<(usize, u64, [f32; 2])>,
+    },
+}
+
+// The captured nodes and their keys. The capture of the root is the whole page.
+pub(crate) struct Captures {
     keys: FxHashMap<usize, u64>,
     root: Option<usize>,
-    // The image pseudo-elements, with the key of the capture that each shows and the size it has until then.
-    images: Vec<(usize, u64, [f32; 2])>,
-    suppressed: bool,
 }
 
 impl Capture {
+    fn images(&self) -> &[(usize, u64, [f32; 2])] {
+        match self {
+            Capture::New { images, .. } => images,
+            _ => &[],
+        }
+    }
+
     pub(crate) fn size(&self, node: usize) -> Option<[f32; 2]> {
-        Some(self.images.iter().find(|image| image.0 == node)?.2)
+        Some(self.images().iter().find(|image| image.0 == node)?.2)
     }
 }
 
@@ -86,35 +100,44 @@ pub(crate) fn call(
             return Ok(json!(found));
         }
         "capture" => {
-            let mode = args[1].as_u64().unwrap_or(0) as u8;
+            let new = match args[1].as_u64() {
+                Some(1) => false,
+                Some(2) => true,
+                _ => bail!("Expected a capture of the old or the new state"),
+            };
             let root = args[2].as_u64().map(|id| id as usize);
-            let bit = if mode == 1 { OLD } else { NEW };
+            let bit = if new { NEW } else { OLD };
             let keys = list(3).chain(root.map(|id| id as u64));
-            let images: Vec<u64> = list(4).collect();
-            state.transition = Some(Rc::new(Capture {
-                mode,
+            let captures = Captures {
                 keys: keys.map(|id| (id as usize, id | bit)).collect(),
                 root,
-                images: (images.as_chunks::<4>().0.iter())
-                    .map(|four| (four[0] as usize, four[1], [four[2] as f32, four[3] as f32]))
-                    .collect(),
-                suppressed: false,
+            };
+            state.transition = Some(Rc::new(match new {
+                false => Capture::Old(captures),
+                true => {
+                    let images: Vec<u64> = list(4).collect();
+                    Capture::New {
+                        captures,
+                        images: (images.as_chunks::<4>().0.iter())
+                            .map(|four| {
+                                (four[0] as usize, four[1], [four[2] as f32, four[3] as f32])
+                            })
+                            .collect(),
+                    }
+                }
             }));
             state.paint_requested = true;
             show(state, |key| key & OLD != 0);
         }
         "suppress" => {
-            state.transition = Some(Rc::new(Capture {
-                suppressed: true,
-                ..Default::default()
-            }));
+            state.transition = Some(Rc::new(Capture::Hold));
         }
         _ => {
             for &(node, ..) in state
                 .transition
                 .take()
                 .iter()
-                .flat_map(|capture| &capture.images)
+                .flat_map(|capture| capture.images())
             {
                 state.media.retired.extend(state.media.images.remove(&node));
             }
@@ -133,7 +156,7 @@ pub(crate) fn covered(doc: &Document, state: &PageState) -> Option<usize> {
     state
         .transition
         .as_ref()
-        .filter(|capture| capture.mode == 2)?;
+        .filter(|capture| matches!(***capture, Capture::New { .. }))?;
     (doc.nodes[0].children.iter().copied()).find(|&id| doc.nodes[id].tag == "html")
 }
 
@@ -142,7 +165,7 @@ fn show(state: &mut PageState, keys: impl Fn(u64) -> bool) {
     let Some(capture) = state.transition.clone() else {
         return;
     };
-    for &(node, key, _) in capture.images.iter().filter(|image| keys(image.1)) {
+    for &(node, key, _) in capture.images().iter().filter(|image| keys(image.1)) {
         if let Some((pixels, _)) = state.media.snapshots.remove(&(key as usize)) {
             let image = crate::render::raster::render_image(&pixels, Vec::new());
             state
@@ -157,7 +180,7 @@ fn show(state: &mut PageState, keys: impl Fn(u64) -> bool) {
 impl Captured {
     // Takes the capture of the page at the start of a frame.
     pub(crate) fn update(&self, state: &PageState, window: &mut Window) {
-        let new = state.transition.clone().filter(|capture| capture.mode != 0);
+        let new = (state.transition.clone()).filter(|capture| !matches!(**capture, Capture::Hold));
         let mut capture = self.capture.borrow_mut();
         if capture.as_ref().map(Rc::as_ptr) != new.as_ref().map(Rc::as_ptr) {
             *capture = new;
@@ -169,7 +192,12 @@ impl Captured {
     // The update callback of a transition runs, and the window keeps the frame of the old state.
     pub(crate) fn suppressed(view: &ViewState) -> bool {
         (view.store.try_borrow().ok())
-            .and_then(|store| Some(store.page_state(view.id)?.transition.as_ref()?.suppressed))
+            .and_then(|store| {
+                Some(matches!(
+                    **store.page_state(view.id)?.transition.as_ref()?,
+                    Capture::Hold
+                ))
+            })
             .unwrap_or(false)
     }
 
@@ -186,16 +214,21 @@ impl Captured {
         draw: &mut dyn FnMut(&mut Window),
     ) -> bool {
         let found = self.capture.borrow().as_ref().and_then(|capture| {
-            let id = match id {
-                Some(id) if Some(id) != capture.root => id,
-                Some(_) => return None,
-                None => capture.root?,
+            let (captures, new) = match &**capture {
+                Capture::Hold => return None,
+                Capture::Old(captures) => (captures, false),
+                Capture::New { captures, .. } => (captures, true),
             };
-            Some((*capture.keys.get(&id)?, capture.mode))
+            let id = match id {
+                Some(id) if Some(id) != captures.root => id,
+                Some(_) => return None,
+                None => captures.root?,
+            };
+            Some((*captures.keys.get(&id)?, new))
         });
         match found {
-            Some((key, 1)) => window.with_shown_snapshot(key, bounds, draw),
-            Some((key, _)) => window.with_snapshot(Some((key, self.fresh.get())), bounds, draw),
+            Some((key, false)) => window.with_shown_snapshot(key, bounds, draw),
+            Some((key, true)) => window.with_snapshot(Some((key, self.fresh.get())), bounds, draw),
             None => return false,
         }
         true
@@ -207,7 +240,7 @@ impl Captured {
             .capture
             .borrow()
             .as_ref()
-            .is_some_and(|capture| capture.mode == 2)
+            .is_some_and(|capture| matches!(**capture, Capture::New { .. }))
         {
             show(state, |key| changed.contains(&key));
         }

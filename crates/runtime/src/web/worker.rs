@@ -65,7 +65,6 @@ fn buffers(items: Option<&[Value]>) -> Result<Vec<bytes::Bytes>> {
 }
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-// An engine that is dropped never polls again, so a subscriber whose queue overflows is removed.
 struct Subscriber {
     names: Vec<String>,
     queue: Vec<(String, Payload)>,
@@ -226,14 +225,17 @@ impl State {
             }
             "channel.open" => {
                 let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-                CHANNELS.lock().unwrap().insert(
-                    id,
-                    Subscriber {
-                        names: Vec::new(),
-                        queue: Vec::new(),
-                        wake: crate::jsc::Waker::current(),
-                    },
-                );
+                CHANNELS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(
+                        id,
+                        Subscriber {
+                            names: Vec::new(),
+                            queue: Vec::new(),
+                            wake: crate::jsc::Waker::current(),
+                        },
+                    );
                 self.channels.push(id);
                 Ok(json!(id))
             }
@@ -241,7 +243,7 @@ impl State {
                 let name = args[1].as_str().context("Expected channel name")?;
                 if let Some(subscriber) = CHANNELS
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get_mut(&args[0].as_u64().context("Expected subscriber")?)
                 {
                     subscriber.names.retain(|other| other != name);
@@ -269,7 +271,11 @@ impl State {
                     value: Value::Array(message),
                     buffers,
                 };
-                for (other, subscriber) in CHANNELS.lock().unwrap().iter_mut() {
+                for (other, subscriber) in CHANNELS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter_mut()
+                {
                     if *other == id || !subscriber.names.contains(&name) {
                         continue;
                     }
@@ -285,7 +291,7 @@ impl State {
             "channel.poll" => {
                 let queue = CHANNELS
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get_mut(&args[0].as_u64().context("Expected subscriber")?)
                     .map(|subscriber| std::mem::take(&mut subscriber.queue))
                     .unwrap_or_default();

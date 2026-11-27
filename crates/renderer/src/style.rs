@@ -430,9 +430,9 @@ pub struct Sizing {
     pub key: u64,
     pub width: Option<(ContentWidth, SizeOf)>,
     pub height: Option<SizeOf>,
-    /// Percent heights inside resolve against the height.
     /// The aspect ratio, whose height is the least content height.
     pub ratio: Option<f32>,
+    /// Percent heights inside resolve against the height.
     pub definite: bool,
 }
 

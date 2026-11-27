@@ -310,7 +310,7 @@ impl Gpu {
         {
             return made.clone();
         }
-        // An instance is one step of 13 vec4 attributes.
+        // An instance is one step of `ATTRIBUTES` vec4 attributes.
         let attributes: [wgpu::VertexAttribute; ATTRIBUTES] = std::array::from_fn(|at| {
             let (offset, shader_location) = (at as u64 * 16, at as u32);
             wgpu::VertexAttribute {
@@ -470,7 +470,6 @@ pub(super) struct Renderer {
     last: Option<Texture>,
     // The layers of the last frame that drew the whole window.
     whole_layers: usize,
-    pub snapshots: Vec<crate::Snapshot>,
 }
 
 // Copies of the last frame that start a frame: the offset of the source, and the region of the window.
@@ -507,7 +506,6 @@ impl Renderer {
             frame: RenderFrame::default(),
             last: None,
             whole_layers: 0,
-            snapshots: Vec::new(),
         })
     }
 
@@ -539,14 +537,20 @@ impl Renderer {
         self.last = None;
     }
 
-    pub fn draw(&mut self, scene: &Scene, capture: bool) -> (Drawn, Capture) {
+    pub fn draw(
+        &mut self,
+        scene: &Scene,
+        capture: bool,
+        snapshots: &mut Vec<crate::Snapshot>,
+    ) -> (Drawn, Capture) {
         let failed = |message: &str| capture.then(|| Err(anyhow!("{message}")));
-        if self.gpu.lost.load(Relaxed) || self.surface.is_none() {
+        let lost = self.gpu.lost.load(Relaxed);
+        let Some(surface) = self.surface.as_ref().filter(|_| !lost) else {
             if let Err(error) = self.recover() {
                 eprintln!("apps: the GPU can't recover: {error:#}");
             }
             return (Drawn::Again, failed("The GPU was lost"));
-        }
+        };
         let window = [self.config.width, self.config.height];
         // The window keeps a copy of each frame, so a frame draws only its damage regions over the last one.
         let last = self
@@ -564,9 +568,6 @@ impl Renderer {
             self.last = last;
             return (Drawn::Skipped, None);
         }
-        let Some(surface) = &self.surface else {
-            return (Drawn::Skipped, None);
-        };
         let output = match surface.get_current_texture() {
             Next::Success(output) => output,
             Next::Suboptimal(stale) => {
@@ -651,7 +652,7 @@ impl Renderer {
         self.last = last;
         for (key, size, buffer) in shots {
             match self.read(buffer, size) {
-                Ok((size, pixels)) => (self.snapshots).push(crate::Snapshot { key, size, pixels }),
+                Ok((size, pixels)) => snapshots.push(crate::Snapshot { key, size, pixels }),
                 Err(error) => eprintln!("apps: failed to read a layer: {error:#}"),
             }
         }

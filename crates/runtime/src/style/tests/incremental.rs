@@ -1140,3 +1140,46 @@ fn auto_directions_follow_their_text() {
         assert_eq!(cached.values[bdi].get(Prop::WIDTH), None);
     }
 }
+
+#[test]
+fn selection_marks_take_no_base_from_freed_styles() {
+    let mut doc = Document::parse("<p>x</p><i>y</i>");
+    let p = element(&doc, "p");
+    let mut state = crate::render::PageState::default();
+    let stored = state.restyle(&mut doc, [800., 600.]);
+    state.styles.animated = HashMap::from([(
+        p,
+        Style::from_iter([(Prop::DISPLAY, Rc::<str>::from("none"))]),
+    )]);
+    let mut copy = state.restyle(&mut doc, [800., 600.]);
+    // The stored styles at the address of the animated ones, as when a frame copy takes the freed block.
+    *Rc::get_mut(&mut copy).unwrap() = (*stored).clone();
+    state.styles.computed = Some(copy);
+    state.styles.invalidate();
+    state.restyle(&mut doc, [800., 600.]);
+    assert_eq!(state.styles.select_marks[p], 0);
+}
+
+#[test]
+fn style_media_attributes_parse_once_and_follow_changes() {
+    let mut doc = Document::parse("<style media='(min-width: 500px)'>p{color:red}</style><p>x</p>");
+    let (p, style) = (element(&doc, "p"), element(&doc, "style"));
+    let mut state = crate::render::PageState::default();
+    let color = |state: &mut crate::render::PageState, doc: &mut Document| {
+        state.styles.invalidate();
+        state.restyle(doc, [800., 600.]).values[p]
+            .get(Prop::COLOR)
+            .map(str::to_owned)
+    };
+    assert_eq!(color(&mut state, &mut doc).as_deref(), Some("red"));
+    let parsed = state.styles.cache.media[&style].2.0[0].clone();
+    assert_eq!(color(&mut state, &mut doc).as_deref(), Some("red"));
+    assert!(Rc::ptr_eq(
+        &parsed,
+        &state.styles.cache.media[&style].2.0[0]
+    ));
+    doc.nodes[style]
+        .attrs
+        .insert("media".into(), "(min-width: 900px)".into());
+    assert_ne!(color(&mut state, &mut doc).as_deref(), Some("red"));
+}

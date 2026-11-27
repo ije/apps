@@ -1,54 +1,42 @@
 use crate::css::value::{tokens::components, tokens::write_number, units::Kind, units::Lengths};
 
 // The longhands of `font-variant` in the order of its value, with groups of keywords that exclude each other.
-const VARIANTS: [(&str, &[&[&str]]); 6] = [
-    (
-        "ligatures",
+const VARIANTS: [&[&[&str]]; 6] = [
+    &[
+        &["common-ligatures", "no-common-ligatures"],
+        &["discretionary-ligatures", "no-discretionary-ligatures"],
+        &["historical-ligatures", "no-historical-ligatures"],
+        &["contextual", "no-contextual"],
+    ],
+    &[&[
+        "small-caps",
+        "all-small-caps",
+        "petite-caps",
+        "all-petite-caps",
+        "unicase",
+        "titling-caps",
+    ]],
+    &[&["historical-forms"]],
+    &[
+        &["lining-nums", "oldstyle-nums"],
+        &["proportional-nums", "tabular-nums"],
+        &["diagonal-fractions", "stacked-fractions"],
+        &["ordinal"],
+        &["slashed-zero"],
+    ],
+    &[
         &[
-            &["common-ligatures", "no-common-ligatures"],
-            &["discretionary-ligatures", "no-discretionary-ligatures"],
-            &["historical-ligatures", "no-historical-ligatures"],
-            &["contextual", "no-contextual"],
+            "jis78",
+            "jis83",
+            "jis90",
+            "jis04",
+            "simplified",
+            "traditional",
         ],
-    ),
-    (
-        "caps",
-        &[&[
-            "small-caps",
-            "all-small-caps",
-            "petite-caps",
-            "all-petite-caps",
-            "unicase",
-            "titling-caps",
-        ]],
-    ),
-    ("alternates", &[&["historical-forms"]]),
-    (
-        "numeric",
-        &[
-            &["lining-nums", "oldstyle-nums"],
-            &["proportional-nums", "tabular-nums"],
-            &["diagonal-fractions", "stacked-fractions"],
-            &["ordinal"],
-            &["slashed-zero"],
-        ],
-    ),
-    (
-        "east-asian",
-        &[
-            &[
-                "jis78",
-                "jis83",
-                "jis90",
-                "jis04",
-                "simplified",
-                "traditional",
-            ],
-            &["full-width", "proportional-width"],
-            &["ruby"],
-        ],
-    ),
-    ("position", &[&["sub", "super"]]),
+        &["full-width", "proportional-width"],
+        &["ruby"],
+    ],
+    &[&["sub", "super"]],
 ];
 
 pub(crate) const VARIANT: [&str; 6] = [
@@ -69,14 +57,10 @@ pub(crate) fn variants(value: &str) -> Option<[String; 6]> {
         "none" => found[0].push((0, "none")),
         _ => {
             for token in value.split_ascii_whitespace() {
-                let (slot, group) =
-                    VARIANTS
-                        .iter()
-                        .enumerate()
-                        .find_map(|(slot, (_, groups))| {
-                            let group = groups.iter().position(|group| group.contains(&token))?;
-                            Some((slot, group))
-                        })?;
+                let (slot, group) = VARIANTS.iter().enumerate().find_map(|(slot, groups)| {
+                    let group = groups.iter().position(|group| group.contains(&token))?;
+                    Some((slot, group))
+                })?;
                 if found[slot].iter().any(|&(other, _)| other == group) {
                     return None;
                 }
@@ -133,7 +117,6 @@ pub(crate) fn ordered(name: &str, value: &str) -> Option<Option<String>> {
                 out
             }
         }),
-        // Strings keep their case.
         "hyphenate-character" => match tokens[..] {
             [token] if token == "auto" || token.starts_with(['"', '\'']) => Some(token.to_owned()),
             _ => None,

@@ -322,10 +322,24 @@ fn rendered_text(
     let mut text = String::new();
     let (mut breaks, mut space, mut rows, mut cells) = (0, false, false, false);
     let mut left = range.map_or(0, |range| range.len());
-    // Open entries carry whether the parent blockifies its children, close entries the required line breaks
-    // and the table state to restore.
-    let mut pending = vec![(root, None, false, false)];
-    while let Some((node, close, a, b)) = pending.pop() {
+    enum Step {
+        // A node, and whether its parent blockifies its children.
+        Open(usize, bool),
+        // The line breaks after a node, and the table state to restore after a table box.
+        Close(usize, Option<(bool, bool)>),
+    }
+    let mut pending = vec![Step::Open(root, false)];
+    while let Some(step) = pending.pop() {
+        let (node, blockified) = match step {
+            Step::Open(node, blockified) => (node, blockified),
+            Step::Close(required, table) => {
+                if let Some(table) = table {
+                    (rows, cells) = table;
+                }
+                breaks = breaks.max(required);
+                continue;
+            }
+        };
         let current = &doc.nodes[node];
         let style = &computed.values[node];
         let display = display(computed, node, style.get(Prop::DISPLAY).unwrap_or("inline"));
@@ -339,14 +353,6 @@ fn rendered_text(
         } else {
             display
         };
-        let table = style::table_box(style::role(computed, node));
-        if let Some(required) = close {
-            if table {
-                (rows, cells) = (a, b);
-            }
-            breaks = breaks.max(required);
-            continue;
-        }
         // Replaced elements draw no children, so their text is not rendered.
         if node != root
             && (display == "none"
@@ -423,7 +429,7 @@ fn rendered_text(
             0
         } else if current.tag == "p" {
             2
-        } else if a
+        } else if blockified
             || matches!(
                 display,
                 "block" | "list-item" | "flex" | "grid" | "table" | "flow-root" | "table-caption"
@@ -436,7 +442,8 @@ fn rendered_text(
         if node != root {
             breaks = breaks.max(required);
         }
-        pending.push((node, Some(required), rows, cells));
+        let table = style::table_box(style::role(computed, node));
+        pending.push(Step::Close(required, table.then_some((rows, cells))));
         if table {
             (rows, cells) = (false, false);
         }
@@ -458,8 +465,9 @@ fn rendered_text(
         if crate::render::layout::cull::skipping(doc, &state.layout, computed, node, false) {
             continue;
         }
-        let blockify =
-            display.ends_with("flex") || display.ends_with("grid") || display == "contents" && a;
+        let blockify = display.ends_with("flex")
+            || display.ends_with("grid")
+            || display == "contents" && blockified;
         pending.extend(
             state
                 .styles
@@ -470,7 +478,7 @@ fn rendered_text(
                 .unwrap_or(&current.children)
                 .iter()
                 .rev()
-                .map(|&child| (child, None, blockify, false)),
+                .map(|&child| Step::Open(child, blockify)),
         );
     }
     text

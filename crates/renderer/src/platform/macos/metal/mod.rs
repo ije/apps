@@ -490,9 +490,15 @@ impl Renderer {
         self.in_transaction = on;
     }
 
-    pub fn update_transparency(&mut self, transparent: bool) {
+    // Forgets the kept frames, so the next frame draws whole.
+    fn forget_frames(&mut self) {
         self.last = None;
         self.drawables.clear();
+        self.regions.clear();
+    }
+
+    pub fn update_transparency(&mut self, transparent: bool) {
+        self.forget_frames();
         self.opaque = !transparent;
         self.layer.setOpaque(!transparent);
     }
@@ -519,8 +525,7 @@ impl Renderer {
             list.trim();
         }
         self.frame.clear_pool(&mut self.pool);
-        self.last = None;
-        self.drawables.clear();
+        self.forget_frames();
         BUFFERS.with(|buffers| buffers.borrow_mut().reset(MIN_INSTANCE_BUFFER));
         // Change size to release spare drawables. The layer keeps its last frame until the next draw restores
         // the size.
@@ -543,8 +548,7 @@ impl Renderer {
         if wide != self.wide {
             self.wide = wide;
             // Kept pixels are in the old color space.
-            self.last = None;
-            self.drawables.clear();
+            self.forget_frames();
             self.frame.clear_pool(&mut self.pool);
             let space = Some(color_space(wide));
             for promoted in &self.promoted {
@@ -633,8 +637,7 @@ impl Renderer {
             false => 0,
         };
         let Some(drawable) = next else {
-            self.last = None;
-            self.drawables.clear();
+            self.forget_frames();
             eprintln!("apps: no drawable for a {size:?} window");
             return capture.then(|| Err(anyhow::anyhow!("No drawable")));
         };
@@ -700,8 +703,7 @@ impl Renderer {
         let (commands, sublayers) = match rendered {
             Ok(commands) => commands,
             Err(error) => {
-                self.last = None;
-                self.drawables.clear();
+                self.forget_frames();
                 eprintln!("apps: failed to render: {error:#}");
                 return capture.then(|| Err(error));
             }

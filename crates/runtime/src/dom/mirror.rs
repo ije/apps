@@ -55,9 +55,12 @@ impl LayoutMirror {
     }
 
     pub(crate) fn mark_inert(&self, id: usize, inert: bool) {
-        unsafe {
-            let flags = self.flags(id);
-            *flags = (*flags & !MIRROR_INERT) | (u8::from(inert) * MIRROR_INERT);
+        debug_assert!(id < self.capacity, "Reserve the mirror first");
+        if id < self.capacity {
+            unsafe {
+                let flags = self.flags(id);
+                *flags = (*flags & !MIRROR_INERT) | (u8::from(inert) * MIRROR_INERT);
+            }
         }
     }
 
@@ -168,9 +171,12 @@ impl LayoutMirror {
     }
 
     pub(crate) fn transformed(&mut self, id: usize, on: bool) {
-        unsafe {
-            let flags = self.flags(id);
-            *flags = *flags & !MIRROR_TRANSFORMED | if on { MIRROR_TRANSFORMED } else { 0 };
+        debug_assert!(id < self.capacity, "Reserve the mirror first");
+        if id < self.capacity {
+            unsafe {
+                let flags = self.flags(id);
+                *flags = *flags & !MIRROR_TRANSFORMED | if on { MIRROR_TRANSFORMED } else { 0 };
+            }
         }
     }
 
@@ -323,5 +329,19 @@ mod tests {
         unsafe { *count(&mirror) = 16_777_215. };
         mirror.touch();
         assert_eq!(unsafe { *count(&mirror) }, 0.);
+    }
+
+    // Debug builds catch a caller that did not reserve, and release builds skip the write.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "Reserve the mirror first"))]
+    fn flag_writes_past_the_buffer_do_nothing() {
+        let mut mirror = LayoutMirror::default();
+        mirror.mark_inert(3, true);
+        mirror.transformed(3, true);
+        mirror.reserve(0);
+        let id = mirror.capacity();
+        mirror.mark_inert(id, true);
+        mirror.transformed(id, true);
+        assert!(!mirror.is_transformed(id) && mirror.capacity() == id);
     }
 }

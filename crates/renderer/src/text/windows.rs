@@ -1032,11 +1032,11 @@ impl TextSystem {
         0
     }
 
-    // DirectWrite shares its font cache across the process, so there is nothing to load ahead.
     pub fn hyphenate(&self, _: &str, _: &str) -> Vec<usize> {
         Vec::new()
     }
 
+    // DirectWrite shares its font cache across the process, so there is nothing to load ahead.
     pub fn warm(_: Vec<Vec<String>>) {}
 }
 

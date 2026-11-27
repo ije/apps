@@ -1,7 +1,6 @@
 pub(crate) mod media;
 pub(crate) mod parser;
 
-// The last field is the position of the declaration in its block, which breaks ties between properties.
 use crate::css::{
     properties::Prop, properties::Style, selector::Selector, selector::SelectorList, value::anchor,
     value::grammar::computed, value::grammar::fold, value::grammar::supports,
@@ -9,6 +8,7 @@ use crate::css::{
     value::shorthand::expand,
 };
 use std::rc::Rc;
+// The last field is the position of the declaration in its block, which breaks ties between properties.
 pub(crate) type Declared = (Prop, Rc<str>, bool, u16);
 
 #[derive(Clone, Debug, Default, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -31,7 +31,10 @@ pub(crate) enum Rule {
     Supports(String, bool, Vec<Rule>),
     Declarations(Declarations),
     Theme(String, Vec<Rule>),
-    Variant(String, String),
+    // A `@custom-variant` definition: a selector template, or a block with `@slot`.
+    CustomVariant(String, String),
+    // A `@variant` block: the name and the body without braces.
+    VariantBlock(String, String),
     Utility(String, String),
     FontFace(Declarations),
     Tailwind(String),
@@ -53,6 +56,8 @@ pub(crate) enum MediaQuery {
     Typed(String, Box<MediaQuery>),
     // A range with the value first, and the text that it keeps.
     Range(String, Box<MediaQuery>),
+    // A container `style()` query of a custom property, and its value or an empty text.
+    Style(String, String),
 }
 
 pub(crate) fn declare(source: &str) -> Vec<[String; 3]> {
@@ -83,7 +88,6 @@ pub(crate) fn declare(source: &str) -> Vec<[String; 3]> {
                     | "grid"
                     | "mask"
                     | "offset"
-                    | "-webkit-mask"
             )
             || !expand(&name, value, &mut expanded)
         {
@@ -193,11 +197,11 @@ impl Rule {
                 format!("@position-try {name}{{{}}}", values.source())
             }
             Self::FontFace(values) => format!("@font-face{{{}}}", values.source()),
-            Self::Variant(name, body) if body.starts_with('{') => format!("@variant {name}{body}"),
-            Self::Variant(name, body) if body.contains("@slot") => {
+            Self::VariantBlock(name, body) => format!("@variant {name}{{{body}}}"),
+            Self::CustomVariant(name, body) if body.contains("@slot") => {
                 format!("@custom-variant {name}{{{body}}}")
             }
-            Self::Variant(name, template) => format!("@custom-variant {name} ({template});"),
+            Self::CustomVariant(name, template) => format!("@custom-variant {name} ({template});"),
             Self::Property(name, syntax, inherits, initial) => format!(
                 "@property {name}{{syntax:{};inherits:{inherits};{}}}",
                 serde_json::to_string(syntax).unwrap_or_default(),
@@ -412,7 +416,11 @@ impl Rule {
                 json!(["import", text.split('"').nth(1)])
             }
             Self::Tailwind(_) => json!(["other", self.source()]),
-            Self::Declarations(_) | Self::Theme(..) | Self::Variant(..) | Self::Utility(..) => {
+            Self::Declarations(_)
+            | Self::Theme(..)
+            | Self::CustomVariant(..)
+            | Self::VariantBlock(..)
+            | Self::Utility(..) => {
                 json!(["other", self.source()])
             }
         }
@@ -424,7 +432,8 @@ pub(crate) enum Edit<'a> {
     Delete,
     Declarations(&'a str),
     Selector(&'a str),
-    Keyframe(&'a str),
+    AppendKeyframe(&'a str),
+    DeleteKeyframe(usize),
     Replace(&'a str),
 }
 
@@ -616,25 +625,23 @@ fn edit_rules<R: std::borrow::Borrow<Rule> + From<Rule>>(
             }
             *rule = new;
         }
-        (Edit::Keyframe(text), Rule::Keyframes(name, frames)) => {
+        // As in CSSOM, an append that doesn't parse does nothing.
+        (Edit::AppendKeyframe(text), Rule::Keyframes(name, frames)) => {
             let parsed = Stylesheet::parse(&format!("@keyframes {name}{{{text}}}"));
-            match text.split_once('{') {
-                Some(_) => match parsed.0.into_iter().next().map(Rc::unwrap_or_clone) {
-                    Some(Rule::Keyframes(_, mut added)) if !added.is_empty() => {
-                        let tree = Rule::Keyframes(String::new(), added.clone()).cssom()[2].clone();
-                        frames.append(&mut added);
-                        return Ok(tree);
-                    }
-                    _ => return Err("SyntaxError"),
-                },
-                None => {
-                    let index: usize = text.parse().map_err(|_| "IndexSizeError")?;
-                    if index >= frames.len() {
-                        return Err("IndexSizeError");
-                    }
-                    frames.remove(index);
-                }
+            if let Some(Rule::Keyframes(_, mut added)) =
+                parsed.0.into_iter().next().map(Rc::unwrap_or_clone)
+                && !added.is_empty()
+            {
+                let tree = Rule::Keyframes(String::new(), added.clone()).cssom()[2].clone();
+                frames.append(&mut added);
+                return Ok(tree);
             }
+        }
+        (Edit::DeleteKeyframe(index), Rule::Keyframes(_, frames)) => {
+            if index >= frames.len() {
+                return Err("IndexSizeError");
+            }
+            frames.remove(index);
         }
         _ => return Err("InvalidModificationError"),
     }

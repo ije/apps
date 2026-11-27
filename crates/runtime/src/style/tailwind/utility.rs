@@ -52,12 +52,11 @@ impl Config {
             name: class.to_owned(),
         };
         let suffix = if important { " !important" } else { "" };
-        let dynamic = calls(utility) || !self.theme.is_empty() || !self.utilities.is_empty();
         let pairs = |pairs: &Pairs| -> Option<Pairs> {
             pairs
                 .iter()
                 .map(|(key, value)| {
-                    let value = match dynamic && calls(value) {
+                    let value = match calls(value) {
                         true => self.resolved(value)? + suffix,
                         false if suffix.is_empty() => value.clone(),
                         false => format!("{value}{suffix}"),

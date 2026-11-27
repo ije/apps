@@ -84,9 +84,6 @@ pub(super) fn frames(state: &mut PageState) -> Result<Value> {
             .unwrap_or_else(PoisonError::into_inner),
     );
     let mut results = Vec::with_capacity(frames.len());
-    if state.media.retired.is_empty() {
-        state.media.retired_canvases.clear();
-    }
     for (node, image) in frames {
         let size = image.size();
         results.push(json!([node, size.width as u32, size.height as u32]));

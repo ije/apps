@@ -114,7 +114,7 @@ globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes, take, jsE
   };
   const transfers = options => {
     const values = Array.from(Array.isArray(options) ? options : options?.transfer ?? []);
-    if (new Set(values).size !== values.length || values.some(v => !(v instanceof ArrayBuffer && typeof v.transfer === 'function') && !(globalThis.ImageBitmap && v instanceof ImageBitmap) && !(globalThis.OffscreenCanvas && v instanceof OffscreenCanvas) && !(globalThis.ElementImage && v instanceof ElementImage))) throw new DOMException('Only ArrayBuffer, ImageBitmap, ElementImage and OffscreenCanvas can be transferred', 'DataCloneError');
+    if (new Set(values).size !== values.length || values.some(v => !(v instanceof ArrayBuffer) && !(globalThis.ImageBitmap && v instanceof ImageBitmap) && !(globalThis.OffscreenCanvas && v instanceof OffscreenCanvas) && !(globalThis.ElementImage && v instanceof ElementImage))) throw new DOMException('Only ArrayBuffer, ImageBitmap, ElementImage and OffscreenCanvas can be transferred', 'DataCloneError');
     return values;
   };
   // Memory that the sender gives up, and shared memory, go as a number from `take`. The native side copies other
@@ -288,7 +288,12 @@ globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes, take, jsE
       }
     },
     report,
-    pending: () => !!parentPort && parentPort._referenced && ((parentPort._listeners.get('message')?.length ?? 0) > 0 || parentPort._messageListeners.size > 0 || typeof parentPort.onmessage === 'function') || [...workers.values()].some(worker => worker._referenced) || [...channels.values()].some(set => [...set].some(channel => channel._referenced)),
+    pending: () => {
+      if (parentPort?._referenced && ((parentPort._listeners.get('message')?.length ?? 0) > 0 || parentPort._messageListeners.size > 0 || typeof parentPort.onmessage === 'function')) return true;
+      for (const worker of workers.values()) if (worker._referenced) return true;
+      for (const set of channels.values()) for (const channel of set) if (channel._referenced) return true;
+      return false;
+    },
     api: { Worker: NodeWorker, MessageChannel, MessagePort, BroadcastChannel, isMainThread: info.main, parentPort, workerData: decode(info.data && parse(info.data), () => call('web.worker.buffers')) ?? null, threadId: info.id, SHARE_ENV: Symbol.for('nodejs.worker_threads.SHARE_ENV'),
       receiveMessageOnPort: port => port._pending?.length ? { message: port._pending.shift() } : undefined },
   };

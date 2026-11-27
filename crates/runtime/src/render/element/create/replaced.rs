@@ -271,5 +271,5 @@ pub(super) fn paint_broken_icon(
         return;
     };
     let bounds = Rect::new(origin, size(px(16.), px(16.)));
-    window.draw_image(bounds, bounds, px(0.), image, false, false);
+    window.draw_image(bounds, bounds, px(0.), image, false);
 }

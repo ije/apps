@@ -140,7 +140,7 @@ pub(crate) fn shown(value: &str, scale: f32) -> (Cow<'_, str>, f32) {
         });
     match best {
         Some((image, density, _)) => match image {
-            Cow::Borrowed(image) if image.starts_with("image(") => {
+            Cow::Borrowed(image) if body(image, &["image"]).is_some() => {
                 (shown(image, scale).0, density as f32)
             }
             image => (image, density as f32),
@@ -181,4 +181,12 @@ fn image_sets_pick_the_best_resolution() {
         Some((["none", "url(b.png)"], 1.))
     );
     assert_eq!(valid("url(a.png)"), None);
+}
+
+#[test]
+fn image_functions_in_sets_take_any_case() {
+    assert_eq!(
+        shown("image-set(IMAGE(red) 1x)", 1.).0,
+        "linear-gradient(red 0 0)"
+    );
 }

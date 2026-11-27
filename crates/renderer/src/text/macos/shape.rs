@@ -32,7 +32,7 @@ impl Book {
     }
 
     fn shape_pieces(&mut self, text: &str, font_size: Pixels, spans: &[Span]) -> Line {
-        self.words.trim(true);
+        self.words.trim();
         let mut glyphs = Vec::with_capacity(text.len());
         let mut x = 0f32;
         let mut start = 0;
@@ -113,7 +113,7 @@ impl Book {
         spans: &[Span],
         parts: &mut Vec<Part>,
     ) -> Option<Line> {
-        self.words.trim(false);
+        self.words.trim();
         let (mut start, mut nudge, mut missing) = (0, false, 0);
         for (index, span) in spans.iter().enumerate() {
             // Every other span shapes a hair larger, as in `shape_whole`, or CoreText joins the spans and forms
@@ -764,12 +764,10 @@ pub(super) struct Words {
 }
 
 impl Words {
-    fn trim(&mut self, pieces: bool) {
+    fn trim(&mut self) {
         if self.count > 16384 {
             self.faces.clear();
-            if pieces {
-                self.pieces.clear();
-            }
+            self.pieces.clear();
             self.count = 0;
         }
     }
@@ -874,5 +872,25 @@ mod tests {
             assert!(same(&line, &whole), "{sample}");
         }
         assert!(text.0.borrow().words.count > 0);
+    }
+
+    #[test]
+    fn the_word_path_clears_the_monospace_pieces() {
+        let text = TextSystem::default();
+        let span = |font: &str, len| Span {
+            len,
+            font: text.font(&Font::new(font)).unwrap(),
+            size: px(16.),
+            letter_spacing: px(0.),
+            word_spacing: px(0.),
+            inset: [px(0.); 2],
+            nowrap: false,
+        };
+        let (mono, words) = ("let x = 1;", "Hello world");
+        text.shape(mono, px(16.), &[span("Menlo", mono.len())]);
+        assert!(!text.0.borrow().words.pieces.is_empty());
+        text.0.borrow_mut().words.count = 16385;
+        text.shape(words, px(16.), &[span("Helvetica", words.len())]);
+        assert!(text.0.borrow().words.pieces.is_empty());
     }
 }

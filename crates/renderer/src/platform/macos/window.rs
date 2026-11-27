@@ -21,11 +21,7 @@ use std::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
 };
-
-// After this long without frames, the window gives back its spare GPU memory.
-const QUIET: Duration = Duration::from_secs(1);
 
 // The display link stays on for this many ticks after the last frame. A start takes 4 to 11 ms, so
 // frames that come one by one, like a 60 Hz scroll on a 120 Hz display, would land unevenly.
@@ -250,7 +246,8 @@ impl Window {
         lock(&self.pacer).want(false);
         self.renderer.trim();
         let callbacks = self.callbacks;
-        let release = crate::platform::timer(QUIET, move || events().release(callbacks));
+        let release =
+            crate::platform::timer(crate::platform::QUIET, move || events().release(callbacks));
         self.quiet = Some(release);
     }
 

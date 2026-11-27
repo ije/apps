@@ -124,8 +124,12 @@ pub(crate) fn serialize(value: &str) -> Option<String> {
             });
         }
         let channels = channels.map(number).join(" ");
-        Some(if alpha < 1. {
-            format!("{name}{channels} / {})", number(alpha.max(0.)))
+        // `none` is NaN.
+        Some(if alpha < 1. || alpha.is_nan() {
+            format!(
+                "{name}{channels} / {})",
+                number(if alpha < 0. { 0. } else { alpha })
+            )
         } else {
             format!("{name}{channels})")
         })
@@ -1060,5 +1064,17 @@ mod tests {
             ", blue)".repeat(64)
         );
         assert_eq!(color(&nested), None);
+    }
+
+    #[test]
+    fn relative_colors_keep_a_none_alpha() {
+        let text = super::serialize("rgb(from red r g b / none)");
+        assert_eq!(text.as_deref(), Some("color(srgb 1 0 0 / none)"));
+        assert_eq!(color(&text.unwrap()), Some((0xff0000, 0)));
+        // Only the keyword is `none`: an origin alpha of `none` is 0 in a relative color.
+        assert_eq!(
+            super::serialize("rgb(from rgb(0 0 0 / none) r g b)").as_deref(),
+            Some("color(srgb 0 0 0 / 0)")
+        );
     }
 }

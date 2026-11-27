@@ -65,14 +65,8 @@ impl NodePass<'_> {
             self.registry,
             &self.theme,
         );
-        let (_text_system, [width, height], _scale, native_theme, fast, stored) = (
-            self.text_system,
-            self.viewport,
-            self.scale,
-            self.native_theme,
-            self.fast,
-            self.stored,
-        );
+        let ([width, height], native_theme, fast, stored) =
+            (self.viewport, self.native_theme, self.fast, self.stored);
         let order = walk.walk.order();
         // The generation and revision of each dependency key in the list of the current node.
         let mut inheritable = std::mem::take(&mut style_cache.inheritable);
@@ -139,11 +133,7 @@ impl NodePass<'_> {
             flags: style_flags,
             lengths,
             extras,
-            list_items: _,
-            authored: _,
-            anonymous: _,
             containers,
-            counted: _,
             revision,
             ..
         } = out;

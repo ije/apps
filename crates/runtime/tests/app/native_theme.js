@@ -21,7 +21,8 @@
     assert(theme[name] === true, 'Read current native preference: ' + name);
     assert(!Reflect.set(theme, name, false) && theme[name], 'Readonly preference: ' + name);
   }
-  assert(!shell.pending(), 'Reading preferences must not keep the event loop polling');
+  shell.poll();
+  assert(!calls.includes('native.poll'), 'Reading preferences must not keep the event loop polling');
   for (const value of [null, undefined, '', 'auto', 'Dark', 1, {}, ['dark']]) {
     const before = calls.length;
     let error;
@@ -32,7 +33,8 @@
   const listener = function (...args) { assert(this === theme && !args.length, 'Updated event arguments'); updates++; };
   theme.addListener('updated', listener);
   theme.prependOnceListener('updated', () => once++);
-  assert(!shell.pending(), 'Theme listeners must not keep the event loop polling');
+  shell.poll();
+  assert(calls.at(-1) === 'native.poll', 'Theme listeners poll for native updates');
   for (const source of ['dark', 'light', 'system']) {
     theme.themeSource = source;
     assert(theme.themeSource === source && updates === 0, 'Source changes wait for native notifications');
@@ -42,7 +44,7 @@
   assert(updates === 2 && once === 1, 'Native updates and once listeners');
   theme.removeListener('updated', listener);
   events.push({ type: 'theme' }); shell.poll();
-  assert(updates === 2 && !shell.pending(), 'Listener removal');
+  assert(updates === 2, 'Listener removal');
   const failing = __appsNativeShell(op => { if (op === 'native.poll') return events.splice(0); if (op === 'native.notification.show') throw Error('Notifications require an app bundle identifier'); if (op === 'native.safeStorage.encrypt') return btoa('sealed'); throw Error('This native desktop operation is currently available on macOS'); }, __apps.events.EventEmitter);
   assert(failing.nativeTheme.shouldUseDarkColors === false && failing.nativeTheme.themeSource === 'system', 'Theme state has defaults where the platform has none');
   failing.nativeTheme.themeSource = 'dark';

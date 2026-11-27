@@ -317,6 +317,21 @@ impl Geometry {
         self.snaps.remove(&id);
         self.scroll_offsets.remove(&id);
         self.scroll_zooms.remove(&id);
+        self.turned.remove(&id);
+        self.mirror_offsets.remove(&id);
         self.drawn.remove(&id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn forget_drops_the_turned_axis_and_mirror_offset() {
+        let mut geometry = super::Geometry::default();
+        geometry.scroll.insert(7, Default::default());
+        geometry.turned.insert(7);
+        geometry.mirror_offsets.insert(7, Default::default());
+        geometry.forget(7);
+        assert!(!geometry.turned.contains(&7) && !geometry.mirror_offsets.contains_key(&7));
     }
 }

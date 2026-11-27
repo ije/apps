@@ -377,7 +377,7 @@ pub(crate) struct State {
     path: PathBuf,
     transactions: HashMap<u64, Transaction>,
     next_id: u64,
-    idle: Vec<Database>,
+    idle: Option<Database>,
     keys: Option<(Option<String>, Vec<String>)>,
 }
 
@@ -574,9 +574,9 @@ impl State {
                 // Pages also retry on a timer, so a waker is only a shortcut. The list is capped, because another process can hold the lock for as long as it likes.
                 let busy=||{if let Ok(mut waiting)=WAITING.lock()&&waiting.len()<64{waiting.push(crate::jsc::Waker::current());}Ok(json!({"busy":true}))};
                 if self.transactions.values().any(|transaction| transaction.name == name) { return busy(); }
-                let database=match self.idle.pop(){Some(database)=>database,None=>{let database=Database::open(&self.path)?;database.query("PRAGMA synchronous=NORMAL",&[])?;database}};
+                let database=match self.idle.take(){Some(database)=>database,None=>{let database=Database::open(&self.path)?;database.query("PRAGMA synchronous=NORMAL",&[])?;database}};
                 match database.query(if writable {"BEGIN IMMEDIATE"}else{"BEGIN"},&[]) {Ok(_)=>{},Err(error) => {
-                    if self.idle.len() < 4 { self.idle.push(database); }
+                    self.idle = Some(database);
                     if error.to_string().contains("locked") { return busy(); } return Err(error); }}
                 self.next_id+=1;self.transactions.insert(self.next_id,Transaction{database,name,writable});Ok(json!({"id":self.next_id}))
             }
@@ -584,7 +584,7 @@ impl State {
                 let id=args[0].as_u64().context("Expected transaction ID")?;
                 let transaction=self.transactions.remove(&id).context("Transaction is inactive")?;
                 let ended=transaction.database.query(if op=="commit"{"COMMIT"}else{"ROLLBACK"},&[]);
-                if ended.is_ok() && self.idle.len() < 4 { self.idle.push(transaction.database); }
+                if ended.is_ok() { self.idle = Some(transaction.database); }
                 for waker in WAITING.lock().map(|mut waiting|std::mem::take(&mut *waiting)).unwrap_or_default() { waker.wake(); }
                 ended.map(|_|Value::Null)
             }

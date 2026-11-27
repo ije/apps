@@ -161,10 +161,6 @@ pub fn package_app(
     let main = (bytecode && files.contains_key("app.js"))
         .then(|| apps_runtime::jsc::script_source(files, true));
     let bytecode = if bytecode {
-        ensure!(
-            makes_bytecode(runtime, target)?,
-            "--bytecode needs the runtime and JavaScriptCore next to apps, built for this machine"
-        );
         let app: Vec<_> = files
             .iter()
             .filter(|(name, _)| name.starts_with("script-"))
@@ -194,7 +190,6 @@ pub fn package_app(
         let name = apps_runtime::dom::escape(&name);
         let product_name = apps_runtime::dom::escape(&product_name);
         let build = version.split('-').next().unwrap();
-        let version = apps_runtime::dom::escape(&version);
         fs::write(
             app_directory.join("Contents/Info.plist"),
             format!(

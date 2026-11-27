@@ -1,15 +1,14 @@
-globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter, StringDecoder, webcrypto, inspect, codec }) => {
+globalThis.__appsNodeIO = ({ call, sync, asyncCall, output, codes, Buffer, stream, EventEmitter, StringDecoder, webcrypto, inspect, codec }) => {
   // The first `.buffer` read of a new array makes JSC allocate an ArrayBuffer, so own byte arrays pass as they are.
   // Kept values stay fixed views: a length-tracking view would follow later resizes. Empty ones may be detached.
   const input = (value, encoding, kept) => typeof value === 'string' ? Buffer.from(value, encoding) : ArrayBuffer.isView(value) ? (!kept && value instanceof Uint8Array && value.length && (Object.getPrototypeOf(value) === Buffer.prototype || Object.getPrototypeOf(value) === Uint8Array.prototype) ? value : new Uint8Array(value.buffer, value.byteOffset, value.byteLength)) : value instanceof ArrayBuffer ? new Uint8Array(value) : (() => { throw Object.assign(new TypeError('The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView'), { code: 'ERR_INVALID_ARG_TYPE' }); })();
-  const output = data => Object.getPrototypeOf(data) === Uint8Array.prototype ? Object.setPrototypeOf(data, Buffer.prototype) : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
   const encoded = (data, encoding) => encoding && encoding !== 'buffer' ? data.toString(encoding) : data;
 
   const zlibError = error => Object.assign(error, /^Cannot create a Buffer/.test(error.message) ? { code: 'ERR_BUFFER_TOO_LARGE' } : /^unexpected end of file/.test(error.message) ? { code: 'Z_BUF_ERROR', errno: -5 } : { code: 'Z_DATA_ERROR', errno: -3 });
   const zlib = { constants: { Z_NO_FLUSH: 0, Z_PARTIAL_FLUSH: 1, Z_SYNC_FLUSH: 2, Z_FULL_FLUSH: 3, Z_FINISH: 4, Z_OK: 0, Z_STREAM_END: 1, Z_NEED_DICT: 2, Z_ERRNO: -1, Z_STREAM_ERROR: -2, Z_DATA_ERROR: -3, Z_BUF_ERROR: -5, Z_NO_COMPRESSION: 0, Z_BEST_SPEED: 1, Z_BEST_COMPRESSION: 9, Z_DEFAULT_COMPRESSION: -1, Z_FILTERED: 1, Z_HUFFMAN_ONLY: 2, Z_RLE: 3, Z_FIXED: 4, Z_DEFAULT_STRATEGY: 0 } };
   const codecs = new __appsFinalizers(id => sync('zlib.free', id)), flushes = new WeakMap();
   class Zlib extends stream.Transform {
-    #format; #inflate; #options; #id = null; #ended = false;
+    #format; #inflate; #options; #id = null; #ended = false; #head = null;
     constructor(format, inflate, o = {}) {
       super({ ...o, objectMode: false, readableObjectMode: false, writableObjectMode: false });
       this.#format = format; this.#inflate = inflate; this.#options = o; this.bytesWritten = 0;
@@ -17,7 +16,10 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
     }
     #write(chunk, flush) {
       if (this.#id === null) {
-        if (!chunk.length && this.#format === 'unzip' && flush !== zlib.constants.Z_FINISH) return null;
+        if (this.#format === 'unzip') {
+          if (this.#head) { chunk = Buffer.concat([this.#head, chunk]); this.#head = null; }
+          if (chunk.length < 2 && flush !== zlib.constants.Z_FINISH) { this.#head = Buffer.from(chunk); return null; }
+        }
         const kind = this.#format === 'unzip' ? (chunk[0] === 0x1f && chunk[1] === 0x8b ? 'gzip' : 'deflate') : this.#format, opts = this.#options;
         this.#id = sync('zlib.new', kind, this.#inflate, opts.level ?? -1, opts.windowBits ?? 15, opts.dictionary ? input(opts.dictionary) : null);
         codecs.register(this, this.#id, this);
@@ -50,7 +52,7 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
       this.write(marker, () => callback?.());
     }
     params(level, _strategy, callback) { this.flush(zlib.constants.Z_SYNC_FLUSH, () => { if (this.#id !== null) sync('zlib.params', this.#id, level); else this.#options = { ...this.#options, level }; callback?.(); }); }
-    reset() { if (this.#id !== null) { codecs.unregister(this); sync('zlib.free', this.#id); this.#id = null; } this.#ended = false; }
+    reset() { if (this.#id !== null) { codecs.unregister(this); sync('zlib.free', this.#id); this.#id = null; } this.#ended = false; this.#head = null; }
     close(callback) { if (callback) { if (this.closed) queueMicrotask(callback); else this.once('close', callback); } this.destroy(); }
   }
   let table;
@@ -111,11 +113,6 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
     question(query, options = {}) { return new Promise((resolve, reject) => { if (options.signal?.aborted) return reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError', code: 'ABORT_ERR' })); super.question(query, resolve); }); }
   }
   const terminal = (stream, data, callback) => { if (!stream) { callback?.(); return true; } return stream.write(data, callback); };
-  const codes = {
-    clearLine: direction => direction < 0 ? '\x1b[1K' : direction > 0 ? '\x1b[0K' : '\x1b[2K',
-    cursorTo: (x, y) => typeof y === 'number' ? `\x1b[${y + 1};${x + 1}H` : `\x1b[${x + 1}G`,
-    moveCursor: (dx, dy) => (dx < 0 ? `\x1b[${-dx}D` : dx > 0 ? `\x1b[${dx}C` : '') + (dy < 0 ? `\x1b[${-dy}A` : dy > 0 ? `\x1b[${dy}B` : ''),
-  };
   class Readline {
     #stream; #auto; #todo = [];
     constructor(stream, { autoCommit = false } = {}) { this.#stream = stream; this.#auto = autoCommit; }

@@ -428,9 +428,9 @@ impl Native for Toplevel {
         self.start();
     }
 
-    fn draw(&self, scene: &Scene, capture: bool) -> Capture {
+    fn draw(&self, scene: &Scene, capture: bool, snapshots: &mut Vec<crate::Snapshot>) -> Capture {
         let (drawn, capture) = match &mut *self.renderer.borrow_mut() {
-            Some(renderer) => renderer.draw(scene, capture),
+            Some(renderer) => renderer.draw(scene, capture, snapshots),
             None => return capture.then(|| Err(anyhow::anyhow!("The window is closed"))),
         };
         let (counter, synced) = {
@@ -445,13 +445,6 @@ impl Native for Toplevel {
             events().appearance_changed(self.calls);
         }
         capture
-    }
-
-    fn take_snapshots(&self) -> Vec<crate::Snapshot> {
-        match &mut *self.renderer.borrow_mut() {
-            Some(renderer) => std::mem::take(&mut renderer.snapshots),
-            None => Vec::new(),
-        }
     }
 
     fn release(&self) {

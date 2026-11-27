@@ -358,12 +358,12 @@ impl Hooks for Picture {
             match self.cropped {
                 Some(corners) => {
                     cx.window
-                        .draw_image(bounds, fitted, corners, image, false, self.pixelated)
+                        .draw_image(bounds, fitted, corners, image, self.pixelated)
                 }
                 None => {
                     let radii = cx.style.corner_radii.resolve(bounds.size);
                     cx.window
-                        .draw_image(fitted, fitted, radii, image, false, self.pixelated);
+                        .draw_image(fitted, fitted, radii, image, self.pixelated);
                 }
             }
         }
@@ -686,11 +686,35 @@ impl Hooks for PseudoBlock {
 // The distance and the origin of the perspective of a parent, its node and its borders.
 pub(crate) type Perspective = ((f32, String), usize, [f32; 4]);
 
+// How the plain blocks in a box add their bounds to its reach.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Reach {
+    #[default]
+    Plain,
+    // The children stack, so each plain block adds its bounds.
+    Stacks,
+    // A flex column: only plain blocks without a definite size add their bounds.
+    Column,
+    // The box moves its content, so it reaches nothing.
+    Moves,
+}
+
+// What the style of a `DomBox` sets, in `DomBox.style_flags`. The style of a box never changes.
+pub(crate) const STYLE_TRANSFORM: u8 = 1;
+// A transform, or a z-index on a positioned box: a stacking context that isolates blending.
+pub(crate) const STYLE_STACKED: u8 = 2;
+// An `offset-path` that reads the page.
+pub(crate) const STYLE_OFFSET_PAGE: u8 = 4;
+// A `filter` or `clip-path` with `url()`.
+pub(crate) const STYLE_URL_EFFECT: u8 = 8;
+pub(crate) const STYLE_FILTER: u8 = 16;
+pub(crate) const STYLE_FIXED: u8 = 32;
+
 pub(crate) struct DomBox {
     // The axes without insets of an out-of-flow box.
     pub(crate) unplaced: [bool; 2],
     pub(crate) id: usize,
-    pub(crate) plans: u8,
+    pub(crate) reach: Reach,
     pub(crate) ids: Rc<super::effects::Ids>,
     pub(crate) view: Rc<super::ViewState>,
     pub(crate) sticky: Option<Box<Sticky>>,
@@ -702,6 +726,7 @@ pub(crate) struct DomBox {
     pub(crate) sized: Option<[f32; 2]>,
     pub(crate) inset: [Option<f32>; 4],
     pub(crate) style: Rc<css::properties::Style>,
+    pub(crate) style_flags: u8,
     pub(crate) effects: Option<f32>,
     pub(crate) composited: bool,
     pub(crate) transformed: bool,
@@ -815,11 +840,7 @@ impl DomBox {
             self.id,
             scaled(window_bounds.size.width, size.width)
                 || scaled(window_bounds.size.height, size.height)
-                || !self.drawn
-                    && (self.transformed
-                        || super::effects::TRANSFORM_PROPS
-                            .into_iter()
-                            .any(|prop| self.style.get(prop).is_some_and(|value| value != "none"))),
+                || !self.drawn && (self.transformed || self.style_flags & STYLE_TRANSFORM != 0),
         );
         let shapes = &mut dom.geometry.shapes;
         if let Some(shape) = shape {
@@ -999,7 +1020,11 @@ impl DomBox {
             .borrow_mut()
             .pop()
             .map_or(none, |(reach, _)| reach);
-        let reach = if self.plans == u8::MAX { none } else { found };
+        let reach = if self.reach == Reach::Moves {
+            none
+        } else {
+            found
+        };
         let mut reached = view.reach.borrow_mut();
         if reached.len() <= self.id {
             reached.resize(self.id + 1, [f32::NAN; 2]);
@@ -1012,13 +1037,13 @@ impl DomBox {
     // Adds the reach of the box to the box around it.
     fn merge(&self, reach: [f32; 2], window_bounds: Rect<Pixels>, flags: u32) {
         let mut reaching = self.view.reaching.borrow_mut();
-        if let Some(([bottom, top], plans)) = reaching.last_mut() {
+        if let Some(([bottom, top], plan)) = reaching.last_mut() {
             *bottom = bottom.min(reach[0]);
             *top = top.max(reach[1]);
-            if matches!(*plans, 1 | 2)
+            if matches!(*plan, Reach::Stacks | Reach::Column)
                 && flags & (super::layout::cull::PLAIN_BLOCK | super::layout::cull::UNCULLABLE)
                     == super::layout::cull::PLAIN_BLOCK
-                && (*plans == 1 || flags & super::layout::cull::DEFINITE_SIZE == 0)
+                && (*plan == Reach::Stacks || flags & super::layout::cull::DEFINITE_SIZE == 0)
             {
                 *bottom = bottom.min(f32::from(window_bounds.bottom()));
                 *top = top.max(f32::from(window_bounds.top()));
@@ -1067,18 +1092,11 @@ impl Hooks for DomBox {
     fn bounded(&self) -> bool {
         self.placed.get().1.is_none()
             && !self.drawn
-            && (self.effects.is_none()
-                || [Prop::FILTER, Prop::WEBKIT_FILTER]
-                    .into_iter()
-                    .all(|prop| self.style.get(prop).is_none_or(|value| value == "none")))
+            && (self.effects.is_none() || self.style_flags & STYLE_FILTER == 0)
     }
 
     fn reach(&self, size: Size<Pixels>, corners: [Point<Pixels>; 2]) -> [Point<Pixels>; 2] {
-        if self.drawn
-            || super::effects::TRANSFORM_PROPS
-                .iter()
-                .all(|&prop| self.style.get(prop).is_none_or(|value| value == "none"))
-        {
+        if self.drawn || self.style_flags & STYLE_TRANSFORM == 0 {
             return corners;
         }
         super::effects::transform::reach(&self.local, &self.style, &self.units, size, corners)
@@ -1206,7 +1224,7 @@ impl Hooks for DomBox {
             }
             bounds.origin = exact.origin + offset;
         }
-        if self.style.get(Prop::POSITION) == Some("fixed") {
+        if self.style_flags & STYLE_FIXED != 0 {
             // The clip of a hidden box doesn't reach the fixed boxes in it.
             let store = self.view.store.borrow();
             self.hidden
@@ -1223,7 +1241,7 @@ impl Hooks for DomBox {
                 let by = by.map(px);
                 offset += point(by[0], by[1]);
                 bounds.origin += point(by[0], by[1]);
-                let fixed = self.style.get(Prop::POSITION) == Some("fixed");
+                let fixed = self.style_flags & STYLE_FIXED != 0;
                 self.hidden.set(hidden || fixed && self.hidden.get());
             }
         }
@@ -1241,7 +1259,7 @@ impl Hooks for DomBox {
                 Some((*distance, [x - left + ox, y - top + oy]))
             },
         );
-        let offset_style = (super::effects::offset::reads_page(&self.style) && !self.boxless)
+        let offset_style = (self.style_flags & STYLE_OFFSET_PAGE != 0 && !self.boxless)
             .then(|| {
                 let view = &*self.view;
                 let mut store = view.store.borrow_mut();
@@ -1378,7 +1396,7 @@ impl Hooks for DomBox {
                 let flags = cull.info.get(self.id).map_or(0, |info| info.flags);
                 view.reaching
                     .borrow_mut()
-                    .push(([f32::INFINITY, f32::NEG_INFINITY], self.plans));
+                    .push(([f32::INFINITY, f32::NEG_INFINITY], self.reach));
                 // Warning: the answer can move a scroll bar that changes it back, so a box flips at most twice
                 // while the document stays the same.
                 if let (Some(ends), Some(fits)) = (self.ends, fits)
@@ -1480,19 +1498,7 @@ impl Hooks for DomBox {
             && !self.frame
             && !self.space.joins
             && !self.space.preserves
-            && !super::effects::offset::reads_page(&self.style)
-            && [
-                Prop::FILTER,
-                Prop::WEBKIT_FILTER,
-                Prop::CLIP_PATH,
-                Prop::WEBKIT_CLIP_PATH,
-            ]
-            .into_iter()
-            .all(|prop| {
-                self.style
-                    .get(prop)
-                    .is_none_or(|value| !value.contains("url("))
-            })
+            && self.style_flags & (STYLE_OFFSET_PAGE | STYLE_URL_EFFECT) == 0
     }
 
     fn volatile(&self) -> bool {
@@ -1505,7 +1511,7 @@ impl Hooks for DomBox {
             || self.frame
             || self.space.joins
             || self.space.preserves
-            || super::effects::offset::reads_page(&self.style)
+            || self.style_flags & STYLE_OFFSET_PAGE != 0
     }
 
     fn skippable(&self) -> bool {
@@ -1670,7 +1676,7 @@ impl Hooks for DomBox {
             };
             view.reaching
                 .borrow_mut()
-                .push(([f32::INFINITY, f32::NEG_INFINITY], self.plans));
+                .push(([f32::INFINITY, f32::NEG_INFINITY], self.reach));
             window.scope(renderer::Scope::Offset(offset), |window| inner(window));
             self.reached(window_bounds, flags);
             if moved {
@@ -1714,20 +1720,6 @@ impl Hooks for DomBox {
 }
 
 impl DomBox {
-    // A transform or z-index makes a stacking context, which isolates the blending in it.
-    fn stacked(&self) -> bool {
-        (crate::render::effects::TRANSFORM_PROPS.iter())
-            .any(|&prop| self.style.get(prop).is_some_and(|value| value != "none"))
-            || self
-                .style
-                .get(Prop::Z_INDEX)
-                .is_some_and(|value| value != "auto")
-                && self
-                    .style
-                    .get(Prop::POSITION)
-                    .is_some_and(|value| value != "static")
-    }
-
     fn blended(&self) -> bool {
         let store = self.view.store.borrow();
         let styles = store
@@ -1785,7 +1777,10 @@ impl DomBox {
                 false => inner(window),
             }
         };
-        if matrix.is_none() && self.effects.is_none() && !(self.stacked() && self.blended()) {
+        if matrix.is_none()
+            && self.effects.is_none()
+            && !(self.style_flags & STYLE_STACKED != 0 && self.blended())
+        {
             return inner(window);
         }
         // The matrix of a box in a 3D rendering context goes to the plane of the context.
@@ -1974,7 +1969,8 @@ impl DomBox {
         // Isolation affects mix-blend-mode only. An extra group without blending incorrectly hides content
         // from descendant backdrop filters. As in Chrome, transforms and z-index make stacking contexts that
         // isolate too.
-        let isolate = (style.get(Prop::ISOLATION) == Some("isolate") || self.stacked())
+        let isolate = (style.get(Prop::ISOLATION) == Some("isolate")
+            || self.style_flags & STYLE_STACKED != 0)
             && outer.opacity >= 1.
             && outer.blend_mode == renderer::BlendMode::Normal
             && store

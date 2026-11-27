@@ -36,7 +36,6 @@ struct Gpu {
     context: ID3D11DeviceContext,
     factory: IDXGIFactory2,
     composition: IDCompositionDevice,
-    max_texture: u32,
     layout: ID3D11InputLayout,
     draw: Stage,
     composite: Stage,
@@ -240,15 +239,14 @@ impl Gpu {
             )?;
             let uniform =
                 |bytes: usize| dynamic(&device, bytes, D3D11_BIND_CONSTANT_BUFFER).map(Some);
-            let max_texture = if level.0 >= D3D_FEATURE_LEVEL_11_0.0 {
-                16384
-            } else {
-                8192
-            };
             let pages = Pages {
                 device: device.clone(),
                 context: context.clone(),
-                max: max_texture as i32,
+                max: if level.0 >= D3D_FEATURE_LEVEL_11_0.0 {
+                    16384
+                } else {
+                    8192
+                },
                 pages: Default::default(),
             };
             let atlas = match atlas {
@@ -278,7 +276,6 @@ impl Gpu {
                 context,
                 factory,
                 composition,
-                max_texture,
             })
         }
     }
@@ -571,7 +568,8 @@ impl Renderer {
             self.surface = Some(Surface::new(&self.gpu, self.hwnd, self.size, self.opaque)?);
         }
         let mut frame = mem::take(&mut self.frame);
-        frame.record(scene, self.size, self.gpu.max_texture, true);
+        let max = self.gpu.atlas.pages.borrow().max_side() as u32;
+        frame.record(scene, self.size, max, true);
         let encoded = self.encode(&frame);
         if encoded.is_ok() {
             for &(key, target, region) in &frame.shots {

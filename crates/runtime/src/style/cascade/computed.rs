@@ -160,7 +160,8 @@ impl ComputedStyles {
         }
     }
 
-    // Gives a new detached node the styles of an unstyled node, as a full pass does, and grows every list.
+    // Gives a new detached node the styles of an unstyled node, as a full pass does.
+    // `containers` does not grow, so read it with `get`.
     pub(crate) fn place(&mut self, id: usize, len: usize) {
         let (style, vars) = empty();
         self.values.resize(len, style.clone());
@@ -300,6 +301,8 @@ pub(crate) struct ComputedStyles {
     pub(crate) revision: u64,
     // The native theme bits that this pass styled with.
     pub(crate) theme: u32,
+    // The number of the pass that made these styles. Each pass of a page has another number.
+    pub(crate) pass: u64,
 }
 
 // The nodes that anchor positioning places, with their own styles in `authored`, and the ones with an anchor name.

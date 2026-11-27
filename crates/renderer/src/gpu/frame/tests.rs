@@ -781,3 +781,124 @@ fn scissor_regions_draw_into_the_window() {
     ));
     assert!(frame.layers.is_empty());
 }
+
+#[test]
+fn a_frame_recorded_again_without_damage_draws_each_layer_it_composites() {
+    let mask = Clip::from(bounds([0., 0., 400., 300.]));
+    let mut scene = Scene::default();
+    scene.push(Instance::new(BOX, bounds([0., 0., 400., 300.]), mask));
+    scene.push_effect(
+        EffectState {
+            opacity: 0.5,
+            ..effect(mask)
+        },
+        None,
+    );
+    scene.push(Instance::new(BOX, bounds([20., 20., 300., 200.]), mask));
+    scene.pop_effect();
+    scene.diff(Some(&[]));
+    let mut frame = RenderFrame {
+        scissors: true,
+        ..Default::default()
+    };
+    frame.record(&scene, [400, 300], 16384, true);
+    frame.damage = vec![[0, 0, 100, 100]];
+    frame.record(&scene, [400, 300], 16384, true);
+    frame.clear_damage();
+    frame.record(&scene, [400, 300], 16384, true);
+    let drawn = |texture: usize| {
+        (frame.commands.iter()).any(|command| {
+            matches!(command, Command::Pass(super::Target::Layer(layer), _) if frame.layers[*layer].texture == texture)
+        })
+    };
+    for command in &frame.commands {
+        if let Command::Composite {
+            src: super::Target::Layer(layer),
+            ..
+        } = command
+        {
+            assert!(
+                drawn(frame.layers[*layer].texture),
+                "a composited layer was drawn in this frame"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_frame_recorded_again_without_damage_keeps_the_layers_of_earlier_frames() {
+    let mask = Clip::from(bounds([0., 0., 400., 300.]));
+    let mut scene = Scene::default();
+    scene.push(Instance::new(BOX, bounds([0., 0., 400., 300.]), mask));
+    scene.push_effect(
+        EffectState {
+            opacity: 0.5,
+            ..effect(mask)
+        },
+        None,
+    );
+    scene.push(Instance::new(BOX, bounds([20., 20., 300., 200.]), mask));
+    scene.pop_effect();
+    scene.diff(Some(&[]));
+    let mut frame = RenderFrame {
+        scissors: true,
+        ..Default::default()
+    };
+    frame.record(&scene, [400, 300], 16384, true);
+    frame.record(&scene, [400, 300], 16384, true);
+    assert_eq!(frame.cache.len(), 1, "the second frame keeps the layer");
+    frame.damage = vec![[0, 0, 100, 100]];
+    frame.record(&scene, [400, 300], 16384, true);
+    frame.clear_damage();
+    frame.record(&scene, [400, 300], 16384, true);
+    assert_eq!(frame.cache.len(), 1);
+    let passes = (frame.commands.iter())
+        .filter(|command| matches!(command, Command::Pass(super::Target::Layer(_), _)))
+        .count();
+    assert_eq!(passes, 0, "the kept layer draws its pixels");
+}
+
+#[test]
+fn a_frame_recorded_again_without_damage_turns_the_kept_window_once() {
+    let window = Clip::from(bounds([0., 0., 200., 120.]));
+    let viewport = Clip::from(bounds([0., 0., 200., 120.]));
+    let paint = |scene: &mut Scene, offset: f32| {
+        scene.clear();
+        scene.push(Instance::new(BOX, bounds([0., 0., 200., 120.]), window));
+        scene.begin_scroll(7, viewport, crate::point(0., offset), false);
+        for row in 0..12 {
+            let y = 14. + 22. * row as f32 - offset;
+            let mut quad = Instance::new(BOX, bounds([20., y, 120., 16.]), viewport);
+            quad.color = [row as f32 / 12., 0.4, 0., 1.];
+            scene.push(quad);
+        }
+        // A bar that stays over the viewport.
+        scene.pause_cuts(0);
+        scene.push(Instance::new(BOX, bounds([0., 0., 200., 24.]), window));
+        scene.resume_cuts();
+        scene.end_scroll();
+        scene.diff(Some(&[]));
+    };
+    let run = |again: bool| {
+        let (mut scene, mut frame) = (Scene::default(), RenderFrame::default());
+        frame.keeps_under = true;
+        frame.scissors = true;
+        for offset in [0., 10., 20., 30.] {
+            paint(&mut scene, offset);
+            frame.damage = scene.damage_regions([200, 120], &[]).unwrap_or_default();
+            frame.record(&scene, [200, 120], 16384, true);
+            if again && offset == 20. {
+                frame.clear_damage();
+                frame.record(&scene, [200, 120], 16384, true);
+            }
+            scene.drawn();
+        }
+        frame.under.map(|under| (under.id, under.ring))
+    };
+    let once = run(false);
+    assert!(
+        once.is_some_and(|(_, ring)| ring != [0, 0]),
+        "the scroll turns the ring"
+    );
+    assert_eq!(run(true), once);
+}

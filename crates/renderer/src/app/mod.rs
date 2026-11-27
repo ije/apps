@@ -202,10 +202,6 @@ impl App {
         platform::Platform::quit();
     }
 
-    pub fn activate(&self, force: bool) {
-        platform::Platform::activate(force);
-    }
-
     pub fn read_clipboard(&self) -> Option<String> {
         self.platform.read_clipboard()
     }
@@ -383,17 +379,6 @@ impl WindowEvents for Events {
             window.refresh();
             window.with_view(app, |view, window, app| view.window_changed(window, app));
         });
-    }
-
-    #[cfg(target_os = "macos")]
-    fn will_change(&self, at: Callbacks, kind: &str, bounds: Rect) -> bool {
-        native::will_change(at.id, kind, bounds)
-    }
-
-    // Main decides, and closes the window itself.
-    fn should_close(&self, at: Callbacks) -> bool {
-        native::window_event(at.id, native::WindowEvent::CloseRequested);
-        false
     }
 
     fn appearance_changed(&self, at: Callbacks) {

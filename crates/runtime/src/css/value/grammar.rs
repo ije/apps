@@ -701,7 +701,6 @@ const INITIAL: &[(&str, &str)] = &[
     ("transition-timing-function", "ease"),
     ("translate", "none"),
     ("unicode-bidi", "normal"),
-    ("unicode-bidi", "normal"),
     ("user-select", "auto"),
     ("vertical-align", "baseline"),
     ("view-timeline-axis", "block"),
@@ -868,18 +867,6 @@ pub(crate) const SHORTHANDS: &[(&str, &[&str])] = &[
             "border-left-width",
             "border-left-style",
             "border-left-color",
-        ],
-    ),
-    (
-        "outline",
-        &["outline-width", "outline-style", "outline-color"],
-    ),
-    (
-        "text-decoration",
-        &[
-            "text-decoration-line",
-            "text-decoration-style",
-            "text-decoration-color",
         ],
     ),
     (
@@ -1139,7 +1126,6 @@ pub(crate) fn computed(syntax: &str, value: &str, element: Option<&Lengths>) -> 
     unknown.root = unknown.font;
     let units = element.unwrap_or(&unknown);
     let has = |kind: &str| syntax.contains(kind);
-    let number = number;
     let mut independent = true;
     let (separator, joint) = if has("#") { (',', ", ") } else { (' ', " ") };
     let mut one = |part: &str| match units.math(part, f32::NAN, &[]) {

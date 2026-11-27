@@ -674,8 +674,6 @@ fn gpu(binding: &Binding, ctx: Ptr, id: u64, op: &str, args: &[u8]) -> Result<se
     result
 }
 
-// Makes the buffer of these bytes, or the object that they stand for. The flag tells if it is a buffer.
-
 static CWD: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
 impl Host {

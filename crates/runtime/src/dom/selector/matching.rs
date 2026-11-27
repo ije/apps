@@ -12,7 +12,7 @@ use std::{hash::BuildHasher, rc::Rc};
 
 // Whether a simple selector reads the place of the node among its siblings.
 fn positional(simple: &SimpleSelector) -> bool {
-    let SimpleSelector::Pseudo(name, _, parsed, _) = simple else {
+    let SimpleSelector::Pseudo(name, _, parsed, ..) = simple else {
         return false;
     };
     match name.as_str() {
@@ -259,7 +259,7 @@ fn note_attributes(selector: &Selector, names: &mut Named, subject: bool) {
                 let valued = !operator.is_empty() && names.valued.insert(name.clone());
                 names.generation += u32::from(valued) + u32::from(names.names.insert(name));
             }
-            SimpleSelector::Pseudo(_, _, parsed, _) => {
+            SimpleSelector::Pseudo(_, _, parsed, ..) => {
                 for selector in parsed.iter() {
                     note_attributes(selector, names, false);
                 }
@@ -290,7 +290,7 @@ pub(super) fn reads(selector: &Selector) -> u16 {
         all | match simple {
             SimpleSelector::Class(_) => 1 << 8,
             SimpleSelector::Universal => 0,
-            SimpleSelector::Pseudo(name, _, parsed, _)
+            SimpleSelector::Pseudo(name, _, parsed, ..)
                 if matches!(name.as_str(), "scope" | "is" | "where" | "not") =>
             {
                 parsed.iter().fold(0, |all, selector| all | reads(selector))
@@ -335,7 +335,7 @@ fn auto_rtl(doc: &Document, id: usize, memo: &mut SelectorCache) -> bool {
 fn local(selector: &Selector, anchor: &crate::dom::Node) -> bool {
     selector.simple.iter().all(|simple| match simple {
         SimpleSelector::Attribute(name, ..) => !name.eq_ignore_ascii_case("style"),
-        SimpleSelector::Pseudo(name, _, parsed, _) => {
+        SimpleSelector::Pseudo(name, _, parsed, ..) => {
             // These read ancestors. A checked option reads its select, which is above an optgroup.
             !matches!(
                 name.as_str(),
@@ -455,7 +455,7 @@ fn matches_with(
     let compound = !store
         || selector.previous.is_none()
             && selector.simple.iter().all(|simple| match simple {
-                SimpleSelector::Pseudo(_, _, parsed, _) => parsed.is_empty(),
+                SimpleSelector::Pseudo(_, _, parsed, ..) => parsed.is_empty(),
                 SimpleSelector::Parent(..) => false,
                 _ => true,
             });
@@ -541,7 +541,7 @@ fn matches_with(
                     _ => false,
                 }
             }),
-        SimpleSelector::Pseudo(name, argument, parsed, [a, b]) => match name.as_str() {
+        SimpleSelector::Pseudo(name, argument, parsed, [a, b], _) => match name.as_str() {
             "scope" => scope.map_or(node.tag == "html", |scope| {
                 scope == id || node.parent == Some(scope) && doc.nodes[scope].tag == "#document"
             }),
@@ -1028,13 +1028,13 @@ fn matches_with(
             for simple in &selector.simple {
                 let matched = match simple {
                     SimpleSelector::Universal => continue,
-                    SimpleSelector::Pseudo(name, _, parsed, _) if name == "host" => {
+                    SimpleSelector::Pseudo(name, _, parsed, ..) if name == "host" => {
                         parsed.is_empty()
                             || parsed
                                 .iter()
                                 .any(|s| matches_nested(s, doc, host, scope, memo))
                     }
-                    SimpleSelector::Pseudo(name, _, parsed, _)
+                    SimpleSelector::Pseudo(name, _, parsed, ..)
                         if matches!(name.as_str(), "is" | "where") =>
                     {
                         parsed

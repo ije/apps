@@ -4,7 +4,6 @@ use crate::css::properties::Prop;
 use crate::dom::Document;
 use crate::dom::{LEAVING, TOP_LAYER};
 use crate::style;
-use serde_json::{Value, json};
 
 // Whether a convex shape holds a point.
 fn in_shape(
@@ -24,19 +23,55 @@ fn in_shape(
             .all(|side| cross(side, (side + 1) % shape.len(), at) * turn.signum() >= 0.)
 }
 
-// An ancestor, the clip in it, the blocks it makes, whether the point is in its border, and its matrix with 1 when
-// that is 2D.
-type Around = (usize, [f32; 4], u8, bool, Option<[f32; 5]>);
+// An ancestor, the clip in it, the blocks it makes once read, whether the point is in its border, and its matrix
+// with 1 when that is 2D.
+type Around = (
+    usize,
+    [f32; 4],
+    Option<crate::render::effects::Establishes>,
+    bool,
+    Option<[f32; 5]>,
+);
 
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Hit {
+    // All the elements at the point, the topmost first.
+    All,
+    // The topmost element, like `elementFromPoint()`.
+    First,
+    // The text node nearest to the point, else the topmost element, like `caretPositionFromPoint()`.
+    Caret,
+}
+
+// Where a node is with respect to the drawable content of a canvas.
+#[derive(Clone, Copy, PartialEq)]
+enum Drawn {
+    Page,
+    // In the drawable content of a canvas, which takes no pointer.
+    Hidden,
+    // In an element that the canvas drew.
+    Shown,
+}
+
+// A node to visit, or a node that the point hit.
+struct Pending {
+    id: usize,
+    clip: [f32; 4],
+    hit: bool,
+    depth: usize,
+    drawn: Drawn,
+    ring: bool,
+}
+
+// `First` and `Caret` give one node at most.
 pub(crate) fn hit_test(
     doc: &Document,
     state: &PageState,
     computed: &style::ComputedStyles,
     viewport: [f32; 2],
     [x, y]: [f32; 2],
-    first: bool,
-    caret: bool,
-) -> Value {
+    mode: Hit,
+) -> Vec<usize> {
     let mut nearest = Vec::new();
     // Like Chrome, a box at the height of the point comes first, then the boxes below it, then the boxes above it.
     // Then the vertical and the horizontal distance of the point to the box.
@@ -82,17 +117,31 @@ pub(crate) fn hit_test(
                 && std::iter::successors(Some(id), |&id| up(id)).last() == Some(0)
         })
         .collect();
-    // The last field is 1 in the drawable content of a canvas, which takes no pointer, and 2 in an element
-    // that the canvas drew.
-    let mut pending = vec![(0, screen, false, 0, 0u8, false)];
-    pending.extend(top.iter().map(|&id| (id, screen, false, 0, 0, false)));
+    let mut pending: Vec<Pending> = std::iter::once(0)
+        .chain(top.iter().copied())
+        .map(|id| Pending {
+            id,
+            clip: screen,
+            hit: false,
+            depth: 0,
+            drawn: Drawn::Page,
+            ring: false,
+        })
+        .collect();
     let mut hits = Vec::new();
     // The ancestors of the current node with the clips inside them and, once read, the containing blocks they
-    // make: 1 when read, 2 for absolute and 4 for fixed boxes. The last field is the matrix from the box to the
-    // window, once read.
+    // make. The last field is the matrix from the box to the window, once read.
     let mut path: Vec<Around> = Vec::new();
     let inside = |clip: [f32; 4]| x >= clip[0] && x < clip[2] && y >= clip[1] && y < clip[3];
-    while let Some((id, mut clip, hit, depth, mut drawn, mut ring)) = pending.pop() {
+    while let Some(Pending {
+        id,
+        mut clip,
+        hit,
+        depth,
+        mut drawn,
+        mut ring,
+    }) = pending.pop()
+    {
         if hit {
             hits.push(id);
             continue;
@@ -125,7 +174,7 @@ pub(crate) fn hit_test(
             continue;
         }
         path.truncate(depth);
-        if drawn != 0 {
+        if drawn != Drawn::Page {
             drawn = match state.geometry.drawn.get(&id) {
                 Some(place) => {
                     // The clip is in the content box of the canvas.
@@ -150,9 +199,9 @@ pub(crate) fn hit_test(
                             clip[3].min(y + height),
                         ];
                     }
-                    2
+                    Drawn::Shown
                 }
-                None if node.attrs.contains_key("drawable") => 1,
+                None if node.attrs.contains_key("drawable") => Drawn::Hidden,
                 None => drawn,
             };
         }
@@ -163,16 +212,19 @@ pub(crate) fn hit_test(
                 .get(Prop::POSITION)
                 .filter(|&value| matches!(value, "absolute" | "fixed"))
         {
-            let bit = if escape == "fixed" { 4 } else { 2 };
             (clip, ring) = path
                 .iter_mut()
                 .rev()
                 .find_map(|(id, clip, made, ring, _)| {
-                    if *made == 0 {
-                        let block = crate::render::effects::establishes(&computed.values[*id]);
-                        *made = 1 | (u8::from(block.absolute) * 2) | (u8::from(block.fixed) * 4);
-                    }
-                    (*made & bit != 0).then_some((*clip, *ring))
+                    let made = made.get_or_insert_with(|| {
+                        crate::render::effects::establishes(&computed.values[*id])
+                    });
+                    (if escape == "fixed" {
+                        made.fixed
+                    } else {
+                        made.absolute
+                    })
+                    .then_some((*clip, *ring))
                 })
                 .unwrap_or((screen, false));
         }
@@ -203,13 +255,13 @@ pub(crate) fn hit_test(
             let axes = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y].map(|prop| {
                 canvas
                     || contained
-                    || drawn != 1
+                    || drawn != Drawn::Hidden
                         && style.get(prop).is_some_and(|value| {
                             matches!(value, "hidden" | "clip" | "auto" | "scroll")
                         })
             });
             let clips = canvas
-                || drawn != 1
+                || drawn != Drawn::Hidden
                     && axes.contains(&true)
                     && !super::viewport_overflow(doc, computed, id);
             let out = x < left || x >= left + width || y < top || y >= top + height;
@@ -221,7 +273,7 @@ pub(crate) fn hit_test(
                     .any(|&prop| style.contains(prop));
             // A point outside the bounds is outside a clip on both axes.
             let far = clips && out && axes == [true; 2] && !margin;
-            path.push((id, clip, 0, ring, None));
+            path.push((id, clip, None, ring, None));
             // The size of a transformed box and the point in it.
             let local = (!far
                 && (clips || rounded)
@@ -254,7 +306,7 @@ pub(crate) fn hit_test(
                 && !style
                     .get(Prop::VISIBILITY)
                     .is_some_and(|value| matches!(value, "hidden" | "collapse"));
-            if caret && node.tag == "#text" && selectable && height > 0. {
+            if mode == Hit::Caret && node.tag == "#text" && selectable && height > 0. {
                 nearest.push((id, gap([left, top, width, height])));
             }
             let within = |[left, top, width, height]: [f32; 4]| {
@@ -278,7 +330,7 @@ pub(crate) fn hit_test(
                     .find_map(|(id, ..)| shape_of(*id))
                     .is_none_or(|shape| !shape.is_empty());
             if shown
-                && (caret || !node.tag.starts_with('#'))
+                && (mode == Hit::Caret || !node.tag.starts_with('#'))
                 && match state.geometry.fragments.is_empty() {
                     _ if shape.is_some() => shape.is_some_and(|shape| in_shape(shape, point)),
                     true => within([left, top, width, height]),
@@ -294,13 +346,20 @@ pub(crate) fn hit_test(
                     || shape.is_some_and(|shape| shape.len() != 4)
                     || corners.contains(rect, at))
                 && selectable
-                && drawn != 1
+                && drawn != Drawn::Hidden
             {
-                pending.push((id, clip, true, depth, drawn, false));
+                pending.push(Pending {
+                    id,
+                    clip,
+                    hit: true,
+                    depth,
+                    drawn,
+                    ring: false,
+                });
             }
             // A canvas shows its drawable content only inside its box.
             if canvas {
-                drawn = 1;
+                drawn = Drawn::Hidden;
             }
             let nowhere = [
                 f32::INFINITY,
@@ -374,13 +433,20 @@ pub(crate) fn hit_test(
         {
             continue;
         }
-        path.push((id, clip, 0, ring, None));
+        path.push((id, clip, None, ring, None));
         pending.extend(
             computed
                 .flat_children(doc, id)
                 .iter()
                 .filter(|child| !top.contains(child))
-                .map(|&child| (child, clip, false, depth + 1, drawn, ring)),
+                .map(|&id| Pending {
+                    id,
+                    clip,
+                    hit: false,
+                    depth: depth + 1,
+                    drawn,
+                    ring,
+                }),
         );
     }
     hits.sort_by_cached_key(|&id| {
@@ -437,11 +503,11 @@ pub(crate) fn hit_test(
             break;
         }
     }
-    if caret {
+    if mode == Hit::Caret {
         if let Some(&id) = hits.first()
             && doc.nodes[id].tag == "#text"
         {
-            return json!(id);
+            return vec![id];
         }
         let target = hits.first().copied();
         let editable = |id: usize| {
@@ -484,20 +550,17 @@ pub(crate) fn hit_test(
             })
             .min_by(|a, b| order(&a.1, &b.1))
             .map(|(id, _)| id);
-        return json!(text.or(target));
+        return text.or(target).into_iter().collect();
     }
-    if first && let Some(&id) = hits.first() {
-        return json!(id);
+    if mode == Hit::First {
+        hits.truncate(1);
+        if hits.is_empty() && x >= 0. && y >= 0. && x < viewport[0] && y < viewport[1] {
+            hits.extend(
+                (doc.nodes[0].children.iter()).find(|&&id| !doc.nodes[id].tag.starts_with('#')),
+            );
+        }
     }
-    if first && x >= 0. && y >= 0. && x < viewport[0] && y < viewport[1] {
-        return json!(
-            doc.nodes[0]
-                .children
-                .iter()
-                .find(|&&id| !doc.nodes[id].tag.starts_with('#'))
-        );
-    }
-    if first { Value::Null } else { json!(hits) }
+    hits
 }
 
 // Whether Chrome gives the box a paint layer of its own.

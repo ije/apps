@@ -951,6 +951,7 @@ impl Tree {
             Some(hooks) => hooks.stays(slot.exact, slot.unscroll),
             None => slot.children.is_empty(),
         };
+        let mut skipped = false;
         if let Some(by) = delta.filter(|by| *by != Point::default())
             && follows
             && !self.full
@@ -1041,25 +1042,16 @@ impl Tree {
                     }
                     false => slot.lag += by,
                 }
-                self.shifting &= slot.flat;
-                if slot.escaped().is_some() {
-                    self.unescape(window);
-                }
-                let min = |a: Option<usize>, b: Option<usize>| {
-                    a.zip(b).map(|(a, b)| a.min(b)).or(a).or(b)
-                };
-                self.escapes = min(escapes, own);
-                let painted = own.filter(|_| self.slots[index as usize].style.z_index.is_none());
-                self.foreign = min(foreign, painted);
-                self.still &= delta == self.delta;
-                return;
+                skipped = true;
+            } else {
+                window.truncate_regions(start as usize);
             }
-            window.truncate_regions(start as usize);
         }
         // A box whose boxes all stay where they were copies its regions, and its hooks keep what it gave
         // its ancestors.
         let slot = &self.slots[index as usize];
-        if !clipped
+        if !skipped
+            && !clipped
             && slot.skips
             && stays
             && !(self.unshift && slot.lag != Point::default())
@@ -1094,21 +1086,22 @@ impl Tree {
                 (slot.own_regions, slot.own_touched) = (slot.regions, slot.touched);
                 slot.skipped = self.prepaints;
                 self.remap(index, first..last, None, (pass, regions[0], start), touched);
-                let slot = &mut self.slots[index as usize];
-                self.shifting &= slot.flat;
-                if slot.escaped().is_some() {
-                    self.unescape(window);
-                }
-                let min = |a: Option<usize>, b: Option<usize>| {
-                    a.zip(b).map(|(a, b)| a.min(b)).or(a).or(b)
-                };
-                self.escapes = min(escapes, own);
-                let painted = own.filter(|_| self.slots[index as usize].style.z_index.is_none());
-                self.foreign = min(foreign, painted);
-                self.still &= delta == self.delta;
-                return;
+                skipped = true;
+            } else {
+                window.truncate_regions(start as usize);
             }
-            window.truncate_regions(start as usize);
+        }
+        if skipped {
+            let slot = &self.slots[index as usize];
+            self.shifting &= slot.flat;
+            if slot.escaped().is_some() {
+                self.unescape(window);
+            }
+            self.escapes = escapes.into_iter().chain(own).min();
+            let painted = own.filter(|_| self.slots[index as usize].style.z_index.is_none());
+            self.foreign = foreign.into_iter().chain(painted).min();
+            self.still &= delta == self.delta;
+            return;
         }
         // The boxes inside take the moves of this box without a prepaint, so they move with it from here.
         self.lags

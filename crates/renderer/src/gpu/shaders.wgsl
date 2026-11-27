@@ -1,4 +1,4 @@
-// The one shader source of all backends. Keep the layouts in sync with gpu.rs.
+// The one shader source of all backends. Keep the layouts in sync with gpu/mod.rs.
 //
 // Bindings:
 //   group 0  binding 0  `globals`    uniform Globals, set per pass
@@ -682,9 +682,6 @@ fn draw_fragment(v: Varyings) -> @location(0) vec4<f32> {
                 pixel = vec4<f32>(to_p3(pixel.rgb), pixel.a);
             } else if globals.wide == 0.0 && p3 {
                 pixel = vec4<f32>(gamut(pixel.rgb, P3_TO_SRGB), pixel.a);
-            }
-            if (flags & 1u) != 0u {
-                pixel = vec4<f32>(vec3<f32>(dot(pixel.rgb, REC709)), pixel.a);
             }
             var alpha = pixel.a * v.info.z;
             if any(v.rx != vec4<f32>(0.0)) {

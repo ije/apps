@@ -1,5 +1,5 @@
 use super::super::Build;
-use super::super::border::{border_canvas, inset_shadows};
+use super::super::border::{bands, border_canvas, inset_shadows, shade_border};
 use super::super::kept::{Query, hashed};
 use super::super::margin::{clear_bits, float_side, percent_bound, percent_calc};
 use super::super::query::{inset_axes, only_auto_ratio, positioner, static_mark};
@@ -264,18 +264,21 @@ pub(super) fn pseudo_elements(
         if border_image.is_some() {
             decoration = decoration.border_color(renderer::Color::TRANSPARENT);
         } else if let Some(first) = shown.next() {
-            if shown.all(|side| colors[side] == colors[first]) {
+            let kinds = sides.map(|(_, kind, _)| pseudo.get(kind).unwrap_or("solid"));
+            // Like the borders of a box: shaded or mixed styles, or mixed colors, draw as their own child.
+            if !matches!(kinds[first], "groove" | "ridge" | "inset" | "outset")
+                && shown.all(|side| (colors[side], kinds[side]) == (colors[first], kinds[first]))
+            {
                 decoration = decoration.border_color(colors[first]);
+                decoration.style().border_style =
+                    crate::render::effects::border_style(kinds[first]);
             } else {
                 decoration = decoration.border_color(renderer::Color::TRANSPARENT);
-                let kinds = sides.map(|(_, kind, _)| {
-                    crate::render::effects::border_style(pseudo.get(kind).unwrap_or("solid"))
-                });
                 decoration = decoration.child(border_canvas(
-                    vec![([0.; 4], pseudo_borders, colors)],
+                    bands(pseudo_borders, colors, kinds, shade_border),
                     pseudo_borders,
                     pseudo_radius,
-                    kinds,
+                    kinds.map(crate::render::effects::border_style),
                     true,
                 ));
             }

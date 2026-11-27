@@ -50,6 +50,8 @@ pub(crate) struct StyleCache {
     pub(crate) pass: u64,
     pub(crate) states: u32,
     pub(crate) sheets: HashMap<usize, Sheet>,
+    // The `media` attribute of each `<style>` and `<link>`: the pass that used it, its text and its query.
+    pub(crate) media: HashMap<usize, (u64, String, Stylesheet)>,
     pub(crate) cssom: HashMap<usize, Cssom>,
     pub(crate) constructed: FxHashMap<u32, Rc<Stylesheet>>,
     pub(crate) derived: Derived,
@@ -99,7 +101,6 @@ pub(crate) struct StyleCache {
 pub(crate) struct Environment {
     pub(crate) viewport: [f32; 2],
     pub(crate) metrics: Option<f32>,
-    pub(crate) reduced_motion: bool,
     pub(crate) native_theme: u32,
     pub(crate) registry: Rc<Registry>,
     pub(crate) scheme: Option<Rc<str>>,
@@ -262,6 +263,7 @@ impl StyleCache {
             self.matches.forget_selectors();
         }
         self.sheets.retain(|_, (used, ..)| *used == pass);
+        self.media.retain(|_, (used, ..)| *used == pass);
         self.tables.retain(|_, table| table.pass == pass);
         if self
             .walk
@@ -304,7 +306,6 @@ pub(crate) struct StyleContext {
     pub shadows: Rc<Shadows>,
     pub top_layer: bool,
     pub animated: HashMap<usize, Style>,
-    pub reduced_motion: bool,
     pub theme: u32,
     pub scale: f32,
     pub aliases: HashMap<String, String>,
@@ -342,30 +343,14 @@ pub(crate) fn compute_styles(
     context: Option<&StyleContext>,
 ) -> ComputedStyles {
     let mut out = ComputedStyles::default();
-    let (reduced_motion, native_theme) = context.map_or_else(
-        || (false, 0),
-        |context| (context.reduced_motion, context.theme),
-    );
+    let native_theme = context.map_or(0, |context| context.theme);
     if let Some(text) = text_system {
         font_names(
             text,
             context.map_or(&HashMap::new(), |context| &context.aliases),
         );
     }
-    let blank = || Collect {
-        width,
-        height,
-        reduced_motion,
-        native_theme,
-        rules: Vec::new(),
-        container: None,
-        media: None,
-        blocks: Vec::new(),
-        layers: Vec::new(),
-        keyframes: HashMap::new(),
-        properties: Registry::default(),
-        layered: HashMap::new(),
-    };
+    let blank = || Collect::new(width, height, native_theme);
     let shadows = context.map_or_else(Default::default, |context| context.shadows.clone());
     style_cache.shadows = shadows.clone();
     let walk = style_cache.walk(doc, &shadows);
@@ -383,27 +368,16 @@ pub(crate) fn compute_styles(
             .iter()
             .any(|&(id, _)| doc.nodes[id as usize].state & crate::dom::FULLSCREEN != 0);
     let inserted = context.map_or(&[][..], |context| &context.inserted[..]);
-    let _user = |sheet: &Rc<Stylesheet>| {
-        inserted
-            .iter()
-            .any(|(inserted, user)| *user && Rc::ptr_eq(inserted, sheet))
-    };
     let scale = context.map_or(1., |context| context.scale);
     let metrics = text_system.map(|_| scale);
     let old = &mut style_cache.environment;
-    if old.viewport != [width, height]
-        || old.metrics != metrics
-        || old.reduced_motion != reduced_motion
-        || old.native_theme != native_theme
+    if old.viewport != [width, height] || old.metrics != metrics || old.native_theme != native_theme
     {
         fast = false;
         style_cache.full = true;
-        let resized = old.metrics == metrics
-            && old.reduced_motion == reduced_motion
-            && old.native_theme == native_theme;
+        let resized = old.metrics == metrics && old.native_theme == native_theme;
         old.viewport = [width, height];
         old.metrics = metrics;
-        old.reduced_motion = reduced_motion;
         old.native_theme = native_theme;
         style_cache.values.retain(|_, values| {
             values.retain(|value| resized && !value.viewport);
@@ -480,7 +454,6 @@ pub(crate) fn compute_styles(
         fullscreen,
         &mut fast,
         [width, height],
-        reduced_motion,
         native_theme,
     );
     let indices: FxHashMap<usize, usize> = style_cache
@@ -640,7 +613,7 @@ pub(crate) fn compute_styles(
         stored,
     }
     .run(style_cache, &mut out, &mut orphans);
-    let last = context.and_then(|context| context.previous.as_deref());
+    out.pass = style_cache.stamp;
     if stored {
         if !fast {
             style_cache.matches.clean_all();
@@ -655,9 +628,7 @@ pub(crate) fn compute_styles(
             scopes: used,
         });
     }
-    number_lists(
-        doc, &walk, &mut out, previous, last, fast, recount, counters,
-    );
+    number_lists(doc, &walk, &mut out, previous, fast, recount, counters);
     style_cache.collapse_tables(doc, &walk, &mut out, [width, height], previous, fast);
     anonymous_tables(doc, &walk, &shadows, &mut out, previous, fast, &mut orphans);
     style_cache.orphans = orphans;

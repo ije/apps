@@ -1061,6 +1061,18 @@ fn gradient<'a>(
     })
 }
 
+// The `background-repeat` or `mask-repeat` keyword of each axis.
+pub(crate) fn repeat_modes(repeat: &str) -> [&str; 2] {
+    let mut words = repeat.split_whitespace();
+    match (words.next(), words.next()) {
+        (Some("repeat-x"), None) => ["repeat", "no-repeat"],
+        (Some("repeat-y"), None) => ["no-repeat", "repeat"],
+        (Some(one), None) => [one; 2],
+        (Some(x), Some(y)) => [x, y],
+        (None, _) => ["repeat"; 2],
+    }
+}
+
 /// The tile and its place in an area, as `tile` gives them, after `round` sized it, and the step from one tile to
 /// the next on each axis, or `None` where it doesn't repeat.
 pub(crate) fn tile_repeat(
@@ -1072,14 +1084,7 @@ pub(crate) fn tile_repeat(
     height: f32,
     natural: Option<[f32; 2]>,
 ) -> ([[f32; 2]; 2], [Option<f32>; 2]) {
-    let words: Vec<&str> = repeat.split_whitespace().collect();
-    let modes = match words.as_slice() {
-        ["repeat-x"] => ["repeat", "no-repeat"],
-        ["repeat-y"] => ["no-repeat", "repeat"],
-        [one] => [*one; 2],
-        [a, b, ..] => [*a, *b],
-        [] => ["repeat"; 2],
-    };
+    let modes = repeat_modes(repeat);
     let extent = [width, height];
     let [mut sides, mut at] = tile(size, position, units, width, height, natural);
     if modes.contains(&"round") {

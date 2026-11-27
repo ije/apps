@@ -29,7 +29,7 @@ use self::pseudos::pseudo_elements;
 use self::replaced::replaced;
 use self::svg::svg_box;
 use self::turn::{turn, turn_corners, turn_style};
-use super::border::{border_canvas, fieldset_border, inset_shadows, shade_border};
+use super::border::{bands, border_canvas, fieldset_border, inset_shadows, shade_border};
 use super::columns::columns;
 use super::kept::{Query, Read, Replay, hashed};
 use super::margin::{definite_line, in_flow, margins, overscroll, viewport_overflow};
@@ -503,7 +503,6 @@ pub(super) fn create(
         (Some("center" | "-webkit-center"), _) => Some(renderer::AlignContent::Center),
         _ => None,
     };
-    let line_align = Some(renderer::AlignItems::Baseline);
     let mut cx = Cx {
         reader,
         build,
@@ -552,7 +551,6 @@ pub(super) fn create(
         layers: RefCell::default(),
         rtl,
         line_justify,
-        line_align,
         all_inline: false,
         hit: None,
     };
@@ -697,7 +695,7 @@ pub(super) fn create(
         if hit.is_none() {
             el = el.flex_row().flex_wrap();
             el.style().justify_content = line_justify;
-            el.style().align_items = line_align;
+            el.style().align_items = Some(renderer::AlignItems::Baseline);
             // A box that is stretched taller keeps its lines at the top, without space between them.
             el.style().align_content = Some(renderer::AlignContent::FlexStart);
             el.style().inline = renderer::Inline::Lines;
@@ -1670,54 +1668,17 @@ pub(super) fn create(
                 .any(|side| border_colors[side] != border_colors[first])
         })
     {
-        let mut bands = vec![([0.; 4], borders, [renderer::Color::TRANSPARENT; 4])];
-        let split = (0..4).any(|side| matches!(border_kinds[side], "groove" | "ridge"));
-        if split {
-            bands.push(([0.; 4], [0.; 4], [renderer::Color::TRANSPARENT; 4]));
-        }
         // Like Chrome, the shades of an `<hr>` don't follow its `color`.
         let ink = (node.tag == "hr")
             .then(|| style.get(Prop::COLOR).and_then(css::value::color::paint))
             .flatten();
-        let shade_border = |color, dark| match ink == Some(color) {
-            true if dark => renderer::Color::hex(0x9a9a9aff),
-            true => renderer::Color::hex(0xeeeeeeff),
-            false => shade_border(color, dark),
-        };
-        for side in 0..4 {
-            let color = border_colors[side];
-            let raised = side == 0 || side == 3;
-            let (outer, inner) = match border_kinds[side] {
-                "inset" => (shade_border(color, raised), None),
-                "outset" => (shade_border(color, !raised), None),
-                "groove" => (
-                    shade_border(color, raised),
-                    Some(shade_border(color, !raised)),
-                ),
-                "ridge" => (
-                    shade_border(color, !raised),
-                    Some(shade_border(color, raised)),
-                ),
-                _ => (color, None),
-            };
-            bands[0].2[side] = outer;
-            if let Some(inner) = inner {
-                let half = borders[side] / 2.;
-                bands[0].1[side] = half;
-                bands[1].0[side] = half;
-                bands[1].1[side] = half;
-                bands[1].2[side] = inner;
+        let bands = bands(borders, border_colors, border_kinds, |color, dark| {
+            match ink == Some(color) {
+                true if dark => renderer::Color::hex(0x9a9a9aff),
+                true => renderer::Color::hex(0xeeeeeeff),
+                false => shade_border(color, dark),
             }
-        }
-        if split {
-            bands[1].0 = std::array::from_fn(|side| {
-                if bands[1].1[side] > 0. {
-                    bands[1].0[side]
-                } else {
-                    borders[side]
-                }
-            });
-        }
+        });
         let mut border = border_canvas(
             bands,
             borders,
@@ -1872,7 +1833,7 @@ pub(super) fn create(
     {
         el = el.cursor(renderer::Cursor::Text);
     }
-    let mut plans = 0;
+    let mut reach = crate::render::paint::Reach::Plain;
     let cell = slot.is_some() && style::role(styles, id) == style::CELL;
     // As in browsers, a button centers its content in its height, and `align-content` aligns it in a block.
     // Content that overflows starts at the top, unless the value says `unsafe`.
@@ -1929,7 +1890,7 @@ pub(super) fn create(
             own,
             preserve,
             &mut cut_parts,
-            &mut plans,
+            &mut reach,
         );
     }
     if let Some([width, height]) = intrinsic.filter(|size| skipped && size != &[0.; 2]) {
@@ -2031,7 +1992,7 @@ pub(super) fn create(
         replaced,
         bars,
         cut_parts,
-        plans,
+        reach,
         text_clip,
         carry.pseudo_origin,
     )

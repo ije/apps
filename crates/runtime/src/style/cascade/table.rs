@@ -118,8 +118,6 @@ impl StyleCache {
             authored,
             ..
         } = out;
-        let _count = doc.nodes.len();
-        // This adjusts styles after caching, so cached styles stay unadjusted.
         const SIDES: [[Prop; 4]; 4] = [
             [
                 Prop::BORDER_TOP_STYLE,

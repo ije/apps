@@ -37,7 +37,7 @@ pub(crate) struct Instance {
     // shadow: flag 1 inset, blur sigma
     // line: flags 1 wavy, 2 dashes, 4 round dots, thickness, aux the length and period of dashes
     // glyph: -, atlas page
-    // image: flag 1 grayscale, flag 2 premultiplied source, flag 4 pixelated, flag 8 Display P3 source, opacity,
+    // image: flag 2 premultiplied source, flag 4 pixelated, flag 8 Display P3 source, opacity,
     // atlas page
     pub info: [f32; 4],
     // Corner shapes from `Radii::shape_array`: of `radii` (and `aux_radii`), then of `round_radii`.

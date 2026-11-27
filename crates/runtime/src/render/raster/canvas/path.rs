@@ -295,10 +295,9 @@ pub fn svg_path(d: &str) -> Vec<f64> {
         .replace('&', "&amp;")
         .replace('"', "&quot;")
         .replace('<', "&lt;");
-    let tree = svg_tree(
-        &format!(r#"<svg xmlns="http://www.w3.org/2000/svg"><path d="{d}"/></svg>"#),
-        false,
-    );
+    let tree = svg_tree(&format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><path d="{d}"/></svg>"#
+    ));
     let Some(usvg::Node::Path(path)) = tree
         .as_ref()
         .ok()

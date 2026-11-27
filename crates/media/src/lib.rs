@@ -826,6 +826,8 @@ enum Source {
 // The decoder and its progress, kept while the player has no thread.
 struct Decoder {
     media: *mut c_void,
+    // FFmpeg and the WAV reader read the bytes in place, so they live until `apps_ffmpeg_close`.
+    source: Source,
     waker: Waker,
     duration: f64,
     has_video: bool,
@@ -916,6 +918,7 @@ fn open(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
     }
     let decoder = Decoder {
         media,
+        source,
         waker,
         duration,
         has_video,
@@ -943,6 +946,7 @@ fn open(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
 fn run(shared: Arc<Shared>, decoder: Decoder) {
     let Decoder {
         media,
+        source,
         waker,
         duration,
         has_video,
@@ -1193,6 +1197,7 @@ fn run(shared: Arc<Shared>, decoder: Decoder) {
         let Some(wait) = wait else {
             state.parked = Some(Decoder {
                 media,
+                source,
                 waker,
                 duration,
                 has_video,
@@ -1673,5 +1678,73 @@ mod tests {
             assert_eq!(lock(&shared.state).seek, Some(expected));
             assert_eq!(shared.sound.time().0, expected);
         }
+    }
+
+    #[test]
+    fn paused_players_keep_their_bytes() {
+        extern "C" fn waker() -> *mut c_void {
+            std::ptr::null_mut()
+        }
+        extern "C" fn wake(_: *mut c_void) {}
+        extern "C" fn alloc(length: usize) -> *mut u8 {
+            Box::into_raw(vec![0u8; length].into_boxed_slice()).cast()
+        }
+        extern "C" fn free(bytes: *mut u8, length: usize) {
+            drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(bytes, length)) });
+        }
+        extern "C" fn surfaces() -> bool {
+            false
+        }
+        let host = Host {
+            waker,
+            wake,
+            drop_waker: wake,
+            alloc,
+            free,
+            surfaces,
+        };
+        let media = unsafe { apps_media_new((&raw const host).cast()) };
+        let data: Vec<u8> = (0..4000).flat_map(|_| 16384i16.to_le_bytes()).collect();
+        let mut bytes =
+            b"RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x40\x1f\0\0\x80\x3e\0\0\x02\0\x10\0data"
+                .to_vec();
+        bytes.extend((data.len() as u32).to_le_bytes());
+        bytes.extend(data);
+        unsafe {
+            apps_media_open(
+                media,
+                1,
+                std::ptr::null(),
+                bytes.as_ptr(),
+                bytes.len(),
+                false,
+            )
+        };
+        let shared = unsafe { &*media.cast::<Media>() }.players[&1]
+            .shared
+            .clone();
+        // Plays without the audio output.
+        shared.sound.unmixed.store(true, Relaxed);
+        let wait = |done: &dyn Fn(&State) -> bool| {
+            let start = Instant::now();
+            while !done(&lock(&shared.state)) {
+                assert!(start.elapsed() < Duration::from_secs(10));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait(&|state| state.parked.is_some());
+        // Freed bytes would get these values.
+        let reused: Vec<_> = (0..64).map(|_| vec![0x55u8; bytes.len()]).collect();
+        unsafe { apps_media_control(media, 1, PLAY, 0.) };
+        wait(&|state| state.events.iter().any(|event| event == "\"ended\""));
+        let (ring, channels) = shared.sound.ring.get().unwrap();
+        assert!(
+            ring.iter()
+                .enumerate()
+                .all(|(index, sample)| index % channels >= 2
+                    || f32::from_bits(sample.load(Relaxed)) == 0.5)
+        );
+        drop(reused);
+        unsafe { apps_media_free(media) };
     }
 }

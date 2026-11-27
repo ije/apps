@@ -2,7 +2,7 @@
 // and `timeline-scope`, in Chrome's form.
 use crate::css::value::{grammar::syntax_matches, tokens::components};
 
-pub(crate) const RANGES: [&str; 6] = [
+const RANGES: [&str; 6] = [
     "cover",
     "contain",
     "entry",
@@ -12,7 +12,7 @@ pub(crate) const RANGES: [&str; 6] = [
 ];
 pub(crate) const AXES: [&str; 4] = ["block", "inline", "x", "y"];
 // Each shorthand and its longhands.
-pub(crate) const SHORTHANDS: [(&str, &[&str]); 3] = [
+const SHORTHANDS: [(&str, &[&str]); 3] = [
     (
         "animation-range",
         &["animation-range-start", "animation-range-end"],

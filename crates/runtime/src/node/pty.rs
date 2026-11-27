@@ -18,9 +18,14 @@ struct Session {
     events: mpsc::Receiver<Vec<u8>>,
     pending: Vec<u8>,
     eof: bool,
-    exited: bool,
+    exit: Exit,
+}
+
+enum Exit {
+    Running,
     // The exit event that waits for the output, and its deadline.
-    exit: Option<(Value, Instant)>,
+    Waiting(Value, Instant),
+    Reported,
 }
 
 #[cfg(all(test, unix))]
@@ -58,7 +63,11 @@ mod tests {
 }
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take().filter(|_| !self.exited) {
+        if let Some(mut child) = self
+            .child
+            .take()
+            .filter(|_| matches!(self.exit, Exit::Running))
+        {
             // kill() waits up to 200 ms for SIGHUP, so it must not run on the UI thread.
             let _ = std::thread::Builder::new()
                 .name("apps-pty-kill".into())
@@ -171,8 +180,7 @@ impl State {
                         events,
                         pending: Vec::new(),
                         eof: false,
-                        exited: false,
-                        exit: None,
+                        exit: Exit::Running,
                     },
                 );
                 Ok(json!({"id":self.next,"pid":pid}))
@@ -205,13 +213,12 @@ impl State {
                         events.push(json!({"id":id,"type":"data","data":String::from_utf8_lossy(&data[..end])}));
                         session.pending.drain(..end);
                     }
-                    if !session.exited
+                    if matches!(session.exit, Exit::Running)
                         && let Some(child) = &mut session.child
                         && let Some(status) = child.try_wait()?
                     {
                         let event = json!({"id":id,"type":"exit","exitCode":status.exit_code(),"signal":status.signal()});
-                        session.exit = Some((event, Instant::now() + EXIT_WAIT));
-                        session.exited = true;
+                        session.exit = Exit::Waiting(event, Instant::now() + EXIT_WAIT);
                         if !session.eof {
                             let waker = crate::jsc::Waker::current();
                             std::thread::Builder::new()
@@ -222,13 +229,13 @@ impl State {
                                 })?;
                         }
                     }
-                    if let Some((event, _)) = session
-                        .exit
-                        .take_if(|(_, deadline)| session.eof || Instant::now() >= *deadline)
+                    if matches!(session.exit, Exit::Waiting(_, deadline) if session.eof || Instant::now() >= deadline)
+                        && let Exit::Waiting(event, _) =
+                            std::mem::replace(&mut session.exit, Exit::Reported)
                     {
                         events.push(event);
                     }
-                    if session.exited && session.exit.is_none() && session.eof {
+                    if matches!(session.exit, Exit::Reported) && session.eof {
                         events.push(json!({"id":id,"type":"close"}));
                         closed.push(id);
                     }
@@ -251,7 +258,11 @@ impl State {
                     )?)?,
                     _ => {
                         // Never signal a reaped child; its PID may belong to another process.
-                        let Some(child) = session.child.as_mut().filter(|_| !session.exited) else {
+                        let Some(child) = session
+                            .child
+                            .as_mut()
+                            .filter(|_| matches!(session.exit, Exit::Running))
+                        else {
                             return Ok(Value::Null);
                         };
                         #[cfg(unix)]

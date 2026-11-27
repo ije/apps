@@ -1,5 +1,6 @@
+use crate::platform::lock;
 use anyhow::{Context as _, Result, bail};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::{cell::RefCell, thread::JoinHandle, time::Duration, time::Instant};
 use x11rb::connection::Connection as _;
 use x11rb::protocol::Event;
@@ -21,6 +22,20 @@ x11rb::atom_manager! {
         PlainUtf8Upper: b"text/plain;charset=UTF-8",
         Plain: b"text/plain",
         Landing: b"APPS_SELECTION",
+    }
+}
+
+impl Names {
+    // The text targets, best first.
+    fn text(&self) -> [Atom; 6] {
+        [
+            self.Utf8,
+            self.PlainUtf8,
+            self.PlainUtf8Upper,
+            self.Latin1,
+            self.Text,
+            self.Plain,
+        ]
     }
 }
 
@@ -52,11 +67,6 @@ struct Handover {
     finished: Option<mpsc::SyncSender<()>>,
     read: bool,
     done: bool,
-}
-
-// A lock that a panic on the other thread doesn't spoil: the data stays whole.
-fn hold<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 // The data of each target, with text under all text targets.
@@ -113,27 +123,15 @@ impl Selection {
 
     fn kinds(&self) -> Result<Vec<String>> {
         let names = &self.owner.names;
-        let text = [
-            names.Utf8,
-            names.PlainUtf8,
-            names.PlainUtf8Upper,
-            names.Latin1,
-            names.Text,
-            names.Plain,
-        ];
+        let text = names.text();
         let atoms: Vec<Atom> = match self.owner.owns()? {
-            true => hold(&self.owner.items)
+            true => lock(&self.owner.items)
                 .iter()
                 .flatten()
                 .map(|(atom, _)| *atom)
                 .collect(),
             false => {
-                let mut reader = self.reader.borrow_mut();
-                let port = match &mut *reader {
-                    Some(port) => port,
-                    empty => empty.insert(Port::open()?),
-                };
-                let (data, _) = self.fetch(port, names.Targets)?;
+                let (data, _) = self.fetch(names.Targets)?;
                 let words = data.as_chunks::<4>().0.iter();
                 words.map(|word| u32::from_ne_bytes(*word)).collect()
             }
@@ -165,16 +163,11 @@ impl Selection {
             let atom = self.owner.port.conn.intern_atom(false, kind.as_bytes())?;
             let atom = atom.reply()?.atom;
             if self.owner.owns()? {
-                let items = hold(&self.owner.items);
+                let items = lock(&self.owner.items);
                 let item = items.iter().flatten().find(|(own, _)| *own == atom);
                 return Ok(item.context("the clipboard has no such type")?.1.to_vec());
             }
-            let mut reader = self.reader.borrow_mut();
-            let port = match &mut *reader {
-                Some(port) => port,
-                empty => empty.insert(Port::open()?),
-            };
-            Ok(self.fetch(port, atom)?.0)
+            Ok(self.fetch(atom)?.0)
         };
         read()
             .inspect_err(|error| eprintln!("apps: clipboard: {error:#}"))
@@ -190,27 +183,19 @@ impl Selection {
     fn text(&self) -> Result<String> {
         let names = &self.owner.names;
         if self.owner.owns()? {
-            let items = hold(&self.owner.items);
+            let items = lock(&self.owner.items);
             let text = items.iter().flatten().find(|(atom, _)| *atom == names.Utf8);
             return Ok(String::from_utf8(
                 text.context("the clipboard holds no text")?.1.to_vec(),
             )?);
         }
-        let mut reader = self.reader.borrow_mut();
-        let port = match &mut *reader {
-            Some(port) => port,
-            empty => empty.insert(Port::open()?),
-        };
-        let kinds = [
-            names.Utf8,
-            names.PlainUtf8,
-            names.PlainUtf8Upper,
-            names.Latin1,
-            names.Text,
-            names.Plain,
-        ];
+        // Opens the reader once, so a failed connection is not tried again for each target.
+        if self.reader.borrow().is_none() {
+            *self.reader.borrow_mut() = Some(Port::open()?);
+        }
+        let kinds = names.text();
         let listed = self
-            .fetch(port, names.Targets)
+            .fetch(names.Targets)
             .ok()
             .filter(|(_, kind)| *kind == names.AtomList);
         let offered: Option<Vec<Atom>> = listed.map(|(data, _)| {
@@ -228,7 +213,7 @@ impl Selection {
         // With a target list, only the best target is asked for.
         let tries = if offered.is_some() { 1 } else { kinds.len() };
         for kind in kinds.into_iter().filter(shared).take(tries) {
-            let Ok((data, got)) = self.fetch(port, kind) else {
+            let Ok((data, got)) = self.fetch(kind) else {
                 continue;
             };
             match got {
@@ -240,8 +225,13 @@ impl Selection {
         bail!("the clipboard holds no text")
     }
 
-    fn fetch(&self, port: &Port, target: Atom) -> Result<(Vec<u8>, Atom)> {
+    fn fetch(&self, target: Atom) -> Result<(Vec<u8>, Atom)> {
         let names = &self.owner.names;
+        let mut reader = self.reader.borrow_mut();
+        let port = match &mut *reader {
+            Some(port) => port,
+            empty => empty.insert(Port::open()?),
+        };
         let (conn, window) = (&port.conn, port.window);
         // A fresh property shows which change answers this request.
         conn.delete_property(window, names.Landing)?;
@@ -345,7 +335,7 @@ impl Owner {
             let atom = conn.intern_atom(false, kind.as_bytes())?.reply()?.atom;
             owned.push((atom, data));
         }
-        *hold(&self.items) = Some(owned);
+        *lock(&self.items) = Some(owned);
         conn.set_selection_owner(self.port.window, names.CLIPBOARD, x11rb::CURRENT_TIME)?;
         conn.flush()?;
         Ok(())
@@ -367,7 +357,7 @@ impl Owner {
             match self.port.conn.wait_for_event()? {
                 Event::DestroyNotify(gone) if gone.window == self.port.window => return Ok(()),
                 Event::SelectionClear(lost) if lost.selection == names.CLIPBOARD => {
-                    *hold(&self.items) = None;
+                    *lock(&self.items) = None;
                 }
                 Event::SelectionRequest(request) => {
                     // One refused answer, like a text past the request size limit, must not end the server.
@@ -389,7 +379,7 @@ impl Owner {
     }
 
     fn progress(&self, step: impl FnOnce(&mut Handover)) {
-        let mut handover = hold(&self.handover);
+        let mut handover = lock(&self.handover);
         if handover.finished.is_some() {
             step(&mut handover);
             if handover.read && handover.done {
@@ -410,7 +400,7 @@ impl Owner {
         } else {
             request.property
         };
-        let items = hold(&self.items).clone();
+        let items = lock(&self.items).clone();
         let (to, ours) = (request.requestor, request.selection == names.CLIPBOARD);
         let given = match items.filter(|_| ours) {
             Some(items) if request.target == names.Targets => {
@@ -456,12 +446,12 @@ impl Owner {
 
     // Waits for the clipboard manager at most 100 ms.
     fn hand_over(&self) -> Result<()> {
-        let empty = hold(&self.items).is_none();
+        let empty = lock(&self.items).is_none();
         if empty || !self.owns()? {
             return Ok(());
         }
         let (finished, wait) = mpsc::sync_channel(1);
-        *hold(&self.handover) = Handover {
+        *lock(&self.handover) = Handover {
             finished: Some(finished),
             ..Handover::default()
         };

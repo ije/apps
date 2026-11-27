@@ -17,14 +17,20 @@ macro_rules! same {
 #[derive(Default, Clone)]
 pub struct Paragraph(Rc<RefCell<Option<ParagraphState>>>);
 
+#[derive(Clone, Copy, PartialEq)]
+enum Shaped {
+    Free,
+    MinContent,
+    Width(Pixels),
+}
+
 struct ParagraphState {
-    shaped_width: Option<Pixels>,
+    shaped: Shaped,
     lines: Rc<[TextLine]>,
     line_height: Pixels,
     top: Pixels,
     wrap_width: Option<Pixels>,
     floats: Option<Rc<[[f32; 4]]>>,
-    truncated: bool,
     // Where the ellipsis starts.
     cut: Option<usize>,
     size: Size<Pixels>,
@@ -105,7 +111,7 @@ impl TextState {
                     });
                     last = Some((a, b));
                     joined
-                        && same!(a, b; len, font, letter_spacing, word_spacing, font_size, inset, nowrap, clear, hyphenation, rtl, plaintext, embedding)
+                        && same!(a, b; len, font, letter_spacing, word_spacing, font_size, inset, nowrap, preserve, clear, tab_size, hyphenation, rtl, plaintext, embedding)
                 });
         if !same {
             return false;
@@ -175,11 +181,11 @@ impl TextState {
             && wrap_width == inner.wrap_width
             && (wraps || style.text_indent_percent == 0.)
             && inner.floats == floats
-            && inner.shaped_width != Some(px(0.))
+            && inner.shaped != Shaped::MinContent
             && truncate.is_none()
             // A truncated layout answers an unconstrained probe with the truncated size,
             // so it is never reused.
-            && !inner.truncated
+            && inner.cut.is_none()
         {
             return (inner.size, Some(inner.baselines));
         }
@@ -399,13 +405,16 @@ impl TextState {
         if probe.is_none() || layout.0.borrow().is_none() {
             self.repaint.set(false);
             *layout.0.borrow_mut() = Some(ParagraphState {
-                shaped_width: if min_content { Some(px(0.)) } else { width },
+                shaped: match width {
+                    _ if min_content => Shaped::MinContent,
+                    Some(width) => Shaped::Width(width),
+                    None => Shaped::Free,
+                },
                 lines,
                 line_height,
                 top,
                 wrap_width,
                 floats,
-                truncated,
                 cut,
                 size,
                 baselines,
@@ -452,14 +461,17 @@ impl TextState {
         let style = self.style.borrow();
         let wraps = style.white_space == WhiteSpace::Normal || style.text_overflow.is_some();
         drop(style);
-        let stale =
-            self.repaint.take()
-                || wraps
-                    && self.layout.0.borrow().as_ref().is_some_and(|inner| {
-                        match inner.shaped_width {
-                            Some(shaped) => (shaped - width).abs() > px(0.01),
-                            None => inner.size.width > width + px(0.01),
-                        }
+        let stale = self.repaint.take()
+            || wraps
+                && self
+                    .layout
+                    .0
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|inner| match inner.shaped {
+                        Shaped::Width(shaped) => (shaped - width).abs() > px(0.01),
+                        Shaped::MinContent => width.abs() > px(0.01),
+                        Shaped::Free => inner.size.width > width + px(0.01),
                     });
         if stale {
             let floats = self.floats.borrow().clone();
@@ -823,13 +835,12 @@ mod tests {
             |runs: Vec<TextRun>| TextState::new("ab cd".into(), Some(runs.into()), &style, 1.);
         let old = state(vec![run(2, 0xff0000ff), run(3, 0x0000ffff)]);
         *old.layout.0.borrow_mut() = Some(ParagraphState {
-            shaped_width: None,
+            shaped: Shaped::Free,
             lines: Rc::new([]),
             line_height: px(0.),
             top: px(0.),
             wrap_width: None,
             floats: None,
-            truncated: false,
             cut: None,
             size: Size::default(),
             baselines: [px(0.); 2],
@@ -857,5 +868,25 @@ mod tests {
             }
         ));
         assert!(!same_shaping(&style, &wide));
+    }
+
+    #[test]
+    fn layout_changes_drop_the_measure() {
+        let style = TextStyle::default();
+        let state =
+            |run: TextRun| TextState::new("a\tb".into(), Some(vec![run].into()), &style, 1.);
+        let old = state(style.run(3));
+        for run in [
+            TextRun {
+                tab_size: 2.,
+                ..style.run(3)
+            },
+            TextRun {
+                preserve: !style.run(3).preserve,
+                ..style.run(3)
+            },
+        ] {
+            assert!(!old.keep(&state(run)));
+        }
     }
 }

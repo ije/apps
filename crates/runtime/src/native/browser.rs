@@ -10,12 +10,20 @@ pub enum Parent<W> {
     Gone,
 }
 
+enum Attach {
+    Pending,
+    Attached,
+}
+
 #[derive(Default)]
 pub struct State {
     views: HashMap<u64, Browser>,
     next_id: u64,
-    attaches: Vec<(u64, u64)>,
-    parents: HashMap<u64, u64>,
+    // The views that wait for their window, in the order of their attach calls, which stacks the native views.
+    // A view that is no longer pending stays here until the next `attach_pending`.
+    pending: Vec<u64>,
+    // The window of each view and whether the view is in it yet.
+    parents: HashMap<u64, (u64, Attach)>,
 }
 
 impl State {
@@ -66,7 +74,6 @@ impl State {
                 let id = arguments[0].as_u64().context("Expected browser id")?;
                 self.views.remove(&id);
                 self.parents.remove(&id);
-                self.attaches.retain(|(view, _)| *view != id);
                 Ok(Value::Null)
             }
             _ => {
@@ -75,15 +82,14 @@ impl State {
                 match operation {
                     "attach" => {
                         let parent = arguments[1].as_u64().context("Expected parent window id")?;
-                        self.attaches.retain(|(view, _)| *view != id);
-                        self.attaches.push((id, parent));
-                        self.parents.insert(id, parent);
+                        self.pending.retain(|view| *view != id);
+                        self.pending.push(id);
+                        self.parents.insert(id, (parent, Attach::Pending));
                         Ok(Value::Null)
                     }
                     "detach" => {
                         browser.detach()?;
                         self.parents.remove(&id);
-                        self.attaches.retain(|(view, _)| *view != id);
                         Ok(Value::Null)
                     }
                     "bounds" => {
@@ -108,15 +114,20 @@ impl State {
         &mut self,
         parent: impl Fn(u64) -> Parent<W>,
     ) {
-        for (id, window) in std::mem::take(&mut self.attaches) {
+        for id in std::mem::take(&mut self.pending) {
+            let Some(&(window, Attach::Pending)) = self.parents.get(&id) else {
+                continue;
+            };
             let result = match parent(window) {
-                Parent::Ready(handle, scale) => self
-                    .views
-                    .get(&id)
-                    .context("Browser is destroyed")
-                    .and_then(|browser| browser.attach(&handle, scale)),
+                Parent::Ready(handle, scale) => {
+                    self.parents.insert(id, (window, Attach::Attached));
+                    self.views
+                        .get(&id)
+                        .context("Browser is destroyed")
+                        .and_then(|browser| browser.attach(&handle, scale))
+                }
                 Parent::Waiting => {
-                    self.attaches.push((id, window));
+                    self.pending.push(id);
                     Ok(())
                 }
                 Parent::Gone => self.close_window(window),
@@ -127,15 +138,14 @@ impl State {
         }
     }
     pub fn close_window(&mut self, window: u64) -> Result<()> {
-        for (&id, &parent) in &self.parents {
+        for (&id, &(parent, _)) in &self.parents {
             if parent == window
                 && let Some(browser) = self.views.get(&id)
             {
                 browser.detach()?;
             }
         }
-        self.parents.retain(|_, parent| *parent != window);
-        self.attaches.retain(|(_, parent)| *parent != window);
+        self.parents.retain(|_, (parent, _)| *parent != window);
         Ok(())
     }
 }
@@ -149,11 +159,15 @@ mod tests {
         let mut state = State::default();
         assert_eq!(state.call("reserve", &Value::Null, "").unwrap(), 1);
         assert_eq!(state.call("reserve", &Value::Null, "").unwrap(), 2);
-        state.parents.insert(2, 1);
-        state.attaches.push((2, 1));
+        state.parents.insert(2, (1, Attach::Pending));
+        state.pending.push(2);
+        state.parents.insert(3, (4, Attach::Attached));
         state.close_window(1).unwrap();
-        assert!(state.parents.is_empty());
-        assert!(state.attaches.is_empty());
+        assert!(state.parents.keys().eq([&3]));
+        state.attach_pending(|_| -> Parent<raw_window_handle::WindowHandle<'static>> {
+            panic!("Detached views don't wait")
+        });
+        assert!(state.pending.is_empty());
         let events = state.call("poll", &Value::Null, "").unwrap();
         assert_eq!(events, serde_json::json!([]));
         assert_eq!(

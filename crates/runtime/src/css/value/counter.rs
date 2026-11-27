@@ -4,6 +4,8 @@ pub(crate) fn counter_text(kind: &str, number: i64) -> String {
         "disc" => "•".into(),
         "circle" => "◦".into(),
         "square" => "▪".into(),
+        "disclosure-closed" => "▸".into(),
+        "disclosure-open" => "▾".into(),
         "decimal-leading-zero" => format!("{number:02}"),
         "lower-alpha" | "lower-latin" | "upper-alpha" | "upper-latin" if number > 0 => {
             let mut letters = Vec::new();
@@ -77,7 +79,7 @@ pub(crate) fn counter_text(kind: &str, number: i64) -> String {
             })
             .collect(),
         "cjk-ideographic" | "trad-chinese-informal" | "simp-chinese-informal"
-            if (1..10000).contains(&number) =>
+            if (0..10000).contains(&number) =>
         {
             let digits: Vec<char> = "零一二三四五六七八九".chars().collect();
             let mut text = String::new();
@@ -95,6 +97,9 @@ pub(crate) fn counter_text(kind: &str, number: i64) -> String {
                     text.push(digits[digit]);
                 }
                 text.push_str(name);
+            }
+            if text.is_empty() {
+                text.push('零');
             }
             text
         }
@@ -223,5 +228,18 @@ pub(crate) fn counter_text(kind: &str, number: i64) -> String {
             }
         }
         _ => number.to_string(),
+    }
+}
+
+#[test]
+fn counters_name_zero_and_disclosure_like_chrome() {
+    for (kind, number, text) in [
+        ("cjk-ideographic", 0, "零"),
+        ("trad-chinese-informal", 0, "零"),
+        ("simp-chinese-informal", 0, "零"),
+        ("disclosure-closed", 3, "▸"),
+        ("disclosure-open", 3, "▾"),
+    ] {
+        assert_eq!(counter_text(kind, number), text, "{kind} {number}");
     }
 }

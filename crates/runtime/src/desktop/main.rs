@@ -292,10 +292,7 @@ impl Main {
                         Ok(tools)
                     }) {
                         Ok(tools) => *self.tools.borrow_mut() = Some(tools),
-                        Err(error) => {
-                            eprintln!("apps: {error:#}");
-                            self.link.fail();
-                        }
+                        Err(error) => eprintln!("apps: developer tools: {error:#}"),
                     }
                 }
                 (ToMain::OpenTools, None) => {}
@@ -759,11 +756,15 @@ impl Main {
             }
             self.receive_with(true);
             let logs: Vec<_> = self.host.borrow_mut().logs.drain(..).collect();
-            if let Some(tools) = &*self.tools.borrow() {
-                for command in tools.commands() {
-                    tools.answer(&command, engine, &self.host, None)?;
-                }
-                tools.events(&logs)?;
+            if let Some(tools) = &*self.tools.borrow()
+                && let Err(error) = tools
+                    .commands()
+                    .iter()
+                    .try_for_each(|command| tools.answer(command, engine, &self.host, None))
+                    .and_then(|()| tools.events(&logs))
+            {
+                eprintln!("apps: developer tools: {error:#}");
+                tools.closed.set(true);
             }
             if !logs.is_empty() {
                 crate::native::devtools::logs(&logs);
@@ -787,8 +788,10 @@ impl Main {
             }
         }
         let closed = self.tools.borrow_mut().take_if(|tools| tools.is_closed());
-        if let (Some(_), Some(engine)) = (closed, &self.engine) {
-            super::panel::release(engine)?;
+        if let (Some(_), Some(engine)) = (closed, &self.engine)
+            && let Err(error) = super::panel::release(engine)
+        {
+            eprintln!("apps: developer tools: {error:#}");
         }
         if self.link.main_pending() {
             delay = delay.min(0);

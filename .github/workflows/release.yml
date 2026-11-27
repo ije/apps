@@ -4,7 +4,6 @@ on:
     tags: ['v*']
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 permissions:
   contents: read
 jobs:
@@ -36,7 +35,7 @@ jobs:
       - uses: ./.github/actions/native
         with:
           aot: ${{ matrix.aot }}
-      - run: bash scripts/build-npm.sh "$([[ $GITHUB_REF_TYPE == tag ]] && echo "${GITHUB_REF_NAME#v}" || echo 0.0.0)"
+      - run: bash scripts/build-npm.sh "${GITHUB_REF_NAME#v}"
       # A broken package must not reach npm: the packed CLI must start and build an app from the packed files.
       - run: |
           bin=packages/apps-${{ matrix.target }}/bin
@@ -57,7 +56,6 @@ jobs:
 
   publish:
     needs: build
-    if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/setup-node@v4

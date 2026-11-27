@@ -210,6 +210,7 @@ impl Layout {
             *node = None;
         }
         self.measurements.texts.remove(&id);
+        self.measurements.boxes.remove(&id);
         self.cull.spills.remove(&id);
         self.measurements.naturals.remove(&id);
         self.blocks.remove(&id);
@@ -226,12 +227,6 @@ impl Layout {
         }
         if let Some(order) = self.painted.get_mut(id) {
             *order = 0;
-        }
-    }
-
-    pub(crate) fn forget_all(&mut self, gone: &rustc_hash::FxHashSet<usize>) {
-        for node in gone {
-            self.measurements.boxes.remove(node);
         }
     }
 

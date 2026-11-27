@@ -15,7 +15,7 @@ pub fn fonts(system: bool) -> MutexGuard<'static, (Arc<usvg::fontdb::Database>, 
 }
 
 pub fn svg(source: &str, width: u32, height: u32) -> Result<Arc<renderer::RenderImage>> {
-    render_svg(&svg_tree(source, false)?, width, height, None)
+    render_svg(&svg_tree(source)?, width, height, None)
 }
 
 // The image of `effects::gradient::gradient_svg`.
@@ -32,37 +32,20 @@ pub fn svg_gradient(
 }
 
 // usvg reads any file that an SVG names in an image. Page content must not reach files this way: a canvas
-// hands their pixels to the page, and a UNC path sends the user's credentials to its host. Only SVG that the
-// runtime wrote itself may name `files`.
-pub fn svg_options(text: bool, files: bool) -> usvg::Options<'static> {
+// hands their pixels to the page, and a UNC path sends the user's credentials to its host.
+pub fn svg_options(text: bool) -> usvg::Options<'static> {
     let mut options = usvg::Options {
         fontdb: fonts(text).0.clone(),
         ..Default::default()
     };
-    options.image_href_resolver.resolve_string = if files {
-        // The runtime names the `data:` URLs of CSS images by `super::image::data_file()`.
-        let file = usvg::ImageHrefResolver::default_string_resolver();
-        Box::new(move |href, options| {
-            if !href.starts_with(super::image::DATA_PREFIX) {
-                return file(href, options);
-            }
-            let bytes = super::image::read(std::path::Path::new(href)).ok()?;
-            (usvg::ImageHrefResolver::default_data_resolver())(
-                "text/plain",
-                Arc::new(bytes),
-                options,
-            )
-        })
-    } else {
-        Box::new(|_, _| None)
-    };
+    options.image_href_resolver.resolve_string = Box::new(|_, _| None);
     options
 }
 
-pub fn svg_tree(source: &str, files: bool) -> Result<usvg::Tree> {
+pub fn svg_tree(source: &str) -> Result<usvg::Tree> {
     Ok(usvg::Tree::from_str(
         source,
-        &svg_options(source.contains("<text"), files),
+        &svg_options(source.contains("<text")),
     )?)
 }
 
@@ -162,7 +145,7 @@ pub fn svg_shape(source: &str) -> Option<([f32; 4], f32)> {
     if let Some(shape) = SHAPES.with_borrow(|shapes| shapes.get(source).copied()) {
         return shape;
     }
-    let shape = svg_tree(source, false).ok().and_then(|tree| {
+    let shape = svg_tree(source).ok().and_then(|tree| {
         let node = tree.node_by_id("apps-shape")?;
         let rect = node.bounding_box();
         let length = match node {
@@ -236,7 +219,7 @@ mod tests {
 
     #[test]
     fn svg_boxes_map_elements_to_canvas_and_own_coordinates() {
-        let (size, content, boxes, _) = svg_boxes(&svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 100 50"><rect id="r" x="10" y="5" width="30" height="20"/><g transform="translate(5 30)"><rect id="apps-7" width="10" height="10"/></g></svg>"##, false).unwrap());
+        let (size, content, boxes, _) = svg_boxes(&svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 100 50"><rect id="r" x="10" y="5" width="30" height="20"/><g transform="translate(5 30)"><rect id="apps-7" width="10" height="10"/></g></svg>"##).unwrap());
         assert_eq!(size, [200., 100.]);
         assert_eq!(content, [5., 5., 35., 35.]);
         let find = |name: &str| {
@@ -250,7 +233,7 @@ mod tests {
             find("apps-7"),
             Some(([10., 60., 20., 20.], [0., 0., 10., 10.]))
         );
-        let (_, _, boxes, _) = svg_boxes(&svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><defs><rect id="s" width="10" height="10"/></defs><use id="u" href="#s" x="20" y="10" transform="scale(2)"/></svg>"##, false).unwrap());
+        let (_, _, boxes, _) = svg_boxes(&svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><defs><rect id="s" width="10" height="10"/></defs><use id="u" href="#s" x="20" y="10" transform="scale(2)"/></svg>"##).unwrap());
         assert_eq!(
             boxes
                 .iter()
@@ -262,7 +245,7 @@ mod tests {
 
     #[test]
     fn svg_filters_past_their_layer_draw() {
-        let tree = svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200"><filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="200" height="2000"><feComposite in="SourceGraphic" in2="SourceGraphic" operator="arithmetic" k2="1"/></filter><rect x="20" y="20" width="160" height="160" fill="#2e8b57" filter="url(#f)"/></svg>"##, false).unwrap();
+        let tree = svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200"><filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="200" height="2000"><feComposite in="SourceGraphic" in2="SourceGraphic" operator="arithmetic" k2="1"/></filter><rect x="20" y="20" width="160" height="160" fill="#2e8b57" filter="url(#f)"/></svg>"##).unwrap();
         let pixels = svg_pixels(&tree, 200, 200, None).unwrap();
         assert_eq!(pixels.pixel(100, 100).unwrap().alpha(), 255);
     }

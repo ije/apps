@@ -273,7 +273,7 @@ pub(super) fn svg_layer(
                     {
                         Some((geometry, _)) => geometry.clone(),
                         None => {
-                            let tree = super::super::raster::svg::svg_tree(source, false).ok();
+                            let tree = super::super::raster::svg::svg_tree(source).ok();
                             let geometry = tree
                                 .as_ref()
                                 .map(super::super::raster::svg::svg_boxes)
@@ -498,7 +498,7 @@ pub(super) fn svg_layer(
                         super::super::raster::svg::render_svg(&tree, raster[0], raster[1], None)
                     }
                     (_, tree) if moved => tree
-                        .map_or_else(|| super::super::raster::svg::svg_tree(&source, false), Ok)
+                        .map_or_else(|| super::super::raster::svg::svg_tree(&source), Ok)
                         .and_then(|tree| {
                             let [kx, ky] = [raster[0] as f32 / area[2], raster[1] as f32 / area[3]];
                             super::super::raster::svg::render_svg(
@@ -543,14 +543,7 @@ pub(super) fn svg_layer(
             let image = state.rasters.svgs.get(&id).map(|(_, image)| image.clone());
             drop(store);
             if let Some(image) = image {
-                window.draw_image(
-                    target,
-                    target,
-                    renderer::Corners::default(),
-                    image,
-                    false,
-                    false,
-                );
+                window.draw_image(target, target, renderer::Corners::default(), image, false);
             }
         },
     )

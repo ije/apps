@@ -103,22 +103,21 @@ build=$output/build
 if [[ -d $source_dir ]] && [[ $(git -C "$source_dir" rev-parse HEAD 2>/dev/null || true) != "$revision" ]]; then
   rm -rf "$source_dir"
 fi
+sparse=(
+  Source/JavaScriptCore Source/WTF Source/bmalloc Source/cmake
+  Source/ThirdParty/gtest Source/ThirdParty/gmock Source/ThirdParty/unifdef
+  Source/ThirdParty/capstone Source/WebGPU Tools/Scripts Tools/jsc
+)
 if [[ ! -d $source_dir ]]; then
   git init -q "$source_dir"
   git -C "$source_dir" remote add origin https://github.com/oven-sh/WebKit.git
   git -C "$source_dir" config core.autocrlf false
-  git -C "$source_dir" sparse-checkout set --cone \
-    Source/JavaScriptCore Source/WTF Source/bmalloc Source/cmake \
-    Source/ThirdParty/gtest Source/ThirdParty/gmock Source/ThirdParty/unifdef \
-    Source/ThirdParty/capstone Source/WebGPU Tools/Scripts Tools/jsc
+  git -C "$source_dir" sparse-checkout set --cone "${sparse[@]}"
   git -C "$source_dir" fetch --depth 1 --filter=blob:none origin "$revision"
   git -C "$source_dir" checkout --detach FETCH_HEAD
 fi
 
-git -C "$source_dir" sparse-checkout set \
-  Source/JavaScriptCore Source/WTF Source/bmalloc Source/cmake \
-  Source/ThirdParty/gtest Source/ThirdParty/gmock Source/ThirdParty/unifdef \
-  Source/ThirdParty/capstone Source/WebGPU Tools/Scripts Tools/jsc
+git -C "$source_dir" sparse-checkout set "${sparse[@]}"
 
 patch=$root/scripts/jsc.patch
 # Bun removes C API locks. Keep this patch when updating the pinned source.

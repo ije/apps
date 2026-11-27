@@ -798,7 +798,6 @@ setters! {
     flex_1() => |s| (s.flex_grow, s.flex_shrink, s.flex_basis) = (1., 1., relative(0.));
     flex_shrink(by: f32) => |s| s.flex_shrink = by;
     flex_shrink_0() => |s| s.flex_shrink = 0.;
-    items_start() => |s| s.align_items = Some(AlignItems::FlexStart);
     items_center() => |s| s.align_items = Some(AlignItems::Center);
     justify_center() => |s| s.justify_content = Some(AlignContent::Center);
     baseline(which: Baseline) => |s| s.baseline = which;

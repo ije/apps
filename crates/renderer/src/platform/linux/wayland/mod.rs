@@ -247,6 +247,12 @@ impl Live {
         found.map_or(&[], |kept| &kept.types)
     }
 
+    // The types of the selection, or `None` when the clipboard holds `copied` or the selection is our own source.
+    fn offered(&self, own_type: &str) -> Option<&[String]> {
+        let types = (self.selection.as_ref()).map_or(&[][..], |offer| self.types(offer));
+        (self.copied.is_empty() && !types.iter().any(|kind| kind == own_type)).then_some(types)
+    }
+
     // Destroys offers that nothing uses, keeping the newest, which waits for its selection or drag event.
     fn prune(&mut self) {
         let newest = self.offers.len().saturating_sub(1);
@@ -1305,14 +1311,10 @@ impl Display for Client {
 
     fn read_clipboard(&self) -> Option<String> {
         let live = self.live.borrow();
-        let types = live
-            .selection
-            .as_ref()
-            .map_or(&[][..], |offer| live.types(offer));
-        if !live.copied.is_empty() || types.contains(&self.own_type) {
+        let Some(types) = live.offered(&self.own_type) else {
             let text = live.copied.iter().find(|(kind, _)| kind == "text/plain");
             return text.map(|(_, data)| String::from_utf8_lossy(data).into_owned());
-        }
+        };
         if let Some(pasted) = &live.pasted {
             return Some(pasted.clone());
         }
@@ -1329,13 +1331,9 @@ impl Display for Client {
 
     fn clipboard_types(&self) -> Vec<String> {
         let live = self.live.borrow();
-        let types = live
-            .selection
-            .as_ref()
-            .map_or(&[][..], |offer| live.types(offer));
-        if !live.copied.is_empty() || types.contains(&self.own_type) {
+        let Some(types) = live.offered(&self.own_type) else {
             return live.copied.iter().map(|(kind, _)| kind.clone()).collect();
-        }
+        };
         let mut kinds: Vec<String> = Vec::new();
         for kind in types {
             let kind = match TEXT_TYPES.contains(&kind.as_str()) {
@@ -1351,14 +1349,10 @@ impl Display for Client {
 
     fn read_clipboard_data(&self, kind: &str) -> Option<Vec<u8>> {
         let live = self.live.borrow();
-        let types = live
-            .selection
-            .as_ref()
-            .map_or(&[][..], |offer| live.types(offer));
-        if !live.copied.is_empty() || types.contains(&self.own_type) {
+        let Some(types) = live.offered(&self.own_type) else {
             let item = live.copied.iter().find(|(own, _)| own == kind);
             return item.map(|(_, data)| data.clone());
-        }
+        };
         if kind == "text/plain" {
             drop(live);
             return self.read_clipboard().map(String::into_bytes);

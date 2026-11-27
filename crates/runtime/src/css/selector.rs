@@ -48,7 +48,14 @@ pub(crate) enum SimpleSelector {
     Root,
     // The flag is 1 for `i`, and 2 for the HTML attributes whose values ignore case on HTML elements.
     Attribute(String, String, String, u8),
-    Pseudo(String, String, #[serde(skip)] Rc<[Selector]>, [i32; 2]),
+    // The last field tells that the argument was parsed in an `@scope` rule, where `:scope` is its root.
+    Pseudo(
+        String,
+        String,
+        #[serde(skip)] Rc<[Selector]>,
+        [i32; 2],
+        bool,
+    ),
     Element(String, String),
     Parent(#[serde(skip)] SelectorList, usize),
     NoNamespace,
@@ -303,8 +310,11 @@ impl Selector {
                         .cloned()
                         .ok_or_else(|| anyhow::anyhow!("Missing CSS parent selector"))?;
                 }
-                SimpleSelector::Pseudo(name, argument, parsed, _) => {
-                    if let Some((selectors, _)) = Self::argument(name, argument, parent, false) {
+                SimpleSelector::Pseudo(name, argument, parsed, _, scoped) => {
+                    let outer = SCOPED.replace(*scoped);
+                    let selectors = Self::argument(name, argument, parent, false);
+                    SCOPED.set(outer);
+                    if let Some((selectors, _)) = selectors {
                         *parsed = selectors.into();
                     }
                 }
@@ -324,7 +334,7 @@ impl Selector {
             .map_or(0, |(_, previous)| previous.states(parents));
         for simple in &self.simple {
             match simple {
-                SimpleSelector::Pseudo(name, _, parsed, _) => {
+                SimpleSelector::Pseudo(name, _, parsed, ..) => {
                     states |= match name.as_str() {
                         "hover" => HOVER,
                         "active" => ACTIVE,
@@ -453,7 +463,7 @@ impl Selector {
     pub(crate) fn stateful(&self) -> bool {
         self.previous.is_none()
             && self.simple.iter().all(|simple| {
-                matches!(simple, SimpleSelector::Pseudo(name, _, parsed, _)
+                matches!(simple, SimpleSelector::Pseudo(name, _, parsed, ..)
                     if !(name.ends_with("child")
                         || name.ends_with("of-type")
                         || matches!(name.as_str(), "empty" | "has" | "host" | "host-context" | "scope"))
@@ -530,7 +540,7 @@ impl Selector {
         for part in &self.simple {
             let alternatives = match part {
                 SimpleSelector::Parent(selectors, _) => selectors.as_slice(),
-                SimpleSelector::Pseudo(name, _, selectors, _)
+                SimpleSelector::Pseudo(name, _, selectors, ..)
                     if matches!(name.as_str(), "is" | "where") =>
                 {
                     &selectors[..]
@@ -857,6 +867,7 @@ impl Selector {
                                     String::new(),
                                     Rc::new([]),
                                     [0, 0],
+                                    false,
                                 ));
                             }
                         } else {
@@ -969,6 +980,7 @@ impl Selector {
                             argument.into(),
                             selectors.into(),
                             nth,
+                            SCOPED.get(),
                         ));
                         continue;
                     }

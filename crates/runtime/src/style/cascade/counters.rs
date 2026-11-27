@@ -21,7 +21,6 @@ pub(crate) fn number_lists(
     walk: &TreeWalk,
     out: &mut ComputedStyles,
     previous: Option<&ComputedStyles>,
-    _last: Option<&ComputedStyles>,
     fast: bool,
     recount: bool,
     counters: bool,
@@ -34,7 +33,6 @@ pub(crate) fn number_lists(
         counted,
         ..
     } = out;
-    let _count = doc.nodes.len();
     let reused = previous
         .filter(|previous| fast && previous.counted)
         .filter(|previous| {

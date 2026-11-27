@@ -8,19 +8,19 @@
 
 | Path | Responsibility |
 |---|---|
-| [src](src) | The public `pierre-apps` crate for Rust apps |
-| [crates/cli](crates/cli) | The `apps` command, module bundler, development loop, app packages, and AOT compiler integration |
-| [crates/runtime](crates/runtime) | App lifecycle, JavaScriptCore, Electron and Node APIs, DOM, CSS, and page rendering |
-| [crates/renderer](crates/renderer) | Native windows, input, retained box trees, Taffy layout, text, atlases, and GPU backends |
-| [crates/webview](crates/webview) | System web views and their native bridge |
-| [crates/webgpu](crates/webgpu) | The optional WebGPU API through wgpu |
-| [crates/media](crates/media) | The audio and video player through FFmpeg and cpal. The optional media library has FFmpeg, and the runtime compiles the same source without it for WAV files |
-| [crates/terminal](crates/terminal) | The optional terminal for `<terminal>`: libghostty-vt, the PTY of the program, and the program status records |
-| [crates/devtools](crates/devtools) | The development tools library: the devtools panel page, the devtools server, and the FPS HUD |
-| [packages](packages) | npm launcher, TypeScript declarations, and packages for each platform and architecture |
-| [scripts](scripts) | JavaScriptCore, FFmpeg, libghostty-vt, and npm package builds |
+| [src](../src) | The public `pierre-apps` crate for Rust apps |
+| [crates/cli](../crates/cli) | The `apps` command, module bundler, development loop, app packages, and AOT compiler integration |
+| [crates/runtime](../crates/runtime) | App lifecycle, JavaScriptCore, Electron and Node APIs, DOM, CSS, and page rendering |
+| [crates/renderer](../crates/renderer) | Native windows, input, retained box trees, Taffy layout, text, atlases, and GPU backends |
+| [crates/webview](../crates/webview) | System web views and their native bridge |
+| [crates/webgpu](../crates/webgpu) | The optional WebGPU API through wgpu |
+| [crates/media](../crates/media) | The audio and video player through FFmpeg and cpal. The optional media library has FFmpeg, and the runtime compiles the same source without it for WAV files |
+| [crates/terminal](../crates/terminal) | The optional terminal for `<terminal>`: libghostty-vt, the PTY of the program, and the program status records |
+| [crates/devtools](../crates/devtools) | The development tools library: the devtools panel page, the devtools server, and the FPS HUD |
+| [packages](../packages) | npm launcher, TypeScript declarations, and packages for each platform and architecture |
+| [scripts](../scripts) | JavaScriptCore, FFmpeg, libghostty-vt, and npm package builds |
 
-The runtime separates JavaScript API objects from native state. [js](crates/runtime/js) contains the API implementations and event loop. [src/jsc](crates/runtime/src/jsc) binds JavaScriptCore. [src/host](crates/runtime/src/host) connects contexts to Rust, checks access by context role, and owns page documents, native resources, and commands. [bundle.rs](crates/runtime/src/bundle.rs) describes the app package.
+The runtime separates JavaScript API objects from native state. [js](../crates/runtime/js) contains the API implementations and event loop. [src/jsc](../crates/runtime/src/jsc) binds JavaScriptCore. [src/host](../crates/runtime/src/host) connects contexts to Rust, checks access by context role, and owns page documents, native resources, and commands. [bundle.rs](../crates/runtime/src/bundle.rs) describes the app package.
 
 ## Build and startup
 
@@ -37,23 +37,23 @@ flowchart LR
     DOM --> Renderer[Layout and GPU renderer]
 ```
 
-The [bundler](crates/cli/src/bundler/mod.rs) uses Oxc to parse, transform, and minify JavaScript, TypeScript, and JSX. It resolves dependencies separately for main, preload, and page code. It also processes HTML, CSS, assets, workers, native addons, and custom loaders.
+The [bundler](../crates/cli/src/bundler/mod.rs) uses Oxc to parse, transform, and minify JavaScript, TypeScript, and JSX. It resolves dependencies separately for main, preload, and page code. It also processes HTML, CSS, assets, workers, native addons, and custom loaders.
 
 The bundler maps `electron` and `@pierre/apps` imports to runtime APIs. Literal `import.meta.resolve()` calls identify pages or script chunks. A `new Worker()` or `fork()` call with a path that the bundler can read from the code makes that file a script chunk. Literal `loadFile()` calls in main code also include the target HTML and its dependencies in the bundle.
 
-JavaScript apps use `apps-runtime` as their executable and `app.js` as their main entry. Apps with `"type": "rust"` use a Cargo binary linked to `pierre-apps`, which exposes the `apps-runtime` app API. Their entry calls `app::run()`, creates windows, and registers native handlers through the [Rust app API](crates/runtime/src/desktop/app.rs).
+JavaScript apps use `apps-runtime` as their executable and `app.js` as their main entry. Apps with `"type": "rust"` use a Cargo binary linked to `pierre-apps`, which exposes the `apps-runtime` app API. Their entry calls `app::run()`, creates windows, and registers native handlers through the [Rust app API](../crates/runtime/src/desktop/app.rs).
 
 ### Module execution
 
 Development bundles use module factories, namespace objects, and export getters. Production bundles use plain functions and shared export slots for eligible modules. The bundler resolves re-exports to their source bindings. Mutable exports retain accessors when necessary.
 
-Modules with cycles, CommonJS, top-level await, or other incompatible constructs retain the general module loader. [modules.js](crates/runtime/js/modules.js) executes the bundle and loads script chunks.
+Modules with cycles, CommonJS, top-level await, or other incompatible constructs retain the general module loader. [modules.js](../crates/runtime/js/modules.js) executes the bundle and loads script chunks.
 
 `import defer` and `import.defer()` give a proxy of the module namespace. The module runs when code first reads one of its exports. A module with top-level await can't run inside a read, so such modules of a deferred graph run before the module that defers them.
 
 ### App bundle
 
-[bundle.rs](crates/runtime/src/bundle.rs) defines `app.bundle`. It starts with an eight-byte header: `APP\0` and a format version. Postcard data follows the header:
+[bundle.rs](../crates/runtime/src/bundle.rs) defines `app.bundle`. It starts with an eight-byte header: `APP\0` and a format version. Postcard data follows the header:
 
 - Files: main code, script chunks, package metadata, asset maps, and native addons.
 - Pages: one packed block for each page, with its parsed HTML document, stylesheets, and inline style declarations.
@@ -61,11 +61,11 @@ Modules with cycles, CommonJS, top-level await, or other incompatible constructs
 
 Asset files remain beside the bundle. The runtime maps `app.bundle` into memory and retains the main script, script chunks, and pages as slices of that mapping. The main script is stored together with its module loader, in the form that runs. JavaScriptCore reads ASCII sources and bytecode in place, so the app makes no copy of them. A window unpacks its page when it loads the page. New builds replace the bundle file because an active app can still hold its mapping.
 
-On macOS, the package uses `Contents/MacOS`, `Contents/Resources`, and `Contents/Frameworks`. Windows and Linux packages keep the executable, bundle, and required libraries in the output directory. [packaging.rs](crates/cli/src/packaging.rs) selects the libraries from the app features and build mode.
+On macOS, the package uses `Contents/MacOS`, `Contents/Resources`, and `Contents/Frameworks`. Windows and Linux packages keep the executable, bundle, and required libraries in the output directory. [packaging.rs](../crates/cli/src/packaging.rs) selects the libraries from the app features and build mode.
 
 ### JavaScriptCore build modes
 
-The runtime loads its own JavaScriptCore library from Bun's WebKit fork. [build-jsc.sh](scripts/build-jsc.sh) builds it with [jsc.patch](scripts/jsc.patch) and the generic event loop. The runtime supplies timers, task queues, native operations, and microtask checkpoints.
+The runtime loads its own JavaScriptCore library from Bun's WebKit fork. [build-jsc.sh](../scripts/build-jsc.sh) builds it with [jsc.patch](../scripts/jsc.patch) and the generic event loop. The runtime supplies timers, task queues, native operations, and microtask checkpoints.
 
 | Mode | Execution |
 |---|---|
@@ -78,7 +78,7 @@ AOT requires a native build: macOS arm64, Linux x64, or Linux arm64. It needs a 
 
 On Linux the image is an ELF shared library. Its header, machine code, and constants are three page-aligned `PT_LOAD` segments, read-only, then executable, then read-only. That is the layout Bun writes into an ELF executable. JavaScriptCore checks those protections with `dl_iterate_phdr`.
 
-The [AOT path](crates/cli/src/aot.rs) uses Bun's Rust frontend and the JavaScriptCore compiler library. The CLI checks that both come from the same Bun revision. Build identifiers and a hash of runtime scripts connect the compiled image to the correct runtime.
+The [AOT path](../crates/cli/src/aot.rs) uses Bun's Rust frontend and the JavaScriptCore compiler library. The CLI checks that both come from the same Bun revision. Build identifiers and a hash of runtime scripts connect the compiled image to the correct runtime.
 
 The AOT JavaScriptCore has no JIT, so code outside the image runs in the interpreter: classic page scripts, `eval()` in main code, `executeJavaScript()`, and Wasm that is not an asset or an `atob()` literal. The build prints the scripts that it does not compile. The front end has no built-in sources of Bun, and these hold the helper for its `using` declarations. So the CLI turns `using` into `try` and `finally` blocks before it compiles. Bun's frontend assumes that `process`, `Bun` and the CommonJS names like `require` always exist. Apps have no global `Bun`, and a page has none of these names. So compiled code reads these names from the global object of its realm, and a name that is missing reads as `undefined`.
 
@@ -98,15 +98,15 @@ On macOS, the main thread owns AppKit and each `BrowserWindow` has a render thre
 
 On Windows and Linux, main code and window pages share the main thread. A busy script can delay all page frames there. The handler pool, blocking pool, network thread, and workers remain separate.
 
-A page and its preload have separate globals but share a VM and host. On macOS, that VM belongs to their render thread. Main and render threads exchange commands and payloads through [host/link.rs](crates/runtime/src/host/link.rs). JavaScript objects do not cross these queues. The runtime uses threads within one process, so a native crash can end the whole app.
+A page and its preload have separate globals but share a VM and host. On macOS, that VM belongs to their render thread. Main and render threads exchange commands and payloads through [host/link.rs](../crates/runtime/src/host/link.rs). JavaScript objects do not cross these queues. The runtime uses threads within one process, so a native crash can end the whole app.
 
 ### Events and communication
 
-[bootstrap.js](crates/runtime/js/bootstrap.js) manages timers and task phases. Native completion events wake the thread that owns the context. The desktop loop arms the next timer and requests a frame only when the page needs one. Each task has a microtask checkpoint. A frame first moves the running scrolls by a step. Then the page runs the scroll events and the animation frame callbacks, and the frame lays out the page. Resize observers run after this layout and before the paint. A callback that changes the page lays it out again, and then only boxes deeper than the shallowest box with an entry get theirs in this frame, as in Chrome. The others wait for the next frame, with an `error` event. Intersection observers then take the last layout, and their callbacks run in a task after the frame. So, as in Chrome, the frame that shows a new scroll offset or size also shows what the listeners and observers changed. A scroll fires `scrollend` when it comes to rest: a script scroll at once, a smooth scroll or a snap with its last step, and a scroll of the user when the user can't go on with it.
+[bootstrap.js](../crates/runtime/js/bootstrap.js) manages timers and task phases. Native completion events wake the thread that owns the context. The desktop loop arms the next timer and requests a frame only when the page needs one. Each task has a microtask checkpoint. A frame first moves the running scrolls by a step. Then the page runs the scroll events and the animation frame callbacks, and the frame lays out the page. Resize observers run after this layout and before the paint. A callback that changes the page lays it out again, and then only boxes deeper than the shallowest box with an entry get theirs in this frame, as in Chrome. The others wait for the next frame, with an `error` event. Intersection observers then take the last layout, and their callbacks run in a task after the frame. So, as in Chrome, the frame that shows a new scroll offset or size also shows what the listeners and observers changed. A scroll fires `scrollend` when it comes to rest: a script scroll at once, a smooth scroll or a snap with its last step, and a scroll of the user when the user can't go on with it.
 
-[bridge.js](crates/runtime/js/bridge.js) implements IPC and `contextBridge`. IPC values follow structured clone semantics. The context bridge also supports function and promise proxies between page and preload contexts. Rust handlers accept JSON values. `AppHandle` lets Rust threads send events to pages or request app exit.
+[bridge.js](../crates/runtime/js/bridge.js) implements IPC and `contextBridge`. IPC values follow structured clone semantics. The context bridge also supports function and promise proxies between page and preload contexts. Rust handlers accept JSON values. `AppHandle` lets Rust threads send events to pages or request app exit.
 
-A worker message crosses threads as JSON text, and each side parses it once. Data that JSON keeps exact, like objects, arrays, strings and finite numbers without shared objects, goes as plain JSON. Other values use a graph form that keeps types, shared objects and cycles. Binary buffers travel beside the text: a transferred `ArrayBuffer` moves its memory to the other VM without a copy, a `SharedArrayBuffer` or a shared `WebAssembly.Memory` shares it, and other buffers are copied once. A `WebAssembly.Module` shares its compiled code. Functions of [jsc.patch](scripts/jsc.patch) take these contents out of one VM and make the object again in the other.
+A worker message crosses threads as JSON text, and each side parses it once. Data that JSON keeps exact, like objects, arrays, strings and finite numbers without shared objects, goes as plain JSON. Other values use a graph form that keeps types, shared objects and cycles. Binary buffers travel beside the text: a transferred `ArrayBuffer` moves its memory to the other VM without a copy, a `SharedArrayBuffer` or a shared `WebAssembly.Memory` shares it, and other buffers are copied once. A `WebAssembly.Module` shares its compiled code. Functions of [jsc.patch](../scripts/jsc.patch) take these contents out of one VM and make the object again in the other.
 
 Synchronous page calls, such as `ipcRenderer.sendSync()` and `window.open()`, can wait for main. On macOS, native input and IME queries wait at most 100 ms for a page. Live resize waits at most 8 ms for a frame. Main continues native work during these waits.
 
@@ -116,7 +116,7 @@ Main dispatch uses common run loop modes, so native work continues inside modal 
 
 ## Context roles and feature flags
 
-The runtime defines three [roles](crates/runtime/src/jsc/mod.rs): main, preload, and renderer. The bundler checks module access, and the native bridge checks each operation again.
+The runtime defines three [roles](../crates/runtime/src/jsc/mod.rs): main, preload, and renderer. The bundler checks module access, and the native bridge checks each operation again.
 
 - Main code can use desktop APIs and the supported Node APIs.
 - Preloads can use the supported Node APIs and a limited Electron API. Their `document` proxy accesses the page through the context bridge.
@@ -125,7 +125,7 @@ The runtime defines three [roles](crates/runtime/src/jsc/mod.rs): main, preload,
 
 Preloads run only for bundled pages and files inside the app directory. HTML strings and external files receive no preload. A page reaches its preload through the context bridge, and the preload reaches main through IPC.
 
-The `features` array in `package.json` controls optional behavior. All entries in [FEATURES](crates/runtime/src/bundle.rs) default to disabled.
+The `features` array in `package.json` controls optional behavior. Each entry of `Feature` in [bundle.rs](../crates/runtime/src/bundle.rs) is off unless `package.json` turns it on.
 
 | Feature | Effect |
 |---|---|
@@ -143,10 +143,10 @@ Without `localNetwork`, page fetch and WebSocket connections reject private addr
 
 The custom page pipeline has four stages:
 
-1. [DOM](crates/runtime/src/dom) stores nodes, attributes, text, state, and revision counters. JavaScript wrappers in [dom.js](crates/runtime/js/dom.js) expose these nodes to page code.
-2. [Style](crates/runtime/src/style) matches selectors and computes the cascade, inheritance, custom properties, animations, and Tailwind utilities.
-3. [Render](crates/runtime/src/render) converts styled DOM nodes into renderer nodes, text, controls, images, and effects.
-4. [Renderer](crates/renderer/src) retains the box tree, computes Taffy layout, shapes text, and submits GPU commands.
+1. [DOM](../crates/runtime/src/dom) stores nodes, attributes, text, state, and revision counters. JavaScript wrappers in [dom.js](../crates/runtime/js/dom.js) expose these nodes to page code.
+2. [Style](../crates/runtime/src/style) matches selectors and computes the cascade, inheritance, custom properties, animations, and Tailwind utilities.
+3. [Render](../crates/runtime/src/render) converts styled DOM nodes into renderer nodes, text, controls, images, and effects.
+4. [Renderer](../crates/renderer/src) retains the box tree, computes Taffy layout, shapes text, and submits GPU commands.
 
 The runtime owns HTML and CSS behavior. The renderer owns windows and the lower-level box, text, and graphics APIs.
 
@@ -180,11 +180,11 @@ The renderer caches text layout, glyphs, images, and intermediate surfaces. It p
 
 ### Anchor positioning
 
-After prepaint, [anchor.rs](crates/runtime/src/render/frame/anchor.rs) finds the anchors of each box that uses them in the layout mirror, and resolves its insets, sizes and position area to pixels. The cascade puts these values over the own style of the box, so a box whose values changed takes another pass in the same frame. A box that overflows its room tries its position options in further passes. Where alignment needs the size of the box, the renderer places it after layout (`Style.anchored`). A scroll between the anchor and the containing block only moves or hides the box in prepaint. An update ends at once when no layout, style or scroll changed, and skips the boxes whose anchors stayed where they were. Which nodes can be anchors of a box is kept until a node on their paths moves or changes its styles there. Pages without such boxes do none of this.
+After prepaint, [anchor.rs](../crates/runtime/src/render/frame/anchor.rs) finds the anchors of each box that uses them in the layout mirror, and resolves its insets, sizes and position area to pixels. The cascade puts these values over the own style of the box, so a box whose values changed takes another pass in the same frame. A box that overflows its room tries its position options in further passes. Where alignment needs the size of the box, the renderer places it after layout (`Style.anchored`). A scroll between the anchor and the containing block only moves or hides the box in prepaint. An update ends at once when no layout, style or scroll changed, and skips the boxes whose anchors stayed where they were. Which nodes can be anchors of a box is kept until a node on their paths moves or changes its styles there. Pages without such boxes do none of this.
 
 ### View transitions
 
-[transition.rs](crates/runtime/src/render/transition.rs) and `dom.js` run same-document view transitions. The pseudo-elements are nodes under the root that dom.js doesn't link, so page APIs don't find them. The `::view-transition` node is in the top layer. Each node takes the rules that its kind matched on the root, and the styles of the transition, like its size and the start of its group animation, from attributes named like the properties, as hints. The frame after `startViewTransition()` reads the old state: the page and each named element paint into layers that the window shows and that are read back, and the layer of the page leaves out the named elements. Frames draw nothing while the update callback runs. Then the page and its named elements draw only into such layers, which are read back when they change, and the image pseudo-elements show them as images. Pages without a transition skip all of this.
+[transition.rs](../crates/runtime/src/render/transition.rs) and `dom.js` run same-document view transitions. The pseudo-elements are nodes under the root that dom.js doesn't link, so page APIs don't find them. The `::view-transition` node is in the top layer. Each node takes the rules that its kind matched on the root, and the styles of the transition, like its size and the start of its group animation, from attributes named like the properties, as hints. The frame after `startViewTransition()` reads the old state: the page and each named element paint into layers that the window shows and that are read back, and the layer of the page leaves out the named elements. Frames draw nothing while the update callback runs. Then the page and its named elements draw only into such layers, which are read back when they change, and the image pseudo-elements show them as images. Pages without a transition skip all of this.
 
 ### Floats, columns and text masks
 
@@ -202,7 +202,7 @@ With `background-clip: text`, a box paints its background in its own layer. The 
 | Windows | Win32 | Direct3D 11 and DirectComposition | DirectWrite |
 | Linux | X11 or Wayland | wgpu with Vulkan or OpenGL | cosmic-text |
 
-The backend implementations live in [renderer/src/platform](crates/renderer/src/platform). On macOS, display links deliver frame requests directly to render threads. Ordinary page frames do not require main JavaScript to return.
+The backend implementations live in [renderer/src/platform](../crates/renderer/src/platform). On macOS, display links deliver frame requests directly to render threads. Ordinary page frames do not require main JavaScript to return.
 
 A display link stays on for 30 ticks after the last frame, because a start takes several milliseconds. A trackpad scroll delta reaches the scroll offset spread over the time between two events, so a 60 Hz scroll moves on each frame of a 120 Hz display. Draws that wait more than 3 ms for a drawable twice in a row skip one tick, which drains the queue of frames and its delay. A skipped tick shows as a dropped frame, so one queued frame, whose waits are shorter, stays.
 
@@ -216,27 +216,27 @@ On macOS, inputs with `appearance: system` use AppKit controls and Liquid Glass 
 
 ## Canvas, WebGPU, and media
 
-[Canvas 2D](crates/runtime/src/render/raster/canvas/mod.rs) uses tiny-skia pixel buffers and the platform text system. The page renderer uploads these images. SVG uses usvg and the runtime's rasterizer.
+[Canvas 2D](../crates/runtime/src/render/raster/canvas/mod.rs) uses tiny-skia pixel buffers and the platform text system. The page renderer uploads these images. SVG uses usvg and the runtime's rasterizer.
 
 `OffscreenCanvas` and `ImageBitmap` store pixels in detached canvas nodes. Page workers have a hidden document for these resources. A transferred canvas sends its latest frame to the page through a single slot, so a slow page does not accumulate frames.
 
 A canvas with `content="drawable"` builds its children in a box that takes no room, and the window does not show them. Each child with the `drawable` attribute paints into a layer of its own. After a frame, the renderer compares a hash of each such layer with the hash of the last frame. It reads the layers that changed back from the GPU, and the page gets a `paint` event. `drawElementImage()` then draws these pixels like an image. The place where a canvas drew an element goes back to the renderer as a hit transform. So the element takes the pointer there, and the layout mirror has its bounds there.
 
-[WebGPU](crates/runtime/src/render/media/gpu.rs) uses `apps-webgpu`. macOS and Windows load it as an optional shared library. Linux links it into the runtime because the page renderer already uses wgpu. WebGPU canvas frames reach the page renderer through CPU readback.
+[WebGPU](../crates/runtime/src/render/media/gpu.rs) uses `apps-webgpu`. macOS and Windows load it as an optional shared library. Linux links it into the runtime because the page renderer already uses wgpu. WebGPU canvas frames reach the page renderer through CPU readback.
 
-[Media](crates/runtime/src/render/media/player.rs) uses the optional `apps-media` shared library. The library uses FFmpeg for media decode and cpal for audio output. [build-ffmpeg.sh](scripts/build-ffmpeg.sh) produces a shared FFmpeg library without GPL or nonfree components. FFmpeg decodes video with VideoToolbox, D3D11 or VA-API where the hardware can. On Linux the library loads libva when a video opens, so it also works without libva. With Vulkan, a decoded 8-bit frame stays in GPU memory: the renderer imports its planes as dma-bufs and draws them as RGB into the atlas, and a canvas that reads the frame copies it. The GPU has read a frame before its decoder surface is free again. Other frames are copied to the CPU, and a video changes to software decoding when these copies are too slow. App packages include that library and `FFmpeg.LICENSE` when the `media` feature is enabled.
+[Media](../crates/runtime/src/render/media/player.rs) uses the optional `apps-media` shared library. The library uses FFmpeg for media decode and cpal for audio output. [build-ffmpeg.sh](../scripts/build-ffmpeg.sh) produces a shared FFmpeg library without GPL or nonfree components. FFmpeg decodes video with VideoToolbox, D3D11 or VA-API where the hardware can. On Linux the library loads libva when a video opens, so it also works without libva. With Vulkan, a decoded 8-bit frame stays in GPU memory: the renderer imports its planes as dma-bufs and draws them as RGB into the atlas, and a canvas that reads the frame copies it. The GPU has read a frame before its decoder surface is free again. Other frames are copied to the CPU, and a video changes to software decoding when these copies are too slow. App packages include that library and `FFmpeg.LICENSE` when the `media` feature is enabled.
 
 The runtime also compiles the source of `apps-media` into itself, without FFmpeg. A WAV decoder takes the place of the FFmpeg functions, so the player and the mixer are the same. This built-in player plays `<audio>` when the `media` feature is disabled, and the app package then has no media library and no FFmpeg.
 
 ## Terminal
 
-A `<terminal>` element shows a terminal session: a terminal and the program that runs in it. [terminal.rs](crates/runtime/src/render/media/terminal.rs) loads the optional `libGhostty` shared library of [crates/terminal](crates/terminal) for the `terminal` feature. The library links [libghostty-vt](https://github.com/ghostty-org/ghostty), which reads the escape sequences and keeps the screen, the scrollback and the selection. [build-ghostty.sh](scripts/build-ghostty.sh) builds it as a static library with Zig. App packages include `Ghostty.LICENSE` with the library.
+A `<terminal>` element shows a terminal session: a terminal and the program that runs in it. [terminal.rs](../crates/runtime/src/render/media/terminal.rs) loads the optional `libGhostty` shared library of [crates/terminal](../crates/terminal) for the `terminal` feature. The library links [libghostty-vt](https://github.com/ghostty-org/ghostty), which reads the escape sequences and keeps the screen, the scrollback and the selection. [build-ghostty.sh](../scripts/build-ghostty.sh) builds it as a static library with Zig. App packages include `Ghostty.LICENSE` with the library.
 
-A preload script creates a session with `terminal.Session` of `@pierre/apps`, and the page sets it on an element. The runtime keeps the sessions of a page by ID, and the session that each element shows. The page and its preload script each have their own object for a session, and the [bridge](crates/runtime/js/bridge.js) sends a session between them as its ID. The native side rejects a new session and a new program from page code. Each of the two contexts polls the events of its sessions after a task. When an element leaves the document, the next poll ends its session.
+A preload script creates a session with `terminal.Session` of `@pierre/apps`, and the page sets it on an element. The runtime keeps the sessions of a page by ID, and the session that each element shows. The page and its preload script each have their own object for a session, and the [bridge](../crates/runtime/js/bridge.js) sends a session between them as its ID. The native side rejects a new session and a new program from page code. Each of the two contexts polls the events of its sessions after a task. When an element leaves the document, the next poll ends its session.
 
-The library starts the program in a PTY: [unix.rs](crates/terminal/src/unix.rs) on macOS and Linux, and a pseudoconsole (ConPTY) in [windows.rs](crates/terminal/src/windows.rs) on Windows. A thread reads the output of the program and writes it to the terminal, so a program with much output does not stop the page. This thread lets the page take the lock of the terminal first, and it wakes the page one time until the page polls. The page then requests a frame.
+The library starts the program in a PTY: [unix.rs](../crates/terminal/src/unix.rs) on macOS and Linux, and a pseudoconsole (ConPTY) in [windows.rs](../crates/terminal/src/windows.rs) on Windows. A thread reads the output of the program and writes it to the terminal, so a program with much output does not stop the page. This thread lets the page take the lock of the terminal first, and it wakes the page one time until the page polls. The page then requests a frame.
 
-The element draws through a [paint hook](crates/runtime/src/render/paint/terminal.rs), like `<canvas>`, so new output needs no style or layout work. The hook reads only the rows that changed since the last frame. For each of these rows, it shapes the text word by word and keeps the glyphs and the background spans. Each frame draws all rows from this data as rectangles and atlas glyphs. A cell is `1ch` wide and `1lh` tall, so the CSS box of the element sets the columns and rows. The hook gives a new size to the terminal and to the PTY in the frame that has it. An element without a session draws nothing. The scroll bar of the element is the one of other boxes. Each frame gives it the place of the screen in the scrollback, and a drag of its knob scrolls the terminal to a row.
+The element draws through a [paint hook](../crates/runtime/src/render/paint/terminal.rs), like `<canvas>`, so new output needs no style or layout work. The hook reads only the rows that changed since the last frame. For each of these rows, it shapes the text word by word and keeps the glyphs and the background spans. Each frame draws all rows from this data as rectangles and atlas glyphs. A cell is `1ch` wide and `1lh` tall, so the CSS box of the element sets the columns and rows. The hook gives a new size to the terminal and to the PTY in the frame that has it. An element without a session draws nothing. The scroll bar of the element is the one of other boxes. Each frame gives it the place of the screen in the scrollback, and a drag of its knob scrolls the terminal to a row.
 
 libghostty-vt also keeps the images of the Kitty graphics protocol. It decodes PNG data with the PNG decoder of the runtime, which the library gets as a callback. Each frame lists the images on the screen. The hook copies the pixels of an image out of the terminal one time, when the image is new or its pixels changed, and draws the images below or above the text as the program asks. An animated image on the screen sets a timer for its next picture.
 
@@ -258,20 +258,20 @@ The runtime reuses data across frames and releases temporary resources after act
 - A smooth CSS gradient rasters with fewer pixels, as far as the GPU's linear filtering stays within two color levels of the full raster. Hard stops and tile edges keep full pixels.
 - The box tree keeps the paint chunks of its boxes in one shared list and rarely used fields in a box of their own, so a box takes about 1 KB.
 
-The allocator belongs to `apps-runtime`, so a Rust app cannot define another global allocator. Memory policy lives in [malloc.rs](crates/runtime/src/malloc.rs), [jsc/mod.rs](crates/runtime/src/jsc/mod.rs), and the platform renderer.
+The allocator belongs to `apps-runtime`, so a Rust app cannot define another global allocator. Memory policy lives in [malloc.rs](../crates/runtime/src/malloc.rs), [jsc/mod.rs](../crates/runtime/src/jsc/mod.rs), and the platform renderer.
 
 ## Development and distribution
 
 `apps run` compiles a development bundle and sends it to the app over stdin as a JSON line. With `--watch`, changes to pages and chunks used only by pages reload the open bundled pages. Main code, shared chunks, and other bundle changes restart the app. Rust source, Cargo manifest, or lockfile changes also rebuild the executable.
 
-With `APPS_TRACE_FCP=1`, the first frame with text or images prints its time. [fcp.mjs](scripts/fcp.mjs) starts a built app several times and prints the median time from process start to that frame.
+With `APPS_TRACE_FCP=1`, the first frame with text or images prints its time. [fcp.mjs](../scripts/fcp.mjs) starts a built app several times and prints the median time from process start to that frame.
 
-`ELECTRON_RUN_AS_NODE=1` selects the [headless script runner](crates/runtime/src/script.rs). It runs JavaScript with the supported Node APIs and no desktop windows. This also lets an app launch a bundled server chunk as a child process. `child_process.fork()` and `utilityProcess.fork()` start such a child with a JSON message channel on an extra descriptor.
+`ELECTRON_RUN_AS_NODE=1` selects the [headless script runner](../crates/runtime/src/script.rs). It runs JavaScript with the supported Node APIs and no desktop windows. This also lets an app launch a bundled server chunk as a child process. `child_process.fork()` and `utilityProcess.fork()` start such a child with a JSON message channel on an extra descriptor.
 
-The runtime implements Node compatibility through [JavaScript modules](crates/runtime/js/node) and [Rust services](crates/runtime/src/node). Node-API addons and `node:ffi` call native code in the same process. There is no Node.js or libuv runtime.
+The runtime implements Node compatibility through [JavaScript modules](../crates/runtime/js/node) and [Rust services](../crates/runtime/src/node). Node-API addons and `node:ffi` call native code in the same process. There is no Node.js or libuv runtime.
 
-`--devtools` opens the [developer tools](crates/runtime/src/desktop/panel.rs): a panel at the left side of the window with a tree of layers and a console. The panel is a system web view beside the page view, so the page gets the rest of the window. Its styles are Tailwind classes that the runtime's own Tailwind compiler turns into CSS when the panel opens. A script in the page reads the DOM and the logged values for the panel, and the renderer draws the box of the selected node. The panel page and this script are in the devtools library, which the runtime loads when the tools first open. On Windows and Linux the panel has a separate window. The shortcuts are those of Chrome, and a button in the panel shows the FPS HUD.
+`--devtools` opens the [developer tools](../crates/runtime/src/desktop/panel.rs): a panel at the left side of the window with a tree of layers and a console. The panel is a system web view beside the page view, so the page gets the rest of the window. Its styles are Tailwind classes that the runtime's own Tailwind compiler turns into CSS when the panel opens. A script in the page reads the DOM and the logged values for the panel, and the renderer draws the box of the selected node. The panel page and this script are in the devtools library, which the runtime loads when the tools first open. On Windows and Linux the panel has a separate window. The shortcuts are those of Chrome, and a button in the panel shows the FPS HUD.
 
 `--enable-devtools-mcp` starts the HTTP/MCP server of the same library for inspection, screenshots, input, and CPU profiles. The FPS HUD is in this library too. Production packages omit the library and reject developer tools.
 
-The `@pierre/apps` npm package contains the launcher and types. An optional package for the host platform supplies the native CLI, runtime, and libraries. On macOS and Linux, the install script links the launcher directly to the CLI. [build-npm.sh](scripts/build-npm.sh) prepares these packages, and the [release workflow](.github/workflows/release.yml) publishes them.
+The `@pierre/apps` npm package contains the launcher and types. An optional package for the host platform supplies the native CLI, runtime, and libraries. On macOS and Linux, the install script links the launcher directly to the CLI. [build-npm.sh](../scripts/build-npm.sh) prepares these packages, and the [release workflow](../.github/workflows/release.yml) publishes them.

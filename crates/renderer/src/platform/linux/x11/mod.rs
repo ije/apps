@@ -939,7 +939,10 @@ impl Client {
         let atoms = &self.atoms;
         let kind = message.type_;
         if kind == atoms.Protocols && first == atoms.DeleteWindow {
-            events().should_close(window.calls);
+            crate::native::window_event(
+                window.calls.id,
+                crate::native::WindowEvent::CloseRequested,
+            );
         } else if kind == atoms.Protocols && first == atoms.SyncRequest {
             window.sync_request(x11rb::protocol::sync::Int64 {
                 lo: third,

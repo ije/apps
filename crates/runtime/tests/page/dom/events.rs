@@ -2,17 +2,9 @@ use super::*;
 
 #[test]
 fn scroll_events_coalesce_and_synchronize_native_and_script_scrolling() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><body><main><div id='left' style='overflow:auto'></div><div id='right' style='overflow:auto'></div></main></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (host, engine) = css_page(
+        "<html><body><main><div id='left' style='overflow:auto'></div><div id='right' style='overflow:auto'></div></main></body></html>",
+    );
     engine.eval(r#"
         const left = document.getElementById('left'), right = document.getElementById('right');
         const received = [];
@@ -53,21 +45,7 @@ fn scroll_events_coalesce_and_synchronize_native_and_script_scrolling() {
 
 #[test]
 fn mutations_preserve_tree_and_event_order() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse("<html><body><main id='root'><p>old</p></main></body></html>"),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (host, engine) = css_page("<html><body><main id='root'><p>old</p></main></body></html>");
     engine.eval(r#"
         const root = document.getElementById('root');
         const old = root.firstChild;
@@ -133,21 +111,7 @@ fn mutations_preserve_tree_and_event_order() {
 
 #[test]
 fn editing_fragments_observers_and_layout() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse("<html><body><main id='root'></main></body></html>"),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (host, engine) = css_page("<html><body><main id='root'></main></body></html>");
     engine.eval(r#"
         const root = document.getElementById('root');
         const fragment = document.createDocumentFragment();
@@ -216,16 +180,7 @@ fn editing_fragments_observers_and_layout() {
 
 #[test]
 fn inner_html_of_a_form_drops_nested_forms() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse("<form id=f><div id=d></div></form>"),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let (_, engine) = css_page("<form id=f><div id=d></div></form>");
     engine
         .eval(
             r#"
@@ -241,17 +196,9 @@ fn inner_html_of_a_form_drops_nested_forms() {
 
 #[test]
 fn shadow_slots_render_light_dom_and_receive_pointer_events() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><head><style>button { color:#123456; }</style></head><body><test-slots><button id='edit'>Edit</button><span slot='missing'>hidden</span><em>text</em></test-slots></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (host, engine) = css_page(
+        "<html><head><style>button { color:#123456; }</style></head><body><test-slots><button id='edit'>Edit</button><span slot='missing'>hidden</span><em>text</em></test-slots></body></html>",
+    );
     engine.eval(r#"
         const host = document.querySelector('test-slots');
         const root = host.attachShadow({mode:'open'});
@@ -307,16 +254,7 @@ fn shadow_slots_render_light_dom_and_receive_pointer_events() {
 
 #[test]
 fn native_events_focus_the_editing_host_and_cross_shadow_roots() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse("<html><body><test-editor></test-editor></body></html>"),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let (_, engine) = css_page("<html><body><test-editor></test-editor></body></html>");
     engine.eval(r#"
         const host = document.querySelector('test-editor');
         const root = host.attachShadow({mode:'open'});
@@ -346,12 +284,9 @@ fn native_events_focus_the_editing_host_and_cross_shadow_roots() {
 
 #[test]
 fn aria_properties_reflect_and_select_focuses_fields() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><body><button id='toggle'></button><input id='field' value='text'></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let (_, engine) = css_page(
+        "<html><body><button id='toggle'></button><input id='field' value='text'></body></html>",
+    );
     engine.eval(r#"
         const toggle = document.getElementById('toggle'), field = document.getElementById('field');
         if (toggle.ariaExpanded !== null || toggle.role !== null) throw Error('Missing attributes reflect as null');
@@ -367,17 +302,9 @@ fn aria_properties_reflect_and_select_focuses_fields() {
 
 #[test]
 fn pointer_hover_tracks_boundary_events_and_interaction_states() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><head><style>#outer:hover{color:red} #inner:hover{color:blue} #outer:focus-within{background-color:green} #inner:active{font-weight:700} #inner:focus{border-top:3px solid}</style></head><body><div id='outer'><div id='inner' tabindex='0'></div></div><div id='other'></div><test-card></test-card></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (host, engine) = css_page(
+        "<html><head><style>#outer:hover{color:red} #inner:hover{color:blue} #outer:focus-within{background-color:green} #inner:active{font-weight:700} #inner:focus{border-top:3px solid}</style></head><body><div id='outer'><div id='inner' tabindex='0'></div></div><div id='other'></div><test-card></test-card></body></html>",
+    );
     engine.eval(r#"
         const [outer, inner, other, card] = ['#outer', '#inner', '#other', 'test-card'].map(s => document.querySelector(s));
         card.attachShadow({mode:'open'}).innerHTML = '<style>:host(:hover){color:purple}</style><span id="part"></span>';
@@ -1184,17 +1111,9 @@ fn indexes_follow_ids_labels_forms_and_bases() {
 #[cfg(target_os = "macos")]
 #[test]
 fn select_popup_picks_options() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<select id='s'><option>One<optgroup label='G'><option disabled>Two<option>Three</optgroup><hr><option hidden>Four<option>Five</select>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (_, engine) = css_page(
+        "<select id='s'><option>One<optgroup label='G'><option disabled>Two<option>Three</optgroup><hr><option hidden>Four<option>Five</select>",
+    );
     engine.eval(r#"
         const s = document.getElementById('s'), seen = [];
         for (const type of ['input', 'change']) s.addEventListener(type, () => seen.push(type + ':' + s.value));
@@ -1215,17 +1134,9 @@ fn select_popup_picks_options() {
 
 #[test]
 fn tab_order_includes_custom_elements_with_their_own_tab_index() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><body><button id='a'></button><x-pad id='pad' contenteditable='true'></x-pad><button id='b'></button></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (_, engine) = css_page(
+        "<html><body><button id='a'></button><x-pad id='pad' contenteditable='true'></x-pad><button id='b'></button></body></html>",
+    );
     engine.eval(r#"
         customElements.define('x-pad', class extends HTMLElement { get tabIndex() { return 0; } });
         const order = [];
@@ -1401,6 +1312,28 @@ fn data_and_blob_requests_fire_each_event_once_with_their_url() {
           await new Promise(resolve => { xhr.onloadend = resolve; xhr.open('GET', url); xhr.send(); });
           same([xhr.responseURL, xhr.responseText, events.filter(type => type !== 'readystatechange')], [final, text, ['load', 'onload', 'loadend']], 'xhr ' + url);
         }
+        "#,
+    );
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn an_xhr_aborted_mid_body_has_no_response_text() {
+    let (.., result) = offscreen_page(
+        r#"
+        const xhr = new XMLHttpRequest(), seen = [];
+        xhr.onprogress = () => xhr.abort();
+        await new Promise(resolve => {
+          xhr.onabort = () => seen.push([xhr.readyState, xhr.responseText, xhr.response]);
+          xhr.onloadend = resolve;
+          xhr.open('GET', 'data:,abc'); xhr.send();
+        });
+        same([seen, xhr.readyState, xhr.status], [[[4, '', '']], 0, 0], 'abort');
+        xhr.onprogress = null;
+        await new Promise(resolve => { xhr.onloadend = resolve; xhr.open('GET', 'data:,abc'); xhr.send(); });
+        same([xhr.readyState, xhr.status, xhr.responseText, xhr.getResponseHeader('content-type')], [4, 200, 'abc', 'text/plain;charset=US-ASCII'], 'reuse');
+        xhr.abort();
+        same([xhr.readyState, xhr.status, xhr.responseText, xhr.getResponseHeader('content-type')], [0, 0, '', null], 'abort when done');
         "#,
     );
     assert_eq!(result, "ok");

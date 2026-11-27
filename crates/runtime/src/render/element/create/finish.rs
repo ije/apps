@@ -7,7 +7,7 @@ use crate::css;
 use crate::css::properties::Prop;
 use crate::render::{
     layout::cull,
-    paint::{DomBox, Turned, scrollbar},
+    paint::{self, DomBox, Turned, scrollbar},
 };
 use crate::style::{self};
 use renderer::{px, size};
@@ -24,7 +24,7 @@ pub(super) fn finish(
     replaced: bool,
     bars: Option<scrollbar::Scrollbar>,
     mut cut_parts: Vec<(usize, usize, crate::render::paint::Piece)>,
-    plans: u8,
+    reach: crate::render::paint::Reach,
     text_clip: bool,
     pseudo_origin: Option<Rc<std::cell::Cell<renderer::Point<renderer::Pixels>>>>,
 ) -> renderer::Child {
@@ -106,18 +106,22 @@ pub(super) fn finish(
                     };
                     let at = [position.x, position.y].map(f32::from);
                     crate::render::hit::hit_test(
-                        &page.doc, state, computed, viewport, at, true, false,
+                        &page.doc,
+                        state,
+                        computed,
+                        viewport,
+                        at,
+                        crate::render::hit::Hit::First,
                     )
-                    .as_u64()
-                    .is_none_or(|target| {
-                        std::iter::successors(Some(target as usize), |&node| {
-                            page.doc.nodes[node].parent
-                        })
-                        .find_map(|node| {
-                            computed.values[node]
-                                .get(Prop::APP_REGION)
-                                .filter(|value| *value != "none")
-                        }) == Some("drag")
+                    .first()
+                    .is_none_or(|&target| {
+                        std::iter::successors(Some(target), |&node| page.doc.nodes[node].parent)
+                            .find_map(|node| {
+                                computed.values[node]
+                                    .get(Prop::APP_REGION)
+                                    .filter(|value| *value != "none")
+                            })
+                            == Some("drag")
                     })
                 });
                 if !dragged {
@@ -334,6 +338,43 @@ pub(super) fn finish(
     if let Some(used) = anchored {
         el.style().anchored = Some(Box::new(used.place));
     }
+    let set = |props: &[Prop]| {
+        (props.iter()).any(|&prop| style.get(prop).is_some_and(|value| value != "none"))
+    };
+    let url = |prop| style.get(prop).is_some_and(|value| value.contains("url("));
+    let transformed = set(&crate::render::effects::TRANSFORM_PROPS);
+    let z_index = style
+        .get(Prop::Z_INDEX)
+        .is_some_and(|value| value != "auto")
+        && style
+            .get(Prop::POSITION)
+            .is_some_and(|value| value != "static");
+    let flag = |on: bool, flag: u8| if on { flag } else { 0 };
+    let style_flags = flag(transformed, paint::STYLE_TRANSFORM)
+        | flag(transformed || z_index, paint::STYLE_STACKED)
+        | flag(
+            crate::render::effects::offset::reads_page(style),
+            paint::STYLE_OFFSET_PAGE,
+        )
+        | flag(
+            [
+                Prop::FILTER,
+                Prop::WEBKIT_FILTER,
+                Prop::CLIP_PATH,
+                Prop::WEBKIT_CLIP_PATH,
+            ]
+            .into_iter()
+            .any(url),
+            paint::STYLE_URL_EFFECT,
+        )
+        | flag(
+            set(&[Prop::FILTER, Prop::WEBKIT_FILTER]),
+            paint::STYLE_FILTER,
+        )
+        | flag(
+            style.get(Prop::POSITION) == Some("fixed"),
+            paint::STYLE_FIXED,
+        );
     let hooks = DomBox {
         text_clip,
         drawn: node.attrs.contains_key("drawable")
@@ -355,6 +396,7 @@ pub(super) fn finish(
             .filter(|&block| block != 0 && Some(block) != parent_box)
             .map(|_| containing),
         style: style.clone(),
+        style_flags,
         effects: effect_layer,
         composited,
         space: renderer::Space {
@@ -483,7 +525,7 @@ pub(super) fn finish(
             })
         },
         id,
-        plans,
+        reach,
         ids: ids.clone(),
         view: view.clone(),
         sticky,

@@ -1432,3 +1432,30 @@ fn zoom_prints_like_chrome_and_inherits_css_pixels() {
     assert_eq!(style("#c").get(Prop::ZOOM), Some("1e+20"));
     assert_eq!(computed.lengths[element(&doc, "#d")].font.zoom, 5e5);
 }
+
+#[test]
+fn shorthand_keywords_match_without_case() {
+    let doc = Document::parse(
+        r#"<style>#b{border:1px SOLID red}#g{background:url(a.png) NO-REPEAT}#q{background:url("a).PNG") RED}#f{font:BOLD 12px Arial}#o{outline:2px DOTTED blue}</style><p id=b></p><p id=g></p><p id=q></p><p id=f></p><p id=o></p>"#,
+    );
+    let get = |selector, name| styles_of(&doc, selector, name);
+    assert_eq!(get("#b", "border-top-style").as_deref(), Some("solid"));
+    assert_eq!(get("#g", "background-repeat").as_deref(), Some("no-repeat"));
+    let image = get("#q", "background-image").unwrap_or_default();
+    assert!(image.contains("a).PNG"), "{image}");
+    assert_eq!(get("#f", "font-weight").as_deref(), Some("700"));
+    assert_eq!(get("#f", "font-family").as_deref(), Some("Arial"));
+    assert_eq!(get("#o", "outline-style").as_deref(), Some("dotted"));
+}
+
+#[test]
+fn animation_math_times_stay_times() {
+    assert_eq!(
+        specified("animation", "calc(1s) spin"),
+        "calc(1s) ease 0s 1 normal none running spin"
+    );
+    assert_eq!(
+        specified("animation", "spin 1s calc(2s)"),
+        "1s ease calc(2s) 1 normal none running spin"
+    );
+}

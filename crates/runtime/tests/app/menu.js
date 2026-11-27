@@ -25,17 +25,16 @@
       }
       __appsInitMenu();
       shell.poll();
-      assert(calls.length === 1 && !shell.pending(), 'Native menu roles do not need polling or repeated setup');
+      assert(calls.length === 1, 'Native menu roles do not need polling or repeated setup');
       shell.Menu.setApplicationMenu(custom);
       assert(calls.length === 2 && calls[1][1][0].label === 'Custom', 'Replace the menu after startup');
       shell.Menu.setApplicationMenu(null);
       assert(calls.length === 3 && calls[2][1] === null && shell.Menu.getApplicationMenu() === null, 'Remove the menu after startup');
       let clicked = false;
       shell.Menu.setApplicationMenu(shell.Menu.buildFromTemplate([{ label: 'Run', click: () => { clicked = true; } }]));
-      assert(shell.pending(), 'Custom menu callbacks keep polling active');
       events.push({ type: 'menu', id: calls.at(-1)[1][0].click });
       shell.poll();
-      assert(clicked, 'Custom menu callbacks still run');
+      assert(clicked && calls.at(-1)[0] === 'native.poll', 'Custom menu callbacks keep polling active and run');
     }
   }
   const calls = [], events = [];
@@ -109,7 +108,7 @@
   context.on('menu-will-show', () => seen.push('show')).on('menu-will-close', () => seen.push('close'));
   context.popup({ x: 1, y: 2, positioningItem: 0, callback: () => seen.push('callback') });
   const request = calls.at(-1)[1];
-  assert(calls.at(-1)[0] === 'native.menu.popup' && request.request > 0 && request.x === 1 && request.positioningItem === 0 && seen.join() === 'show' && shell.pending(), 'Menu.popup returns before the menu closes');
+  assert(calls.at(-1)[0] === 'native.menu.popup' && request.request > 0 && request.x === 1 && request.positioningItem === 0 && seen.join() === 'show', 'Menu.popup returns before the menu closes');
   events.push({ type: 'menu', id: request.template[0].click }, { type: 'popup', id: request.request }, { type: 'menu', id: request.template[0].click });
   shell.poll();
   assert(seen.join() === 'show,pick,close,callback', 'Popup clicks, close and callback reach their menu once');

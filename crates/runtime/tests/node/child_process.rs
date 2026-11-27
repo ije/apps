@@ -507,3 +507,80 @@ fn detached_children_get_signals_alone_and_are_reaped() {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+// A failure kills the process by SIGPIPE, so the test runs in a child.
+#[cfg(unix)]
+#[test]
+fn removed_signal_listener_keeps_sigpipe_ignored() {
+    if std::env::var_os("APPS_SIGPIPE_TEST").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "removed_signal_listener_keeps_sigpipe_ignored",
+                "--test-threads=1",
+            ])
+            .env("APPS_SIGPIPE_TEST", "1")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "Child test ended with {status}");
+        return;
+    }
+    extern "C" fn handler(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {}
+    let read = || unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGUSR2, std::ptr::null(), &mut action);
+        (action.sa_sigaction, action.sa_flags)
+    };
+    let before = unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handler as *const () as libc::sighandler_t;
+        action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut());
+        read()
+    };
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        Rc::new(RefCell::new(Host::default())),
+        Role::Main,
+    )
+    .unwrap();
+    engine
+        .eval(
+            r#"globalThis.testResult = 'pending'; (async () => {
+        const { once } = __apps.events;
+        const listener = () => {};
+        process.on('SIGPIPE', listener).off('SIGPIPE', listener);
+        process.on('SIGUSR2', listener).off('SIGUSR2', listener);
+        const child = __apps.child_process.spawn('/bin/sh', ['-c', 'exec 0<&-; sleep 1']);
+        await new Promise(resolve => setTimeout(resolve, 200));
+        child.stdin.write('x'.repeat(65536));
+        const [error] = await once(child.stdin, 'error');
+        if (error.code !== 'EPIPE') throw error;
+    })().then(() => testResult = 'ok', error => testResult = error.stack || String(error));"#,
+            "sigpipe",
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        engine.tick().unwrap();
+        let result = engine.eval("testResult", "sigpipe-result").unwrap();
+        if result != "pending" {
+            assert_eq!(result, "ok");
+            break;
+        }
+        assert!(Instant::now() < deadline, "SIGPIPE test timed out");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(read(), before, "SIGUSR2 handler and flags");
+}
+
+#[cfg(unix)]
+#[test]
+fn synchronous_timeout_sends_a_numeric_kill_signal() {
+    run(r#"
+        const start = Date.now();
+        const result = __apps.child_process.spawnSync('/bin/sh', ['-c', 'trap "" TERM; sleep 5'], { timeout: 100, killSignal: 9 });
+        if (result.signal !== 'SIGKILL' || Date.now() - start > 3000) throw Error(`Ended by ${result.signal} after ${Date.now() - start} ms`);
+    "#);
+}

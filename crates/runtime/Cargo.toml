@@ -6,15 +6,15 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-base64 = "0.23.1"
+base64.workspace = true
 bbtree.workspace = true
 bytes = "1.12.1"
-cpal = "0.18.2"
+cpal.workspace = true
 cssparser = "0.38.0"
 crc32fast = "1.5.5"
-flate2 = { version = "1.1.11", default-features = false, features = ["zlib-rs"] }
+flate2.workspace = true
 futures-util = "0.3.34"
-getrandom = "0.4.3"
+getrandom.workspace = true
 gif = "0.14.2"
 renderer = { package = "apps-renderer", path = "../renderer" }
 http-body-util = "0.1.5"
@@ -23,12 +23,12 @@ hyper-rustls = { version = "0.27.10", default-features = false }
 hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"] }
 libc.workspace = true
 libffi = "5.2.0"
-libloading = "0.9.0"
+libloading.workspace = true
 log = "0.4.35"
 memmap2 = "0.9.12"
 md-5 = "0.11.0"
 memchr = "2.8.3"
-notify = "8.2.2"
+notify.workspace = true
 png = "0.18.1"
 portable-pty = "0.9.0"
 raw-window-handle.workspace = true
@@ -41,7 +41,7 @@ rustls-native-certs = "0.8.5"
 rustls-webpki = { version = "0.103.16", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.11.1"
+sha2.workspace = true
 socket2 = "0.6.5"
 tiny-skia.workspace = true
 tokio = { version = "1.54.1", features = ["rt", "sync", "time", "net", "io-util", "macros"] }
@@ -157,11 +157,11 @@ apps-media = { path = "../media" }
 apps-terminal = { path = "../terminal" }
 apps-webgpu = { path = "../webgpu" }
 image.workspace = true
-tempfile = "3.27.0"
+tempfile.workspace = true
 
 [build-dependencies]
-cc = "1.11.1"
-miniz_oxide = "0.9.1"
+cc.workspace = true
+miniz_oxide.workspace = true
 oxc_allocator = "=0.158.0"
 oxc_codegen = "=0.158.0"
 oxc_mangler = "=0.158.0"

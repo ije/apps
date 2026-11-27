@@ -1214,7 +1214,6 @@ pub(crate) fn resolved(
     }
 }
 
-// A sum of percentages and lengths, like `calc(10% + 1em)`, as its percentage and its pixels.
 // One longhand of an `animation` or `transition` value, like `duration`.
 pub(crate) fn longhand(value: &str, key: &str, units: &Lengths, initial: Option<&str>) -> String {
     let list = components(value, ',');
@@ -1295,6 +1294,7 @@ pub(crate) fn longhand(value: &str, key: &str, units: &Lengths, initial: Option<
     parts.join(", ")
 }
 
+// A sum of percentages and lengths, like `calc(10% + 1em)`, as its percentage and its pixels.
 pub(crate) fn percent_sum(value: &str, units: &Lengths) -> Option<(f32, f32)> {
     // Such a sum is linear in its base, so it is its value at base 0 and the change of one base of 100.
     // Like Chrome, other functions with percentages in it, like `min(10%, 5px)`, keep their text.
@@ -1386,13 +1386,13 @@ pub(crate) fn physical_name<'a>(style: &Style, name: &'a str) -> Cow<'a, str> {
     if let Some(prop) = Prop::find(name).filter(|prop| prop.is_logical()) {
         return Cow::Borrowed(crate::css::properties::physical(prop, style).name());
     }
-    let mut out = Vec::new();
     if matches!(
         name,
         "-webkit-mask-clip" | "-webkit-mask-composite" | "-webkit-background-clip"
     ) {
         return Cow::Borrowed(&name[8..]);
     }
+    let mut out = Vec::new();
     if (name.contains("block") || name.contains("inline"))
         && expand(name, "0", &mut out)
         && let [(physical, _)] = &out[..]

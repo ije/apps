@@ -138,7 +138,6 @@ impl PageState {
             self.rasters.forget(id, &mut self.media.retired);
             self.styles.cache.adopted.remove(&id);
             self.styles.motion.forget(id);
-            self.interaction.forget(id);
             if doc.target == Some(id) {
                 doc.target = None;
             }
@@ -147,7 +146,6 @@ impl PageState {
             self.styles.cache.forget(&freed);
             let gone: rustc_hash::FxHashSet<usize> = freed.iter().copied().collect();
             self.interaction.forget_all(&gone);
-            self.layout.forget_all(&gone);
             self.rasters.forget_all(&gone, &mut self.media.retired);
             self.dirty |= self.media.retired.len() > retired;
         }
@@ -251,7 +249,7 @@ impl PageState {
         image: Option<Arc<renderer::RenderImage>>,
     ) -> Option<Arc<renderer::RenderImage>> {
         if self.media.recycled.is_empty() {
-            self.media.retired_canvases.clear();
+            self.media.recycled_nodes.clear();
         }
         // A poster that decodes later must not replace the frame.
         self.media.decoding.remove(&id);
@@ -275,7 +273,7 @@ impl PageState {
         // Only the first replaced frame can be on the GPU. Recycle later frames immediately to bound memory in
         // unrendered windows.
         match old {
-            Some(old) if self.media.retired_canvases.insert(id) => {
+            Some(old) if self.media.recycled_nodes.insert(id) => {
                 self.media.recycled.push((id, old));
                 None
             }
@@ -683,5 +681,28 @@ impl PageState {
             prune(doc, parent);
         }
         (dirty, errors)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn later_frames_of_a_node_drop_at_once_until_a_frame() {
+        let image = || {
+            Some(Arc::new(renderer::RenderImage::new_premultiplied(
+                1,
+                1,
+                vec![0; 4],
+            )))
+        };
+        let mut state = PageState::default();
+        state.show_frame(1, image());
+        assert!(state.show_frame(1, image()).is_none());
+        state.media.retire(2, image());
+        assert!(state.show_frame(1, image()).is_some());
+        assert_eq!(state.media.recycled.len(), 1);
+        assert_eq!(state.media.retired.len(), 1);
     }
 }

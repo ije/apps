@@ -677,12 +677,15 @@ fn rebuilt_scenes_damage_what_changed() {
         scene.push(image);
         scene
     };
-    let damage = |from: &mut Scene, to: Scene, fresh: &[crate::gpu::atlas::Fresh]| {
+    let damage = |from: &mut Scene, to: Scene, fresh: &[crate::gpu::atlas::Texels]| {
         from.diff(Some(&[]));
         from.drawn();
         let mut to = to;
-        (to.prior, to.prior_maps, to.drawn) =
-            (mem::take(&mut from.prior), from.prior_maps.clone(), true);
+        (to.prior, to.prior_maps, to.prior_shows) = (
+            mem::take(&mut from.prior),
+            from.prior_maps.clone(),
+            Prior::Exact,
+        );
         to.diff(Some(fresh));
         to.damage
             .rects
@@ -816,7 +819,6 @@ fn patches_before_a_paint_damage_only_what_the_diff_finds() {
             scene.drawn();
         }
         fill(&mut scene, 0.5);
-        scene.rediff_patches();
         scene.diff(Some(&[]));
         assert_eq!(scene.damage.whole, shown);
         assert!(shown || !scene.damage.rects.is_empty());
@@ -875,4 +877,44 @@ fn planes_sort_by_depth_and_split_where_they_meet() {
         clips.contains(&[-4., 50.5]) && clips.contains(&[49.5, 104.]),
         "{clips:?}"
     );
+}
+
+#[test]
+fn backdrops_in_a_scroll_draw_again_when_their_filter_or_corners_change() {
+    let mut scene = Scene::default();
+    let mut frame = |pass: u32, matrix: f32, radius: f32| {
+        scene.begin_paint(pass, &mut Vec::new());
+        let viewport = Clip::from(bounds([0., 0., 400., 300.]));
+        scene.begin_scroll(1, viewport, point(0., 0.), false);
+        scene.push(Instance::new(BOX, bounds([0., 0., 400., 300.]), viewport));
+        let mut color_matrix = [0.; 20];
+        color_matrix[0] = matrix;
+        scene.push_effect(
+            EffectState {
+                backdrop: Some(BackdropState {
+                    bounds: bounds([100., 100., 100., 50.]),
+                    corner_radii: Radii::from(crate::Corners::all(radius)),
+                    blur: 0.,
+                    color_matrix: Some(color_matrix),
+                }),
+                ..effect(viewport)
+            },
+            None,
+        );
+        scene.pop_effect();
+        scene.end_scroll();
+        scene.diff(Some(&[]));
+        let damage = scene.damage.clone();
+        scene.drawn();
+        scene.clear();
+        damage
+    };
+    frame(1, 1., 0.);
+    assert!(frame(2, 1., 0.).rects.is_empty(), "the same scene");
+    for damage in [frame(3, 0.5, 0.), frame(4, 0.5, 8.)] {
+        assert!(
+            (damage.rects.iter()).any(|rect| rect.contains(point(150., 125.))),
+            "{damage:?}"
+        );
+    }
 }

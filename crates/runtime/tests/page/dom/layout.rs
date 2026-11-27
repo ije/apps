@@ -2,21 +2,7 @@ use super::*;
 
 #[test]
 fn window_scroll_moves_the_page() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse("<html><body><main></main></body></html>"),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (host, engine) = css_page("<html><body><main></main></body></html>");
     engine.eval(r#"
         const received = [];
         addEventListener('scroll', e => received.push([e.target === document, e.bubbles, scrollX, scrollY]));
@@ -46,17 +32,9 @@ fn window_scroll_moves_the_page() {
 
 #[test]
 fn hit_testing_follows_paint_order_clipping_and_shadow_trees() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><body><div id='back'></div><div id='front'></div><div id='clip' style='overflow:hidden'><span id='child'></span></div><test-hit></test-hit></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (host, engine) = css_page(
+        "<html><body><div id='back'></div><div id='front'></div><div id='clip' style='overflow:hidden'><span id='child'></span></div><test-hit></test-hit></body></html>",
+    );
     engine.eval("const shadowHost=document.querySelector('test-hit');shadowHost.attachShadow({mode:'open'}).innerHTML='<span id=\"inside\"></span>';", "test").unwrap();
     {
         let host = host.borrow().store.clone();
@@ -102,17 +80,9 @@ fn hit_testing_follows_paint_order_clipping_and_shadow_trees() {
 
 #[test]
 fn hit_testing_takes_the_box_painted_last() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><body><div id='panel' style='height:0'><button id='button'></button></div><pre id='code'><span id='line'>x</span></pre></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (host, engine) = css_page(
+        "<html><body><div id='panel' style='height:0'><button id='button'></button></div><pre id='code'><span id='line'>x</span></pre></body></html>",
+    );
     let ids: Vec<usize> = ["body", "#panel", "#button", "#code", "#line"]
         .iter()
         .map(|selector| {
@@ -153,17 +123,9 @@ fn hit_testing_takes_the_box_painted_last() {
 
 #[test]
 fn scrolling_snaps_to_device_pixels_and_respects_scroll_margins() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><body><div id='box' style='overflow:scroll;scroll-padding:0 10px 0 20%'><i id='caret' style='scroll-margin:0 8px 0 50px'></i><i id='plain'></i></div></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (host, engine) = css_page(
+        "<html><body><div id='box' style='overflow:scroll;scroll-padding:0 10px 0 20%'><i id='caret' style='scroll-margin:0 8px 0 50px'></i><i id='plain'></i></div></body></html>",
+    );
     let ids: Vec<usize> = ["#box", "#caret", "#plain"]
         .iter()
         .map(|selector| {
@@ -218,14 +180,9 @@ fn screen_describes_the_viewport_without_a_window() {
 #[test]
 fn mirror_follows_random_mutations_and_releases() {
     for seed in 1..17u32 {
-        let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow().store.borrow_mut().pages.insert(1, Page { doc: Document::parse("<html><body><div id=a class='x y'>t<!--c-->u<p>p</p></div><ul><li>1</li><li>2</li></ul></body></html>"), dirty: false, ..Default::default() });
-        let engine = JsContext::new(
-            JavaScriptCore::load().unwrap(),
-            host.clone(),
-            Role::Renderer(1),
-        )
-        .unwrap();
+        let (host, engine) = css_page(
+            "<html><body><div id=a class='x y'>t<!--c-->u<p>p</p></div><ul><li>1</li><li>2</li></ul></body></html>",
+        );
         engine.eval(&format!(r#"
           let seed = {seed};
           const rand = n => {{ seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; }};
@@ -310,17 +267,9 @@ fn mirror_follows_random_mutations_and_releases() {
 
 #[test]
 fn layout_mirror_feeds_observers_offsets_and_scrolling() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><body><div id='clip' style='overflow:hidden'><p id='a'>a</p><p id='b'>b</p></div><div id='rel' style='position:relative'><span id='c'>c</span></div><div id='gone' style='display:none'></div></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (host, engine) = css_page(
+        "<html><body><div id='clip' style='overflow:hidden'><p id='a'>a</p><p id='b'>b</p></div><div id='rel' style='position:relative'><span id='c'>c</span></div><div id='gone' style='display:none'></div></body></html>",
+    );
     let place = |rects: &[(&str, [f32; 4])]| {
         let host = host.borrow().store.clone();
         let mut host = host.borrow_mut();
@@ -395,17 +344,9 @@ fn layout_mirror_feeds_observers_offsets_and_scrolling() {
 
 #[test]
 fn scroll_sizes_hold_the_out_of_flow_boxes_whose_containing_block_is_inside() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><body><div id='s'><div id='a' style='position:absolute'></div></div><div id='r' style='position:relative'><div id='b' style='position:absolute'></div></div><div id='n'><div id='p' style='position:relative'><div id='c' style='position:absolute'></div></div></div><div id='t' style='transform:scale(1)'><div id='f' style='position:fixed'></div></div><div id='u'><div id='g' style='position:fixed'></div></div></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (host, engine) = css_page(
+        "<html><body><div id='s'><div id='a' style='position:absolute'></div></div><div id='r' style='position:relative'><div id='b' style='position:absolute'></div></div><div id='n'><div id='p' style='position:relative'><div id='c' style='position:absolute'></div></div></div><div id='t' style='transform:scale(1)'><div id='f' style='position:fixed'></div></div><div id='u'><div id='g' style='position:fixed'></div></div></body></html>",
+    );
     engine.eval("document.body.offsetWidth", "test").unwrap();
     let place = |rects: &[(&str, [f32; 4])]| {
         let store = host.borrow().store.clone();
@@ -626,23 +567,9 @@ fn text_offsets_skip_comments_like_text_points() {
 
 #[test]
 fn throwing_resize_observer_does_not_stop_layout_callbacks() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse(
-                "<html><body><main><div id='box' style='overflow:auto'></div></main></body></html>",
-            ),
-            dirty: false,
-            ..Default::default()
-        },
+    let (_, engine) = css_page(
+        "<html><body><main><div id='box' style='overflow:auto'></div></main></body></html>",
     );
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
     engine
         .eval(
             r#"

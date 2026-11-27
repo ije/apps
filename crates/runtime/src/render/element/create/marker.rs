@@ -90,9 +90,9 @@ pub(super) fn list_marker(cx: &Cx<'_>, fr: &Frame, mut el: renderer::Node) -> re
             );
         let number = styles.list_items.get(&id).copied().unwrap_or(number);
         let marker = match kind {
-            "disc" | "circle" | "square" => css::value::counter::counter_text(kind, number),
-            "disclosure-closed" => "▸".to_owned(),
-            "disclosure-open" => "▾".to_owned(),
+            "disc" | "circle" | "square" | "disclosure-closed" | "disclosure-open" => {
+                css::value::counter::counter_text(kind, number)
+            }
             other if other.starts_with(['"', '\'']) => other.trim_matches(['"', '\'']).to_owned(),
             "cjk-decimal"
             | "cjk-ideographic"

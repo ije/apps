@@ -76,21 +76,17 @@ pub(crate) fn kind(
                 .get(*color)
                 .and_then(css::value::color::color)
                 .is_some_and(|(ink, _)| edges.contains(&ink))
-    }) && [
-        Prop::BORDER_TOP_LEFT_RADIUS,
-        Prop::BORDER_TOP_RIGHT_RADIUS,
-        Prop::BORDER_BOTTOM_RIGHT_RADIUS,
-        Prop::BORDER_BOTTOM_LEFT_RADIUS,
-    ]
-    .into_iter()
-    .all(|corner| {
-        style
-            .get(corner)
-            .is_none_or(|value| matches!(value, "0" | "0px"))
-    }) && style
-        .get(Prop::BACKGROUND_COLOR)
-        .and_then(css::value::color::color)
-        .is_some_and(|(ink, _)| backgrounds.contains(&ink))
+    }) && super::super::effects::clip::RADII
+        .into_iter()
+        .all(|corner| {
+            style
+                .get(corner)
+                .is_none_or(|value| matches!(value, "0" | "0px"))
+        })
+        && style
+            .get(Prop::BACKGROUND_COLOR)
+            .and_then(css::value::color::color)
+            .is_some_and(|(ink, _)| backgrounds.contains(&ink))
         && style
             .get(Prop::BACKGROUND_IMAGE)
             .is_none_or(|value| value == "none");
@@ -151,7 +147,6 @@ pub(crate) fn layer(id: usize, look: Look, view: Rc<super::super::ViewState>) ->
                     bounds,
                     renderer::Radii::default(),
                     image.clone(),
-                    false,
                     false,
                 );
             }

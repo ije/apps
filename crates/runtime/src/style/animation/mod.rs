@@ -1044,7 +1044,6 @@ impl Motion {
             let out = animated.entry(id).or_default();
             advance(list, (id, ""), now, out, events, &mut wakes);
         }
-        frame.backdrops.clear();
         for (&id, (base, list)) in &mut self.backdrop {
             if !list.is_empty() {
                 let mut out = (**base).clone();
@@ -1081,7 +1080,6 @@ impl Motion {
                 }
             }
         }
-        frame.custom.clear();
         if animated.values().any(|values| {
             !values.vars().is_empty()
                 || values.contains(Prop::FONT_SIZE)

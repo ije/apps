@@ -51,6 +51,9 @@ globalThis.__appsSQLite = native => {
     #id;
     #path;
     #options;
+    // Statements keep the connection they were made on, so a reopen doesn't revive them.
+    // The connection holds the database, so a live statement keeps it from being released.
+    #connection;
     constructor(path, options = {}) {
       if (path instanceof URL && path.protocol === 'file:') path = decodeURIComponent(path.pathname);
       else if (ArrayBuffer.isView(path)) path = new TextDecoder().decode(path);
@@ -73,13 +76,14 @@ globalThis.__appsSQLite = native => {
       if (this.isOpen) throw fail(Error, 'ERR_INVALID_STATE', 'database is already open');
       this.#id = call('sqlite.open', this.#path, this.#options);
       databases.set(this, this.#id);
+      this.#connection = { open: true, database: this };
       resources?.register(this, { op: 'sqlite.releaseDatabase', id: this.#id }, this);
     }
     close() {
       open(this);
       call('sqlite.close', this.#id);
       authorizers.delete(this.#id); databases.delete(this);
-      this.#id = undefined;
+      this.#id = undefined; this.#connection.open = false;
       resources?.unregister(this);
     }
     exec(sql) {
@@ -90,7 +94,7 @@ globalThis.__appsSQLite = native => {
     prepare(sql) {
       open(this);
       if (typeof sql !== 'string') throw fail(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "sql" argument must be a string.');
-      return new StatementSync(token, this, call('sqlite.prepare', this.#id, sql), this.#options);
+      return new StatementSync(token, this.#connection, call('sqlite.prepare', this.#id, sql), this.#options);
     }
     setAuthorizer(callback) {
       open(this);
@@ -101,7 +105,7 @@ globalThis.__appsSQLite = native => {
   }
   class StatementSync {
     #id;
-    #database;
+    #connection;
     #names = new Map();
     #bareNames = new Map();
     #anonymous = [];
@@ -112,10 +116,10 @@ globalThis.__appsSQLite = native => {
     #arrays;
     #bare;
     #unknown;
-    constructor(key, database, statement, options) {
+    constructor(key, connection, statement, options) {
       if (key !== token) throw new TypeError('Use database.prepare() to create a statement');
       this.#id = statement.id;
-      this.#database = database;
+      this.#connection = connection;
       for (let index = 0; index < statement.parameters.length; index++) {
         const name = statement.parameters[index];
         if (name === null || name.startsWith('?')) this.#anonymous.push(index + 1);
@@ -133,7 +137,7 @@ globalThis.__appsSQLite = native => {
       resources?.register(this, { op: 'sqlite.releaseStatement', id: this.#id }, this);
     }
     #bind(args) {
-      if (this.#id === undefined || !this.#database.isOpen) throw fail(Error, 'ERR_INVALID_STATE', 'statement has been finalized');
+      if (this.#id === undefined || !this.#connection.open) throw fail(Error, 'ERR_INVALID_STATE', 'statement has been finalized');
       if (this.#cursor?.active) {
         this.#cursor.active = false;
         this.#cursor.invalidated = true;

@@ -120,6 +120,8 @@ pub struct RenderFrame {
     // Set by a backend that draws damage regions straight into the window under a scissor, with no layer for each.
     scissors: bool,
     under: Option<KeptUnder>,
+    // The last id and the kept window before the last record, which `clear_damage` takes back.
+    before: (u64, Option<KeptUnder>),
     // Draws only the items of the window layer before the split of `Under`, or only those after it.
     half: Option<([u32; 2], bool)>,
 }
@@ -127,6 +129,7 @@ pub struct RenderFrame {
 // A window-size texture. In the viewport of the scroll its rows and columns turn like a ring, so a scroll moves
 // `ring` and not the pixels: the window place `p` in the viewport is at the texel
 // `view.xy + (p - view.xy + ring) mod view.wh`, and the other places at `p`.
+#[derive(Clone, Copy)]
 struct KeptUnder {
     scroll: u64,
     id: u64,
@@ -341,9 +344,18 @@ impl RenderFrame {
         (self.keeps_under, self.scissors) = (keep, keep);
     }
 
-    #[cfg(target_os = "linux")]
+    // The last record was not drawn, so the layers it kept are in no texture and the kept window didn't turn.
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn clear_damage(&mut self) {
         self.damage.clear();
+        let (ids, under) = self.before;
+        self.cache.retain(|cached| cached.id <= ids);
+        self.under = under
+            .filter(|under| under.count == self.count.wrapping_sub(1))
+            .map(|under| KeptUnder {
+                count: self.count,
+                ..under
+            });
     }
 
     // Whether the frame skips exactly `layers`, which the backend draws.
@@ -376,6 +388,7 @@ impl RenderFrame {
         self.copy = copy;
         self.kept.clear();
         self.bases.clear();
+        self.before = (self.ids, self.under);
         self.count = self.count.wrapping_add(1);
         let count = self.count;
         self.seen

@@ -125,6 +125,9 @@ impl ViewState {
             self.mismatched.take();
             self.frames.take();
             self.terminals.take();
+            self.culled.take();
+            self.animated.take();
+            self.reach.take();
         }
         // The drawings of ended terminal sessions go now, with their images and timers.
         if !self.terminals.borrow().is_empty() {
@@ -153,7 +156,8 @@ impl ViewState {
                 player.recycle(node as u64, image);
             }
         }
-        dom.media.retired_canvases.clear();
+        dom.media.retired_nodes.clear();
+        dom.media.recycled_nodes.clear();
         if std::mem::take(&mut dom.paint_requested) {
             self.paint.set(true);
         }

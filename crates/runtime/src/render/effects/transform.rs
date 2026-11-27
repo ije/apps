@@ -7,6 +7,7 @@ use renderer::{Pixels, Rect, point, px};
 // A transform at the origin and the size it is for.
 pub(crate) type Local = std::cell::Cell<Option<Box<([f32; 2], Option<Matrix>)>>>;
 
+// The matrix of a box moved by `[x, y]`: `translate(x, y) * matrix * translate(-x, -y)`, without the rounding of
 // a move there and back, so a plain translation stays exact.
 pub(crate) fn placed(m: &Matrix, [x, y]: [f32; 2]) -> Matrix {
     let mut n = *m;
@@ -142,9 +143,6 @@ mod tests {
             }
         }
     }
-
-    // The SVG draws the two parts of `exclude` one over the other, so it matches the XOR of the standard only
-    // where alpha is 0 or 1.
 
     #[test]
     fn transforms_map_window_points_around_the_origin() {

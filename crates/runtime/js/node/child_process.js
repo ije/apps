@@ -1,8 +1,7 @@
-globalThis.__appsChildProcess = (call, EventEmitter, stream, fail) => {
+globalThis.__appsChildProcess = (call, EventEmitter, stream, fail, view) => {
   const children = new Map();
   const key = {};
   let failureID = 0;
-  const view = data => Object.getPrototypeOf(data) === Uint8Array.prototype ? Object.setPrototypeOf(data, Buffer.prototype) : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
   const channel = (target, id, name) => {
     let parts = [];
     const disconnect = now => {

@@ -78,7 +78,14 @@ pub fn run(
         .transpose()?;
     // Without --bytecode or --no-bytecode, a build packs bytecode when this machine can make it for the target.
     let bytecode = match bytecode {
-        Some(bytecode) => bytecode,
+        Some(false) => false,
+        Some(true) => {
+            ensure!(
+                packaging::makes_bytecode(runtime, target)?,
+                "--bytecode needs the runtime and JavaScriptCore next to apps, built for this machine"
+            );
+            true
+        }
         None => compiled.is_none() && rust.is_none() && packaging::makes_bytecode(runtime, target)?,
     };
     let bytes = packaging::package_app(

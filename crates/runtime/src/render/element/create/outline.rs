@@ -1,4 +1,4 @@
-use super::super::border::shade_border;
+use super::super::border::{bevel, shade_border};
 use super::cx::{Cx, Frame};
 use crate::css;
 use crate::css::properties::Prop;
@@ -116,19 +116,10 @@ pub(super) fn outline(
         let name = style.get(Prop::OUTLINE_STYLE).unwrap_or("solid");
         let kind = crate::render::effects::border_style(name);
         // The top and left sides, then the right and bottom ones, of each band from the outer edge in.
-        let bands: Vec<[renderer::Color; 2]> = match name {
-            "inset" => vec![[true, false].map(|dark| shade_border(color, dark))],
-            "outset" => vec![[false, true].map(|dark| shade_border(color, dark))],
-            "groove" => vec![
-                [true, false].map(|dark| shade_border(color, dark)),
-                [false, true].map(|dark| shade_border(color, dark)),
-            ],
-            "ridge" => vec![
-                [false, true].map(|dark| shade_border(color, dark)),
-                [true, false].map(|dark| shade_border(color, dark)),
-            ],
-            _ => vec![[color; 2]],
-        };
+        let [top, bottom] = [true, false].map(|raised| bevel(name, color, raised, shade_border));
+        let bands: Vec<[renderer::Color; 2]> = std::iter::once([top.0, bottom.0])
+            .chain(top.1.zip(bottom.1).map(Into::into))
+            .collect();
         // Like the border box, the outline is square at corners without a radius.
         let mut outline = renderer::canvas(
             |_, _| (),

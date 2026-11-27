@@ -10,11 +10,11 @@ mod window;
 
 use super::single::Task;
 use crate::text::windows::{extent, setting};
-use crate::{Cursor, Rect, WindowOptions, platform::Callbacks, point, px, size};
+use crate::{Cursor, Rect, WindowOptions, platform::Callbacks, platform::lock, point, px, size};
 use anyhow::Result;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering::*};
-use std::sync::{Condvar, LockResult, Mutex, Once, OnceLock, PoisonError};
+use std::sync::{Condvar, Mutex, Once, OnceLock, PoisonError};
 use std::{cell::RefCell, ffi::c_void, thread, time::Duration, time::Instant};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::{Dwm::*, Gdi::*};
@@ -45,11 +45,6 @@ thread_local! {
     static TIMERS: RefCell<Timers> = RefCell::default();
 }
 
-// A lock or wait that another thread's panic poisoned still holds good data here.
-fn held<G>(result: LockResult<G>) -> G {
-    result.unwrap_or_else(PoisonError::into_inner)
-}
-
 fn host() -> HWND {
     HWND(HOST.load(Acquire) as _)
 }
@@ -65,7 +60,7 @@ fn current_cursor() -> Option<HCURSOR> {
 }
 
 pub(crate) fn native_post(task: Task) {
-    held(INBOX.lock()).push_back(task);
+    lock(&INBOX).push_back(task);
     wake();
 }
 
@@ -83,9 +78,9 @@ fn wake() {
 // Runs the work that is due now. Work that it adds waits for the next wake, so input and frames get a turn.
 fn drain() {
     WOKEN.store(false, Release);
-    let count = held(INBOX.lock()).len();
+    let count = lock(&INBOX).len();
     for _ in 0..count {
-        let mut inbox = held(INBOX.lock());
+        let mut inbox = lock(&INBOX);
         let Some(task) = inbox.pop_front() else {
             break;
         };
@@ -196,7 +191,7 @@ impl Platform {
         self::set_cursor(Cursor::Default);
         // Tasks posted before the host existed wait for this wake.
         WOKEN.store(false, Release);
-        if !held(INBOX.lock()).is_empty() {
+        if !lock(&INBOX).is_empty() {
             wake();
         }
         Self
@@ -390,7 +385,7 @@ static PACER: Once = Once::new();
 
 fn want_frames(hwnd: HWND, on: bool) {
     let key = hwnd.0 as isize;
-    let mut windows = held(PACING.wanting.lock());
+    let mut windows = lock(&PACING.wanting);
     if !on {
         windows.retain(|&other| other != key);
     } else if !windows.contains(&key) {
@@ -417,8 +412,11 @@ fn pace() {
     let mut due = Vec::new();
     loop {
         {
-            let all = held(PACING.wanting.lock());
-            let mut windows = held(PACING.wanted.wait_while(all, |list| list.is_empty()));
+            let all = lock(&PACING.wanting);
+            let mut windows = PACING
+                .wanted
+                .wait_while(all, |list| list.is_empty())
+                .unwrap_or_else(PoisonError::into_inner);
             // Hidden and minimized windows drop out, and ask again once shown.
             windows.retain(|&raw| {
                 let hwnd = HWND(raw as _);

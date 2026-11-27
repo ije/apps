@@ -219,3 +219,64 @@ fn copies_match_their_paint_but_for_rounding() {
     assert!(!same("-1 [1966.27, 2.0]", "-1 [1966.52, 2.0]"));
     assert!(!same("-1 [1966.27, 2.0]", "-1 [1966.27, 3.0]"));
 }
+
+#[test]
+fn compaction_and_new_scales_move_the_held_boundaries() {
+    let mut tree = Tree::default();
+    let viewport = size(px(100.), px(100.));
+    let page = |rows: usize, text: &'static str| {
+        let mut float = node().id(1usize).w(px(10.)).h(px(10.)).child(text);
+        float.style().flow = crate::Flow::FLOAT;
+        let rows = (2..rows + 2).map(|id| node().id(id).child(node()).into());
+        let children = rows.chain([float.into()]).collect::<Vec<Child>>();
+        node().id(0usize).children(children).into()
+    };
+    tree.begin(1., 0);
+    tree.commit_root(page(2000, "a"), viewport, 1.);
+    let float = tree.index(1usize.into()).unwrap();
+    let inputs = taffy::LayoutInput {
+        run_mode: taffy::RunMode::PerformLayout,
+        ..taffy::LayoutInput::HIDDEN
+    };
+    let slot = &mut tree.slots[float as usize];
+    slot.cold_mut().inputs = Some(inputs);
+    slot.cache.store(&inputs, taffy::LayoutOutput::HIDDEN);
+    tree.begin(1., 0);
+    tree.commit_root(page(3, "b"), viewport, 1.);
+    assert_eq!(tree.bounded, [float]);
+    tree.bury();
+    assert_eq!(tree.bounded, [tree.index(1usize.into()).unwrap()]);
+    tree.begin(2., 0);
+    assert!(tree.bounded.is_empty());
+}
+
+#[test]
+fn a_new_overflow_clears_the_far_corners_of_all_boxes() {
+    let mut tree = Tree::default();
+    let viewport = size(px(100.), px(100.));
+    let page = |overflow: crate::Overflow, kept: bool| {
+        let mut row = node().id(1usize).child(node().id(2usize));
+        row.style().overflow = crate::point(overflow, overflow);
+        let rows = (3..6usize).map(|id| match kept {
+            true => Child::Kept(id.into()),
+            false => node().id(id).child(node()).into(),
+        });
+        let children = [row.into()].into_iter().chain(rows);
+        node()
+            .id(0usize)
+            .children(children.collect::<Vec<Child>>())
+            .into()
+    };
+    let corners = Some([crate::point(1., 1.); 2]);
+    tree.begin(1., 0);
+    tree.commit_root(page(crate::Overflow::Visible, false), viewport, 1.);
+    tree.slots
+        .iter_mut()
+        .for_each(|slot| slot.cold_mut().far = [corners; 2]);
+    tree.begin(1., 0);
+    tree.commit_root(page(crate::Overflow::Visible, true), viewport, 1.);
+    assert!(tree.slots.iter().any(|slot| slot.far() == [corners; 2]));
+    tree.begin(1., 0);
+    tree.commit_root(page(crate::Overflow::Hidden, true), viewport, 1.);
+    assert!(tree.slots.iter().all(|slot| slot.far() == [None; 2]));
+}

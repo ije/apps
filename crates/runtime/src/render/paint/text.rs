@@ -160,11 +160,11 @@ pub(crate) struct TextHighlight {
     pub(crate) lines: [Option<renderer::Decoration>; 3],
 }
 
-// A background or border of an inline box in a group of the text: the group, rect, corners, fill and border.
+// A background or border of an inline box in a group of the text: the group, rect, radii, fill and border.
 type Grouped = (
     usize,
     Rect<Pixels>,
-    renderer::Corners<Pixels>,
+    renderer::Radii<Pixels>,
     Color,
     renderer::Border,
 );
@@ -2306,24 +2306,41 @@ impl renderer::Hooks for InlineText {
                         );
                         (rect, [start || clone, end || clone])
                     });
-                    Some((style, units, b.x - a.x, parts))
+                    Some((style, units, parts))
                 };
+                // Like Chrome, the radii take the size of the parts put side by side.
                 let radii = |style: &css::properties::Style,
                              units: css::value::units::Lengths,
-                             width: Pixels| {
-                    [
-                        Prop::BORDER_TOP_LEFT_RADIUS,
-                        Prop::BORDER_TOP_RIGHT_RADIUS,
-                        Prop::BORDER_BOTTOM_RIGHT_RADIUS,
-                        Prop::BORDER_BOTTOM_LEFT_RADIUS,
-                    ]
-                    .map(|corner| {
-                        px(style
-                            .get(corner)
-                            .and_then(|v| units.resolve(v, width.into()))
-                            .unwrap_or(0.))
+                             parts: &[(Rect<Pixels>, [bool; 2])]| {
+                    let width = parts
+                        .iter()
+                        .map(|(rect, _)| rect.size.width)
+                        .sum::<Pixels>();
+                    let height = parts.first().map_or(px(0.), |(rect, _)| rect.size.height);
+                    super::super::effects::clip::radii(style, &units, || {
+                        [f32::from(width), f32::from(height)]
                     })
+                    .resolve(size(width, height))
                 };
+                // The radii of a part, with `open` at its open sides.
+                let part_radii =
+                    |mut radii: renderer::Radii<Pixels>, [left, right]: [bool; 2], open| {
+                        for corners in [&mut radii.x, &mut radii.y] {
+                            if !left {
+                                (corners.top_left, corners.bottom_left) = (open, open);
+                            }
+                            if !right {
+                                (corners.top_right, corners.bottom_right) = (open, open);
+                            }
+                        }
+                        if !left {
+                            (radii.shape.top_left, radii.shape.bottom_left) = (0, 0);
+                        }
+                        if !right {
+                            (radii.shape.top_right, radii.shape.bottom_right) = (0, 0);
+                        }
+                        radii
+                    };
                 for inline in &self.data.boxes {
                     let shadowed = self.data.cuts.contains(&self.data.ranges[inline.index].0);
                     if inline.fill.is_transparent()
@@ -2332,8 +2349,7 @@ impl renderer::Hooks for InlineText {
                     {
                         continue;
                     }
-                    let Some((style, units, width, parts)) =
-                        fragments(inline.index, Some(inline), window)
+                    let Some((style, units, parts)) = fragments(inline.index, Some(inline), window)
                     else {
                         continue;
                     };
@@ -2342,7 +2358,7 @@ impl renderer::Hooks for InlineText {
                             (rect, [left && !inline.open[0], right && !inline.open[1]])
                         })
                         .collect();
-                    let radii = radii(style, units, width);
+                    let radii = radii(style, units, &parts);
                     // A spliced box has no box of its own, so each part draws its shadow.
                     let mut shadows = match shadowed {
                         true => css::value::box_shadows(
@@ -2359,14 +2375,7 @@ impl renderer::Hooks for InlineText {
                     for (rect, [left_side, right_side]) in
                         parts.iter().filter(|_| !shadows.is_empty())
                     {
-                        let corner =
-                            |round: bool, radius: Pixels| if round { radius } else { px(0.) };
-                        let corners = renderer::Corners {
-                            top_left: corner(*left_side, radii[0]),
-                            top_right: corner(*right_side, radii[1]),
-                            bottom_right: corner(*right_side, radii[2]),
-                            bottom_left: corner(*left_side, radii[3]),
-                        };
+                        let corners = part_radii(radii, [*left_side, *right_side], px(0.));
                         let far = px(1e4);
                         let [left, right] = [*left_side, *right_side]
                             .map(|closed| if closed { far } else { px(0.) });
@@ -2385,19 +2394,14 @@ impl renderer::Hooks for InlineText {
                                 clip,
                                 renderer::Corners::default(),
                             ))),
-                            |window| window.draw_shadows(wide, corners.into(), &shadows, false),
+                            |window| window.draw_shadows(wide, corners, &shadows, false),
                         );
                     }
                     let [width_above, width_right, width_below, width_left] =
                         inline.borders.map(px);
                     let group = group_of(&self.data.ranges[inline.index].1);
                     for (rect, [left_side, right_side]) in parts {
-                        let corners = renderer::Corners {
-                            top_left: if left_side { radii[0] } else { px(0.) },
-                            top_right: if right_side { radii[1] } else { px(0.) },
-                            bottom_right: if right_side { radii[2] } else { px(0.) },
-                            bottom_left: if left_side { radii[3] } else { px(0.) },
-                        };
+                        let corners = part_radii(radii, [left_side, right_side], px(0.));
                         let border = renderer::Border {
                             widths: renderer::Edges {
                                 top: width_above,
@@ -2423,8 +2427,7 @@ impl renderer::Hooks for InlineText {
                         .binary_search_by_key(&index, |inline| inline.index)
                         .ok()
                         .map(|at| &self.data.boxes[at]);
-                    let Some((style, units, width, parts)) = fragments(index, inline, window)
-                    else {
+                    let Some((style, units, parts)) = fragments(index, inline, window) else {
                         continue;
                     };
                     let Some(kind) = style
@@ -2441,7 +2444,8 @@ impl renderer::Hooks for InlineText {
                         .get(Prop::OUTLINE_OFFSET)
                         .and_then(|v| units.resolve(v, 0.))
                         .unwrap_or(0.);
-                    let radii = radii(style, units, width);
+                    let parts: Vec<_> = parts.collect();
+                    let radii = radii(style, units, &parts);
                     // A focus ring is 2px of the outline color over a 1px ring of white, or of #101010 in a dark
                     // scheme, and has a radius of 3px without a border radius.
                     // Rings as (grow, width, color, style), and how radii grow: (by, then, without a radius).
@@ -2484,19 +2488,24 @@ impl renderer::Hooks for InlineText {
                             if rect.size.width <= px(0.) || rect.size.height <= px(0.) {
                                 continue;
                             }
-                            let corner = |side: bool, radius: Pixels| match side && radius > px(0.)
-                            {
-                                true => (radius + px(by)).max(px(0.)) + px(then),
-                                false => px(square),
-                            };
+                            let mut grown = radii;
+                            for (x, y) in [
+                                (&mut grown.x.top_left, &mut grown.y.top_left),
+                                (&mut grown.x.top_right, &mut grown.y.top_right),
+                                (&mut grown.x.bottom_right, &mut grown.y.bottom_right),
+                                (&mut grown.x.bottom_left, &mut grown.y.bottom_left),
+                            ] {
+                                let round = *x > px(0.) && *y > px(0.);
+                                for radius in [x, y] {
+                                    *radius = match round {
+                                        true => (*radius + px(by)).max(px(0.)) + px(then),
+                                        false => px(square),
+                                    };
+                                }
+                            }
                             outlines.push((
                                 rect,
-                                renderer::Corners {
-                                    top_left: corner(left_side, radii[0]),
-                                    top_right: corner(right_side, radii[1]),
-                                    bottom_right: corner(right_side, radii[2]),
-                                    bottom_left: corner(left_side, radii[3]),
-                                },
+                                part_radii(grown, [left_side, right_side], px(square)),
                                 renderer::Border {
                                     widths: renderer::Edges::all(px(line)),
                                     color,
@@ -2601,10 +2610,7 @@ impl renderer::Hooks for InlineText {
                     }
                     let caret = dom.interaction.selection_caret == Some(*id);
                     let text = &self.data.text[range.clone()];
-                    let source = store
-                        .pages
-                        .get(&view.id)
-                        .map_or("", |page| page.doc.nodes[*id].text.as_str());
+                    let source = doc.nodes[*id].text.as_str();
                     let start = range.start + crate::dom::text::shown_index(source, text, *start);
                     let end = range.start + crate::dom::text::shown_index(source, text, *end);
                     if caret {

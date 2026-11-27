@@ -26,7 +26,7 @@ use macos as sys;
 use windows as sys;
 
 pub use bidi::{Embedding, InlineEdges, reorders, right_to_left};
-pub use breaks::{Banded, Indent, Wrapping};
+pub use breaks::{Indent, Wrapping};
 pub use cache::Span;
 pub use draw::TextCanvas;
 pub use hyphen::*;
@@ -38,6 +38,7 @@ pub use web::FaceRules;
 
 use crate::{Pixels, Rect, Size, px};
 use adjust::ADJUSTED;
+use breaks::Banded;
 
 use cache::Cache;
 use rustc_hash::FxHashMap;
@@ -635,7 +636,7 @@ impl TextSystem {
         self.shape_beside(text, font_size, runs, wrapping, None)
     }
 
-    /// Like `shape_text`, with rows beside the floats of `floats` (see [`Banded`]).
+    /// Like `shape_text`, with rows beside the floats of `floats` (see `Banded`).
     pub fn shape_beside(
         &self,
         text: &str,

@@ -30,9 +30,6 @@ use windows::core::{BOOL, HSTRING, PCWSTR, w};
 
 static CLASS: AtomicU16 = AtomicU16::new(0);
 
-// A window that stops drawing releases its layers after this.
-const QUIET: Duration = Duration::from_secs(1);
-
 struct Shared {
     hwnd: HWND,
     callbacks: Callbacks,
@@ -771,9 +768,10 @@ impl Shared {
             self.wants_frames.set(false);
             want_frames(self.hwnd, false);
             let callbacks = self.callbacks;
-            self.quiet.set(Some(crate::platform::timer(QUIET, move || {
-                events().release(callbacks)
-            })));
+            self.quiet.set(Some(crate::platform::timer(
+                crate::platform::QUIET,
+                move || events().release(callbacks),
+            )));
         }
         true
     }
@@ -1146,7 +1144,10 @@ impl Shared {
                 // Main decides about closing and closes the window itself.
                 WM_CLOSE => {
                     if self.closable.get() {
-                        events().should_close(callbacks);
+                        crate::native::window_event(
+                            callbacks.id,
+                            crate::native::WindowEvent::CloseRequested,
+                        );
                     }
                     Some(0)
                 }

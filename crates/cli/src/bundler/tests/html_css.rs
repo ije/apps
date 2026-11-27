@@ -874,3 +874,28 @@ fn package_marks_system_web_views_of_app_code() {
         assert_eq!(package.contains(r#""webview":true"#), webview, "{page}");
     }
 }
+
+#[test]
+fn referenced_legacy_variant_definitions_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = |name: &str, text: &str| fs::write(dir.path().join(name), text).unwrap();
+    write(
+        "app.css",
+        "@import 'tailwindcss'; @variant pin { &.pin { @slot; } } p { padding: 9px }",
+    );
+    write(
+        "style.css",
+        "@import 'tailwindcss'; @import './app.css' reference;",
+    );
+    let path = dir.path().join("index.html");
+    write(
+        "index.html",
+        "<link rel='stylesheet' href='./style.css'><p class='pin pin:hidden'></p>",
+    );
+    let source = Rc::<Shared>::default().html(&path).unwrap();
+    assert!(!linked_css(&source).contains("9px"));
+    let style = apps_runtime::style::styles(&apps_runtime::bundle::page(&source), 800., 600.)
+        .pop()
+        .unwrap();
+    assert_eq!(style["display"], "none");
+}

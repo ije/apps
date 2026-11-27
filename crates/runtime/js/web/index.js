@@ -201,7 +201,7 @@ globalThis.__appsWeb = (call, codec) => {
     get ignoreBOM() { return this._decoder.ignoreBOM; }
   }
   const params = new WeakMap(), urls = new WeakMap();
-  const usv = value => { const text = String(value); return text.toWellFormed ? text.toWellFormed() : text.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD'); };
+  const usv = value => String(value).toWellFormed();
   const updateParams = value => { const state = params.get(value); state.update?.(); };
   const unplus = text => { if (text.includes('+')) text = text.replaceAll('+', ' '); return text.includes('%') ? decodeURIComponent(text) : text; };
   const query = text => {
@@ -737,73 +737,72 @@ globalThis.__appsWeb = (call, codec) => {
     static UNSENT = 0; static OPENED = 1; static HEADERS_RECEIVED = 2; static LOADING = 3; static DONE = 4;
     UNSENT = 0; OPENED = 1; HEADERS_RECEIVED = 2; LOADING = 3; DONE = 4;
     onreadystatechange = null; upload = new XMLHttpRequestUpload(); readyState = 0; status = 0; statusText = ''; responseURL = ''; responseType = ''; timeout = 0; withCredentials = false;
-    #method; #url; #headers; #sent = false; #run = 0; #controller = null; #timer; #response = null; #chunks = []; #size = 0; #mime = null; #uploading = false;
+    #method; #url; #headers; #mime = null; #request = null;
     #state(value) { this.readyState = value; fireXhr(this, 'readystatechange'); }
-    #reset() { this.#run++; clearTimeout(this.#timer); this.#controller = null; this.#sent = false; this.#uploading = false; this.#response = null; this.#chunks = []; this.#size = 0; this.status = 0; this.statusText = ''; this.responseURL = ''; }
+    #drop() { const request = this.#request; clearTimeout(request?.timer); this.#request = null; this.status = 0; this.statusText = ''; this.responseURL = ''; return request; }
     #fail(type) {
-      this.#run++; clearTimeout(this.#timer); this.#sent = false; this.#response = null; this.#chunks = []; this.status = 0; this.statusText = ''; this.responseURL = '';
+      const { uploading } = this.#drop();
       this.#state(4);
-      if (this.#uploading) { this.#uploading = false; fireXhr(this.upload, type); fireXhr(this.upload, 'loadend'); }
+      if (uploading) { fireXhr(this.upload, type); fireXhr(this.upload, 'loadend'); }
       fireXhr(this, type); fireXhr(this, 'loadend');
     }
     open(method, url, async = true) {
       if (async === false) throw new DOMException('Synchronous requests are not supported', 'InvalidAccessError');
-      this.#controller?.abort(); this.#reset();
+      this.#request?.controller?.abort(); this.#drop();
       this.#method = String(method).toUpperCase(); this.#url = String(url); this.#headers = new Headers();
       this.#state(1);
     }
-    setRequestHeader(name, value) { if (this.readyState !== 1 || this.#sent) throw new DOMException('The request is not open', 'InvalidStateError'); this.#headers.append(name, value); }
+    setRequestHeader(name, value) { if (this.readyState !== 1 || this.#request) throw new DOMException('The request is not open', 'InvalidStateError'); this.#headers.append(name, value); }
     overrideMimeType(mime) { this.#mime = String(mime); }
-    getResponseHeader(name) { return this.#response?.headers.get(name) ?? null; }
-    getAllResponseHeaders() { return this.#response ? [...this.#response.headers].map(([name, value]) => `${name}: ${value}\r\n`).join('') : ''; }
+    getResponseHeader(name) { return this.#request?.response?.headers.get(name) ?? null; }
+    getAllResponseHeaders() { const response = this.#request?.response; return response ? [...response.headers].map(([name, value]) => `${name}: ${value}\r\n`).join('') : ''; }
     send(body = null) {
-      if (this.readyState !== 1 || this.#sent) throw new DOMException('The request is not open', 'InvalidStateError');
+      if (this.readyState !== 1 || this.#request) throw new DOMException('The request is not open', 'InvalidStateError');
       const bodied = body !== null && !['GET', 'HEAD'].includes(this.#method);
       const total = !bodied ? 0 : body.size ?? body.byteLength ?? (typeof body === 'string' ? new TextEncoder().encode(body).length : 0);
-      const run = ++this.#run, controller = this.#controller = new AbortController();
-      this.#sent = true; this.#uploading = bodied;
+      const controller = new AbortController(), request = this.#request = { controller, timer: undefined, response: null, chunks: [], size: 0, uploading: bodied };
       fireXhr(this, 'loadstart');
       if (bodied) fireXhr(this.upload, 'loadstart', { lengthComputable: true, loaded: 0, total });
       let timedOut = false;
-      if (this.timeout > 0) this.#timer = setTimeout(() => { timedOut = true; controller.abort(); }, this.timeout);
+      if (this.timeout > 0) request.timer = setTimeout(() => { timedOut = true; controller.abort(); }, this.timeout);
       (async () => {
         const response = await fetch(this.#url, { method: this.#method, headers: this.#headers, body: bodied ? body : undefined, signal: controller.signal, credentials: this.withCredentials ? 'include' : 'same-origin' });
-        if (run !== this.#run) return;
-        if (bodied) { this.#uploading = false; for (const type of ['progress', 'load', 'loadend']) fireXhr(this.upload, type, { lengthComputable: true, loaded: total, total }); }
-        this.#response = response; this.status = response.status; this.statusText = response.statusText; this.responseURL = response.url;
+        if (request !== this.#request) return;
+        if (bodied) { request.uploading = false; for (const type of ['progress', 'load', 'loadend']) fireXhr(this.upload, type, { lengthComputable: true, loaded: total, total }); }
+        request.response = response; this.status = response.status; this.statusText = response.statusText; this.responseURL = response.url;
         this.#state(2);
         const length = Number(response.headers.get('content-length')) || 0, reader = response.body?.getReader();
         while (reader) {
           const { value, done } = await reader.read();
-          if (run !== this.#run) { reader.cancel().catch(() => {}); return; }
+          if (request !== this.#request) { reader.cancel().catch(() => {}); return; }
           if (done) break;
-          this.#chunks.push(value); this.#size += value.length;
+          request.chunks.push(value); request.size += value.length;
           this.#state(3);
-          fireXhr(this, 'progress', { lengthComputable: length > 0, loaded: this.#size, total: length });
+          fireXhr(this, 'progress', { lengthComputable: length > 0, loaded: request.size, total: length });
         }
-        if (run !== this.#run) return;
-        clearTimeout(this.#timer); this.#sent = false;
+        if (request !== this.#request) return;
+        clearTimeout(request.timer); request.controller = null;
         this.#state(4);
-        fireXhr(this, 'load', { lengthComputable: length > 0, loaded: this.#size, total: length });
-        fireXhr(this, 'loadend', { lengthComputable: length > 0, loaded: this.#size, total: length });
-      })().catch(() => { if (run === this.#run) this.#fail(timedOut ? 'timeout' : 'error'); });
+        fireXhr(this, 'load', { lengthComputable: length > 0, loaded: request.size, total: length });
+        fireXhr(this, 'loadend', { lengthComputable: length > 0, loaded: request.size, total: length });
+      })().catch(() => { if (request === this.#request) this.#fail(timedOut ? 'timeout' : 'error'); });
     }
     abort() {
-      const controller = this.#controller, active = this.#sent;
-      this.#controller = null;
-      if (active) { this.#fail('abort'); controller?.abort(); }
-      else this.#reset();
+      const controller = this.#request?.controller;
+      if (controller) { this.#fail('abort'); controller.abort(); }
+      else this.#drop();
       this.readyState = 0;
     }
-    get #bytes() { const bytes = new Uint8Array(this.#size); let at = 0; for (const chunk of this.#chunks) { bytes.set(chunk, at); at += chunk.length; } return bytes; }
+    get #bytes() { const { chunks = [], size = 0 } = this.#request ?? {}, bytes = new Uint8Array(size); let at = 0; for (const chunk of chunks) { bytes.set(chunk, at); at += chunk.length; } return bytes; }
     get responseText() { if (this.responseType !== '' && this.responseType !== 'text') throw new DOMException('The response is not text', 'InvalidStateError'); return this.readyState < 3 ? '' : new TextDecoder().decode(this.#bytes); }
-    get responseXML() { return this.responseType === 'document' && this.readyState === 4 && globalThis.DOMParser && this.#size ? new DOMParser().parseFromString(new TextDecoder().decode(this.#bytes), 'text/html') : null; }
+    get responseXML() { return this.responseType === 'document' && this.readyState === 4 && globalThis.DOMParser && this.#request?.size ? new DOMParser().parseFromString(new TextDecoder().decode(this.#bytes), 'text/html') : null; }
     get response() {
+      const response = this.#request?.response;
       if (this.responseType === '' || this.responseType === 'text') return this.responseText;
-      if (this.readyState !== 4 || !this.#response) return null;
+      if (this.readyState !== 4 || !response) return null;
       if (this.responseType === 'json') { try { return JSON.parse(new TextDecoder().decode(this.#bytes)); } catch { return null; } }
       if (this.responseType === 'arraybuffer') return this.#bytes.buffer;
-      if (this.responseType === 'blob') return adopt(this.#bytes, this.#mime ?? this.#response.headers.get('content-type') ?? '');
+      if (this.responseType === 'blob') return adopt(this.#bytes, this.#mime ?? response.headers.get('content-type') ?? '');
       return this.responseXML;
     }
   }

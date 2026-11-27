@@ -373,7 +373,7 @@ impl Drop for Fetch {
 }
 
 pub struct State {
-    pub(crate) renderer: bool,
+    renderer: bool,
     platform: crate::web::platform::State,
     servers: crate::web::serve::State,
     sockets: crate::web::websocket::State,
@@ -702,6 +702,7 @@ pub(crate) unsafe extern "C" fn url_parts(
             key.as_deref().zip(value.as_deref()),
         )?;
         let href = url.as_str();
+        let ascii = href.is_ascii();
         let mut items = [std::ptr::null_mut(); 11];
         items[0] = api.utf8(ctx, href.as_bytes())?;
         for (item, position) in items[1..].iter_mut().zip([
@@ -722,7 +723,7 @@ pub(crate) unsafe extern "C" fn url_parts(
                 position => position,
             };
             let end = url[..position].len();
-            let end = if href.is_ascii() {
+            let end = if ascii {
                 end
             } else {
                 href[..end].encode_utf16().count()

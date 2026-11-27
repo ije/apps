@@ -47,9 +47,9 @@ mod web;
 pub(crate) use apps_webview as webview;
 #[cfg(target_os = "linux")]
 pub(crate) use native::webview;
+pub use render::media::{gpu, player, terminal};
 pub use web::download;
 // The DOM operations of page scripts, which tests drive directly.
-pub use render::media::{gpu, player, terminal};
 pub use web::dom::call as dom_call;
 
 pub use anyhow::Result;

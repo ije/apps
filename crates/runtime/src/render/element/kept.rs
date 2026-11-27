@@ -143,10 +143,6 @@ impl Kept {
     pub(crate) fn subtree(&self) -> u64 {
         self.call.subtree
     }
-
-    pub(crate) fn same_reads(&self, other: &Self) -> bool {
-        self.reads == other.reads
-    }
 }
 
 #[derive(Clone, Copy, PartialEq)]

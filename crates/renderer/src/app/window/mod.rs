@@ -1353,9 +1353,6 @@ impl Window {
         let captures = mem::take(&mut self.captures);
         self.scene.read_shots(&mut self.shots);
         let fresh = self.atlas.take_fresh();
-        // Patches of composited animations before a paint in the same frame can't place their damage, but the diff
-        // finds it.
-        self.scene.rediff_patches();
         self.scene.diff(fresh.as_deref());
         let (mut frame, snapshots) =
             (self.platform).draw(&self.scene, Some(self.native), !captures.is_empty());
@@ -1419,9 +1416,9 @@ impl Window {
         &mut self,
         app: &mut App,
         mut render: impl FnMut(&Tree, &mut Self, &mut App) -> Child,
-    ) -> bool {
+    ) {
         if self.drawing {
-            return false;
+            return;
         }
         self.drawing = true;
         let mut again;
@@ -1455,7 +1452,6 @@ impl Window {
         if again {
             self.refresh();
         }
-        true
     }
 
     fn update_cursor(&mut self, app: &mut App) {
@@ -1805,7 +1801,6 @@ impl Window {
         mask
     }
 
-    // Stops the cuts of the scroll viewports inside the first `depth` until `resume_cuts`.
     // An out-of-flow box paints in `f` outside the cuts and viewports of the scrolls inside the first `depth`.
     pub(crate) fn with_cuts_paused<R>(
         &mut self,

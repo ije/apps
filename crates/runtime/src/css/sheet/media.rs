@@ -24,7 +24,7 @@ impl MediaQuery {
     ) -> Option<bool> {
         let (name, op, value) = match self {
             Self::All => return Some(true),
-            Self::Unknown(_) => return None,
+            Self::Unknown(_) | Self::Style(..) => return None,
             Self::Not(query) => {
                 return query
                     .matches(width, height, reduced_motion, theme, lengths)
@@ -212,7 +212,7 @@ impl MediaQuery {
         match self {
             Self::All => "all".into(),
             Self::Unknown(text) | Self::Range(text, _) => text.clone(),
-            Self::Feature(kind, name, value) if kind == "style" => match value.as_str() {
+            Self::Style(name, value) => match value.as_str() {
                 "" => format!("style({name})"),
                 _ => format!("style({name}: {value})"),
             },

@@ -29,7 +29,8 @@ fn edit<'a>(kind: &str, text: &'a str) -> css::sheet::Edit<'a> {
         "insert" => css::sheet::Edit::Insert(text),
         "style" => css::sheet::Edit::Declarations(text),
         "selector" => css::sheet::Edit::Selector(text),
-        "keyframe" => css::sheet::Edit::Keyframe(text),
+        "keyframe" => css::sheet::Edit::AppendKeyframe(text),
+        "keyframe-delete" => css::sheet::Edit::DeleteKeyframe(text.parse().unwrap_or(usize::MAX)),
         "replace" => css::sheet::Edit::Replace(text),
         _ => css::sheet::Edit::Delete,
     }
@@ -100,7 +101,7 @@ pub(super) fn animation(args: &Value, doc: &mut Document, state: &mut PageState)
         .collect();
     let number = |index: usize| spec["timing"][index].as_f64().unwrap_or(0.);
     let iterations = number(3);
-    let animation = style::animation::timing::Scripted::new(
+    let mut animation = style::animation::timing::Scripted::new(
         id,
         &frames,
         [
@@ -126,7 +127,6 @@ pub(super) fn animation(args: &Value, doc: &mut Document, state: &mut PageState)
             _ => 0,
         },
     );
-    let mut animation = animation;
     // A scroll-driven animation: the node of its timeline, the timeline and its range, and its start in percent.
     if let Some(scroll) = spec["scroll"].as_array().filter(|scroll| scroll.len() == 5) {
         let at = scroll[0].as_u64().map_or(usize::MAX, |at| at as usize);
@@ -643,7 +643,7 @@ pub(super) fn computed(
     })
     .flatten()
     .and_then(|grid| state.layout.grid_area(grid, id));
-    let block = area.map_or(block, |[width, height]| [block[0], block[1], width, height]);
+    let mut block = area.map_or(block, |[width, height]| [block[0], block[1], width, height]);
     let inline = !doc.nodes[id].tag.starts_with('#')
         && style
             .get(Prop::DISPLAY)
@@ -666,7 +666,7 @@ pub(super) fn computed(
     // The untransformed border box. Inline boxes and boxes that are not rendered have none, so their
     // percentages stay as they are.
     // The box of a rendered `::before` or `::after`: its place, size and padding plus border.
-    let pseudo_box = (generated
+    let mut pseudo_box = (generated
         && !inline
         && shown(id)
         && !matches!(style.get(Prop::DISPLAY), Some("none" | "contents"))
@@ -675,32 +675,31 @@ pub(super) fn computed(
             .is_some_and(|content| !matches!(content, "none" | "normal")))
     .then(|| state.layout.pseudo_box(id, pseudo == "after"))
     .flatten();
-    let size = (pseudo.is_empty() && !inline && shown(id))
+    let mut size = (pseudo.is_empty() && !inline && shown(id))
         .then(|| {
-            let inner = state.layout.content_size(id)?;
-            let sides = edges(style, &units, block[2], true);
-            Some([
-                inner[0] + sides[1] + sides[3],
-                inner[1] + sides[0] + sides[2],
-            ])
-        })
-        .flatten()
-        .or_else(|| {
-            (pseudo.is_empty() && !inline && shown(id))
-                .then(|| {
+            state
+                .layout
+                .content_size(id)
+                .map(|inner| {
+                    let sides = edges(style, &units, block[2], true);
+                    [
+                        inner[0] + sides[1] + sides[3],
+                        inner[1] + sides[0] + sides[2],
+                    ]
+                })
+                .or_else(|| {
                     state
                         .geometry
                         .mirror
                         .get(&id)
                         .map(|rect| [rect[2], rect[3]])
                 })
-                .flatten()
         })
+        .flatten()
         .or_else(|| pseudo_box.map(|rect| [rect[2], rect[3]]));
     // Layout is in zoomed pixels, and computed values are in CSS pixels of the element.
     let zoom = units.font.zoom;
     let unzoom = |rect: &mut [f32]| rect.iter_mut().for_each(|value| *value /= zoom);
-    let (mut block, mut size, mut pseudo_box) = (block, size, pseudo_box);
     if zoom != 1. {
         unzoom(&mut block);
         size.iter_mut().for_each(|size| unzoom(size));

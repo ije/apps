@@ -394,7 +394,12 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
         }
     }
     fs::write(directory.path().join("manifest.json"), &manifest)?;
-    link_image(
+    let link = if cfg!(target_os = "linux") {
+        link_elf
+    } else {
+        link_macho
+    };
+    link(
         directory.path(),
         layout[0],
         layout[1],
@@ -402,20 +407,6 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
         manifest.len(),
     )?;
     Ok(directory)
-}
-
-fn link_image(
-    directory: &Path,
-    header: usize,
-    executable: usize,
-    image_size: usize,
-    manifest_size: usize,
-) -> Result<()> {
-    if cfg!(target_os = "linux") {
-        link_elf(directory, header, executable, image_size, manifest_size)
-    } else {
-        link_macho(directory, header, executable, image_size, manifest_size)
-    }
 }
 
 fn link_macho(

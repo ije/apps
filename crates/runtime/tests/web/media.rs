@@ -482,3 +482,18 @@ fn broken_media_reports_an_error() {
         "4,3,loadstart,error"
     );
 }
+
+#[test]
+fn sources_from_inner_html_start_the_load() {
+    let (_host, engine, base) = page(apps_runtime::bundle::Features::default());
+    engine
+        .eval(&format!("globalThis.media = document.createElement('audio'); {EVENTS} media.innerHTML = '<source src=\"{base}tone.wav\">'"), "media-test")
+        .unwrap();
+    assert_eq!(
+        wait(
+            &engine,
+            "events.includes('loadedmetadata') ? media.currentSrc.endsWith('/tone.wav') : 'pending ' + events.join()"
+        ),
+        "true"
+    );
+}

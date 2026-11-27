@@ -40,10 +40,10 @@ pub(crate) struct DevTools {
     browser: Browser,
     mode: &'static str,
     // The context that the tools look at. Only its console messages have values to expand.
-    context: Value,
+    role: Role,
     titlebar: f64,
     ready: Cell<bool>,
-    closed: Cell<bool>,
+    pub(super) closed: Cell<bool>,
     next: Cell<u64>,
     events: RefCell<Vec<Value>>,
     polled: Cell<Instant>,
@@ -78,7 +78,7 @@ impl DevTools {
         Ok(Self {
             browser,
             mode,
-            context: json!(role),
+            role,
             titlebar,
             ready: Cell::new(false),
             closed: Cell::new(false),
@@ -132,12 +132,16 @@ impl DevTools {
 
     pub(crate) fn events(&self, values: &[Value]) -> Result<()> {
         let window = |context: &Value| context["renderer"].as_u64().or(context["preload"].as_u64());
+        if values.is_empty() {
+            return Ok(());
+        }
+        let own = json!(self.role);
         let batch: Vec<_> = values.iter().filter_map(|event| if event["method"] == "Runtime.consoleAPICalled" {
             let params = &event["params"];
             // Windows that share a thread share their logs: keep the ones of this window.
             let other = window(&params["context"])
-                .is_some_and(|id| id != crate::host::WORKER_PAGE && window(&self.context).is_some_and(|own| own != id));
-            let values = (params["context"] == self.context).then(|| &params["ref"]);
+                .is_some_and(|id| id != crate::host::WORKER_PAGE && window(&own).is_some_and(|own| own != id));
+            let values = (params["context"] == own).then(|| &params["ref"]);
             (!other).then(|| json!({"type":"console","level":params["type"],"text":params["text"],"ref":values}))
         } else { Some(event.clone()) }).collect();
         if !self.ready.get() {
@@ -247,7 +251,7 @@ impl DevTools {
 
 impl Drop for DevTools {
     fn drop(&mut self) {
-        if self.context != "main" {
+        if self.role != Role::Main {
             PAGE_TOOLS.fetch_sub(1, Ordering::Relaxed);
         }
     }
@@ -288,9 +292,15 @@ impl super::Desktop {
                     self.devtools.insert(id, tools);
                 } else if !open {
                     self.devtools.remove(&id);
-                    if let Some(engine) = view.and_then(|view| view.renderer.as_deref()) {
-                        release(engine)?;
+                    if let Some(engine) = view.and_then(|view| view.renderer.as_deref())
+                        && let Err(error) = release(engine)
+                    {
+                        eprintln!("apps: developer tools: {error:#}");
                     }
+                }
+                // Refresh first: a failed message to the panel below must not keep the old picker on screen.
+                if let Some(handle) = view.and_then(|view| view.handle) {
+                    cx.refresh_window(handle);
                 }
                 if let Some(data) = view.and_then(|view| view.data.upgrade()) {
                     let mut inspect = data.inspect.get();
@@ -307,12 +317,9 @@ impl super::Desktop {
                     if let Some(tools) = self.devtools.get(&id) {
                         tools.inspected(&data)?;
                         if show == Some("console") {
-                            tools.events(&[serde_json::json!({"type":"show","tab":show})])?;
+                            tools.events(&[serde_json::json!({"type":"show"})])?;
                         }
                     }
-                }
-                if let Some(handle) = view.and_then(|view| view.handle) {
-                    cx.refresh_window(handle);
                 }
             }
             // The FPS HUD of the window. Open developer tools show if it is on.
@@ -362,11 +369,11 @@ impl super::Desktop {
                     inspect.hover = None;
                 }
                 data.inspect.set(inspect);
-                if !args[2].is_number() || args[4] == true {
-                    tools.inspected(&data)?;
-                }
                 if let Some(handle) = view.handle {
                     cx.refresh_window(handle);
+                }
+                if !args[2].is_number() || args[4] == true {
+                    tools.inspected(&data)?;
                 }
             }
             _ => {}

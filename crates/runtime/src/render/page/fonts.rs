@@ -61,7 +61,7 @@ impl PageState {
                 let Some(range) = range else {
                     return (usize::MAX, index);
                 };
-                if !scanned {
+                if chars.is_empty() {
                     return (0, index);
                 }
                 let used = ranges(range)
@@ -422,5 +422,52 @@ mod tests {
                 "{font}"
             );
         }
+    }
+
+    #[test]
+    fn ranged_faces_from_inserted_rules_load_without_a_dom_change() {
+        let system = std::rc::Rc::new(renderer::TextSystem::new());
+        let assets = HashMap::from(["cyrillic.woff2", "latin.woff2"].map(|name| {
+            let fonts = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fonts");
+            (name.to_owned(), PathBuf::from(fonts).join("test.woff2"))
+        }));
+        let mut doc = Document::parse(
+            "<style>@font-face { font-family: Cyrillic; src: url(cyrillic.woff2); unicode-range: U+0400-04FF }</style><p>AB</p>",
+        );
+        let mut state = PageState::default();
+        state.fonts.system = Some(system);
+        state.pixel_ratio = 1.;
+        state.base = url::Url::parse("apps:///index.html").ok();
+        state.restyle(&mut doc, [800., 600.]);
+        state.load_fonts(&doc, &assets);
+        let style = doc
+            .nodes
+            .iter()
+            .position(|node| node.tag == "style")
+            .unwrap();
+        let rule =
+            "@font-face { font-family: Latin; src: url(latin.woff2); unicode-range: U+0000-00FF }";
+        let styles = &mut state.styles;
+        styles
+            .cache
+            .edit_sheet(
+                &doc,
+                style,
+                &mut styles.sheets,
+                Some((1, true)),
+                |sheet, _| sheet.edit(&[1], crate::css::sheet::Edit::Insert(rule)),
+            )
+            .unwrap();
+        state.styles.invalidate();
+        state.restyle(&mut doc, [800., 600.]);
+        let (added, faces) = state.load_fonts(&doc, &assets);
+        assert!(added);
+        assert_eq!(
+            faces
+                .iter()
+                .map(|(family, _, _, status, _)| format!("{family} {status}"))
+                .collect::<Vec<_>>(),
+            ["Cyrillic unloaded", "Latin loaded"]
+        );
     }
 }

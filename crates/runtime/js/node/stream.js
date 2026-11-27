@@ -38,7 +38,7 @@ globalThis.__appsNodeStreams = (EventEmitter, Buffer, StringDecoder) => {
   };
   const initReadable = (stream, options = {}) => {
     const objectMode = !!(options.objectMode || options.readableObjectMode);
-    stream._readableState = { objectMode, highWaterMark: options.readableHighWaterMark ?? options.highWaterMark ?? marks[+objectMode], buffer: [], length: 0, flowing: null, ended: false, endEmitted: false, reading: false, consumed: false, listening: false, pending: false, decoder: null, encoding: null, pipes: [], autoDestroy: options.autoDestroy !== false, emitClose: options.emitClose !== false };
+    stream._readableState = { objectMode, highWaterMark: options.readableHighWaterMark ?? options.highWaterMark ?? marks[+objectMode], buffer: [], length: 0, flowing: null, ended: false, endEmitted: false, reading: false, consumed: false, listening: false, pending: false, draining: false, ending: false, decoder: null, encoding: null, pipes: [], autoDestroy: options.autoDestroy !== false, emitClose: options.emitClose !== false };
     stream.destroyed = false; stream.closed = false; stream.errored = null;
     if (options.read) stream._read = options.read;
     if (options.destroy) stream._destroy = options.destroy;

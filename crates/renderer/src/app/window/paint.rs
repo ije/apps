@@ -88,17 +88,15 @@ impl Window {
         }
     }
 
-    // The content of a scroll container, which `offset` moved, paints between these two calls.
-    // The content of a scroll container paints in an interest area around its viewport, which stays put in the
-    // content until the viewport nears its edge, so copies of the content can move with a scroll. The scene
-    // clips the content to the viewport after paint. Prepaint uses the same masks.
     // Whether a scroll container here paints its content in an interest area.
     pub(crate) fn opens_interest(&self) -> bool {
         self.content_mask().radii == Default::default()
     }
 
     // Runs `f` in the interest area of a scroll at `at`: a point of the box in the window, so the area moves with
-    // the box when an outer scroll moves it, and the scroll offset.
+    // the box when an outer scroll moves it, and the scroll offset. The area stays put in the content until the
+    // viewport nears its edge, so copies of the content can move with a scroll. The scene clips the content to the
+    // viewport after paint. Prepaint uses the same masks.
     pub(crate) fn with_interest<R>(
         &mut self,
         at: Option<(Point<Pixels>, Point<Pixels>)>,
@@ -806,7 +804,6 @@ impl Window {
         image_bounds: Rect<Pixels>,
         radii: impl Into<Radii<Pixels>>,
         image: Arc<RenderImage>,
-        grayscale: bool,
         pixelated: bool,
     ) {
         if self.opacity <= 0. {
@@ -849,8 +846,7 @@ impl Window {
         instance.radii = radii.scale(self.scale_factor).to_array();
         [instance.shape[0], instance.shape[1]] = radii.shape_array();
         instance.info[1] = f32::from(
-            u8::from(grayscale)
-                | u8::from(image.is_premultiplied()) << 1
+            u8::from(image.is_premultiplied()) << 1
                 | u8::from(pixelated) << 2
                 | u8::from(image.is_display_p3()) << 3,
         );

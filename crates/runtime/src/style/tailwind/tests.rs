@@ -2134,3 +2134,45 @@ fn packed_tables_match_the_source() {
     assert_eq!(TEXT.static_lines.len(), text::STATIC.lines().count());
     assert!(super::ORDER_INDEX.len() == text::ORDER.split_ascii_whitespace().count());
 }
+
+#[test]
+fn variant_blocks_and_definitions_parse_apart() {
+    use crate::css::sheet::Rule;
+    let sheet = super::Stylesheet::parse(
+        "@custom-variant a (&:hover); @custom-variant b { &:focus { @slot; } }
+        @custom-variant c { color: red } @variant d { color: red; @slot; } @variant e { color: red }
+        @layer l { @variant f { @slot; } }",
+    );
+    let kind = |rule: &Rule| match rule {
+        Rule::CustomVariant(name, _) => format!("custom {name}"),
+        Rule::VariantBlock(name, _) => format!("block {name}"),
+        Rule::Layer(_, children) => {
+            format!("layer {:?}", children.first().map(|rule| rule.source()))
+        }
+        _ => "other".to_owned(),
+    };
+    let kinds: Vec<_> = sheet.0.iter().map(|rule| kind(rule)).collect();
+    assert_eq!(
+        kinds,
+        [
+            "custom a",
+            "custom b",
+            // Tailwind makes this a definition, but it stays a block, as before.
+            "block c",
+            "custom d",
+            "block e",
+            "layer Some(\"@variant f{ @slot; }\")",
+        ]
+    );
+    let sources: Vec<_> = sheet.0.iter().map(|rule| rule.source()).collect();
+    assert_eq!(
+        sources[..5],
+        [
+            "@custom-variant a (&:hover);",
+            "@custom-variant b{ &:focus { @slot; } }",
+            "@variant c{ color: red }",
+            "@custom-variant d{ color: red; @slot; }",
+            "@variant e{ color: red }",
+        ]
+    );
+}

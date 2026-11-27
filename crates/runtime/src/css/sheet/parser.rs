@@ -404,7 +404,7 @@ impl<'i> AtRuleParser<'i> for Rules {
                 .unwrap_or(text.len());
             let (name, template) = (&text[..end], text[end..].trim());
             return Ok(Item::Rule(match template.strip_prefix('(') {
-                Some(template) if self.top_level => Rule::Variant(
+                Some(template) if self.top_level => Rule::CustomVariant(
                     name.to_owned(),
                     template
                         .strip_suffix(')')
@@ -413,7 +413,8 @@ impl<'i> AtRuleParser<'i> for Rules {
                         .to_owned(),
                 ),
                 _ if custom && !template.is_empty() => return Err(ParseError::unexpected_token()),
-                _ => Rule::Variant(text, String::new()),
+                _ if custom => Rule::CustomVariant(text, String::new()),
+                _ => Rule::VariantBlock(text, String::new()),
             }));
         }
         if name.eq_ignore_ascii_case("theme") && self.parent.is_none() {
@@ -547,7 +548,7 @@ impl<'i> AtRuleParser<'i> for Rules {
                         if !name.starts_with("--") {
                             continue;
                         }
-                        MediaQuery::Feature("style".into(), name.into(), value.trim().into())
+                        MediaQuery::Style(name.into(), value.trim().into())
                     }
                     MediaQuery::Feature(name, op, value) => match name.as_str() {
                         "width" | "inline-size" => {
@@ -648,7 +649,7 @@ impl<'i> AtRuleParser<'i> for Rules {
     fn rule_without_block(&mut self, item: Item, _: &ParserState) -> Result<Item, ()> {
         match item {
             Item::Rule(Rule::Tailwind(_) | Rule::Layer(..)) | Item::Declaration(_) => Ok(item),
-            Item::Rule(Rule::Variant(_, ref template)) if !template.is_empty() => Ok(item),
+            Item::Rule(Rule::CustomVariant(_, ref template)) if !template.is_empty() => Ok(item),
             _ => Err(()),
         }
     }
@@ -759,13 +760,16 @@ impl<'i> AtRuleParser<'i> for Rules {
                 source(input, &mut body, "/**/")?;
                 Rule::Utility(name, body)
             }
-            Item::Rule(Rule::Variant(name, template)) if template.is_empty() => {
+            // Like Tailwind, a top-level `@variant` block with `@slot` is a definition too.
+            Item::Rule(
+                Rule::CustomVariant(name, template) | Rule::VariantBlock(name, template),
+            ) if template.is_empty() => {
                 let mut body = String::new();
                 source(input, &mut body, "/**/")?;
-                if !self.top_level || !body.contains("@slot") {
-                    body = format!("{{{body}}}");
+                match self.top_level && body.contains("@slot") {
+                    true => Rule::CustomVariant(name, body),
+                    false => Rule::VariantBlock(name, body),
                 }
-                Rule::Variant(name, body)
             }
             Item::Rule(Rule::Keyframes(name, _)) => Rule::Keyframes(
                 name,
@@ -1705,5 +1709,14 @@ mod tests {
         ] {
             assert_eq!(supported(condition), expected, "{condition}");
         }
+    }
+
+    #[test]
+    fn media_features_named_style_are_no_style_queries() {
+        let sheet = crate::css::sheet::Stylesheet::parse("@media (style: x) { p { color: red } }");
+        let Rule::Media(queries, _) = &*sheet.0[0] else {
+            unreachable!()
+        };
+        assert_eq!(queries[0].source(), "(style: x)");
     }
 }

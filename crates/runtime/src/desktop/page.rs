@@ -153,9 +153,10 @@ impl Desktop {
                 data,
                 input,
                 title: None,
+                titled: 0,
                 preload: None,
                 renderer: None,
-                fullscreen: None,
+                fullscreen: super::HtmlFullscreen::Off,
                 focused: true,
             },
         );

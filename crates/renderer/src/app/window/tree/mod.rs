@@ -466,6 +466,8 @@ pub struct Tree {
     unbounded: u32,
     prepaints: u32,
     full: bool,
+    // A kept box changed what scroll containers take from it, so the places of all boxes must be found again.
+    rescoped: bool,
     // A paint could not copy a box that a scroll moved without a prepaint, so the next prepaint goes through all.
     unshift: bool,
     // All boxes in the current box are `flat` so far.
@@ -562,6 +564,7 @@ impl Tree {
             self.marks.clear();
             self.roomed.clear();
             self.orphans.clear();
+            self.bounded.clear();
             self.root = None;
             self.styles = Interned::default();
             self.shared.clear();
@@ -593,6 +596,7 @@ impl Tree {
         self.stretch = Some(viewport);
         let root = self.commit(root, &inherited, scale);
         self.stretch = None;
+        self.unfar_all();
         if let Some(root) = root {
             self.slots[usize::from(root)].parent = NONE;
             self.orphans.extend(self.root.replace(index_of(root)));
@@ -612,6 +616,7 @@ impl Tree {
         };
         let inherited = self.slots[index as usize].inherited.clone();
         self.commit_node(node, &inherited, scale);
+        self.unfar_all();
         changed(&mut self.slots, index as usize);
         // The boxes around keep their layout caches unless the patch clears them.
         self.dirty(index, true);
@@ -883,18 +888,13 @@ impl Tree {
             (slot.shift, slot.turned) = Default::default();
         }
         // Whether scroll containers take the absolute boxes in this box reads these styles.
-        let scoped = kept.is_some()
+        self.rescoped |= kept.is_some()
             && (slot.style.contains != styled.contains || slot.style.overflow != styled.overflow);
         slot.style = styled;
         slot.stretched = stretched;
         slot.volatile = hooks.as_ref().is_some_and(|hooks| hooks.volatile());
         slot.placed = None;
         unfar(&mut self.slots, index as usize);
-        if scoped {
-            self.slots.iter_mut().for_each(|slot| {
-                slot.clear_far();
-            });
-        }
         let slot = &mut self.slots[index as usize];
         slot.events = events;
         slot.hooks = hooks;
@@ -979,6 +979,14 @@ impl Tree {
         }
         list.push((own.clone(), text.clone()));
         text
+    }
+
+    fn unfar_all(&mut self) {
+        if mem::take(&mut self.rescoped) {
+            self.slots.iter_mut().for_each(|slot| {
+                slot.clear_far();
+            });
+        }
     }
 
     fn scope(&self) -> u64 {
@@ -1072,6 +1080,10 @@ impl Tree {
                 .collect();
         }
         self.marks.retain(|_, index| {
+            *index = moved[*index as usize];
+            *index != NONE
+        });
+        self.bounded.retain_mut(|index| {
             *index = moved[*index as usize];
             *index != NONE
         });

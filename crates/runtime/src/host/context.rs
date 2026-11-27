@@ -240,14 +240,15 @@ pub struct JsContext {
 }
 
 impl JsContext {
-    // A context whose host calls go to `router`, and whose workers run with `run_worker`.
-    pub(super) fn create(
+    pub fn new(api: Rc<JavaScriptCore>, host: Rc<RefCell<Host>>, role: Role) -> Result<Self> {
+        Self::new_interruptible(api, host, role, None)
+    }
+
+    pub fn new_interruptible(
         api: Rc<JavaScriptCore>,
         host: Rc<RefCell<Host>>,
         role: Role,
         interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-        router: Callback,
-        run_worker: crate::web::worker::Run,
     ) -> Result<Self> {
         let devtools = !host.borrow().app.packaged;
         let mut engine = Engine::new(api.clone(), &format!("apps {role:?}"), devtools)?;
@@ -260,7 +261,7 @@ impl JsContext {
             web: RefCell::new(crate::web::State::new(
                 matches!(role, Role::Renderer(_)),
                 host.borrow().app.assets.clone(),
-                run_worker,
+                super::worker::run,
             )),
             ffi: Default::default(),
             node: RefCell::default(),
@@ -336,7 +337,7 @@ impl JsContext {
             ],
         );
         let natives = [
-            ("__appsNative", router),
+            ("__appsNative", super::ops::call as Callback),
             ("__appsNow", jsc::context::now),
             ("__appsLoadAddon", crate::node::napi::load),
             ("__appsFFINative", ffi_call),
@@ -501,8 +502,7 @@ impl JsContext {
             napi.sweep();
             napi.drain();
         }
-        // Run one macrotask per call so JSC drains microtasks between tasks. -2 signals a completed
-        // macrotask.
+        // `__appsTick` runs tasks for about 1 s at most and returns -2 when tasks are left.
         loop {
             let delay = self
                 .engine

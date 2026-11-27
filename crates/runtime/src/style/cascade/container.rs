@@ -54,7 +54,7 @@ pub(crate) fn style_query(
     names: &mut Vec<Prop>,
 ) -> Option<bool> {
     match query {
-        MediaQuery::Feature(kind, name, value) if kind == "style" => {
+        MediaQuery::Style(name, value) => {
             // Interned, so a name that no rule declares is still read.
             let prop = Prop::new(name);
             names.push(prop);

@@ -680,3 +680,59 @@ fn pretty_rows_rects_and_carets_of_case_mappings_like_chrome() {
              </body>")],
     );
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn webviews_in_shadow_roots_attach() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const pending = run(`new Promise(resolve => {
+            const host = document.createElement('div');
+            document.body.append(host);
+            // Only parsing wraps the guest: a script that reads it first would attach it anyway.
+            host.attachShadow({ mode: 'open' }).innerHTML = "<webview src='data:text/html,<p>guest</p>' style='display:block;width:100px;height:100px'></webview>";
+            setTimeout(() => { try { host.shadowRoot.querySelector('webview').getWebContentsId(); resolve('attached'); } catch { resolve('nothing'); } }, 1000);
+        })`);
+        let result;
+        pending.then(value => result = value);
+        while (result === undefined) await win.webContents.capturePage();
+        if (result !== 'attached') fail('webview in a shadow root: ' + result);
+        "#,
+        &[("page.html", "<body style='margin:0'><p>page</p></body>")],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn webviews_outside_the_page_tree_do_not_attach() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const pending = run(`new Promise(resolve => {
+            const view = id => "<webview id=" + id + " src='data:text/html,<p>guest</p>' style='display:block;width:100px;height:100px'></webview>";
+            const inner = document.createElement('div');
+            inner.innerHTML = '<template>' + view('inner') + '</template>';
+            document.body.append(inner);
+            new DOMParser().parseFromString(view('parsed'), 'text/html');
+            document.implementation.createHTMLDocument('').body.innerHTML = view('made');
+            setTimeout(() => {
+                const before = attached.join(), clone = document.getElementById('page').content.cloneNode(true);
+                clone.firstElementChild.id = 'clone';
+                document.body.append(clone);
+                setTimeout(() => resolve(before + ' ' + attached.join()), 1000);
+            }, 1000);
+        })`);
+        let result;
+        pending.then(value => result = value);
+        while (result === undefined) await win.webContents.capturePage();
+        if (result !== ' clone') fail('webviews outside the page: ' + result);
+        "#,
+        &[(
+            "page.html",
+            "<script>globalThis.attached = []; const send = HTMLWebViewElement.prototype.dispatchEvent; \
+             HTMLWebViewElement.prototype.dispatchEvent = function (event) { if (event.type === 'did-attach') attached.push(this.id); return send.call(this, event); };</script>\
+             <body style='margin:0'><p>page</p><template id=page><webview id=page src='data:text/html,<p>guest</p>' style='display:block;width:100px;height:100px'></webview></template></body>",
+        )],
+    );
+}

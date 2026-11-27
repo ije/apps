@@ -437,15 +437,13 @@ impl Pages for Input {
 
 // Do not use cx or window inside f: reflow accesses them through pointers.
 pub(crate) fn scripted<R>(cx: &mut App, window: Option<&mut Window>, f: impl FnOnce() -> R) -> R {
-    crate::host::context::REFLOW.set(Some(reflow));
-    crate::host::context::CLIPBOARD.set(Some(clipboard));
     let previous = SCRIPTS.replace(Some((cx, window.map(|window| window as *mut Window))));
     let result = f();
     SCRIPTS.set(previous);
     result
 }
 
-fn clipboard(text: Option<String>) -> Option<String> {
+pub(super) fn clipboard(text: Option<String>) -> Option<String> {
     let (cx, _) = SCRIPTS.get()?;
     // SAFETY: the pointer comes from `scripted`, whose caller does not touch it until the script returns.
     let cx = unsafe { &*cx };
@@ -488,7 +486,7 @@ pub(crate) fn edit(
     }
 }
 
-fn reflow(id: u64) {
+pub(super) fn reflow(id: u64) {
     let Some((cx, window)) = SCRIPTS.get() else {
         return;
     };
@@ -1090,9 +1088,8 @@ fn events(data: PageView) -> renderer::Node {
                     let seen = state.layout.cull.seen.as_ref().map(|seen| seen.2.clone()).or_else(|| state.styles.computed.clone());
                     target = seen.as_ref().and_then(|computed| {
                         let at = [position.x, position.y].map(f32::from);
-                        crate::render::hit::hit_test(&page.doc, state, computed, viewport, at, true, false).as_u64()
-                    })
-                    .map(|id| id as usize);
+                        crate::render::hit::hit_test(&page.doc, state, computed, viewport, at, crate::render::hit::Hit::First).first().copied()
+                    });
                     if let Some(target) = target {
                         let mut chain = Vec::new();
                         let mut node = Some(target);

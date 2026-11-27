@@ -357,7 +357,7 @@ impl Config {
                     }
                 }
             }
-            Rule::Variant(name, template) if !template.starts_with('{') => {
+            Rule::CustomVariant(name, template) => {
                 match self.variants.iter_mut().find(|(other, _)| other == name) {
                     Some((_, old)) => old.clone_from(template),
                     None => self.variants.push((name.clone(), template.clone())),
@@ -888,13 +888,9 @@ impl Config {
                     }
                     Some(rules)
                 }
-                Rule::Variant(name, body) if body.starts_with('{') => {
+                Rule::VariantBlock(name, body) => {
                     let depth = self.nested.get();
                     let base = parent.unwrap_or(":scope");
-                    let body = body
-                        .strip_prefix('{')
-                        .and_then(|body| body.strip_suffix('}'))
-                        .unwrap_or_default();
                     let mut css = String::new();
                     let list = match depth < 32 {
                         true => self.variant_list(name, base, 0),
@@ -1004,8 +1000,12 @@ fn imports(rule: &Rule) -> bool {
 
 fn configures(rule: &Rule) -> bool {
     match rule {
-        Rule::Tailwind(_) | Rule::Theme(..) | Rule::Variant(..) | Rule::Utility(..) => true,
-        Rule::Layer(_, children) => children.iter().any(configures),
+        Rule::Tailwind(_)
+        | Rule::Theme(..)
+        | Rule::CustomVariant(..)
+        | Rule::VariantBlock(..)
+        | Rule::Utility(..) => true,
+        Rule::Layer(_, children) => children.is_empty() || children.iter().any(configures),
         _ => false,
     }
 }

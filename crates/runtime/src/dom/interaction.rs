@@ -19,20 +19,19 @@ pub(crate) struct Highlight {
 }
 
 impl Interaction {
-    pub(crate) fn forget(&mut self, id: usize) {
-        if self.focus == Some(id) {
+    pub(crate) fn forget_all(&mut self, gone: &rustc_hash::FxHashSet<usize>) {
+        if self.focus.is_some_and(|id| gone.contains(&id)) {
             self.focus = None;
         }
-        self.selection.remove(&id);
-        for highlight in self.highlighted.values_mut() {
-            highlight.nodes.remove(&id);
-        }
-        if self.selection_caret == Some(id) {
+        if self.selection_caret.is_some_and(|id| gone.contains(&id)) {
             self.selection_caret = None;
         }
-    }
-
-    pub(crate) fn forget_all(&mut self, gone: &rustc_hash::FxHashSet<usize>) {
+        for id in gone {
+            self.selection.remove(id);
+            for highlight in self.highlighted.values_mut() {
+                highlight.nodes.remove(id);
+            }
+        }
         self.top_layer.retain(|node| !gone.contains(node));
         for ids in &mut self.states {
             ids.retain(|node| !gone.contains(node));

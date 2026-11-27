@@ -1929,3 +1929,86 @@ fn turning_3d_contexts_draw_their_last_frame() {
         )],
     );
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn pseudo_element_borders_draw_their_style_like_boxes() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        for (let n = 0; n < 3; n++) await win.webContents.capturePage();
+        const rect = async (x, y) => (await win.webContents.capturePage({ x, y, width: 80, height: 30 })).toBitmap();
+        for (const [name, y] of [['dashed', 0], ['ridge', 40], ['mixed', 80], ['dotted', 120], ['double', 160]]) {
+            const [pseudo, box] = [await rect(0, y), await rect(200, y)];
+            const off = pseudo.findIndex((value, at) => Math.abs(value - box[at]) > 8);
+            if (off >= 0) fail(name + ' differs at ' + (off >> 2) % 80 + ',' + Math.floor((off >> 2) / 80));
+        }
+        "#,
+        &[(
+            "page.html",
+            "<style>body{margin:0;background:#fff}.a{position:absolute;left:0;width:80px}\
+             .a::before,.a>i{content:'';display:block;box-sizing:border-box;width:80px;height:30px}.a>i{position:absolute;left:200px;top:0}\
+             .d::before,.d>i{border:2px dashed #a00}.r::before,.r>i{border:6px ridge rgb(200,150,100)}\
+             .m::before,.m>i{border:3px solid #00a;border-style:solid dashed}.o::before,.o>i{border:4px dotted #0a0}\
+             .w::before,.w>i{border:6px double #a0a}</style>\
+             <div class='a d' style=top:0><i></i></div><div class='a r' style=top:40px><i></i></div>\
+             <div class='a m' style=top:80px><i></i></div><div class='a o' style=top:120px><i></i></div>\
+             <div class='a w' style=top:160px><i></i></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn broken_background_images_load_once() {
+    let text = run_hidden(
+        r#"
+        await load('page.html');
+        // A selection change paints the page again without a new box.
+        for (let n = 0; n < 6; n++) {
+            await run(`getSelection().selectAllChildren(document.getElementById(${n % 2 ? "'a'" : "'b'"}))`);
+            await win.webContents.capturePage();
+            await new Promise(resolve => setTimeout(resolve, 30));
+        }
+        "#,
+        &[(
+            "page.html",
+            "<body style='margin:0'><div style='width:60px;height:60px;background-image:url(data:image/png;base64,AAAA)'></div>\
+             <p id=a>a</p><p id=b>b</p></body>",
+        )],
+    );
+    let errors = text.matches("apps: CSS image").count();
+    assert_eq!(errors, 1, "{text}");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn inline_boxes_round_their_corners_like_blocks() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const bitmap = async (x, y) => (await win.webContents.capturePage({ x, y, width: 14, height: 14 })).toBitmap();
+        for (const radius of ['16px', '16px / 12px', '50%', '9999px', '40% 10px']) {
+            // A block of the same size and radius, at a whole pixel offset from the span.
+            const at = JSON.parse(await run(`(() => {
+                const span = document.getElementById('span'), block = document.getElementById('block');
+                span.style.borderRadius = block.style.borderRadius = '${radius}';
+                const r = span.getBoundingClientRect();
+                Object.assign(block.style, { left: r.x + 'px', top: r.y + 100 + 'px', width: r.width + 'px', height: r.height + 'px' });
+                return JSON.stringify([Math.floor(r.x), Math.floor(r.y), Math.floor(r.right) - 14, Math.floor(r.bottom) - 14]);
+            })()`));
+            for (const [x, y] of [[at[0], at[1]], [at[2], at[1]], [at[0], at[3]], [at[2], at[3]]]) {
+                const [inline, block] = [await bitmap(x, y), await bitmap(x, y + 100)];
+                const off = inline.findIndex((value, index) => Math.abs(value - block[index]) > 24);
+                if (off >= 0) fail(radius + ' at ' + [x, y] + ' byte ' + off + ': ' + inline[off] + ' vs ' + block[off]);
+            }
+        }
+        "#,
+        &[(
+            "page.html",
+            "<body style='margin:0;background:#fff;font:40px/60px sans-serif'><p style='margin:0'>\
+             <span id=span style='background:#f00;color:transparent;padding:0 30px'>ab</span></p>\
+             <div id=block style='position:absolute;box-sizing:border-box;background:#f00'></div></body>",
+        )],
+    );
+}

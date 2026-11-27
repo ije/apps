@@ -8,7 +8,10 @@ use super::grid::grid_container;
 use crate::css;
 use crate::css::properties::Prop;
 use crate::render::layout::size::place;
-use crate::render::{layout::cull, paint::text::InlineText};
+use crate::render::{
+    layout::cull,
+    paint::{Reach, text::InlineText},
+};
 use crate::style::{self};
 use renderer::{Child, px, relative};
 use std::rc::Rc;
@@ -25,7 +28,7 @@ pub(super) fn children(
     own: Option<[f32; 2]>,
     preserve: bool,
     cut_parts: &mut Vec<(usize, usize, crate::render::paint::Piece)>,
-    plans: &mut u8,
+    reach: &mut Reach,
 ) -> renderer::Node {
     let Cx {
         reader,
@@ -47,7 +50,6 @@ pub(super) fn children(
         cut_pseudos,
         all_inline,
         line_justify,
-        line_align,
         rtl,
         ref hit,
         flexbox,
@@ -169,7 +171,7 @@ pub(super) fn children(
             .child(first)
             .children(rest);
         next.style().justify_content = line_justify;
-        next.style().align_items = line_align;
+        next.style().align_items = Some(renderer::AlignItems::Baseline);
         next.style().inline = renderer::Inline::Lines;
         next
     };
@@ -251,12 +253,14 @@ pub(super) fn children(
             // Floats are uncullable, so a run of blocks becomes a spacer only between them.
             flow
         };
-    *plans = if info[id].flags & cull::MOVES_CONTENT != 0 {
-        u8::MAX
+    *reach = if info[id].flags & cull::MOVES_CONTENT != 0 {
+        Reach::Moves
     } else if grid.is_some() || stacks && (!flexbox || wrap) {
-        1
+        Reach::Stacks
+    } else if stacks {
+        Reach::Column
     } else {
-        2 * u8::from(stacks)
+        Reach::Plain
     };
     let stack = build.zone.clone().filter(|_| stacks);
     #[cfg(debug_assertions)]
@@ -964,7 +968,7 @@ pub(super) fn children(
                         node.style().flex_shrink = 1e6;
                     }
                     let mut joint = renderer::node().flex().flex_row().flex_shrink(1.);
-                    joint.style().align_items = line_align;
+                    joint.style().align_items = Some(renderer::AlignItems::Baseline);
                     joint.style().align_self = cx.align_of(&mut child_element);
                     joint.style().inline = renderer::Inline::Hangs;
                     joint.child(child_element).child(space).into()
@@ -1104,7 +1108,7 @@ pub(super) fn children(
                         .child(child_element),
                 };
                 next.style().justify_content = line_justify;
-                next.style().align_items = line_align;
+                next.style().align_items = Some(renderer::AlignItems::Baseline);
                 next.style().inline = renderer::Inline::Lines;
                 if doc.nodes[child].tag == "br" {
                     place!(next, None);

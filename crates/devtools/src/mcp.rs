@@ -489,9 +489,7 @@ fn windows(args: &Value) -> Result<Answer> {
 }
 
 fn dispatch(tool: &str, args: Value, key: Option<u64>) -> Result<Answer> {
-    let timeout =
-        Duration::from_millis(30_000 + args["duration"].as_u64().unwrap_or(0).min(60_000));
-    wait(post(tool, args, key)?, timeout)
+    wait(post(tool, args, key)?, Duration::from_secs(30))
 }
 
 fn post(tool: &str, args: Value, key: Option<u64>) -> Result<Posted> {
@@ -594,6 +592,7 @@ const TOOLS: &str = r#"[
     "keep": {"type": "boolean", "description": "Keep the messages for the next call."}
   }}},
   {"name": "memory", "description": "Reports process memory, the JavaScript heap and DOM sizes. Can collect garbage first or write a heap snapshot.", "inputSchema": {"type": "object", "properties": {
+    "window": {"type": "integer", "description": "Window id from `windows`. Defaults to the first window."},
     "gc": {"type": "boolean", "description": "Run a full garbage collection first."},
     "snapshot": {"type": "boolean", "description": "Write a Web Inspector heap snapshot file and summarize it by class."}
   }}},

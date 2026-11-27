@@ -202,13 +202,9 @@ impl Builder {
                         serde_json::to_string(&value.to_string())?
                     )
                 }
-                _ if self.shared.asset_name(&path).is_some() => format!(
-                    "export default {};",
-                    json!(format!(
-                        "apps:///{}",
-                        self.shared.asset_name(&path).unwrap()
-                    ))
-                ),
+                _ if let Some(name) = self.shared.asset_name(&path) => {
+                    format!("export default {};", json!(format!("apps:///{name}")))
+                }
                 "cjs" | "cts" if !dependency => bail!(
                     "CommonJS is only supported in npm packages: {}",
                     path.display()

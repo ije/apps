@@ -32,10 +32,20 @@ pub(crate) struct View {
     data: Weak<crate::render::ViewState>,
     input: Weak<view::Input>,
     title: Option<String>,
+    // The document revision that `title` was read at.
+    titled: u64,
     preload: Option<Rc<JsContext>>,
     renderer: Option<Rc<JsContext>>,
-    fullscreen: Option<[bool; 2]>,
+    fullscreen: HtmlFullscreen,
     focused: bool,
+}
+
+// The fullscreen that the page asked for. `restore` leaves the window fullscreen mode on exit, and `seen` is set
+// once the window was fullscreen, so a window change without it ends the page fullscreen.
+#[derive(PartialEq)]
+enum HtmlFullscreen {
+    Off,
+    On { restore: bool, seen: bool },
 }
 
 impl View {
@@ -416,7 +426,9 @@ impl Desktop {
                         page.dirty = true;
                     }
                     "devtools" | "hud" | "inspect" => {
-                        self.tools(action, id, args, cx.as_deref_mut())?
+                        if let Err(error) = self.tools(action, id, args, cx.as_deref_mut()) {
+                            eprintln!("apps: developer tools: {error:#}");
+                        }
                     }
                     "close" => {
                         self.devtools.remove(&id);
@@ -501,20 +513,28 @@ impl Desktop {
                     "htmlFullscreen" => {
                         let on = args[2] == true;
                         let view = self.views.get_mut(&id).context("Window is closed")?;
-                        if on == view.fullscreen.is_some() {
+                        if on == (view.fullscreen != HtmlFullscreen::Off) {
                             continue;
                         }
-                        let before = view.fullscreen.take().map(|[before, _]| before);
+                        let restore = matches!(
+                            std::mem::replace(&mut view.fullscreen, HtmlFullscreen::Off),
+                            HtmlFullscreen::On { restore: true, .. }
+                        );
                         let mut was = false;
                         if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
                             cx.update_window(handle, |window, _| {
                                 was = window.window_state().fullscreen;
-                                if on && !was || before == Some(false) && was {
+                                if on && !was || restore && was {
                                     window.control().toggle_fullscreen();
                                 }
                             });
                         }
-                        view.fullscreen = on.then_some([was, was]);
+                        if on {
+                            view.fullscreen = HtmlFullscreen::On {
+                                restore: !was,
+                                seen: was,
+                            };
+                        }
                         self.link
                             .event("html-full-screen", id, Some(on.into()), "apps:fullscreen");
                     }
@@ -568,8 +588,11 @@ impl Desktop {
             let Some(title) = (self.host.borrow().store.borrow())
                 .pages
                 .get(&id)
-                .filter(|page| page.dirty)
-                .map(|page| page.doc.title())
+                .filter(|page| page.dirty && page.doc.nodes.latest() != view.titled)
+                .map(|page| {
+                    view.titled = page.doc.nodes.latest();
+                    page.doc.title()
+                })
             else {
                 continue;
             };
@@ -656,9 +679,9 @@ impl Desktop {
                     }
                 }
                 match &mut view.fullscreen {
-                    Some([_, seen]) if fullscreen => *seen = true,
-                    Some([_, true]) => {
-                        view.fullscreen = None;
+                    HtmlFullscreen::On { seen, .. } if fullscreen => *seen = true,
+                    HtmlFullscreen::On { seen: true, .. } => {
+                        view.fullscreen = HtmlFullscreen::Off;
                         if let Some(renderer) = &view.renderer
                             && let Err(error) = view::scripted(cx, None, || {
                                 renderer
@@ -720,16 +743,22 @@ impl Desktop {
                     continue;
                 };
                 let (commands, data) = (tools.commands(), view.data.upgrade());
-                view::scripted(cx, None, || -> Result<()> {
+                let result = view::scripted(cx, None, || -> Result<()> {
                     for command in &commands {
                         tools.answer(command, engine, &app.host, data.as_deref())?;
                     }
                     delay = delay.min(tools.poll(engine)?);
-                    if tools.is_closed() {
-                        panel::release(engine)?;
-                    }
                     Ok(())
-                })?;
+                });
+                if let Err(error) = result {
+                    eprintln!("apps: developer tools: {error:#}");
+                    tools.closed.set(true);
+                }
+                if tools.is_closed()
+                    && let Err(error) = view::scripted(cx, None, || panel::release(engine))
+                {
+                    eprintln!("apps: developer tools: {error:#}");
+                }
                 if let Some(handle) = view.handle.filter(|_| !commands.is_empty()) {
                     cx.refresh_window(handle);
                 }
@@ -743,8 +772,11 @@ impl Desktop {
                 let logs: Vec<_> = app.host.borrow_mut().logs.drain(..).collect();
                 let main_logs = std::mem::take(&mut app.main_logs);
                 for tools in app.devtools.values() {
-                    tools.events(&logs)?;
-                    tools.events(&main_logs)?;
+                    if let Err(error) = tools.events(&logs).and_then(|()| tools.events(&main_logs))
+                    {
+                        eprintln!("apps: developer tools: {error:#}");
+                        tools.closed.set(true);
+                    }
                 }
                 crate::native::devtools::logs(&logs);
             }
@@ -1113,6 +1145,8 @@ impl Desktop {
         crate::host::context::NATIVE.set(Some(|op, args| {
             renderer::sync_main(|| crate::native::native_call(op, args))
         }));
+        crate::host::context::REFLOW.set(Some(view::reflow));
+        crate::host::context::CLIPBOARD.set(Some(view::clipboard));
         crate::native::devtools::install(owner.unwrap_or(0));
         let runtime = Rc::new(RefCell::new(Self {
             api,

@@ -298,7 +298,7 @@
     return __appsDelay();
   };
   // Yield -2 within about 1 s to avoid the page watchdog. Check time every 8 tasks to limit clock overhead.
-  globalThis.__appsTick = () => { const start = clock(); for (let tasks = 1; ; tasks++) { const delay = step(); if (delay !== -2 || !codec.drain || (tasks % 8 === 0 && clock() - start > 1000)) return delay; codec.drain(); } };
+  globalThis.__appsTick = () => { const start = clock(); for (let tasks = 1; ; tasks++) { const delay = step(); if (delay !== -2 || (tasks % 8 === 0 && clock() - start > 1000)) return delay; codec.drain(); } };
   globalThis.__appsDelay = () => {
     if (ticks.length || immediates.size || bridge.poll.queued()) return 0;
     const at = earliest(), delay = at === Infinity ? -1 : Math.max(0, at - clock());
@@ -404,9 +404,9 @@
   node = globalThis.__appsNode(call, events.EventEmitter, inspector, info, codec);
   delete globalThis.__appsNode;
   const stream = once(() => installStreams(events.EventEmitter, node.Buffer, node.string_decoder.StringDecoder));
-  const childProcess = once(() => children = installChildren(call, events.EventEmitter, stream(), fail));
+  const childProcess = once(() => children = installChildren(call, events.EventEmitter, stream(), fail, node.bytes));
   let ioMade;
-  const io = once(() => ioMade = installIO({ call, sync: node.sync, asyncCall: node.asyncCall, Buffer: node.Buffer, stream: stream(), EventEmitter: events.EventEmitter, StringDecoder: node.string_decoder.StringDecoder, webcrypto: globalThis.__appsNodeCrypto.webcrypto, inspect, codec }));
+  const io = once(() => ioMade = installIO({ call, sync: node.sync, asyncCall: node.asyncCall, output: node.bytes, codes: node.codes, Buffer: node.Buffer, stream: stream(), EventEmitter: events.EventEmitter, StringDecoder: node.string_decoder.StringDecoder, webcrypto: globalThis.__appsNodeCrypto.webcrypto, inspect, codec }));
   // Do not initialize crypto through io() just for this check. No KeyObject can exist before crypto loads.
   node.util.types.isKeyObject = value => ioMade !== undefined && value instanceof ioMade.crypto.KeyObject;
   node.util.types.isProxy = value => value !== globalThis && isProxy(value);
@@ -606,20 +606,19 @@
   const loadError = (code, description, url) => Object.assign(new Error(`${description} (${code}) loading '${url}'`), { code: description, errno: code, url });
   const pending = (win, op, ...args) => new Promise((resolve, reject) => { const id = ++nextCapture; captures.set(id, { resolve, reject, win, op }); call('window', op, win, id, ...args); });
   class WebContents extends browsers.Contents {
-    constructor(win) { super(); Object.defineProperty(this, 'id', { value: browsers.reserve(), enumerable: true }); pages.set(this, { win, url: '', title: '', loading: false, load: null, html: null, zoom: [1, 0] }); }
+    constructor(win) { super(); Object.defineProperty(this, 'id', { value: browsers.reserve(), enumerable: true }); pages.set(this, { win, url: '', title: '', load: null, html: null, zoom: [1, 0] }); }
     #page() { const page = pages.get(this); if (!windows.has(page.win)) throw destroyed(); return page; }
     _load(op, target, url) {
       const page = this.#page(), request = ++nextLoad;
       call('window', op, page.win, target, request);
       page.load?.reject(loadError(-3, 'ERR_ABORTED', page.load.url));
-      Object.assign(page, { loading: true, html: op === 'load' ? target : page.html });
+      if (op === 'load') page.html = target;
       return new Promise((resolve, reject) => { page.load = { request, url, resolve, reject }; });
     }
     _event(name, data) {
       const page = pages.get(this), load = page.load?.request === data?.request ? page.load : null;
       if (name === 'title') { page.title = data; return; }
       if (load) page.load = null;
-      page.loading = false;
       if (name === 'failed') {
         this.emit('did-fail-load', event(), data.code, data.description, data.url, true, info.pid, 1);
         this.emit('did-stop-loading');
@@ -658,7 +657,7 @@
     }
     #input = false;
     #listen() { const on = this.listenerCount('before-input-event') > 0; if (on !== this.#input && !this.isDestroyed()) { this.#input = on; call('window', 'input', pages.get(this).win, on); } return this; }
-    static { for (const method of ['on', 'addListener', 'prependListener', 'once', 'prependOnceListener', 'removeListener', 'removeAllListeners']) this.prototype[method] = function(...args) { events.EventEmitter.prototype[method].apply(this, args); return this.#listen(); }; }
+    static { for (const method of ['on', 'addListener', 'prependListener', 'removeListener', 'removeAllListeners']) this.prototype[method] = function(...args) { events.EventEmitter.prototype[method].apply(this, args); return this.#listen(); }; }
     getType() { return 'window'; }
     get session() { return browsers.session.defaultSession; }
     #frame; #history; #debugger;
@@ -707,7 +706,7 @@
     focus() { BrowserWindow.fromId(this.#page().win).focus(); }
     getURL() { return pages.get(this).url; }
     getTitle() { return pages.get(this).title; }
-    isLoading() { return pages.get(this).loading; }
+    isLoading() { return pages.get(this).load !== null; }
     isDestroyed() { return !windows.has(pages.get(this).win); }
     getOSProcessId() { return info.pid; }
     getProcessId() { return info.pid; }
@@ -723,6 +722,7 @@
     for (const child of win.contentView.children) win.contentView.removeChildView(child);
     const page = pages.get(win.webContents);
     page.load?.reject(loadError(-3, 'ERR_ABORTED', page.load.url));
+    page.load = null;
     for (const [id, request] of captures) if (request.win === win.id) { captures.delete(id); request.reject(destroyed()); }
     for (const [target, name] of [[win.webContents, 'destroyed'], [win, 'closed'], [app, 'window-close']]) try { target.emit(name); } catch (error) { hooks.report(error); }
     if (windows.size) return;
@@ -877,7 +877,7 @@
       app.emit('browser-window-created', event(), this);
     }
     #listen() { const on = this.listenerCount('will-resize') + this.listenerCount('will-move') > 0; if (on !== this.#frames && !this.isDestroyed()) { this.#frames = on; call('window', 'willChange', this.id, on); } return this; }
-    static { for (const method of ['on', 'addListener', 'prependListener', 'once', 'prependOnceListener', 'removeListener', 'removeAllListeners']) this.prototype[method] = function(...args) { events.EventEmitter.prototype[method].apply(this, args); return this.#listen(); }; }
+    static { for (const method of ['on', 'addListener', 'prependListener', 'removeListener', 'removeAllListeners']) this.prototype[method] = function(...args) { events.EventEmitter.prototype[method].apply(this, args); return this.#listen(); }; }
     load(html) { return this.webContents._load('load', String(html), 'apps://app/'); }
     loadFile(file, options) { return this.webContents.loadFile(file, options); }
     loadURL(url) { return this.webContents.loadURL(url); }

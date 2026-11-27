@@ -7,7 +7,7 @@ use bbtree::unsync::BBTreeMap;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, path::Path};
 
-const HEADER: &[u8; 8] = b"APP\0\x03\0\0\0";
+const HEADER: &[u8; 8] = b"APP\0\x04\0\0\0";
 
 pub const LINK_SHEET: &str = "apps-sheet";
 
@@ -30,19 +30,19 @@ pub fn unpack_page(bytes: &[u8]) -> Result<Document> {
         doc.nodes[0].tag == "#document" && doc.nodes[0].parent.is_none(),
         "Invalid document root"
     );
+    // The adoption agency can give a child a lower id than its parent, so walk the tree from the root.
     let mut seen = vec![false; doc.nodes.len()];
     seen[0] = true;
-    for (id, node) in doc.nodes.iter().enumerate() {
-        for &child in &node.children {
-            ensure!(
-                child > id && child < doc.nodes.len(),
-                "Invalid document child"
-            );
+    let mut stack = vec![0];
+    while let Some(id) = stack.pop() {
+        for &child in &doc.nodes[id].children {
+            ensure!(child < doc.nodes.len(), "Invalid document child");
             ensure!(
                 !seen[child] && doc.nodes[child].parent == Some(id),
                 "Invalid document parent"
             );
             seen[child] = true;
+            stack.push(child);
         }
     }
     ensure!(
@@ -1120,5 +1120,68 @@ mod tests {
         let mut doc = unpack_page(&page).unwrap();
         doc.nodes[0].children.push(usize::MAX);
         assert!(unpack_page(&postcard::to_allocvec(&doc).unwrap()).is_err());
+    }
+
+    #[test]
+    fn misnested_formatting_tags_survive_the_bundle() {
+        let html = "<body><b><i><div>x</b></body>";
+        let dir = tempfile::tempdir().unwrap();
+        let files = BBTreeMap::from([
+            ("app.js".into(), "$appsDefine({id:0});".into()),
+            ("page-0.html".into(), html.into()),
+        ]);
+        write(&dir.path().join("app.bundle"), &files, &[]).unwrap();
+        let page = read(dir.path())
+            .unwrap()
+            .pages
+            .remove("page-0.html")
+            .unwrap();
+        let doc = unpack_page(&page).unwrap();
+        let raw = Document::parse(html);
+        assert_eq!(doc.nodes.len(), raw.nodes.len());
+        for (a, b) in doc.nodes.iter().zip(&raw.nodes) {
+            assert_eq!(
+                (&a.tag, a.parent, &a.children),
+                (&b.tag, b.parent, &b.children)
+            );
+        }
+        let div = doc.nodes.iter().position(|n| n.tag == "div").unwrap();
+        assert!(doc.nodes[div].parent.unwrap() > div);
+        let mut cycle = unpack_page(&page).unwrap();
+        let parent = cycle.nodes[div].parent.unwrap();
+        cycle.nodes[div].children.push(parent);
+        assert!(unpack_page(&postcard::to_allocvec(&cycle).unwrap()).is_err());
+        let mut cycle = unpack_page(&page).unwrap();
+        let (a, b) = (cycle.nodes.len(), cycle.nodes.len() + 1);
+        for other in [b, a] {
+            let mut node = cycle.nodes[div].clone();
+            node.parent = Some(other);
+            node.children = vec![other];
+            cycle.nodes.push(node);
+        }
+        assert!(unpack_page(&postcard::to_allocvec(&cycle).unwrap()).is_err());
+    }
+
+    #[test]
+    fn scope_roots_inside_functions_survive_the_bundle() {
+        let html = "<html><head><style>@scope (.card) { :is(:scope) > p { color: red } :not(:scope) > b { color: blue } }</style></head><body><div class=card><p>x</p><span><b>y</b></span></div><p>z</p></body></html>";
+        let dir = tempfile::tempdir().unwrap();
+        let files = BBTreeMap::from([
+            ("app.js".into(), "$appsDefine({id:0});".into()),
+            ("page-0.html".into(), html.into()),
+        ]);
+        write(&dir.path().join("app.bundle"), &files, &[]).unwrap();
+        let doc = unpack_page(&read(dir.path()).unwrap().pages["page-0.html"]).unwrap();
+        let colors = |doc: &Document| {
+            let styles = style::styles(doc, 800., 600.);
+            (0..doc.nodes.len())
+                .filter(|&id| matches!(&*doc.nodes[id].tag, "p" | "b"))
+                .map(|id| styles[id].get("color").cloned().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+        let raw = colors(&Document::parse(html));
+        assert_eq!(raw[0], "red");
+        assert_eq!(raw[1], "blue");
+        assert_eq!(colors(&doc), raw);
     }
 }

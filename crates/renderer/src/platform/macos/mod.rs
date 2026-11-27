@@ -11,6 +11,7 @@ mod threads;
 mod vsync;
 mod window;
 
+use crate::platform::lock;
 use crate::{Cursor, Rect, WindowOptions, platform::Callbacks};
 use anyhow::Result;
 use objc2::{
@@ -23,10 +24,7 @@ use objc2_app_kit::{
     NSPasteboard, NSPasteboardTypeString, NSScreen,
 };
 use objc2_foundation::{NSArray, NSString, NSURL, NSUserDefaults};
-use std::{
-    cell::RefCell,
-    sync::{Mutex, MutexGuard, PoisonError},
-};
+use std::cell::RefCell;
 
 pub use controls::control_size;
 pub(crate) use glass::available as supports_glass;
@@ -51,11 +49,6 @@ impl<T> Sendable<T> {
     pub fn take(self) -> T {
         self.0
     }
-}
-
-// A panic while a lock is held leaves its data usable here.
-pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 define_class!(

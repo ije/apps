@@ -66,7 +66,6 @@ pub(super) struct Cx<'a> {
     pub(super) layers: RefCell<crate::render::inline::Layers>,
     pub(super) rtl: bool,
     pub(super) line_justify: Option<renderer::AlignContent>,
-    pub(super) line_align: Option<renderer::AlignItems>,
     pub(super) all_inline: bool,
     /// The style of an equal box built before, which this box shares.
     pub(super) hit: Option<Rc<renderer::Style>>,

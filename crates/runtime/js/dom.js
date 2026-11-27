@@ -24,7 +24,7 @@
   let stale = true, staleAt, scrolled = false, scrolledAt, laid = false, version = 0, shape = 0;
   const rare = { base: 0, title: 0 };
   let retrying = false;
-  let highlights = new Map(), highlightShape = -1, highlightsQueued = false, looseRanges = 0;
+  let highlightShape = -1, highlightsQueued = false, looseRanges = 0;
   const flush = () => {
     if (looseRanges && highlightShape !== shape) queueHighlights();
     if (!size) return;
@@ -68,8 +68,9 @@
     changed = stale = true; staleAt = geometry[2]; version++; if (code === 2 || code === 3) { shape++; if (readers) { const kid = records[b]; if (code === 2 && kid.up) noteTree(kid, kid.up); noteTree(kid, records[a], code === 3); } } codes[size] = code; codes[size + 1] = a; codes[size + 2] = typeof b === 'string' ? (texts.push(alone(b)), b.length) : b; codes[size + 3] = typeof c === 'string' ? (texts.push(alone(c)), c.length) : c; size += 4;
     if (!scheduled) { scheduled = true; microtask(drain); } else if (size > 1 << 18) flush();
   };
-  let webviewScan = true, pickFiles, openSelect;
-  const call = (name, ...args) => { flush(); if (name === 'dom.html') { changed = true; shape++; webviewScan ||= /<webview/i.test(args[1]); } if (name === 'dom.scroll') { scrolled = true; scrolledAt = geometry[2]; version++; } else if (name === 'dom.html' || name === 'dom.focus' || name === 'dom.target' || name === 'dom.hover' || name === 'dom.active' || name === 'dom.font' || name === 'dom.animation' || name === 'dom.sheet' || name === 'dom.adopt' || name === 'dom.constructed' && args[0] || name === 'dom.popoverSource') { stale = true; staleAt = geometry[2]; version++; } return host(name, ...args); };
+  // Parsed `<webview>` records wait for a wrapper until the next layout. A wrapper registers its guest.
+  let parsedWebviews = null, pickFiles, openSelect;
+  const call = (name, ...args) => { flush(); if (name === 'dom.html') { changed = true; shape++; } if (name === 'dom.scroll') { scrolled = true; scrolledAt = geometry[2]; version++; } else if (name === 'dom.html' || name === 'dom.focus' || name === 'dom.target' || name === 'dom.hover' || name === 'dom.active' || name === 'dom.font' || name === 'dom.animation' || name === 'dom.sheet' || name === 'dom.adopt' || name === 'dom.constructed' && args[0] || name === 'dom.popoverSource') { stale = true; staleAt = geometry[2]; version++; } return host(name, ...args); };
   // Keep mirror arrays private. Retain constructors and avoid prototype getters. A nonzero first float means
   // Rust moved the buffer.
   const F32 = Float32Array, U8 = Uint8Array;
@@ -179,6 +180,7 @@
       if (tag === 'base' || tag === 'title') rare[tag]++;
       if (tag === 'template' && end > i + 5 && rec.attrs.has('shadowrootmode')) (declarative ??= []).push(rec);
       media ||= tag === 'img' || tag === 'video' || tag === 'audio';
+      if (tag === 'webview') (parsedWebviews ??= []).push(rec);
       if (readers) noteNode(rec, up);
       if (tag === 'input' && end > i + 5 && rec.attrs.has('checked')) (radios ??= []).push(rec);
       if ((tag === 'input' || tag === 'select' || tag === 'textarea') && end > i + 5 && limited(rec.attrs)) (controls ??= []).push(rec);
@@ -246,8 +248,10 @@
   const release = node => { if (node._held) for (const child of node._held) child._parent = null; node._held = null; };
   const definitions = new Map(), defined = new WeakMap(), definitionsWaiting = new Map();
   let constructing = null;
-  const wrapped = [], names = new Map(), types = { __proto__: null, '#document': 9, '#text': 3, '#comment': 8, '#fragment': 11, '#doctype': 10 }, events = new WeakMap(), registered = [], pointers = new Set(), captures = new Map(), gotten = new Map(), observers = new Set();
-  let readyState = 'loading', currentScript = null, active = null, navStart = null, hovered = null, selection = null, composing = null, mutationQueued = false, selectionDrag = null, quiet = 0, shadows = 0, moving = false, wheeling = false, iterating = false, native = 0, hoverVersion = 0;
+  const wrapped = [], names = new Map(), types = { __proto__: null, '#document': 9, '#text': 3, '#comment': 8, '#fragment': 11, '#doctype': 10 }, events = new WeakMap(), registered = [], observers = new Set();
+  // The target that `setPointerCapture()` asked for, and the one that got `gotpointercapture`.
+  let pointerCapture = null, gotCapture = null;
+  let readyState = 'loading', currentScript = null, active = null, navStart = null, hovered = null, selection = null, composition = null, mutationQueued = false, selectionDrag = null, quiet = 0, shadows = 0, moving = false, wheeling = false, iterating = false, native = 0, hoverVersion = 0;
   const selectionPending = new Set();
   const topLayer = [], dialogs = [], autos = [], hints = [], fullscreens = [], watchers = [];
   const selectionChanged = (target = document) => {
@@ -585,8 +589,8 @@
       if (fullscreens.some(node => !node.isConnected)) exitFullscreen(true);
       for (const node of [...topLayer, ...dialogs]) if (!node.isConnected) { if (node._popover) hidePopover(node, false, false); if (dialogs.includes(node)) closeDialog(node); }
     }
-    if (captures.size) for (const [id, node] of captures) if (!node.isConnected) captures.delete(id);
-    if (gotten.size) for (const [id, node] of gotten) if (!node.isConnected) { gotten.delete(id); dispatch(document, trusted(new PointerEvent('lostpointercapture', { pointerId: id, pointerType: 'mouse', isPrimary: true, bubbles: true, composed: true }))); }
+    if (pointerCapture && !pointerCapture.isConnected) pointerCapture = null;
+    if (gotCapture && !gotCapture.isConnected) { gotCapture = null; dispatch(document, trusted(new PointerEvent('lostpointercapture', { pointerId: 1, pointerType: 'mouse', isPrimary: true, bubbles: true, composed: true }))); }
     if (parent && navStart && (!navStart[0].isConnected || navStart[1] && !navStart[1].isConnected)) navStart = [parent, next && of(next)];
     if (!active || active.isConnected) return;
     finishComposition();
@@ -639,7 +643,7 @@
   const setHTML = (node, value, inert = false) => replaceAll(node, removed => {
     const list = json(node.nodeType === 1 ? call('dom.html', node._id, String(value), contextTag(node)) : call('dom.html', node._id, String(value)));
     release(node); detach(node._m); const media = load(list); relist(node._m); removed();
-    if (!inert) { if (media) __appsImages(node); if (definitions.size) for (const kid of node._m.kids) reactions(kid); }
+    if (!inert) { if (media) __appsImages(node); if (node._select && !node._network) node._select(); if (definitions.size) for (const kid of node._m.kids) reactions(kid); }
   });
   class List extends Array { static get [Symbol.species]() { return Array; } item(index) { return this[index] ?? null; } toString() { return Object.prototype.toString.call(this); } }
   class NodeList extends List {}
@@ -695,11 +699,11 @@
   };
   const reserved = new Map();
   class Live {
-    constructor(read, reads, named) { this.read = read; this.reads = reads; this.version = reads ? -1 : 0; this.ref = this.list = null; this.named = named; this.stale = true; this.names = null; this.namesAt = 0; }
+    constructor(read, reads, named) { this.read = read; this.reads = reads; this.version = 0; this.ref = this.list = null; this.named = named; this.stale = true; this.names = null; this.namesAt = 0; }
     drop(rec) { const list = this.list, last = list.length - 1; if (last < 0) return; const at = list[0]._m === rec ? 0 : list[last]._m === rec ? last : list.findIndex(node => node._m === rec); if (at >= 0) { if (at === last) list.length = last; else list.splice(at, 1); this.names = null; } }
     sync(list) {
-      if (this.version >= 0 ? this.version !== version || this.stale : this.stale) {
-        if (this.version >= 0) this.version = version;
+      if (this.reads ? this.stale : this.version !== version || this.stale) {
+        if (!this.reads) this.version = version;
         this.stale = false; this.names = null; this.list = list;
         if (this.reads) waitFor(this, this.reads);
         const found = this.read(); list.length = found.length;
@@ -728,7 +732,7 @@
       return found && (found.length > 1 ? this.named(key, found) : found[0]);
     }
     get(list, key) {
-      if (this.version >= 0 || this.stale) this.sync(list);
+      if (!this.reads || this.stale) this.sync(list);
       if (typeof key === 'string') { const code = key.charCodeAt(0); if (code >= 48 && code <= 57 || key === 'length') return list[key]; return this.byName(list, key) ?? list[key]; }
       if (key === raw) return list; if (key === lookup) return name => this.byName(list, name, true);
       return list[key];
@@ -1365,9 +1369,10 @@
     get tabIndex() { const value = parseInt(this.getAttribute('tabindex'), 10), tag = this.localName; return Number.isNaN(value) ? /^(input|textarea|button|select|iframe|object|video|audio|terminal)$/.test(tag) || (tag === 'a' || tag === 'area') && (this.namespaceURI === XHTML || this.hasAttribute('href')) || tag === 'summary' && activation(this) ? 0 : -1 : value; } set tabIndex(value) { this.setAttribute('tabindex', Number(value) | 0); }
     attachShadow(options) { if (this._shadow) throw new DOMException('Shadow root already exists', 'NotSupportedError'); if(!['open','closed'].includes(options.mode))throw new TypeError('Invalid shadow mode');if(this.namespaceURI!==XHTML||!/^(article|aside|blockquote|body|div|footer|h[1-6]|header|main|nav|p|section|span|[a-z][a-z0-9._]*-[a-z0-9._-]*)$/.test(this.localName))throw new DOMException(`<${this.localName}> cannot have a shadow root`, 'NotSupportedError');const root = document.createDocumentFragment(); shadows++; Object.setPrototypeOf(root,ShadowRoot.prototype);root.host=this;root.mode=options.mode;root.delegatesFocus=!!options.delegatesFocus;root.slotAssignment=options.slotAssignment==='manual'?'manual':'named';root.clonable=!!options.clonable;root.serializable=!!options.serializable;this._shadow=root;root._m.host=this._m;this._m.shadow=root._m;op(6,this._id,root._id);return root; }
     get shadowRoot() { return this._shadow?.mode === 'open' ? this._shadow : null; }
-    setPointerCapture(id) { if (!pointers.has(id)) throw new DOMException('Pointer is not active', 'NotFoundError'); captures.set(id, this); }
-    hasPointerCapture(id) { return captures.get(id) === this; }
-    releasePointerCapture(id) { if (captures.get(id) === this) captures.delete(id); }
+    // Only the mouse, pointer 1, can be active.
+    setPointerCapture(id) { if (id !== 1 || !press) throw new DOMException('Pointer is not active', 'NotFoundError'); pointerCapture = this; }
+    hasPointerCapture(id) { return id === 1 && pointerCapture === this; }
+    releasePointerCapture(id) { if (id === 1 && pointerCapture === this) pointerCapture = null; }
     insertAdjacentElement(position, node) { if (!(node instanceof Element)) throw new TypeError('Expected an Element'); return adjacent(this, position, node); }
     insertAdjacentText(position, text) { adjacent(this, position, document.createTextNode(String(text))); }
     webkitMatchesSelector(selector) { return this.matches(selector); }
@@ -2247,7 +2252,7 @@
     get length() { return this.cssRules.length; }
     findRule(key) { key = keyText(key); return this.cssRules.findLast(rule => rule._data[0] === key) ?? null; }
     appendRule(text) { const frames = this._sheet._edit('keyframe', this._path(), String(text)); for (const data of frames ?? []) { this._data[2].push(data); this.cssRules.push(new CSSKeyframeRule(this._sheet, this, data)); } }
-    deleteRule(key) { const rule = this.findRule(key); if (!rule) return; const index = this.cssRules.indexOf(rule); this._sheet._edit('keyframe', this._path(), String(index)); this._data[2].splice(index, 1); this.cssRules.splice(index, 1); }
+    deleteRule(key) { const rule = this.findRule(key); if (!rule) return; const index = this.cssRules.indexOf(rule); this._sheet._edit('keyframe-delete', this._path(), String(index)); this._data[2].splice(index, 1); this.cssRules.splice(index, 1); }
   }
   class CSSFontFaceRule extends CSSRule { get style() { return this._style ??= declaration({ rule: this, raw: true, read: () => this._data[1], write: list => { this._data[1] = list; this._sheet._edit('style', this._path(), declarationText(list)); } }); } }
   class CSSPositionTryDescriptors extends CSSStyleDeclaration {}
@@ -2282,7 +2287,7 @@
       if (path && this._node) result = call('dom.sheet', this._node._id, kind, value, path);
       else if (path && this._live) result = call('dom.constructed', this._id, kind, value, path);
       else if (kind === 'insert') { const parsed = call('dom.constructed', 0, 'parse', value); result = parsed.length === 1 && parsed[0][0] !== 'other' ? parsed[0] : { error: 'SyntaxError' }; }
-      else if (kind === 'keyframe' && value.includes('{')) result = call('dom.constructed', 0, 'parse', `@keyframes x{${value}}`)[0]?.[2] ?? { error: 'SyntaxError' };
+      else if (kind === 'keyframe') result = call('dom.constructed', 0, 'parse', `@keyframes x{${value}}`)[0]?.[2];
       else if (kind === 'selector') { const parsed = call('dom.constructed', 0, 'parse', `${value}{}`); result = parsed.length === 1 && parsed[0][0] === 'style' ? parsed[0][1] : { error: 'SyntaxError' }; }
       if (result?.error) throw new DOMException(`Failed to ${kind} the CSS rule`, result.error);
       return result;
@@ -2370,7 +2375,7 @@
     delete(name) { const old = this.get(name = String(name)), found = super.delete(name); if (found) nameHighlight(old, -1); return found; }
     clear() { for (const name of [...this.keys()]) this.delete(name); }
   }
-  highlights = new HighlightRegistry();
+  const highlights = new HighlightRegistry();
   const CSS = {
     highlights,
     supports(name, value) { return call('dom.supports', String(name), arguments.length > 1 ? String(value) : null); },
@@ -2646,7 +2651,7 @@
   // As in Chrome, a document is at most this deep.
   const xmlDepth = 5000, XML = 'http://www.w3.org/XML/1998/namespace', XMLNS = 'http://www.w3.org/2000/xmlns/';
   const parseXML = (source, type) => {
-    const doc = new XMLDocument(type), open = [doc], scopes = [{ __proto__: null, '': null, xml: 'http://www.w3.org/XML/1998/namespace', xmlns: 'http://www.w3.org/2000/xmlns/' }], entities = new Map([['amp', '&'], ['lt', '<'], ['gt', '>'], ['quot', '"'], ['apos', "'"]]);
+    const doc = new XMLDocument(type), open = [doc], scopes = [{ __proto__: null, '': null, xml: XML, xmlns: XMLNS }], entities = new Map([['amp', '&'], ['lt', '<'], ['gt', '>'], ['quot', '"'], ['apos', "'"]]);
     const link = node => { const parent = open.at(-1), kid = node._m; op(2, parent._id, node._id, -1); kid.up = parent._m; kid.i = parent._m.kids.push(kid) - 1; hold(parent, node); };
     let at = 0, expanded = 0, doctype = false;
     const fail = (message = 'Unexpected token: ' + (source[at] ?? ''), where = at) => { throw [message, where]; };
@@ -3149,7 +3154,7 @@
   }
   class DOMPoint extends DOMPointReadOnly {}
   for (const [i, name] of ['x', 'y', 'z', 'w'].entries()) { Object.defineProperty(DOMPointReadOnly.prototype, name, { configurable: true, enumerable: true, get() { return this._p[i]; } }); Object.defineProperty(DOMPoint.prototype, name, { configurable: true, enumerable: true, get() { return this._p[i]; }, set(value) { this._p[i] = +value; } }); }
-  // Match Canvas::draw opcodes and argument counts in render/canvas.rs. Keep f64 precision for large
+  // Match Canvas::draw opcodes and argument counts in render/raster/canvas/mod.rs. Keep f64 precision for large
   // coordinates.
   class CanvasPath {
     arc(x, y, radius, start, end, counter = false) { if (radius < 0) throw new DOMException('The radius is negative', 'IndexSizeError'); this._op(28, x, y, radius, start, end, counter ? 1 : 0); }
@@ -3684,7 +3689,7 @@
   class ElementGeometryUpdateEvent extends Event { constructor(type, options = {}) { super(type, options); this.elements = Object.freeze([...options.elements ?? []]); } }
   // Runs after a frame with the drawable elements that draw otherwise than before. Canvases inside others paint first.
   globalThis.__appsPaint = ids => {
-    if (transition?._phase === 1) runUpdate(transition);
+    if (transition?._phase === 'captured') runUpdate(transition);
     const changed = new Map();
     for (const canvas of paintRequests) changed.set(canvas, []);
     paintRequests.clear();
@@ -4018,7 +4023,7 @@
       // As in browsers, microtasks run after each callback.
       drainMicrotasks?.();
     }
-    if (transition?._phase === 0) captureOld(transition);
+    if (transition?._phase === 'capture') captureOld(transition);
     microtask(() => { timelineTime = null; });
   };
   // One request covers every callback until the next frame runs.
@@ -4149,7 +4154,7 @@
     for (const { offset } of frames) {
       if (offset === null) continue;
       if (!(offset >= 0 && offset <= 1)) throw new TypeError('Keyframe offsets must be between 0 and 1');
-      if (offset < previous) throw new TypeError('Keyframe offsets must be in animationOrder');
+      if (offset < previous) throw new TypeError('Keyframe offsets must be in order');
       previous = offset;
     }
     const known = frames.map(frame => frame.offset ?? frame.computed);
@@ -4213,7 +4218,7 @@
   // As in Chrome, an element with no box can't take committed styles: a disconnected one, one in a `display: none` or `content-visibility: hidden` box of the flat tree, or one with `display: contents`.
   const boxless = target => { if (!target.isConnected) return true; for (let node = target; node; node = node.assignedSlot ?? node.parentElement ?? node.parentNode?.host) { const style = getComputedStyle(node); if (style.display === 'none' || node === target && style.display === 'contents' || node !== target && style.contentVisibility === 'hidden') return true; } return false; };
   class Animation extends EventTarget {
-    #id = ++animationIds; #effect = null; #timeline; #start = null; #hold = null; #rate = 1; #pendingRate = null; #playing = false; #pausing = false; #previous = null;
+    #id = ++animationIds; #effect = null; #timeline; #start = null; #hold = null; #rate = 1; #pendingRate = null; #task = null; #previous = null;
     #finished; #settle; #fail; #done = false; #queued = false; #ready; #readyResolve = null; #readyReject = null; #timer; #replace = 'active'; #synced = null; #sent = null; #range = ['normal', 'normal'];
     static {
       retimed = animation => animation.#update(false, false);
@@ -4249,7 +4254,7 @@
     set timeline(timeline) {
       const time = this.#current(), running = this.#start !== null && this.#hold === null;
       this.#timeline = timeline ?? null;
-      if (time !== null) { this.#start = null; this.#hold = time; if (running) { this.#playing = true; this.#schedule(); } }
+      if (time !== null) { this.#start = null; this.#hold = time; if (running) { this.#task ??= 'play'; this.#schedule(); } }
       this.#update(false, false);
     }
     get startTime() { return this.#scroll() && this.#start !== null ? unitValue(this.#start, 'percent') : this.#start; }
@@ -4265,7 +4270,7 @@
       this.#apply();
       this.#start = time;
       if (time === null) this.#hold = previous; else if (this.#rate !== 0) this.#hold = null;
-      if (this.pending) { this.#playing = this.#pausing = false; this.#resolve(); }
+      if (this.pending) { this.#task = null; this.#resolve(); }
       this.#update(true, false);
     }
     get currentTime() { const time = this.#current(); return this.#scroll() && time !== null ? unitValue(time, 'percent') : time; }
@@ -4273,7 +4278,7 @@
       if (value == null) { if (this.#current() !== null) throw new TypeError('The current time cannot be null'); return; }
       const time = finite(percentOf(value));
       this.#seek(time);
-      if (this.#pausing) { this.#hold = time; this.#apply(); this.#start = null; this.#pausing = false; this.#resolve(); }
+      if (this.#task === 'pause') { this.#hold = time; this.#apply(); this.#start = null; this.#task = null; this.#resolve(); }
       this.#update(true, false);
     }
     get playbackRate() { return this.#rate; }
@@ -4293,12 +4298,12 @@
     get playState() {
       const time = this.#current();
       if (time === null && this.#start === null && !this.pending) return 'idle';
-      if (this.#pausing || this.#start === null && !this.#playing) return 'paused';
+      if (this.#task === 'pause' || this.#start === null && this.#task !== 'play') return 'paused';
       const rate = this.#effective();
       return time !== null && (rate > 0 && time >= this.#end() || rate < 0 && time <= 0) ? 'finished' : 'running';
     }
     get replaceState() { return this.#replace; }
-    get pending() { return this.#playing || this.#pausing; }
+    get pending() { return this.#task !== null; }
     get ready() { return this.#ready; }
     get finished() { return this.#finished; }
     // Browsers resolve the promises at once but fire the events in a later task.
@@ -4306,12 +4311,12 @@
     #commit() {
       const now = this.#now();
       if (now === null || !this.pending) return;
-      if (this.#playing) {
-        this.#playing = false;
+      const task = this.#task;
+      this.#task = null;
+      if (task === 'play') {
         if (this.#hold !== null) { this.#apply(); this.#start = this.#rate === 0 ? now : now - this.#hold / this.#rate; if (this.#rate !== 0) this.#hold = null; }
         else if (this.#start !== null && this.#pendingRate !== null) { const time = (now - this.#start) * this.#rate; this.#apply(); if (this.#rate === 0) this.#hold = time; else this.#start = now - time / this.#rate; }
       } else {
-        this.#pausing = false;
         if (this.#start !== null && this.#hold === null) this.#hold = (now - this.#start) * this.#rate;
         this.#apply();
         this.#start = null;
@@ -4321,33 +4326,32 @@
     }
     play() { this.#play(true); }
     #play(rewind) {
-      const aborted = this.#pausing, time = this.#current(), end = this.#end(), rate = this.#effective();
+      const aborted = this.#task === 'pause', time = this.#current(), end = this.#end(), rate = this.#effective();
       let seek = null;
       if (rewind && rate > 0 && (time === null || time < 0 || time >= end)) seek = 0;
       else if (rewind && rate < 0 && (time === null || time <= 0 || time > end)) { if (end === Infinity) throw new DOMException('Cannot play an endless animation in reverse', 'InvalidStateError'); seek = end; }
       else if (rate === 0 && time === null) seek = 0;
       // Like Chrome, a scroll-driven animation that plays from its start starts at the edge of its range.
-      if (seek !== null && this.#scroll()) { const state = scrollState(this.#scroll(), ...this.#range); this.#start = state?.[3] == null ? 0 : rate < 0 ? state[4] : state[3]; this.#hold = null; this.#playing = this.#pausing = false; this.#update(false, false); return; }
+      if (seek !== null && this.#scroll()) { const state = scrollState(this.#scroll(), ...this.#range); this.#start = state?.[3] == null ? 0 : rate < 0 ? state[4] : state[3]; this.#hold = null; this.#task = null; this.#update(false, false); return; }
       if (seek !== null) this.#hold = seek;
       if (this.#hold !== null) this.#start = null;
       const waiting = this.pending;
-      this.#playing = this.#pausing = false;
+      this.#task = null;
       if (this.#hold === null && seek === null && !aborted && this.#pendingRate === null) return;
       if (!waiting) this.#wait();
-      this.#playing = true;
+      this.#task = 'play';
       this.#schedule();
       this.#update(false, false);
     }
     pause() {
-      if (this.#pausing || this.playState === 'paused') return;
+      if (this.#task === 'pause' || this.playState === 'paused') return;
       if (this.#current() === null) {
         const end = this.#end();
         if (this.#effective() < 0 && end === Infinity) throw new DOMException('Cannot pause an endless animation in reverse', 'InvalidStateError');
         this.#hold = this.#effective() < 0 ? end : 0;
       }
-      if (!this.#playing) this.#wait();
-      this.#playing = false;
-      this.#pausing = true;
+      if (!this.#task) this.#wait();
+      this.#task = 'pause';
       this.#schedule();
       this.#update(false, false);
     }
@@ -4358,12 +4362,12 @@
       const limit = this.#rate > 0 ? end : 0, now = this.#now();
       this.#seek(limit);
       if (this.#start === null && now !== null) this.#start = now - limit / this.#rate;
-      if (this.pending && this.#start !== null) { if (this.#pausing) this.#hold = null; this.#playing = this.#pausing = false; this.#resolve(); }
+      if (this.pending && this.#start !== null) { if (this.#task === 'pause') this.#hold = null; this.#task = null; this.#resolve(); }
       this.#update(true, true);
     }
     cancel() {
       if (this.playState !== 'idle') {
-        if (this.pending) { this.#playing = this.#pausing = false; this.#apply(); this.#readyReject?.(new DOMException('The animation was canceled', 'AbortError')); this.#readyResolve = this.#readyReject = null; this.#ready = Promise.resolve(this); }
+        if (this.pending) { this.#task = null; this.#apply(); this.#readyReject?.(new DOMException('The animation was canceled', 'AbortError')); this.#readyResolve = this.#readyReject = null; this.#ready = Promise.resolve(this); }
         if (!this.#done) this.#fail(new DOMException('The animation was canceled', 'AbortError'));
         this.#reset();
         this.#fire('cancel', this.#now(), null);
@@ -4578,8 +4582,9 @@
     keys() { return this.#set.values(); } values() { return this.#set.values(); } entries() { return this.#set.entries(); } [Symbol.iterator]() { return this.#set.values(); }
     get [Symbol.toStringTag]() { return 'ViewTransitionTypeSet'; }
   }
+  // `_phase` goes capture, captured, update, animate, done. A skip goes to done from any phase.
   class ViewTransition {
-    constructor(token, update, types) { if (token !== cssToken) throw new TypeError('Illegal constructor'); Object.assign(this, { _update: update, _phase: 0, _called: false, _done: deferred(), _ready: deferred(), _finished: deferred(), _types: new ViewTransitionTypeSet(types), _vt: 0, _old: null, _new: null, _pseudos: new Map() }); }
+    constructor(token, update, types) { if (token !== cssToken) throw new TypeError('Illegal constructor'); Object.assign(this, { _update: update, _phase: 'capture', _called: false, _done: deferred(), _ready: deferred(), _finished: deferred(), _types: new ViewTransitionTypeSet(types), _vt: 0, _old: null, _new: null, _pseudos: new Map() }); }
     get updateCallbackDone() { return this._done.promise; }
     get ready() { return this._ready.promise; }
     get finished() { return this._finished.promise; }
@@ -4629,10 +4634,10 @@
     call('dom.viewTransition', 'end');
   };
   const skipTransition = (t, reason) => {
-    if (t._phase > 3) return;
+    if (t._phase === 'done') return;
     if (!t._called) setTimeout(() => callUpdate(t));
     if (transition === t) endTransition(t, false);
-    t._phase = 4;
+    t._phase = 'done';
     t._ready.reject(reason);
     t._done.promise.then(() => t._finished.resolve(), error => t._finished.reject(error));
   };
@@ -4651,14 +4656,14 @@
   const capture = (mode, names, images) => { const list = [...names.values()]; call('dom.viewTransition', 'capture', mode, list.find(entry => entry.root)?.id ?? null, list.filter(entry => !entry.root).map(entry => entry.id), images); };
   // The frame after this draws the page as it is and captures the named elements.
   const captureOld = t => {
-    t._phase = 1;
+    t._phase = 'captured';
     const names = transitionNames();
     if (typeof names === 'string') return skipTransition(t, duplicate('Snapshot capture failed'));
     capture(1, t._old = names, []);
   };
   // Frames wait while the update callback runs.
   const runUpdate = t => {
-    t._phase = 2;
+    t._phase = 'update';
     call('dom.viewTransition', 'suppress');
     const timer = setTimeout(() => skipTransition(t, new DOMException('Transition was aborted because of timeout in DOM update', 'TimeoutError')), 4000);
     callUpdate(t);
@@ -4685,7 +4690,7 @@
     }
     op(9, vt, 1);
     capture(2, names, images);
-    t._phase = 3;
+    t._phase = 'animate';
     t._ready.resolve();
     watchTransition(t);
   };
@@ -4700,7 +4705,7 @@
     const busy = state => state === 'running' || state === 'paused';
     if (found.some(entry => busy(entry[5])) || [...liveAnimations].some(animation => effects.get(animation.effect)?.pseudo?.startsWith('::view-transition') && busy(animation.playState))) return watchTransition(t);
     endTransition(t, true);
-    t._phase = 4;
+    t._phase = 'done';
     t._finished.resolve();
   });
   Object.defineProperties(Document.prototype, {
@@ -4817,11 +4822,14 @@
   };
   globalThis.__appsLayout = () => {
     if (active) { observing = true; const lost = !focusable(active); observing = false; if (lost) active.blur(); }
-    if (webviewScan) { webviewScan = false; document.querySelectorAll('webview'); }
+    if (parsedWebviews) { for (const rec of parsedWebviews) if (!rec.ref && records[rec.id] === rec) of(rec); parsedWebviews = null; }
     for (const ref of webviewRefs) {
       const view = ref.deref();
       if (!view) { webviewRefs.delete(ref); continue; }
-      if (!view.isConnected) {
+      // Only views in the page tree show, not those in other documents or in parsed template contents.
+      let rec = view._m;
+      while ((rec.up ?? rec.host) && rec.tag !== 'template') rec = rec.up ?? rec.host;
+      if (rec !== records[0]) {
         if (view._guest !== null) { attachedWebviews.delete(view._guest); call('dom.open', 'webview', 'detach', view._guest, null); view._guest = null; view._bounds = ''; }
         continue;
       }
@@ -4846,6 +4854,7 @@
       hoverVersion = -1; node.dispatchEvent(new Event('scroll', { bubbles: !id }));
     }
     __appsMediaChanged();
+    if (!(hoverCheck || !last || !hovered || hoverVersion === version && (press || hoverLayout === moves[0] && !geometry[0]) || press && !pointerCapture)) hoverCheck = setTimeout(checkHover, 100);
   };
   // As in the HTML rendering steps, resize observers run after the layout of a frame and before its paint. A callback
   // that changes the page lays it out again, and then only boxes deeper than the shallowest one that got an entry get
@@ -4928,7 +4937,9 @@
     return false;
   };
 
-  globalThis.__appsEditing = () => terminalOf(active) ? { id: active._id, text: active._preedit, start: active._preedit.length, end: active._preedit.length, marked: composing } : editable(active) ? { id: active._id, text: active.value, start: active._direction === 'backward' ? active._end ?? 0 : active._start ?? 0, end: active._direction === 'backward' ? active._start ?? 0 : active._end ?? 0, marked: composing } : active?.isContentEditable ? { id: active._id, text: active.textContent, start: textOffset(active,selection.anchorNode,selection.anchorOffset), end: textOffset(active,selection.focusNode,selection.focusOffset), node: selection.focusNode?._id, offset: selection.focusOffset, marked: composing } : null;
+  // An input method composes `text` over `start..end`. It began at `at`, where it replaced `removed`.
+  const marked = () => composition && [composition.start, composition.end];
+  globalThis.__appsEditing = () => terminalOf(active) ? { id: active._id, text: active._preedit, start: active._preedit.length, end: active._preedit.length, marked: marked() } : editable(active) ? { id: active._id, text: active.value, start: active._direction === 'backward' ? active._end ?? 0 : active._start ?? 0, end: active._direction === 'backward' ? active._start ?? 0 : active._end ?? 0, marked: marked() } : active?.isContentEditable ? { id: active._id, text: active.textContent, start: textOffset(active,selection.anchorNode,selection.anchorOffset), end: textOffset(active,selection.focusNode,selection.focusOffset), node: selection.focusNode?._id, offset: selection.focusOffset, marked: marked() } : null;
   // The formatting that the next typed text gets, like Chrome's typing style: the inline elements around the
   // last deleted text, which typing copies. A selection change clears it.
   let typing = [];
@@ -5102,12 +5113,11 @@
     if (typed && last?.typed && last.at + last.inserted.length === at) last.inserted += inserted;
     else if (history.undo.push({ at, removed, inserted, typed }) > 100) history.undo.shift();
   };
-  let composed = null;
   // Call before active changes. End composition with its text intact and only a compositionend event.
   const finishComposition = () => {
-    if (composing === null) return;
-    const target = active, [at, removed, text] = composed;
-    composing = null; call('dom.endComposition');
+    if (composition === null) return;
+    const target = active, { at, removed, text } = composition;
+    composition = null; call('dom.endComposition');
     if (terminalOf(target)) { target._preedit = ''; call('terminal.preedit', terminalOf(target), ''); return; }
     finish();
     if (!text || !target?.isConnected) return;
@@ -5119,27 +5129,27 @@
     const target = active;
     if (!target || disabled(target) || target.readOnly) return finishComposition();
     // Plain edits of editable content take the selection, since the text of the host walks all of it.
-    const lazy = start == null && end == null && composing === null && !mark && target.isContentEditable && !editable(target) && !terminalOf(target) && selection.rangeCount > 0;
+    const lazy = start == null && end == null && composition === null && !mark && target.isContentEditable && !editable(target) && !terminalOf(target) && selection.rangeCount > 0;
     const state = lazy ? { text: '', start: 0, end: 0 } : __appsEditing(); if (!state) return finishComposition();
     text = String(text);
     // A terminal shows the text that an input method composes at its cursor, and sends the result to its program.
     const session = terminalOf(target);
     if (session) {
-      const began = composing !== null;
+      const began = composition !== null;
       if (mark && !began) dispatch(target, trusted(new CompositionEvent('compositionstart', { bubbles: true, composed: true, data: '' })));
       if (mark) dispatch(target, trusted(new CompositionEvent('compositionupdate', { bubbles: true, composed: true, data: text })));
-      composing = mark ? [0, text.length] : null; composed = [0, '', mark ? text : ''];
+      composition = mark ? { start: 0, end: text.length, at: 0, removed: '', text } : null;
       call('terminal.preedit', session, target._preedit = mark ? text : '');
       if (!mark && text) call('terminal.write', session, 0, text);
       if (!mark && began) dispatch(target, trusted(new CompositionEvent('compositionend', { bubbles: true, composed: true, data: text })));
       return true;
     }
-    start ??= composing?.[0] ?? Math.min(state.start,state.end); end ??= composing?.[1] ?? Math.max(state.start,state.end);
+    start ??= composition?.start ?? Math.min(state.start,state.end); end ??= composition?.end ?? Math.max(state.start,state.end);
     start = Math.max(0, Math.min(start, state.text.length)); end = Math.max(start, Math.min(end, state.text.length));
-    const isComposing = mark || composing !== null, continuing = composing !== null, control = editable(target);
+    const isComposing = mark || composition !== null, continuing = composition !== null, control = editable(target);
     inputType ??= isComposing ? 'insertCompositionText' : text ? 'insertText' : 'deleteContentBackward';
-    if (mark && !composing) {
-      composing = [start,end]; composed = [start, state.text.slice(start,end), ''];
+    if (mark && !composition) {
+      composition = { start, end, at: start, removed: state.text.slice(start,end), text: '' };
       dispatch(target, trusted(new CompositionEvent('compositionstart', { bubbles: true, composed: true, data: '' })));
     }
     if (isComposing) dispatch(target, trusted(new CompositionEvent('compositionupdate', { bubbles: true, composed: true, data: text })));
@@ -5250,13 +5260,13 @@
       } finally { if (mark) pause(); else finish(); }
     }
     if (!mark && control && !inputType.startsWith('history')) {
-      const [at, removed] = isComposing ? composed ?? [start, ''] : [start, state.text.slice(start,end)];
+      const [at, removed] = !isComposing ? [start, state.text.slice(start,end)] : composition ? [composition.at, composition.removed] : [start, ''];
       remember(target, at, removed, control || !/^insert(Paragraph|LineBreak)$/.test(inputType) ? text : '', !removed && /^insert(Text|CompositionText)$/.test(inputType));
     }
-    if (isComposing) { composing = [start,start+text.length]; composed[2] = text; }
+    if (isComposing) composition = { start, end: start + text.length, at: composition?.at ?? start, removed: composition?.removed ?? '', text };
     dispatch(target, trusted(new InputEvent('input', options)));
     if (isComposing && !mark) {
-      composing = null;
+      composition = null;
       dispatch(target, trusted(new CompositionEvent('compositionend', { bubbles: true, composed: true, data: text })));
     }
     return true;
@@ -5374,7 +5384,7 @@
   const picks=new Map();let nextPick=0;
   pickFiles=input=>{if(!native)return;const id=++nextPick;picks.set(id,input);call('dom.filePicker',{id,multiple:input.multiple,directory:input.hasAttribute('webkitdirectory'),accept:input.getAttribute('accept')??''});};
   globalThis.__appsFilesPicked=(id,files)=>{const input=picks.get(id);picks.delete(id);if(!input)return;if(!files){dispatch(input,new Event('cancel',{bubbles:true}));return;}input._files=fileList(files.map(({name,lastModified,data})=>new File([Uint8Array.fromBase64(data)],name,{lastModified,type:fileType(name)})));showFiles(input);dispatch(input,new Event('input',{bubbles:true,composed:true}));dispatch(input,new Event('change',{bubbles:true}));};
-  const pickOption=(select,option)=>{if(option._current)return;for(const other of options(select))other._selected=other===option;select._none=false;selectedness(select);revalidate(select);dispatch(select,trusted(new Event('input',{bubbles:true,composed:true})));interacted(select);dispatch(select,trusted(new Event('change',{bubbles:true})));};
+  const pickOption=(select,option)=>{if(option._current)return;for(const other of options(select))other._selected=other===option;select._none=null;selectedness(select);revalidate(select);dispatch(select,trusted(new Event('input',{bubbles:true,composed:true})));interacted(select);dispatch(select,trusted(new Event('change',{bubbles:true})));};
   openSelect=select=>{
     if(!native||select.multiple||select.size>1||disabled(select))return;
     const id=++nextPick,list=[],items=[],rect=select.getBoundingClientRect();let selected=-1;
@@ -5384,7 +5394,7 @@
     picks.set(id,[select,list]);const scheme=getComputedStyle(select).colorScheme;call('dom.selectPopup',{id,x:rect.x,y:rect.y,width:rect.width,height:rect.height,selected,items,dark:scheme.includes('dark')&&(!scheme.includes('light')||matchMedia('(prefers-color-scheme: dark)').matches)});
   };
   // The menu takes the pointerup of the press that opened it.
-  globalThis.__appsSelectPicked=(id,index)=>{const [select,list]=picks.get(id)??[];picks.delete(id);if(press&&select?.contains(press.target)){press=null;pointers.delete(1);call('dom.active',[]);}if(list?.[index]&&select.isConnected)pickOption(select,list[index]);};
+  globalThis.__appsSelectPicked=(id,index)=>{const [select,list]=picks.get(id)??[];picks.delete(id);if(press&&select?.contains(press.target)){press=null;call('dom.active',[]);}if(list?.[index]&&select.isConnected)pickOption(select,list[index]);};
   class ClipboardItem {
     constructor(items) { this._items = { ...items }; this.types = Object.keys(this._items); this.presentationStyle = 'unspecified'; }
     async getType(type) { if (!(type in this._items)) throw new DOMException('The type was not found', 'NotFoundError'); const value = await this._items[type]; return value instanceof Blob ? value : new Blob([value], { type }); }
@@ -5474,10 +5484,10 @@
   let press = null, last = null, sliding = null, hoverCheck = null, scrollStart = null;
   // As in Chrome, capture changes take effect before the next pointer event, and after `pointerup` ends the capture.
   const settleCapture = data => {
-    const pending = captures.get(1), current = gotten.get(1);
+    const pending = pointerCapture, current = gotCapture;
     if (pending === current) return;
-    if (current) { gotten.delete(1); dispatch(current, trusted(new PointerEvent('lostpointercapture', mouseInit(data, { cancelable: false })))); }
-    if (pending) { gotten.set(1, pending); dispatch(pending, trusted(new PointerEvent('gotpointercapture', mouseInit(data, { cancelable: false })))); }
+    if (current) { gotCapture = null; dispatch(current, trusted(new PointerEvent('lostpointercapture', mouseInit(data, { cancelable: false })))); }
+    if (pending) { gotCapture = pending; dispatch(pending, trusted(new PointerEvent('gotpointercapture', mouseInit(data, { cancelable: false })))); }
   };
   // As in Chrome, the hovered element follows DOM, layout and scroll changes under a still pointer, at most every 100 ms.
   // A layout without DOM changes, like a transition, checks again until the layouts stop. During a press, a DOM change
@@ -5485,21 +5495,15 @@
   let hoverLayout = 0;
   const checkHover = () => {
     hoverCheck = null;
-    if (!last || !hovered || pointers.size && !captures.has(1)) return;
-    const data = { clientX: last[0], clientY: last[1], buttons: pointers.size }, capture = captures.get(1), hit = capture ?? hitAt(last[0], last[1]);
+    if (!last || !hovered || press && !pointerCapture) return;
+    const data = { clientX: last[0], clientY: last[1], buttons: press ? 1 : 0 }, capture = pointerCapture, hit = capture ?? hitAt(last[0], last[1]);
     native++; try { if (!capture) settleCapture(data); hover(hit?.nodeType === 3 ? hit.parentElement : hit, mouseInit(data), () => settleCapture(data)); settleCapture(data); } finally { native--; }
     hoverVersion = version; hoverLayout = moves[0];
-  };
-  const pointerLayout = globalThis.__appsLayout;
-  globalThis.__appsLayout = () => {
-    pointerLayout();
-    if (hoverCheck || !last || !hovered || hoverVersion === version && (pointers.size || hoverLayout === moves[0] && !geometry[0]) || pointers.size && !captures.has(1)) return;
-    hoverCheck = setTimeout(checkHover, 100);
   };
   const slide = (node, x) => { const rect = node.getBoundingClientRect(), thumb = Math.min(rect.height, 16), [min, max] = rangeBounds(node); setRange(node, min + Math.min(1, Math.max(0, (x - rect.left - thumb / 2) / (rect.width - thumb || 1))) * (max - min)); };
   const mouseInit = (data, extra) => ({ bubbles: true, cancelable: true, composed: true, view: window, clientX: data.clientX, clientY: data.clientY, screenX: data.screenX ?? data.clientX, screenY: data.screenY ?? data.clientY, ctrlKey: !!data.ctrlKey, metaKey: !!data.metaKey, altKey: !!data.altKey, shiftKey: !!data.shiftKey, button: data.button ?? 0, buttons: data.buttons ?? 0, detail: data.detail ?? 0, movementX: last ? data.clientX - last[0] : 0, movementY: last ? data.clientY - last[1] : 0, pointerId: 1, pointerType: 'mouse', isPrimary: true, ...extra });
   // Queue the end event after finished-promise reactions, as browsers do.
-  globalThis.__appsDispatch = (name, ids, data = {}) => { if (transition?._phase === 3 && /^(pointer|mouse|click|dblclick|auxclick|contextmenu|wheel|drag|drop)/.test(name)) ids = ids?.map(() => document.documentElement._id); else if (transitionNodes.size && ids?.some(id => transitionNodes.has(id))) { if (transitionNodes.has(ids[0]) && /^(animation|transition)/.test(name)) data = { ...data, pseudoElement: transitionNodes.get(ids[0]) }; ids = ids.map(id => transitionNodes.has(id) ? document.documentElement._id : id); } const run = () => { native++; try { return nativeEvent(name, ids, data); } finally { native--; } }; if (/^(animation|transition)(end|cancel)$/.test(name) && cssEvent(name, ids[0], data)) { microtask(run); return true; } return run(); };
+  globalThis.__appsDispatch = (name, ids, data = {}) => { if (transition?._phase === 'animate' && /^(pointer|mouse|click|dblclick|auxclick|contextmenu|wheel|drag|drop)/.test(name)) ids = ids?.map(() => document.documentElement._id); else if (transitionNodes.size && ids?.some(id => transitionNodes.has(id))) { if (transitionNodes.has(ids[0]) && /^(animation|transition)/.test(name)) data = { ...data, pseudoElement: transitionNodes.get(ids[0]) }; ids = ids.map(id => transitionNodes.has(id) ? document.documentElement._id : id); } const run = () => { native++; try { return nativeEvent(name, ids, data); } finally { native--; } }; if (/^(animation|transition)(end|cancel)$/.test(name) && cssEvent(name, ids[0], data)) { microtask(run); return true; } return run(); };
   const nativeEvent = (name, ids, data) => {
     if (name === 'pointerexit') { hover(null, data); last = null; return true; }
     if (name === 'fullscreen:exit') { if (fullscreens.length) exitFullscreen(true, true); return true; }
@@ -5535,7 +5539,7 @@
         data = { ...rest, key, code, keyCode: ime ? 229 : keyCodes[key] ?? (/^[a-z0-9]$/i.test(raw) ? upper.charCodeAt(0) : /^F\d+$/.test(code) ? 111 + Number(code.slice(1)) : 0) };
       }
       if (name === 'keydown' && data.key === 'Escape' && fullscreens.length) { exitFullscreen(true); return false; }
-      const event = trusted(new KeyboardEvent(name, { bubbles: true, cancelable: true, composed: true, isComposing: composing !== null, ...data }));
+      const event = trusted(new KeyboardEvent(name, { bubbles: true, cancelable: true, composed: true, isComposing: composition !== null, ...data }));
       if (!dispatch(target, event)) return false;
       if (event.isComposing || event.keyCode === 229) return true;
       // Like Chrome, keys that type a character, and Enter, fire `keypress`. Canceling it stops the text.
@@ -5683,7 +5687,7 @@
       return true;
     }
     const located = Number.isFinite(data.clientX) && Number.isFinite(data.clientY);
-    const hit = captures.get(1) ?? wrap(ids[0]) ?? (located ? hitAt(data.clientX, data.clientY) : null), element = hit?.nodeType === 3 ? hit.parentElement : hit;
+    const hit = pointerCapture ?? wrap(ids[0]) ?? (located ? hitAt(data.clientX, data.clientY) : null), element = hit?.nodeType === 3 ? hit.parentElement : hit;
     if (!located) data = { ...data, clientX: Number.isFinite(data.clientX) ? data.clientX : last?.[0] ?? 0, clientY: Number.isFinite(data.clientY) ? data.clientY : last?.[1] ?? 0 };
     if (name === 'click') { if (element) { fireClick(element, mouseInit(data), true); if (data.detail === 2) dispatch(element, trusted(new MouseEvent('dblclick', mouseInit(data)))); } return !!element; }
     if (name === 'wheel') {
@@ -5694,7 +5698,7 @@
     if (name !== 'pointermove' && name !== 'pointerdown' && name !== 'pointerup') return false;
     if (name === 'pointerdown') finishComposition();
     // Like Chrome, a new capture target gets the pointer boundary events, then `gotpointercapture`, then the mouse ones.
-    if (!captures.has(1)) settleCapture(data);
+    if (!pointerCapture) settleCapture(data);
     hover(element, mouseInit(data), () => settleCapture(data)); hoverVersion = version; hoverLayout = moves[0];
     settleCapture(data);
     // A terminal gets the pointer while a button is down, also outside its box, and every move above it.
@@ -5706,7 +5710,7 @@
     if (name === 'pointerup' && !data.buttons) call('dom.active', []);
     if (!target) return false;
     const first = name === 'pointerdown' && (!press || press.button === button), ended = name === 'pointerup' && !data.buttons;
-    if (first) { pointers.add(1); press = { target, button, detail: data.detail ?? 1, mouse: true }; }
+    if (first) { press = { target, button, detail: data.detail ?? 1, mouse: true }; }
     if (first || ended) {
       if (autos.length || hints.length) {
         const clicked = nearestPopover(target, [...autos, ...hints]), invoker = path(target).map(node => node.nodeType === 1 && invoked(node)).find(popover => popover?._popover && popover._popover !== 'manual') ?? null;
@@ -5788,12 +5792,12 @@
       }
     }
     // As in Chrome, the capture ends before `click`.
-    if (ended) { captures.delete(1); settleCapture(data); }
+    if (ended) { pointerCapture = null; settleCapture(data); }
     if (name === 'pointerup' && press?.button === button) {
       const down = path(press.target), common = path(target).find(node => node.nodeType === 1 && down.includes(node)), detail = press.detail;
       if (!blocked && common?.isConnected) { if (button === 0) { fireClick(common, { ...init, detail }, true); if (detail === 2) dispatch(common, trusted(new MouseEvent('dblclick', { ...init, detail }))); } else dispatch(common, trusted(new PointerEvent('auxclick', { ...init, detail }))); }
     }
-    if (ended) { selectionDrag = null; press = null; pointers.delete(1); }
+    if (ended) { selectionDrag = null; press = null; }
     // The press changes its own state, so only later changes check the hover.
     if (name === 'pointerdown') hoverVersion = version;
     return result;

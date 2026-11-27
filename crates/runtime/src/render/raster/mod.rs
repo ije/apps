@@ -111,10 +111,37 @@ impl Rasters {
     ) {
         self.backgrounds.retain(|(node, _), (_, image)| {
             let keep = !gone.contains(node);
-            if !keep {
+            if !keep && Arc::strong_count(image) == 1 {
                 retired.push(image.clone());
             }
             keep
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removed_backgrounds_retire_only_images_that_no_box_shares() {
+        let image = || Arc::new(renderer::RenderImage::new_premultiplied(1, 1, vec![0; 4]));
+        let (shared, own) = (image(), image());
+        let mut rasters = Rasters::default();
+        rasters
+            .backgrounds
+            .insert((1, 0), (String::new(), shared.clone()));
+        rasters
+            .backgrounds
+            .insert((1, 1), (String::new(), own.clone()));
+        rasters
+            .backgrounds
+            .insert((2, 0), (String::new(), shared.clone()));
+        drop(own);
+        let mut retired = Vec::new();
+        rasters.forget_all(&[1].into_iter().collect(), &mut retired);
+        assert_eq!(rasters.backgrounds.len(), 1);
+        assert_eq!(retired.len(), 1);
+        assert!(!Arc::ptr_eq(&retired[0], &shared));
     }
 }

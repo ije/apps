@@ -1,4 +1,5 @@
-// Tables that build.rs packs. The runtime reads them through `tables::TEXT`.
+// Tables that build.rs packs. The runtime reads them through `tables::TEXT`, except the shared value
+// constants at the end.
 #![cfg_attr(not(test), allow(dead_code))]
 
 macro_rules! shadow {

@@ -385,7 +385,6 @@ fn input(args: &Value, desktop: &Desktop, cx: &mut App, reply: &Reply) -> Result
 #[cfg(test)]
 mod tests {
     use crate::{
-        host::Host,
         host::context::JsContext,
         jsc::Role,
         jsc::{self, JavaScriptCore},
@@ -427,6 +426,5 @@ mod tests {
         assert_eq!(engine.eval("debugger; 'after'", "test").unwrap(), "after");
         drop(engine);
         assert!(crate::host::context::contexts().is_empty());
-        let _ = Host::default();
     }
 }

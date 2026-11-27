@@ -2,12 +2,9 @@ use super::*;
 
 #[test]
 fn svg_presentation_attributes_links_and_attribute_nodes() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><head><style>.c{fill:blue}</style></head><body><svg><g style='fill:red;stroke:blue'><path id=a fill=none /><path id=b stroke-width=5 /><path id=c class=c fill=green /></g><g fill=green><path id=d /></g></svg><p id=p fill=red></p></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let (_, engine) = css_page(
+        "<html><head><style>.c{fill:blue}</style></head><body><svg><g style='fill:red;stroke:blue'><path id=a fill=none /><path id=b stroke-width=5 /><path id=c class=c fill=green /></g><g fill=green><path id=d /></g></svg><p id=p fill=red></p></body></html>",
+    );
     engine.eval(r#"
         const style = (id, name) => getComputedStyle(document.getElementById(id)).getPropertyValue(name);
         const got = [style('a', 'fill'), style('b', 'stroke-width'), style('c', 'fill'), style('d', 'fill'), style('p', 'fill')].join('|');
@@ -30,12 +27,9 @@ fn svg_presentation_attributes_links_and_attribute_nodes() {
 
 #[test]
 fn core_dom_interfaces_follow_the_standard() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><body><div id='a' z='1' b='2' class='x y'>t<!--c-->u</div><template id='t'><p>hi</p></template></body></html>"),
-        dirty: false, ..Default::default()
-    });
-    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let (_, engine) = css_page(
+        "<html><body><div id='a' z='1' b='2' class='x y'>t<!--c-->u</div><template id='t'><p>hi</p></template></body></html>",
+    );
     engine.eval(r#"
       const fails = [];
       const check = (name, fn) => { try { if (!fn()) fails.push(name); } catch (e) { fails.push(name + ': ' + e.message); } };
@@ -137,16 +131,7 @@ fn dom_matrix_math_keeps_nan_infinity_negative_zero_and_2d() {
 
 #[test]
 fn sibling_walks_follow_mutations() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse("<body><ul></ul><ol><li>a</li><li>b</li></ol></body>"),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let (_, engine) = css_page("<body><ul></ul><ol><li>a</li><li>b</li></ol></body>");
     engine.eval(r#"
         const list = document.querySelector('ul'), other = document.querySelector('ol');
         for (let i = 0; i < 6; i++) { const li = document.createElement('li'); li.id = 'i' + i; li.append('x'); list.append(li); }
@@ -724,21 +709,7 @@ fn table_parts_without_a_table_keep_their_displays_like_chrome() {
 
 #[test]
 fn same_text_writes_large_fragments_and_id_queries() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse("<body><p id=label>a</p><div id=empty></div></body>"),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
+    let (host, engine) = css_page("<body><p id=label>a</p><div id=empty></div></body>");
     let dirty = |source: &str| {
         engine.tick().unwrap();
         host.borrow()

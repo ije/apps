@@ -151,9 +151,12 @@ define_class!(
     unsafe impl NSObjectProtocol for AppsWindow {}
 
     unsafe impl NSWindowDelegate for AppsWindow {
+        // Main decides, and closes the window itself.
         #[unsafe(method(windowShouldClose:))]
         fn should_close(&self, _: &AnyObject) -> bool {
-            events().should_close(self.ivars().callbacks)
+            let id = self.ivars().callbacks.id;
+            crate::native::window_event(id, crate::native::WindowEvent::CloseRequested);
+            false
         }
 
         #[unsafe(method(windowDidResize:))]
@@ -179,7 +182,7 @@ define_class!(
                 false => "bottom",
             };
             let bounds = flip(NSRect::new(frame.origin, size), primary_top(self.mtm()));
-            match events().will_change(self.ivars().callbacks, edge, bounds) {
+            match crate::native::will_change(self.ivars().callbacks.id, edge, bounds) {
                 true => frame.size,
                 false => size,
             }
@@ -188,7 +191,7 @@ define_class!(
         #[unsafe(method(windowWillMove:))]
         fn will_move(&self, _: &AnyObject) {
             let bounds = flip(self.frame(), primary_top(self.mtm()));
-            events().will_change(self.ivars().callbacks, "move", bounds);
+            crate::native::will_change(self.ivars().callbacks.id, "move", bounds);
         }
 
         #[unsafe(method(windowDidChangeOcclusionState:))]

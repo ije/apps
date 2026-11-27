@@ -335,7 +335,7 @@ globalThis.__appsTypedOM = {
       const tokens = [], re = /\s*(?:([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)([a-z%]*)|(-?[a-z][\w-]*)\(|(-?[a-z][\w-]*)|(\S))/giy;
       let match;
       while (re.lastIndex < text.length && (match = re.exec(text))) tokens.push(match);
-      if (re.lastIndex < text.trimEnd().length || !tokens.length) return null;
+      if (re.lastIndex < text.length || !tokens.length) return null;
       let at = 0;
       const peek = () => tokens[at]?.[5], take = c => peek() === c && ++at;
       const sum = () => {

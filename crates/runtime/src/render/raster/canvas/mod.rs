@@ -1331,7 +1331,7 @@ mod tests {
         let image = svg(r##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><path d="M0 0h2v2H0Z" fill="#ff0000" opacity="0.5"/></svg>"##, 4, 4).unwrap();
         assert_eq!(image.size().width as u32, 4);
         assert_eq!(image.bytes(), [0, 0, 128, 128].repeat(16));
-        let tree = svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"><path d="M0 0h2v2H0Z" fill="#ff0000"/><path d="M2 0h2v2H2Z" fill="#0000ff"/></svg>"##, false).unwrap();
+        let tree = svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"><path d="M0 0h2v2H0Z" fill="#ff0000"/><path d="M2 0h2v2H2Z" fill="#0000ff"/></svg>"##).unwrap();
         let rotated = render_svg(&tree, 1, 2, Some(([2., 1.], [0., 1., -1., 0., 1., 0.]))).unwrap();
         assert_eq!(
             rotated.bytes(),
@@ -1468,7 +1468,7 @@ mod tests {
 
     #[test]
     fn svg_sources_draw_capped_at_their_canvas_size() {
-        let tree = svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" width="30000" height="10"><path d="M0 0h15000v10H0Z" fill="#ff0000"/><path d="M15000 0h15000v10H15000Z" fill="#0000ff"/></svg>"##, false).unwrap();
+        let tree = svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" width="30000" height="10"><path d="M0 0h15000v10H0Z" fill="#ff0000"/><path d="M15000 0h15000v10H15000Z" fill="#0000ff"/></svg>"##).unwrap();
         let pixels = svg_pixels(&tree, 30000, 10, None).unwrap();
         assert_eq!([pixels.width(), pixels.height()], [RASTER_MAX, 10]);
         let [red, blue] = [
