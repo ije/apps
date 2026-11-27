@@ -31,6 +31,29 @@ impl Grid {
         })
     }
 
+    /// The first baseline of the grid: the one that `baselines` has for its first item.
+    pub(crate) fn set_first_baseline(
+        &mut self,
+        styles: &crate::style::ComputedStyles,
+        baselines: Option<&Baselines>,
+    ) {
+        let Some(child) = self.first_item else {
+            return;
+        };
+        let (Some(&[first, _]), Ok(at)) = (
+            baselines.and_then(|baselines| baselines.get(&child)),
+            self.cells.binary_search_by_key(&child, |cell| cell.0),
+        ) else {
+            return;
+        };
+        let (_, cell, [_, y, _, height], _) = self.cells[at];
+        let area = self.columns.iter().skip(cell[0]).take(cell[2]).sum::<f32>()
+            + cell[2].saturating_sub(1) as f32 * self.gap[0];
+        let [top, _, bottom, _] =
+            styles.lengths[child].edges(&styles.values[child], css::properties::MARGIN, area);
+        self.first_baseline = Some(y + top + first.unwrap_or(height - top - bottom));
+    }
+
     /// The width and height of the grid area of a cell placement: column, row, columns, rows.
     pub(crate) fn area(&self, place: [usize; 4]) -> [f32; 2] {
         [0, 1].map(|axis| {

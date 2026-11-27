@@ -1280,24 +1280,13 @@ pub(crate) fn layout(
         .filter(based)
         .map(|(_, cell)| cell[1])
         .min();
-    if let Some((index, cell)) = cells
-        .iter()
-        .enumerate()
+    grid.first_item = (cells.iter().enumerate())
         .filter(based)
         .filter(|(_, cell)| Some(cell[1]) == top)
         .min_by_key(|(index, cell)| (derived[*index].baseline != Some(false), cell[0]))
-    {
-        let (child, _, [_, y, _, height], _) = grid.cells[index];
-        grid.first_item = Some(child);
-        if let Some(&[first, _]) = baselines.and_then(|baselines| baselines.get(&child)) {
-            let area = grid.columns.iter().skip(cell[0]).take(cell[2]).sum::<f32>()
-                + cell[2].saturating_sub(1) as f32 * grid.gap[0];
-            let [top, _, bottom, _] =
-                styles.lengths[child].edges(&styles.values[child], css::properties::MARGIN, area);
-            grid.first_baseline = Some(y + top + first.unwrap_or(height - top - bottom));
-        }
-    }
+        .map(|(index, _)| grid.cells[index].0);
     grid.cells.sort_unstable_by_key(|(child, ..)| *child);
+    grid.set_first_baseline(styles, baselines);
     if outermost {
         measured.edges = None;
     }
@@ -1426,7 +1415,25 @@ mod tests {
             measured.boxes.remove(&id);
             measured.texts.remove(&id);
         }
+        let key = (main, Some(300f32.to_bits()), None);
+        assert!(measured.grid(key).is_none());
         let after = sizes(&doc, &mut measured);
+        let fresh = |doc: &Document| {
+            let mut measured = Measurements::default();
+            layout(
+                doc,
+                main,
+                &styles,
+                Some(300.),
+                None,
+                None,
+                None,
+                &text,
+                &mut measured,
+                true,
+            )
+        };
+        assert_eq!(*measured.grid(key).unwrap(), fresh(&doc));
         assert!(
             after[0][0] > before[0][0] && after[0][1] > before[0][1],
             "{before:?} {after:?}"

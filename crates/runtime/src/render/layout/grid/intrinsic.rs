@@ -781,6 +781,9 @@ fn measure(
             let [columns, rows] = [0, 1].map(|axis| grid.extent(axis));
             let captions = grid.captions[0] + grid.captions[1];
             measured.set_size(key, [columns, rows, captions, 0.]);
+            if bits != COLUMNS {
+                measured.set_grid((id, key.1, bits), grid);
+            }
             [columns, rows, captions]
         };
         let sized = available.is_some() || vertical[0].is_some();

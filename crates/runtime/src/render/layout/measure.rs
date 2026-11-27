@@ -15,6 +15,8 @@ pub(crate) struct Measure {
     margins: Option<[[f32; 2]; 2]>,
     // How far the first line of a text box reaches above its strut.
     lead: Option<f32>,
+    // The layout of a grid with its rows, without inherited tracks and baselines.
+    grid: Option<std::rc::Rc<super::grid::Grid>>,
 }
 
 #[derive(Default)]
@@ -109,6 +111,14 @@ impl Measurements {
 
     pub(crate) fn set_lead(&mut self, key: Key, lead: f32) {
         self.find_mut(key).lead = Some(lead);
+    }
+
+    pub(crate) fn grid(&self, key: Key) -> Option<std::rc::Rc<super::grid::Grid>> {
+        self.find(key)?.grid.clone()
+    }
+
+    pub(crate) fn set_grid(&mut self, key: Key, grid: super::grid::Grid) {
+        self.find_mut(key).grid = Some(std::rc::Rc::new(grid));
     }
 
     /// Like CSS, each run of text nodes in a flex or grid container is one anonymous item. Its first node builds it

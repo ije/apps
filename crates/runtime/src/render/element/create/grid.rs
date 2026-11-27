@@ -292,21 +292,40 @@ pub(super) fn grid_container(
             })
             .map(|(_, _, _, grid)| grid.clone());
         Some(cached.unwrap_or_else(|| {
-            let grid = crate::render::layout::grid::layout::layout(
-                doc,
-                id,
-                styles,
-                Some(content[0]),
-                height,
-                slot.as_ref().map(|(_, grid)| grid),
-                view.store
-                    .borrow()
-                    .page_state(view.id)
-                    .map(|dom| &dom.layout.baselines),
-                text,
-                &mut measured.borrow_mut(),
-                true,
-            );
+            // A measure laid out the same grid when it has no inherited tracks and no baseline-aligned items.
+            let measure = slot.is_none().then(|| {
+                let key = (id, Some(content[0].to_bits()), height.map(f32::to_bits));
+                measured.borrow().grid(key)
+            });
+            let measure = measure
+                .flatten()
+                .filter(|grid| !grid.cells.iter().any(|cell| cell.3));
+            let store = view.store.borrow();
+            let baselines = store.page_state(view.id).map(|dom| &dom.layout.baselines);
+            let lay = || {
+                crate::render::layout::grid::layout::layout(
+                    doc,
+                    id,
+                    styles,
+                    Some(content[0]),
+                    height,
+                    slot.as_ref().map(|(_, grid)| grid),
+                    baselines,
+                    text,
+                    &mut measured.borrow_mut(),
+                    true,
+                )
+            };
+            let grid = match measure {
+                Some(grid) => {
+                    let mut grid = Grid::clone(&grid);
+                    grid.set_first_baseline(styles, baselines);
+                    debug_assert_eq!(grid, lay(), "grid {id} differs from its measure");
+                    grid
+                }
+                None => lay(),
+            };
+            drop(store);
             view.store.borrow_mut().state(view.id).layout.grids.insert(
                 id,
                 (
