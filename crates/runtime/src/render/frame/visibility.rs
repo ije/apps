@@ -430,6 +430,17 @@ pub(super) fn forget(
     drop_hidden_images(cx.doc, dom, cx.visible, styles, |image| {
         window.release_image(image)
     });
+    // Paint skips boxes far outside the window, so their SVG rasters go here. A box rasters again when it
+    // comes within one window size.
+    let viewport = window.viewport_size();
+    dom.rasters.svgs.retain(|&id, (_, image)| {
+        !crate::render::element::svg::far(&dom.geometry.mirror, id, viewport, 2.) || {
+            if Arc::strong_count(image) == 1 {
+                window.release_image(image.clone());
+            }
+            false
+        }
+    });
     cx.view
         .mask_sources
         .borrow_mut()

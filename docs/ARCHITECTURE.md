@@ -254,6 +254,7 @@ The runtime reuses data across frames and releases temporary resources after act
 - macOS startup sets `MallocSpaceEfficient=1`. A global allocator caches small blocks per thread and returns them during idle cleanup.
 - After about one second without frames, a window releases spare GPU resources. Its last frame remains visible.
 - An inline SVG rasters at the size that its transforms show, and keeps its raster while that size stays within half of it, so an animated transform doesn't raster it in each frame. Boxes with the same mask inputs and size share one mask image.
+- An SVG more than two window sizes outside the window drops its raster, by its place in the layout mirror, so also in layers that paint without the clips around them. It rasters again within one window size.
 - A smooth CSS gradient rasters with fewer pixels, as far as the GPU's linear filtering stays within two color levels of the full raster. Hard stops and tile edges keep full pixels.
 - The box tree keeps the paint chunks of its boxes in one shared list and rarely used fields in a box of their own, so a box takes about 1 KB.
 

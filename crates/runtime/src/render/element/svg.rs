@@ -419,6 +419,26 @@ pub(super) fn svg_layer(
             if area[2] <= 0. || area[3] <= 0. {
                 return;
             }
+            let target = Rect::new(
+                point(bounds.left() + px(area[0]), bounds.top() + px(area[1])),
+                size(px(area[2]), px(area[3])),
+            );
+            // A box outside the content mask, or far outside the window, keeps no raster. The layout mirror places
+            // boxes in layers too, which paint without the clips around them. A far box paints again in each
+            // frame, so it rasters when it comes near.
+            let far = far(&state.geometry.mirror, id, window.viewport_size(), 1.);
+            if far || target.intersect(mask).is_empty() {
+                match far {
+                    true => window.paint_volatile(),
+                    false => window.cull(),
+                }
+                if let Some((_, old)) = state.rasters.svgs.remove(&id)
+                    && Arc::strong_count(&old) == 1
+                {
+                    window.release_image(old);
+                }
+                return;
+            }
             let moved = area != [0., 0., width, height];
             // A transform that shows the box smaller gets fewer pixels. A raster with up to twice the pixels it
             // shows stays, so an animated transform doesn't draw it again in each frame.
@@ -523,10 +543,6 @@ pub(super) fn svg_layer(
             let image = state.rasters.svgs.get(&id).map(|(_, image)| image.clone());
             drop(store);
             if let Some(image) = image {
-                let target = Rect::new(
-                    point(bounds.left() + px(area[0]), bounds.top() + px(area[1])),
-                    size(px(area[2]), px(area[3])),
-                );
                 window.draw_image(
                     target,
                     target,
@@ -544,4 +560,20 @@ pub(super) fn svg_layer(
     .bottom(px(padding[2]))
     .left(px(padding[3]))
     .into()
+}
+
+// Whether the box of `id` in the layout mirror is more than `margin` window sizes outside the window.
+pub(crate) fn far(
+    mirror: &crate::dom::LayoutMirror,
+    id: usize,
+    window: renderer::Size<renderer::Pixels>,
+    margin: f32,
+) -> bool {
+    let [width, height] = [f32::from(window.width), f32::from(window.height)];
+    mirror.get(&id).is_some_and(|&[x, y, w, h]| {
+        x + w < -width * margin
+            || y + h < -height * margin
+            || x > width * (1. + margin)
+            || y > height * (1. + margin)
+    })
 }
