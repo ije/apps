@@ -132,19 +132,38 @@ impl StyleCache {
                     "meta" | "style" | "link" | "html" | "table"
                 )
             };
-            // A patched walk keeps the lists when no node in them, and no node for them, moved or changed.
-            // `tree` then stays as it is: without shadow trees, every node is in the first tree.
-            let patched = shadows.hosts.is_empty()
-                && walk.trees.len() == 1
-                && walk.walk.since(serial).is_some_and(|touched| {
-                    let mut listed = walk.special[0].iter().chain(&walk.tables);
-                    touched.len() <= 256
-                        && !listed.any(|&id| touched.contains(&(id as u32)))
-                        && touched
-                            .iter()
-                            .all(|&id| !(walk.walk.contains(id as usize) && special(id as usize)))
-                });
-            if !patched || cfg!(debug_assertions) {
+            // A patched walk keeps the lists when no node in them, no node for them and no shadow root moved or
+            // changed. Nodes that moved keep the tree of their parent, which comes before them in the walk.
+            let patched = walk.walk.since(serial).filter(|touched| {
+                touched.iter().all(|&id| {
+                    let id = id as usize;
+                    walk.listed.binary_search(&id).is_err()
+                        && !(walk.walk.contains(id) && special(id))
+                        && (shadows.hosts.is_empty() || !shadows.hosts.contains_key(&id))
+                })
+            });
+            // Without shadow trees, every node is in the first tree, so `tree` stays as it is.
+            if let Some(touched) = patched.filter(|_| walk.trees.len() > 1) {
+                let tree = Rc::make_mut(&mut walk.tree);
+                tree.resize(doc.nodes.len(), u32::MAX);
+                let mut joined: Vec<(u32, u32)> = touched
+                    .iter()
+                    .filter_map(|&id| {
+                        let at = walk.walk.place(id as usize);
+                        if at.is_none() {
+                            tree[id as usize] = u32::MAX;
+                        }
+                        Some((at?, id))
+                    })
+                    .collect();
+                joined.sort_unstable();
+                let last = walk.trees.len() as u32 - 1;
+                for (_, id) in joined {
+                    tree[id as usize] =
+                        doc.nodes[id as usize].parent.map_or(0, |parent| tree[parent].min(last));
+                }
+            }
+            if patched.is_none() || cfg!(debug_assertions) {
                 let mut tree = vec![u32::MAX; doc.nodes.len()];
                 let mut trees = vec![(0, usize::MAX)];
                 let mut lists = vec![Vec::new()];
@@ -171,11 +190,15 @@ impl StyleCache {
                     }
                 }
                 assert!(
-                    !patched
-                        || (&trees, &lists, &tables) == (&*walk.trees, &walk.special, &walk.tables),
+                    patched.is_none()
+                        || (&trees, &lists, &tables) == (&*walk.trees, &walk.special, &walk.tables)
+                            && (trees.len() == 1 || tree == *walk.tree),
                     "patched style walk lists differ"
                 );
-                if !patched {
+                if patched.is_none() {
+                    let mut listed: Vec<usize> = lists.iter().flatten().chain(&tables).copied().collect();
+                    listed.sort_unstable();
+                    walk.listed = listed;
                     walk.tree = Rc::new(tree);
                     walk.trees = Rc::new(trees);
                     (walk.special, walk.tables) = (lists, tables);
@@ -303,6 +326,8 @@ pub(crate) struct TreeWalk {
     pub(crate) trees: Rc<Vec<(usize, usize)>>,
     pub(crate) special: Vec<Vec<usize>>,
     pub(crate) tables: Vec<usize>,
+    // The nodes of `special` and `tables`, sorted.
+    pub(crate) listed: Vec<usize>,
 }
 
 pub(crate) fn compute_styles(

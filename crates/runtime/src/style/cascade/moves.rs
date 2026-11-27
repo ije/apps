@@ -38,11 +38,11 @@ pub(crate) fn mark_moves(
                 .and_then(|&index| trees.get(index as usize))
                 .map(|tree| tree.0)
         };
-        // Without shadow trees, only the nodes that a patched walk touched can have another place.
+        // With the same shadow trees, only the nodes that a patched walk touched can have another place or tree.
         let touched = walk
             .walk
             .since(old.serial)
-            .filter(|_| shadows.hosts.is_empty() && old.trees.len() == 1);
+            .filter(|_| *old.trees == *walk.trees);
         let mut placed = Vec::new();
         if touched.is_none() || cfg!(debug_assertions) {
             placed.resize(doc.nodes.len(), GONE);
@@ -54,13 +54,26 @@ pub(crate) fn mark_moves(
         }
         match touched {
             Some(touched) => {
-                // A node with another parent is dirty by its snapshot. A node that joins has no style.
+                // A node with another parent is dirty by its snapshot. A node that joins has no style. The
+                // children of a host and shadow roots can have another walk parent with the same parent.
+                let shadowed = walk.trees.len() > 1;
                 for &id in touched {
                     let id = id as usize;
                     if !walk.walk.contains(id) {
                         out.leave(id, unstyled, empty);
-                    } else if Rc::ptr_eq(&out.values[id], unstyled) {
+                        continue;
+                    }
+                    if Rc::ptr_eq(&out.values[id], unstyled)
+                        || shadowed
+                            && (doc.nodes[id]
+                                .parent
+                                .map_or(id != 0, |parent| shadows.roots.contains_key(&parent))
+                                || root(&old.tree, &old.trees, id) != root(&walk.tree, &walk.trees, id))
+                    {
                         matches.touch(id);
+                        if let Some(&host) = shadows.hosts.get(&id) {
+                            matches.touch(host);
+                        }
                     }
                 }
                 #[cfg(debug_assertions)]
@@ -72,11 +85,16 @@ pub(crate) fn mark_moves(
                             "node {id} moved outside the patched walk"
                         );
                         assert!(
-                            !kept
-                                || *slot == up
-                                || matches.is_dirty(id as usize)
-                                || doc.nodes[id as usize].parent != Some(up as usize),
+                            !kept || *slot == up || matches.is_dirty(id as usize),
                             "node {id} moved without a dirty mark"
+                        );
+                        assert!(
+                            !kept
+                                || walk.trees.len() == 1
+                                || root(&old.tree, &old.trees, id as usize)
+                                    == root(&walk.tree, &walk.trees, id as usize)
+                                || matches.is_dirty(id as usize),
+                            "node {id} changed its tree without a dirty mark"
                         );
                         *slot = if kept { KEPT } else { *slot };
                     }
