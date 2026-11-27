@@ -82,6 +82,8 @@ fn keyword(value: &str) -> bool {
 
 // The place of the content sizes of a box that has keyword sizes in `Measurements::sizes`.
 const RAW: Option<u32> = Some(u32::MAX);
+// The place of the column extent of a grid that laid out no rows.
+const COLUMNS: Option<u32> = Some(u32::MAX - 2);
 
 /// The border box size that a keyword or `calc-size()` value of a size property gives. `space` is the size of the
 /// containing block, and `fills` says that an `auto` width fills it.
@@ -740,28 +742,40 @@ fn measure(
             .into_iter()
             .any(|name| style.get(name).is_some_and(|v| v.starts_with("subgrid")))
     {
-        let mut extent = |width: Option<f32>, height: Option<f32>| {
-            let key = (id, width.map(f32::to_bits), height.map(f32::to_bits), true);
-            if let Some([columns, rows, captions, _]) = measured.size(key) {
-                return [columns, rows, captions];
+        // Without rows, only the columns are laid out, and the rows and captions are 0.
+        let mut extent = |width: Option<f32>, height: Option<f32>, rows: bool| {
+            let bits = if rows {
+                height.map(f32::to_bits)
+            } else {
+                COLUMNS
+            };
+            let key = (id, width.map(f32::to_bits), bits, true);
+            let whole = (id, key.1, None, true);
+            if let Some([columns, tall, captions, _]) =
+                (measured.size(key)).or_else(|| measured.size(whole).filter(|_| !rows))
+            {
+                return [columns, tall, captions];
             }
-            let grid = layout(doc, id, styles, width, height, None, None, text, measured);
+            let grid = layout(
+                doc, id, styles, width, height, None, None, text, measured, rows,
+            );
             let [columns, rows] = [0, 1].map(|axis| grid.extent(axis));
             let captions = grid.captions[0] + grid.captions[1];
             measured.set_size(key, [columns, rows, captions, 0.]);
             [columns, rows, captions]
         };
-        let [min, ..] = extent(Some(0.), None);
-        let [max, natural, captions] = extent(None, None);
+        let sized = available.is_some() || vertical[0].is_some();
+        let [min, ..] = extent(Some(0.), None, false);
+        let [max, natural, mut captions] = extent(None, None, !sized);
         content = [min, max, natural];
-        if available.is_some() || vertical[0].is_some() {
+        if sized {
             let fit = style.get(Prop::WIDTH) == Some("fit-content");
             let width = available.map(|width| if fit { width.min(max).max(min) } else { width });
-            content[2] = extent(width, vertical[0])[1];
+            [_, content[2], captions] = extent(width, vertical[0], true);
         }
         // The height of a table leaves out its captions.
         if captions > 0. {
-            let captions = extent(available, vertical[0])[2];
+            let captions = extent(available, vertical[0], true)[2];
             vertical = vertical.map(|height| height.map(|height| height + captions));
         }
     } else {
@@ -1673,6 +1687,7 @@ pub(super) fn first_baseline(
             None,
             text,
             measured,
+            true,
         );
         let first = layout.cells.iter().map(|cell| cell.1[1]).min()?;
         // (aligned, column, baseline)

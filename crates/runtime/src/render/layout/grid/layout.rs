@@ -43,6 +43,7 @@ pub(crate) fn layout(
     baselines: Option<&Baselines>,
     text: &renderer::TextSystem,
     measured: &mut Measurements,
+    rows: bool,
 ) -> Grid {
     use Sizing::*;
     let style = &styles.values[id];
@@ -58,7 +59,9 @@ pub(crate) fn layout(
     let width = match width {
         Some(space) if space > 0. && matches!(style::role(styles, id), 13 | 14) => {
             let [min, max] = [Some(0.), None].map(|width| {
-                let grid = layout(doc, id, styles, width, None, None, None, text, measured);
+                let grid = layout(
+                    doc, id, styles, width, None, None, None, text, measured, false,
+                );
                 grid.columns.iter().sum::<f32>()
                     + grid.columns.len().saturating_sub(1) as f32 * grid.gap[0]
             });
@@ -788,7 +791,7 @@ pub(crate) fn layout(
     let mut offsets = [0.; 2];
     let mut boxes = vec![[0f32; 4]; cells.len()];
     let mut shims = Vec::new();
-    for axis in 0..2 {
+    for axis in 0..1 + usize::from(rows) {
         if axis == 1 {
             let column_starts = starts(&grid.columns);
             let mut aligned = Vec::new();
@@ -839,7 +842,9 @@ pub(crate) fn layout(
                 if size > used && style::table_box(style::role(styles, child)) {
                     let frame = frame(&styles.values[child], &styles.lengths[child], area);
                     let inner = Some(size - frame[1] - frame[3]);
-                    let grid = layout(doc, child, styles, inner, None, None, None, text, measured);
+                    let grid = layout(
+                        doc, child, styles, inner, None, None, None, text, measured, true,
+                    );
                     if grid.captions != [0.; 2] {
                         height = grid.extent(1) + frame[0] + frame[2];
                     }
@@ -863,6 +868,7 @@ pub(crate) fn layout(
                         None,
                         text,
                         measured,
+                        true,
                     );
                     height = inner.extent(1) + frame[0] + frame[2];
                 }
@@ -1170,6 +1176,12 @@ pub(crate) fn layout(
             grid.rows = sizes;
         }
     }
+    if !rows {
+        if outermost {
+            measured.edges = None;
+        }
+        return grid;
+    }
     let row_starts = starts(&grid.rows);
     let extent = block.unwrap_or_else(|| {
         grid.columns.iter().sum::<f32>()
@@ -1319,6 +1331,7 @@ mod tests {
             None,
             &text,
             &mut Default::default(),
+            true,
         );
         assert_eq!(grid.rows, [26., 26.]);
         let cells: Vec<_> = grid.cells.iter().map(|(_, cell, ..)| *cell).collect();
@@ -1348,6 +1361,7 @@ mod tests {
             None,
             &text,
             &mut Default::default(),
+            true,
         );
         let heights: Vec<_> = grid.cells.iter().map(|(.., bounds, _)| bounds[3]).collect();
         assert_eq!(heights, [10., 30.]);
@@ -1375,11 +1389,49 @@ mod tests {
                     None,
                     &text,
                     &mut Default::default(),
+                    true,
                 )
                 .rows
             })
             .collect();
         assert_eq!(rows, [vec![240.], vec![90.]]);
+    }
+
+    #[test]
+    fn column_extents_forget_a_changed_item() {
+        let text = renderer::TextSystem::new();
+        let mut doc = Document::parse(
+            "<style>main{display:grid;grid-template-columns:auto auto}</style><main><b>a b</b><b>c</b></main>",
+        );
+        let mut state = crate::render::PageState::default();
+        let styles = state.restyle(&mut doc, [800., 600.]);
+        let main = doc
+            .nodes
+            .iter()
+            .position(|node| node.tag == "main")
+            .unwrap();
+        let word = doc
+            .nodes
+            .iter()
+            .position(|node| node.text == "a b")
+            .unwrap();
+        let sizes = |doc: &Document, measured: &mut Measurements| {
+            [None, Some(300.)]
+                .map(|width| intrinsic(doc, main, &styles, width, None, &text, measured))
+        };
+        let mut measured = Measurements::default();
+        let before = sizes(&doc, &mut measured);
+        doc.nodes[word].text = "a wide word".into();
+        for id in [word, doc.nodes[word].parent.unwrap(), main] {
+            measured.boxes.remove(&id);
+            measured.texts.remove(&id);
+        }
+        let after = sizes(&doc, &mut measured);
+        assert!(
+            after[0][0] > before[0][0] && after[0][1] > before[0][1],
+            "{before:?} {after:?}"
+        );
+        assert_eq!(after, sizes(&doc, &mut Measurements::default()));
     }
 
     #[test]
@@ -1404,6 +1456,7 @@ mod tests {
                 None,
                 &text,
                 &mut Default::default(),
+                true,
             )
             .cells
             .into_iter()

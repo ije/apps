@@ -305,6 +305,7 @@ pub(super) fn grid_container(
                     .map(|dom| &dom.layout.baselines),
                 text,
                 &mut measured.borrow_mut(),
+                true,
             );
             view.store.borrow_mut().state(view.id).layout.grids.insert(
                 id,
