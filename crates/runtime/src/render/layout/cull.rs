@@ -28,8 +28,8 @@ pub(crate) const SHOWN: u32 = 131072;
 // The box is uncullable also inside a box that confines what it paints: replaced and drawable elements, fixed,
 // sticky and anchored boxes, size containers and the focus.
 pub(crate) const PINNED: u32 = 262144;
-// The box confines what uncullable boxes in it paint, so it can become a spacer. Its place then holds while none of
-// the boxes in it changed.
+// The box, or a box in it, confines what uncullable boxes in it paint, so it can become a spacer. Its place then holds
+// while none of the boxes in it changed.
 pub(crate) const CONFINES: u32 = 524288;
 
 // The revision of the box that its place holds for.

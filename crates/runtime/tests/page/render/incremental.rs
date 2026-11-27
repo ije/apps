@@ -559,6 +559,33 @@ fn clipping_tiles_far_from_the_view_are_spacers_with_exact_boxes_inside() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn far_blocks_around_clipping_tiles_take_the_transforms_in_them() {
+    // The row is a plain block far below the view, so it becomes a spacer when its tiles confine their cards.
+    let tiles = "<div class=t><div class=f id=f><div class=c></div></div></div>".repeat(4);
+    let page = format!(
+        "<style>body{{margin:0}}.t{{position:relative;display:inline-block;width:200px;height:200px;overflow:hidden}}\
+         .f{{position:absolute;left:50%;top:50%;translate:-50% -50%;scale:var(--s,1)}}.c{{width:300px;height:300px}}</style>\
+         <body><div style='height:3000px'></div><div id=row>{tiles}</div><div style='height:3000px'></div></body>"
+    );
+    let text = run_hidden(
+        r#"
+        const width = () => run("String(Math.round(document.getElementById('f').getBoundingClientRect().width))");
+        await load('row.html');
+        for (let n = 0; n < 3; n++) await win.webContents.capturePage();
+        await run("document.getElementById('f').style.setProperty('--s', '0.5')");
+        for (let n = 0; n < 3; n++) await win.webContents.capturePage();
+        console.log('FAR ' + await width());
+        "#,
+        &[("row.html", &page)],
+    );
+    assert!(
+        text.contains("FAR 150"),
+        "a far card takes its new scale: {text}"
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn cleared_blocks_far_below_floats_stay_spacers() {
     let mut page =
         String::from("<body id=body style='margin:0'><p id=o style='margin:0'>x</p><div>");

@@ -283,7 +283,7 @@ pub(super) fn detect(
         let (mut positioned, mut any) = (rustc_hash::FxHasher::default(), false);
         for &child in &node.children {
             let child_info = &info[child];
-            below |= child_info.flags & !cull::CONFINES;
+            below |= child_info.flags;
             if child_info.flags & cull::OUT_OF_FLOW != 0 {
                 std::hash::Hasher::write_usize(&mut positioned, child);
                 any = true;
