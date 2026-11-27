@@ -3,8 +3,8 @@ use super::*;
 #[test]
 #[ignore = "requires the macOS window server"]
 fn exit_transitions_keep_their_boxes_until_they_end() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         const state = "(r => [r.width, r.height, document.getElementById('d').dataset.ended].join())(document.getElementById('i').getBoundingClientRect())";
         const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
         await load('exit.html');
@@ -24,21 +24,21 @@ fn exit_transitions_keep_their_boxes_until_they_end() {
         got = await run(state);
         if (got !== '0,0,1') fail('after: ' + got);
         "#,
-        &[(
-            "exit.html",
-            "<body style='margin:0'><style>#d{transition:opacity 1s,display 1s allow-discrete}#d.off{display:none;opacity:0}</style>\
+    &[(
+      "exit.html",
+      "<body style='margin:0'><style>#d{transition:opacity 1s,display 1s allow-discrete}#d.off{display:none;opacity:0}</style>\
              <div id=d><svg id=i width=200 height=200><rect width=200 height=200 fill=red /></svg></div>\
              <script>document.getElementById('d').addEventListener('transitionend', event => {\
              if (event.propertyName === 'display') event.target.dataset.ended = 1 })</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn closing_dialogs_stay_in_the_top_layer_until_their_overlay_ends() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
         const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap().subarray(0, 3)].reverse();
         const frames = async ms => { for (const end = Date.now() + ms; Date.now() < end; await wait(16)) await win.webContents.capturePage(); };
@@ -57,24 +57,24 @@ fn closing_dialogs_stay_in_the_top_layer_until_their_overlay_ends() {
         [dialog, backdrop] = [await pixel(200, 150), await pixel(20, 20)];
         if (!(dialog[1] > 200 && dialog[2] < 60 && backdrop.every(value => value > 240))) fail('closed: ' + dialog + ' ' + backdrop);
         "#,
-        &[(
-            "dialog.html",
-            "<body style='margin:0;background:white'><style>\
+    &[(
+      "dialog.html",
+      "<body style='margin:0;background:white'><style>\
              dialog{opacity:0;transition:opacity 1s linear,overlay 1s allow-discrete,display 1s allow-discrete;width:100px;height:100px;padding:0;border:0;background:blue}\
              dialog[open]{opacity:1}@starting-style{dialog[open]{opacity:0}}\
              dialog::backdrop{background:transparent;transition:background-color 1s linear,overlay 1s allow-discrete,display 1s allow-discrete}\
              dialog[open]::backdrop{background:red}@starting-style{dialog[open]::backdrop{background:transparent}}\
              #later{position:absolute;left:100px;top:50px;width:200px;height:200px;background:lime;z-index:10}\
              </style><dialog id=d></dialog><div id=later></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn text_draws_its_selection_in_the_frame_a_popover_leaves() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('popover.html');
         await run("document.getElementById('p').showPopover()");
         await win.webContents.capturePage();
@@ -84,20 +84,20 @@ fn text_draws_its_selection_in_the_frame_a_popover_leaves() {
         const pixel = [...(await win.webContents.capturePage({ x: 10, y: 110, width: 1, height: 1 })).toBitmap().subarray(0, 3)];
         if (pixel.every(value => value > 240)) fail('no selection: ' + pixel);
         "#,
-        &[(
-            "popover.html",
-            "<body style='margin:0;font:40px/1 Helvetica'><div id=p popover>pop</div>\
+    &[(
+      "popover.html",
+      "<body style='margin:0;font:40px/1 Helvetica'><div id=p popover>pop</div>\
              <p id=t style='margin:100px 0 0'>MMMMMM</p></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn modal_dialogs_make_the_rest_of_the_page_inert() {
-    run_hidden(
-        &format!(
-            r#"{INPUT}
+  run_hidden(
+    &format!(
+      r#"{INPUT}
         await load('modal.html');
         await run("$('d').showModal()");
         await frames(50);
@@ -124,10 +124,10 @@ fn modal_dialogs_make_the_rest_of_the_page_inert() {
         await frames(50);
         await expect('closed', "[document.elementFromPoint(20, 20).id, ($('out').focus(), document.activeElement.id)].join()", 'out,out');
         "#
-        ),
-        &[(
-            "modal.html",
-            "<body style='margin:0'><style>#out{position:absolute;left:10px;top:10px;width:80px;height:30px}\
+    ),
+    &[(
+      "modal.html",
+      "<body style='margin:0'><style>#out{position:absolute;left:10px;top:10px;width:80px;height:30px}\
              #pop{position:fixed;inset:auto;left:300px;top:10px;margin:0;padding:0;border:0;width:80px;height:40px}\
              dialog{position:fixed;inset:auto;left:150px;top:150px;margin:0;padding:0;border:0;width:200px;height:100px}\
              body.through dialog::backdrop{pointer-events:none}</style>\
@@ -136,16 +136,16 @@ fn modal_dialogs_make_the_rest_of_the_page_inert() {
              globalThis.$ = id => document.getElementById(id); globalThis.log = [];\
              for (const type of ['pointerdown', 'click']) addEventListener(type, event => log.push(type + ':' + (event.target.id || event.target.localName)), true);\
              </script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn dialogs_take_the_focus_when_nothing_in_them_can() {
-    run_hidden(
-        &format!(
-            r#"{INPUT}
+  run_hidden(
+    &format!(
+      r#"{INPUT}
         await load('dialog.html');
         await expect('tab index', "$('d').tabIndex", -1);
         await expect('closed', "$('d').focus(), document.activeElement.localName", 'body');
@@ -166,24 +166,24 @@ fn dialogs_take_the_focus_when_nothing_in_them_can() {
         await frames(50);
         await expect('empty dialog', "document.activeElement.id", 'd');
         "#
-        ),
-        &[(
-            "dialog.html",
-            "<body style='margin:0'><style>dialog{{position:fixed;inset:auto;left:150px;top:100px;margin:0;width:200px;height:100px}}</style>\
+    ),
+    &[(
+      "dialog.html",
+      "<body style='margin:0'><style>dialog{{position:fixed;inset:auto;left:150px;top:100px;margin:0;width:200px;height:100px}}</style>\
              <button id=out>out</button><dialog id=d><p>text</p></dialog><dialog id=e><p>text</p><button id=b>b</button></dialog><script>\
              globalThis.$ = id => document.getElementById(id); globalThis.log = [];\
              for (const type of ['focus', 'blur']) addEventListener(type, event => log.push(type + ':' + event.target.id), true);\
              </script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn inert_subtrees_lose_focus_and_take_no_presses_or_typing() {
-    run_hidden(
-        &format!(
-            r#"{INPUT}
+  run_hidden(
+    &format!(
+      r#"{INPUT}
         await load('inert.html');
         await expect('focus', "$('f').focus(), $('wrap').inert = true, document.activeElement.id", 'f');
         await frames(150);
@@ -197,22 +197,22 @@ fn inert_subtrees_lose_focus_and_take_no_presses_or_typing() {
         await input({{ action: 'type', text: 'y' }});
         await expect('live again', "[document.activeElement.id, $('f').value].join()", 'f,y');
         "#
-        ),
-        &[(
-            "inert.html",
-            "<body style='margin:0'><div id=wrap><input id=f style='position:absolute;left:10px;top:10px;width:100px;height:20px'></div>\
+    ),
+    &[(
+      "inert.html",
+      "<body style='margin:0'><div id=wrap><input id=f style='position:absolute;left:10px;top:10px;width:100px;height:20px'></div>\
              <script>globalThis.$ = id => document.getElementById(id); globalThis.log = [];\
              addEventListener('blur', event => log.push('blur:' + event.target.id), true);</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn exit_transitions_take_no_focus_but_leaving_shown_boxes_do() {
-    run_hidden(
-        &format!(
-            r#"{INPUT}
+  run_hidden(
+    &format!(
+      r#"{INPUT}
         await load('exit.html');
         await run("$('out').focus(); $('d').showModal()");
         await frames(50);
@@ -238,10 +238,10 @@ fn exit_transitions_take_no_focus_but_leaving_shown_boxes_do() {
         await frames(100);
         await expect('shown by an animation', "[getComputedStyle($('box')).display, ($('bb').focus(), document.activeElement.id)].join()", 'block,k1');
         "#
-        ),
-        &[(
-            "exit.html",
-            "<body style='margin:0'><style>#out{position:absolute;left:300px;top:10px;width:60px;height:30px}\
+    ),
+    &[(
+      "exit.html",
+      "<body style='margin:0'><style>#out{position:absolute;left:300px;top:10px;width:60px;height:30px}\
              dialog{position:fixed;inset:auto;left:150px;top:100px;margin:0;padding:0;border:0;width:200px;height:100px;transition:overlay 1s allow-discrete,display 1s allow-discrete}\
              #kept{display:block;left:20px;top:150px;width:100px;height:60px}\
              #box{position:absolute;left:100px;top:200px;width:100px;height:40px;transition:display 1s allow-discrete}#box.off{display:none}\
@@ -251,15 +251,15 @@ fn exit_transitions_take_no_focus_but_leaving_shown_boxes_do() {
              globalThis.$ = id => document.getElementById(id); globalThis.log = [];\
              for (const type of ['pointerdown', 'click']) addEventListener(type, event => log.push(type + ':' + (event.target.id || event.target.localName)), true);\
              </script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn positioned_grids_and_popovers_size_like_chrome() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         await load('t.html');
         const boxes = "[...document.querySelectorAll('[id]')].map(e => { const r = e.getBoundingClientRect(); return e.id + ':' + [r.x, r.y, r.width, r.height].join(',') }).join(' ')";
         console.log('BOXES ' + await run(boxes));
@@ -267,9 +267,9 @@ fn positioned_grids_and_popovers_size_like_chrome() {
         const bytes = (await win.webContents.capturePage({ x: 20, y: 180, width: 1, height: 1 })).toBitmap();
         console.log('REMOVED ' + [bytes[2], bytes[1], bytes[0]].join(','));
         "#,
-        &[(
-            "t.html",
-            "<body style='margin:0'><style>.g{display:grid;position:absolute}i{display:block;width:40px;height:30px}\
+    &[(
+      "t.html",
+      "<body style='margin:0'><style>.g{display:grid;position:absolute}i{display:block;width:40px;height:30px}\
              [popover]{margin:0;padding:0;border:0;inset:10px auto auto 8px;background:red}</style>\
              <div style='position:relative;width:300px;height:200px'>\
              <div id=a class=g style='left:10px;top:5px'><i></i><i></i></div>\
@@ -282,27 +282,28 @@ fn positioned_grids_and_popovers_size_like_chrome() {
              <div id=q popover style='display:flex'><i></i><i></i></div>\
              <div id=r popover style='display:block'><i></i><i></i></div>\
              <script>for (const id of 'pqr') document.getElementById(id).showPopover()</script></body>",
-        )],
-    );
-    let line = |name: &str| {
-        text.lines()
-            .find_map(|line| line.strip_prefix(name))
-            .unwrap_or_else(|| panic!("{text}"))
-    };
-    // Chrome's values: a fit-content grid shrinks to its items, and insets take room from a stretched grid.
-    assert_eq!(
-        line("BOXES "),
-        "a:10,5,40,60 b:20,5,250,30 c:250,160,40,30 d:20,5,40,30 e:50,20,40,150 f:60,20,40,30 \
+    )],
+  );
+  let line = |name: &str| {
+    text
+      .lines()
+      .find_map(|line| line.strip_prefix(name))
+      .unwrap_or_else(|| panic!("{text}"))
+  };
+  // Chrome's values: a fit-content grid shrinks to its items, and insets take room from a stretched grid.
+  assert_eq!(
+    line("BOXES "),
+    "a:10,5,40,60 b:20,5,250,30 c:250,160,40,30 d:20,5,40,30 e:50,20,40,150 f:60,20,40,30 \
          p:8,150,40,60 q:8,10,80,30 r:8,10,40,60"
-    );
-    assert_eq!(line("REMOVED "), "255,255,255");
+  );
+  assert_eq!(line("REMOVED "), "255,255,255");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn view_transitions_cross_fade_captures_and_end() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap().subarray(0, 3)].reverse();
         await load('vt.html');
         await run(`globalThis.t = document.startViewTransition(() => document.body.className = 'on'); t.ready.then(() => globalThis.ready = 1); 0`);
@@ -322,10 +323,10 @@ fn view_transitions_cross_fade_captures_and_end() {
         const blue = await pixel(230, 30);
         if (!(blue[2] > 200 && blue[0] < 60)) fail('the page after: ' + blue);
         "#,
-        &[(
-            "vt.html",
-            "<body style='margin:0;background:#fff'><style>#box{position:absolute;left:10px;top:10px;width:40px;height:40px;\
+    &[(
+      "vt.html",
+      "<body style='margin:0;background:#fff'><style>#box{position:absolute;left:10px;top:10px;width:40px;height:40px;\
              background:red;view-transition-name:box}.on #box{left:210px;background:blue}</style><div id=box></div></body>",
-        )],
-    );
+    )],
+  );
 }

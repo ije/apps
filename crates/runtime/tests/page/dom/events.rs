@@ -2,10 +2,10 @@ use super::*;
 
 #[test]
 fn scroll_events_coalesce_and_synchronize_native_and_script_scrolling() {
-    let (host, engine) = css_page(
-        "<html><body><main><div id='left' style='overflow:auto'></div><div id='right' style='overflow:auto'></div></main></body></html>",
-    );
-    engine.eval(r#"
+  let (host, engine) = css_page(
+    "<html><body><main><div id='left' style='overflow:auto'></div><div id='right' style='overflow:auto'></div></main></body></html>",
+  );
+  engine.eval(r#"
         const left = document.getElementById('left'), right = document.getElementById('right');
         const received = [];
         document.querySelector('main').addEventListener('scroll', () => received.push('bubble'));
@@ -26,10 +26,10 @@ fn scroll_events_coalesce_and_synchronize_native_and_script_scrolling() {
         left.scrollTo(30,15); __appsLayout(); __appsLayout();
         if(received.length) throw Error('Unchanged scroll dispatched an event');
     "#, "test").unwrap();
-    let id: usize = engine.eval("left._id", "test").unwrap().parse().unwrap();
-    host.borrow().store.borrow().pages[&1].state.geometry.scroll[&id]
-        .set_offset(renderer::point(renderer::px(-60.), renderer::px(-25.)));
-    engine.eval(r#"
+  let id: usize = engine.eval("left._id", "test").unwrap().parse().unwrap();
+  host.borrow().store.borrow().pages[&1].state.geometry.scroll[&id]
+    .set_offset(renderer::point(renderer::px(-60.), renderer::px(-25.)));
+  engine.eval(r#"
         __appsLayout(); __appsLayout();
         if(JSON.stringify(received)!=='[["capture","left"],["left",60,25],["capture","right"],["right",60,25]]') throw Error(JSON.stringify(received));
         received.length=0;
@@ -45,8 +45,8 @@ fn scroll_events_coalesce_and_synchronize_native_and_script_scrolling() {
 
 #[test]
 fn mutations_preserve_tree_and_event_order() {
-    let (host, engine) = css_page("<html><body><main id='root'><p>old</p></main></body></html>");
-    engine.eval(r#"
+  let (host, engine) = css_page("<html><body><main id='root'><p>old</p></main></body></html>");
+  engine.eval(r#"
         const root = document.getElementById('root');
         const old = root.firstChild;
         root.textContent = '';
@@ -95,24 +95,24 @@ fn mutations_preserve_tree_and_event_order() {
         parent.appendChild(button);
         root.appendChild(parent);
     "#, "test").unwrap();
-    assert!(host.borrow().store.borrow().pages[&1].dirty);
-    let host = host.borrow().store.clone();
-    let host = host.borrow();
-    let doc = &host.pages[&1].doc;
-    let styles = apps_runtime::style::styles(doc, 800., 600.);
-    let button = doc
-        .nodes
-        .iter()
-        .position(|node| node.tag == "button")
-        .unwrap();
-    assert_eq!(styles[button]["color"], "#123456");
-    assert_eq!(styles[button]["font-size"], "24px");
+  assert!(host.borrow().store.borrow().pages[&1].dirty);
+  let host = host.borrow().store.clone();
+  let host = host.borrow();
+  let doc = &host.pages[&1].doc;
+  let styles = apps_runtime::style::styles(doc, 800., 600.);
+  let button = doc
+    .nodes
+    .iter()
+    .position(|node| node.tag == "button")
+    .unwrap();
+  assert_eq!(styles[button]["color"], "#123456");
+  assert_eq!(styles[button]["font-size"], "24px");
 }
 
 #[test]
 fn editing_fragments_observers_and_layout() {
-    let (host, engine) = css_page("<html><body><main id='root'></main></body></html>");
-    engine.eval(r#"
+  let (host, engine) = css_page("<html><body><main id='root'></main></body></html>");
+  engine.eval(r#"
         const root = document.getElementById('root');
         const fragment = document.createDocumentFragment();
         const input = document.createElement('textarea');
@@ -167,39 +167,40 @@ fn editing_fragments_observers_and_layout() {
         const resize = new ResizeObserver(entries => observed.push(entries[0].contentRect.width, entries[0].borderBoxSize[0].inlineSize)); resize.observe(input);
         globalThis.editorId = input._id;
     "#, "test").unwrap();
-    let id: usize = engine.eval("editorId", "test").unwrap().parse().unwrap();
-    host.borrow()
-        .store
-        .borrow_mut()
-        .state(1)
-        .geometry
-        .mirror
-        .insert(id, [20., 30., 200., 80.]);
-    engine.eval("__appsObserve(true); __appsObserve(true); if (observed.join() !== '194,200' || input.getBoundingClientRect().x !== 20 || input.clientHeight !== 78 || input.offsetHeight !== 80 || input.clientLeft !== 1) throw Error('Layout observation ' + observed.join());", "test").unwrap();
+  let id: usize = engine.eval("editorId", "test").unwrap().parse().unwrap();
+  host
+    .borrow()
+    .store
+    .borrow_mut()
+    .state(1)
+    .geometry
+    .mirror
+    .insert(id, [20., 30., 200., 80.]);
+  engine.eval("__appsObserve(true); __appsObserve(true); if (observed.join() !== '194,200' || input.getBoundingClientRect().x !== 20 || input.clientHeight !== 78 || input.offsetHeight !== 80 || input.clientLeft !== 1) throw Error('Layout observation ' + observed.join());", "test").unwrap();
 }
 
 #[test]
 fn inner_html_of_a_form_drops_nested_forms() {
-    let (_, engine) = css_page("<form id=f><div id=d></div></form>");
-    engine
-        .eval(
-            r#"
+  let (_, engine) = css_page("<form id=f><div id=d></div></form>");
+  engine
+    .eval(
+      r#"
       const d=document.getElementById('d');d.innerHTML='<form id=n><input name=a></form>b';
       if(d.innerHTML!=='<input name="a">b')throw Error(d.innerHTML);
       const out=document.createElement('div');out.innerHTML='<form id=n><input></form>';
       if(out.querySelectorAll('form').length!==1)throw Error(out.innerHTML);
     "#,
-            "test",
-        )
-        .unwrap();
+      "test",
+    )
+    .unwrap();
 }
 
 #[test]
 fn shadow_slots_render_light_dom_and_receive_pointer_events() {
-    let (host, engine) = css_page(
-        "<html><head><style>button { color:#123456; }</style></head><body><test-slots><button id='edit'>Edit</button><span slot='missing'>hidden</span><em>text</em></test-slots></body></html>",
-    );
-    engine.eval(r#"
+  let (host, engine) = css_page(
+    "<html><head><style>button { color:#123456; }</style></head><body><test-slots><button id='edit'>Edit</button><span slot='missing'>hidden</span><em>text</em></test-slots></body></html>",
+  );
+  engine.eval(r#"
         const host = document.querySelector('test-slots');
         const root = host.attachShadow({mode:'open'});
         root.innerHTML = '<style>:host {background-color:white;color:#445566;--tone:#987654} slot {color:var(--tone)} button {color:red}</style><header><slot name="actions"><button id="fallback">Fallback</button></slot></header><slot name="actions" id="duplicate">duplicate</slot><slot></slot>';
@@ -226,18 +227,19 @@ fn shadow_slots_render_light_dom_and_receive_pointer_events() {
         if (events.join() !== 'edit,slot,host') throw Error('Slotted event path');
         globalThis.ids = [host._id, edit._id, root.getElementById('fallback')._id, host.querySelector('span')._id];
     "#, "test").unwrap();
-    let ids: Vec<usize> =
-        serde_json::from_str(&engine.eval("JSON.stringify(ids)", "test").unwrap()).unwrap();
-    for id in ids {
-        host.borrow()
-            .store
-            .borrow_mut()
-            .state(1)
-            .geometry
-            .mirror
-            .insert(id, [0., 0., 100., 40.]);
-    }
-    engine.eval(r#"
+  let ids: Vec<usize> =
+    serde_json::from_str(&engine.eval("JSON.stringify(ids)", "test").unwrap()).unwrap();
+  for id in ids {
+    host
+      .borrow()
+      .store
+      .borrow_mut()
+      .state(1)
+      .geometry
+      .mirror
+      .insert(id, [0., 0., 100., 40.]);
+  }
+  engine.eval(r#"
         if (document.elementFromPoint(10,10) !== edit) throw Error('Slotted button is not hit-testable');
         edit.slot = 'missing';
         if (slot.assignedNodes().length || slot.assignedNodes({flatten:true})[0].id !== 'fallback') throw Error('Fallback assignment');
@@ -254,8 +256,8 @@ fn shadow_slots_render_light_dom_and_receive_pointer_events() {
 
 #[test]
 fn native_events_focus_the_editing_host_and_cross_shadow_roots() {
-    let (_, engine) = css_page("<html><body><test-editor></test-editor></body></html>");
-    engine.eval(r#"
+  let (_, engine) = css_page("<html><body><test-editor></test-editor></body></html>");
+  engine.eval(r#"
         const host = document.querySelector('test-editor');
         const root = host.attachShadow({mode:'open'});
         root.innerHTML = '<div contenteditable="true"><span><b>text</b></span></div>';
@@ -284,10 +286,10 @@ fn native_events_focus_the_editing_host_and_cross_shadow_roots() {
 
 #[test]
 fn aria_properties_reflect_and_select_focuses_fields() {
-    let (_, engine) = css_page(
-        "<html><body><button id='toggle'></button><input id='field' value='text'></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><body><button id='toggle'></button><input id='field' value='text'></body></html>",
+  );
+  engine.eval(r#"
         const toggle = document.getElementById('toggle'), field = document.getElementById('field');
         if (toggle.ariaExpanded !== null || toggle.role !== null) throw Error('Missing attributes reflect as null');
         toggle.ariaExpanded = 'false'; toggle.ariaPressed = String(true); toggle.ariaLabel = 'Toggle'; toggle.role = 'switch';
@@ -302,10 +304,10 @@ fn aria_properties_reflect_and_select_focuses_fields() {
 
 #[test]
 fn pointer_hover_tracks_boundary_events_and_interaction_states() {
-    let (host, engine) = css_page(
-        "<html><head><style>#outer:hover{color:red} #inner:hover{color:blue} #outer:focus-within{background-color:green} #inner:active{font-weight:700} #inner:focus{border-top:3px solid}</style></head><body><div id='outer'><div id='inner' tabindex='0'></div></div><div id='other'></div><test-card></test-card></body></html>",
-    );
-    engine.eval(r#"
+  let (host, engine) = css_page(
+    "<html><head><style>#outer:hover{color:red} #inner:hover{color:blue} #outer:focus-within{background-color:green} #inner:active{font-weight:700} #inner:focus{border-top:3px solid}</style></head><body><div id='outer'><div id='inner' tabindex='0'></div></div><div id='other'></div><test-card></test-card></body></html>",
+  );
+  engine.eval(r#"
         const [outer, inner, other, card] = ['#outer', '#inner', '#other', 'test-card'].map(s => document.querySelector(s));
         card.attachShadow({mode:'open'}).innerHTML = '<style>:host(:hover){color:purple}</style><span id="part"></span>';
         const log = [];
@@ -315,24 +317,25 @@ fn pointer_hover_tracks_boundary_events_and_interaction_states() {
         globalThis.ids = [outer._id, inner._id, other._id, card._id, card.shadowRoot.querySelector('#part')._id];
         globalThis.check = (expected, label) => { const actual = log.splice(0).join(); if (actual !== expected) throw Error(label + ': ' + actual); };
     "#, "test").unwrap();
-    let ids: Vec<usize> =
-        serde_json::from_str(&engine.eval("JSON.stringify(ids)", "test").unwrap()).unwrap();
-    for (id, bounds) in ids.into_iter().zip([
-        [0., 0., 100., 100.],
-        [0., 0., 50., 50.],
-        [0., 100., 100., 100.],
-        [0., 200., 100., 100.],
-        [0., 200., 50., 50.],
-    ]) {
-        host.borrow()
-            .store
-            .borrow_mut()
-            .state(1)
-            .geometry
-            .mirror
-            .insert(id, bounds);
-    }
-    engine.eval(r#"
+  let ids: Vec<usize> =
+    serde_json::from_str(&engine.eval("JSON.stringify(ids)", "test").unwrap()).unwrap();
+  for (id, bounds) in ids.into_iter().zip([
+    [0., 0., 100., 100.],
+    [0., 0., 50., 50.],
+    [0., 100., 100., 100.],
+    [0., 200., 100., 100.],
+    [0., 200., 50., 50.],
+  ]) {
+    host
+      .borrow()
+      .store
+      .borrow_mut()
+      .state(1)
+      .geometry
+      .mirror
+      .insert(id, bounds);
+  }
+  engine.eval(r#"
         const move = (x, y) => __appsDispatch('pointermove', [], {pointerId:1, pointerType:'mouse', clientX:x, clientY:y});
         move(10, 10);
         check('pointerover:inner,pointerenter:outer,pointerenter:inner,mouseover:inner,mouseenter:outer,mouseenter:inner', 'enter');
@@ -368,9 +371,9 @@ fn pointer_hover_tracks_boundary_events_and_interaction_states() {
 
 #[test]
 fn uncaught_page_errors_fire_error_events() {
-    let (_, engine) = checked_page(
-        "<html><body></body></html>",
-        r#"
+  let (_, engine) = checked_page(
+    "<html><body></body></html>",
+    r#"
         globalThis.seen = [];
         addEventListener('error', e => { seen.push(e.constructor.name + ':' + e.message + ':' + (e.lineno > 0) + ':' + (e.error?.message === e.message.slice(16)));});
         addEventListener('unhandledrejection', e => { seen.push('rejection:' + e.reason.message); e.preventDefault(); });
@@ -384,20 +387,20 @@ fn uncaught_page_errors_fire_error_events() {
         let canceled; document.body.onerror = e => { canceled = e; return true; }; document.body.dispatchEvent(new ErrorEvent('error'));
         check('element onerror gets the event', () => canceled instanceof ErrorEvent);
         "#,
-    );
-    for _ in 0..5 {
-        engine.tick().unwrap();
-    }
-    assert_eq!(
-        engine.eval("seen.join('\\n')", "test").unwrap(),
-        "ErrorEvent:Uncaught Error: frame:true:true\nonerror:string,string,number,number,frame\nErrorEvent:Uncaught Error: micro:true:true\nonerror:string,string,number,number,micro\nErrorEvent:Uncaught Error: timer:true:true\nonerror:string,string,number,number,timer\nrejection:promise"
-    );
+  );
+  for _ in 0..5 {
+    engine.tick().unwrap();
+  }
+  assert_eq!(
+    engine.eval("seen.join('\\n')", "test").unwrap(),
+    "ErrorEvent:Uncaught Error: frame:true:true\nonerror:string,string,number,number,frame\nErrorEvent:Uncaught Error: micro:true:true\nonerror:string,string,number,number,micro\nErrorEvent:Uncaught Error: timer:true:true\nonerror:string,string,number,number,timer\nrejection:promise"
+  );
 }
 
 #[test]
 fn inner_text_selections_and_table_displays_follow_rendering() {
-    checked_page(
-        "<html><body><div id='n'>\n  <div>\n    <p>one   two</p>\n    <p>three</p>\n  </div>\n  <div> four <b>five</b></div>\n</div>\
+  checked_page(
+    "<html><body><div id='n'>\n  <div>\n    <p>one   two</p>\n    <p>three</p>\n  </div>\n  <div> four <b>five</b></div>\n</div>\
          <div id='br'><div>a<br></div><div>b<br><br></div>c<br></div>\
          <div id='pre'><pre>  a  b\n  c </pre><span style='white-space:pre-wrap'> x  y </span><span style='white-space:pre-line'> p  q\n r </span>z</div>\
          <table id='t'><thead><tr><th>h1</th><th>h2</th></tr></thead><tbody><tr><td>a</td><td>b</td></tr><tr><td>c</td><td></td></tr></tbody></table>\
@@ -408,7 +411,7 @@ fn inner_text_selections_and_table_displays_follow_rendering() {
          <div id='f' style='display:flex'><span>a</span> <span>b</span></div>\
          <div id='s'><p>one   two</p>\n<div>three <b>four</b> five</div>\n<table><tr><td>a</td><td>b</td></tr></table></div>\
          <table id='g' style='display:grid'><tbody style='display:contents'><tr style='display:contents'><td style='display:block'>g</td></tr></tbody></table></body></html>",
-        r#"
+    r#"
         const text = id => document.getElementById(id).innerText;
         check('blocks and white space', () => text('n') === 'one two\n\nthree\n\nfour five');
         check('br at block ends', () => text('br') === 'a\n\nb\n\n\nc\n');
@@ -441,14 +444,14 @@ fn inner_text_selections_and_table_displays_follow_rendering() {
         const root = host.attachShadow({ mode: 'open' }); root.innerHTML = '<template><slot></slot></template><slot id=slot></slot>';
         check('slots skip templates', () => root.querySelector('#slot').assignedNodes().length === 1 && host.firstChild.assignedSlot === root.querySelector('#slot') && host.innerText === 'light');
         "#,
-    );
+  );
 }
 
 #[test]
 fn event_handler_properties_are_listeners_in_order() {
-    checked_page(
-        "<html><body><div id='d' onclick='throw Error(1)'></div><svg id='s'></svg></body></html>",
-        r#"
+  checked_page(
+    "<html><body><div id='d' onclick='throw Error(1)'></div><svg id='s'></svg></body></html>",
+    r#"
         const d = document.getElementById('d');
         check('feature detection', () => 'oninput' in document && 'onclick' in d && 'onmousedown' in window && 'onclick' in document.getElementById('s') && !('onclick' in new Text('')));
         check('default null', () => d.onclick === null && document.oninput === null && window.onload === null);
@@ -469,14 +472,14 @@ fn event_handler_properties_are_listeners_in_order() {
         check('window handler', () => windowCalls === 1);
         check('preact style names', () => 'onclick' in d && !('onClick' in d));
         "#,
-    );
+  );
 }
 
 #[test]
 fn select_options_follow_selection_and_keyboard() {
-    let (host, _) = checked_page(
-        "<html><body><form id='f'><select id='s' name='fruit'><option value='a'>Apple</option><option>  Banana  split </option><optgroup label='g'><option value='c' disabled>Cherry</option><option value='d'>Date</option></optgroup></select><select id='m' multiple><option selected>x</option><option selected>y</option></select></form></body></html>",
-        r#"
+  let (host, _) = checked_page(
+    "<html><body><form id='f'><select id='s' name='fruit'><option value='a'>Apple</option><option>  Banana  split </option><optgroup label='g'><option value='c' disabled>Cherry</option><option value='d'>Date</option></optgroup></select><select id='m' multiple><option selected>x</option><option selected>y</option></select></form></body></html>",
+    r#"
         const s = document.getElementById('s'), m = document.getElementById('m');
         check('classes', () => s instanceof HTMLSelectElement && s.options[0] instanceof HTMLOptionElement && s.querySelector('optgroup') instanceof HTMLOptGroupElement && Object.prototype.toString.call(s) === '[object HTMLSelectElement]');
         check('default first option', () => s.selectedIndex === 0 && s.value === 'a' && s.type === 'select-one' && s.length === 4 && s.options.length === 4);
@@ -504,29 +507,29 @@ fn select_options_follow_selection_and_keyboard() {
         check('keyboard skips disabled options', () => events.join() === 'input:true:Banana split,change:true:Banana split,input:true:d,change:true:d');
         globalThis.selectId = s.options[3]._id;
         "#,
-    );
-    let host = host.borrow().store.clone();
-    let host = host.borrow();
-    let doc = &host.pages[&1].doc;
-    let option = doc
-        .nodes
-        .iter()
-        .position(|node| {
-            node.tag == "option" && node.attrs.get("value").map(String::as_str) == Some("d")
-        })
-        .unwrap();
-    assert!(apps_runtime::dom::matches(
-        doc,
-        option,
-        "select option:checked"
-    ));
+  );
+  let host = host.borrow().store.clone();
+  let host = host.borrow();
+  let doc = &host.pages[&1].doc;
+  let option = doc
+    .nodes
+    .iter()
+    .position(|node| {
+      node.tag == "option" && node.attrs.get("value").map(String::as_str) == Some("d")
+    })
+    .unwrap();
+  assert!(apps_runtime::dom::matches(
+    doc,
+    option,
+    "select option:checked"
+  ));
 }
 
 #[test]
 fn native_presses_follow_the_browser_event_sequence() {
-    checked_page(
-        "<html><body><div id='a' tabindex='0'>a</div><input id='i'><div id='b'>b</div></body></html>",
-        r#"
+  checked_page(
+    "<html><body><div id='a' tabindex='0'>a</div><input id='i'><div id='b'>b</div></body></html>",
+    r#"
         const a = document.getElementById('a'), i = document.getElementById('i'), b = document.getElementById('b');
         const log = [];
         for (const type of ['pointerdown','mousedown','pointerup','mouseup','click','auxclick','contextmenu','dblclick','wheel']) a.addEventListener(type, e => log.push(type + ':' + e.button + ':' + e.buttons + ':' + e.detail + ':' + e.isTrusted + (e instanceof MouseEvent ? '' : '!')));
@@ -563,14 +566,14 @@ fn native_presses_follow_the_browser_event_sequence() {
         const shadowEvent = new Event('x', { bubbles: true, composed: true }); inner.dispatchEvent(shadowEvent);
         check('shadow target cleared after dispatch', () => shadowEvent.target === null);
         "#,
-    );
+  );
 }
 
 #[test]
 fn checkbox_and_radio_activation_runs_before_listeners() {
-    checked_page(
-        "<html><body><input id='c' type='checkbox'><input id='r1' type='radio' name='g' checked><input id='r2' type='radio' name='g'><label id='l'>Label <input id='lc' type='checkbox'></label><label for='t' id='lt'>Text</label><input id='t'></body></html>",
-        r#"
+  checked_page(
+    "<html><body><input id='c' type='checkbox'><input id='r1' type='radio' name='g' checked><input id='r2' type='radio' name='g'><label id='l'>Label <input id='lc' type='checkbox'></label><label for='t' id='lt'>Text</label><input id='t'></body></html>",
+    r#"
         const c = document.getElementById('c'), r1 = document.getElementById('r1'), r2 = document.getElementById('r2');
         const seen = [];
         c.addEventListener('click', () => seen.push('click:' + c.checked));
@@ -599,14 +602,14 @@ fn checkbox_and_radio_activation_runs_before_listeners() {
         c.click();
         check('user toggles skip page setters, like React tracks', () => writes === 0 && tracked === false);
         "#,
-    );
+  );
 }
 
 #[test]
 fn range_inputs_sanitize_slide_and_step() {
-    let (host, engine) = checked_page(
-        "<html><body><input id='r' type='range'></body></html>",
-        r#"
+  let (host, engine) = checked_page(
+    "<html><body><input id='r' type='range'></body></html>",
+    r#"
         const r = document.getElementById('r'), values = [];
         check('default is the middle', () => r.value === '50' && r.valueAsNumber === 50);
         r.max = '1';
@@ -620,20 +623,21 @@ fn range_inputs_sanitize_slide_and_step() {
         const any = ['1.6494845360824741', '3.999999999999999', '1.2e2', '0.0000001234', '1152921504606846976', '12345678901234567.5', ' 5', '-0'].map(v => (r.value = v, r.value));
         check('step any keeps 15 digits like Chrome ' + any, () => any.join() === '1.64948453608247,4,1.2e+2,1,1.15292150460684697e+18,1.23456789012346e+16,5e+29,1');
         "#,
-    );
-    let id: usize = engine
-        .eval("document.getElementById('r')._id", "test")
-        .unwrap()
-        .parse()
-        .unwrap();
-    host.borrow()
-        .store
-        .borrow_mut()
-        .state(1)
-        .geometry
-        .mirror
-        .insert(id, [0., 0., 116., 16.]);
-    engine.eval(r#"
+  );
+  let id: usize = engine
+    .eval("document.getElementById('r')._id", "test")
+    .unwrap()
+    .parse()
+    .unwrap();
+  host
+    .borrow()
+    .store
+    .borrow_mut()
+    .state(1)
+    .geometry
+    .mirror
+    .insert(id, [0., 0., 116., 16.]);
+  engine.eval(r#"
         const r = document.getElementById('r'), seen = [];
         r.removeAttribute('min'); r.removeAttribute('max'); r.removeAttribute('step'); r.value = '50';
         r.addEventListener('input', () => seen.push('input:' + r.value));
@@ -651,9 +655,9 @@ fn range_inputs_sanitize_slide_and_step() {
 
 #[test]
 fn file_lists_and_input_type_changes_like_chrome() {
-    checked_page(
-        "<html><body><form id=fm><input id=f name=f type=file></form><input id=t value=12345></body></html>",
-        r#"
+  checked_page(
+    "<html><body><form id=fm><input id=f name=f type=file></form><input id=t value=12345></body></html>",
+    r#"
         const f = document.getElementById('f'), t = document.getElementById('t'), dt = new DataTransfer();
         dt.items.add(new File(['abc'], 'a.txt')); dt.items.add(new File(['d'], 'b.txt'));
         const list = dt.files;
@@ -683,14 +687,14 @@ fn file_lists_and_input_type_changes_like_chrome() {
         t.type = 'number'; t.type = 'text';
         check('a type that gains the selection API starts at 0', () => t.selectionStart === 0 && t.selectionEnd === 0 && t.selectionDirection === 'none');
         "#,
-    );
+  );
 }
 
 #[test]
 fn focus_editing_fonts_and_xml_follow_the_standard() {
-    checked_page(
-        "<html><body><button id=b1>1</button><x-host id=h><button id=light>light</button></x-host><button id=b3>3</button><textarea id=t></textarea><svg viewBox='0 0 10 10'><text>a&nbsp;b</text><foreignObject><div>x<br>y</div></foreignObject></svg></body></html>",
-        r#"
+  checked_page(
+    "<html><body><button id=b1>1</button><x-host id=h><button id=light>light</button></x-host><button id=b3>3</button><textarea id=t></textarea><svg viewBox='0 0 10 10'><text>a&nbsp;b</text><foreignObject><div>x<br>y</div></foreignObject></svg></body></html>",
+    r#"
         const $ = id => document.getElementById(id), root = $('h').attachShadow({ mode: 'open' }), order = [];
         root.innerHTML = '<button id=inner>inner</button><slot></slot>';
         $('b1').focus();
@@ -710,14 +714,14 @@ fn focus_editing_fonts_and_xml_follow_the_standard() {
         check('xml', () => xml.serializeToString(document.querySelector('svg')) === '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><text>a b</text><foreignObject><div xmlns="http://www.w3.org/1999/xhtml">x<br />y</div></foreignObject></svg>' && xml.serializeToString(document.createTextNode('a <&>')) === 'a &lt;&amp;&gt;');
         check('xml attributes', () => { const div = document.createElement('div'); div.setAttribute('title', '"\n'); return xml.serializeToString(div) === '<div xmlns="http://www.w3.org/1999/xhtml" title="&quot;&#10;"></div>'; });
         "#,
-    );
+  );
 }
 
 #[test]
 fn focus_follows_focusability_removal_and_shadow_roots() {
-    checked_page(
-        "<html><body><div id='plain'>x</div><a id='link' href='#x'>l</a><a id='nolink'>n</a><button id='b'>b</button><div id='tab' tabindex='2'></div><div id='host'></div><input id='first' tabindex='1'></body></html>",
-        r#"
+  checked_page(
+    "<html><body><div id='plain'>x</div><a id='link' href='#x'>l</a><a id='nolink'>n</a><button id='b'>b</button><div id='tab' tabindex='2'></div><div id='host'></div><input id='first' tabindex='1'></body></html>",
+    r#"
         const $ = id => document.getElementById(id);
         $('plain').focus();
         check('non-focusable ignored', () => document.activeElement === document.body);
@@ -751,14 +755,14 @@ fn focus_follows_focusability_removal_and_shadow_roots() {
         __appsDispatch('keydown', [], { key: 'Tab', shiftKey: true });
         check('shift tab', () => document.activeElement.id === 'link');
         "#,
-    );
+  );
 }
 
 #[test]
 fn text_controls_commit_change_on_blur_and_enter_and_forms_submit() {
-    checked_page(
-        "<html><body><form id='f'><input id='i' name='q' value='start' required pattern='[a-z]+'><textarea id='t' name='t'>hello</textarea><input type='email' id='e' name='e'><button id='go'>Go</button><button id='clear' type='reset'>Reset</button></form><input id='other'></body></html>",
-        r#"
+  checked_page(
+    "<html><body><form id='f'><input id='i' name='q' value='start' required pattern='[a-z]+'><textarea id='t' name='t'>hello</textarea><input type='email' id='e' name='e'><button id='go'>Go</button><button id='clear' type='reset'>Reset</button></form><input id='other'></body></html>",
+    r#"
         const $ = id => document.getElementById(id), i = $('i'), t = $('t'), f = $('f');
         check('textarea class', () => t instanceof HTMLTextAreaElement && !(t instanceof HTMLInputElement) && !(i instanceof HTMLTextAreaElement) && t.type === 'textarea');
         i.value = 'abc';
@@ -801,14 +805,14 @@ fn text_controls_commit_change_on_blur_and_enter_and_forms_submit() {
         check('reset button restores defaults', () => i.value === 'start' && t.value === 'hello' && $('e').value === '');
         check('form data', () => { i.value = 'q1'; const data = new FormData(f); return data.get('q') === 'q1' && data.get('t') === 'hello' && !data.has('go'); });
         "#,
-    );
+  );
 }
 
 #[test]
 fn load_events_and_ready_state_follow_the_page_lifecycle() {
-    let (_, engine) = checked_page(
-        "<html><body></body></html>",
-        r#"
+  let (_, engine) = checked_page(
+    "<html><body></body></html>",
+    r#"
         globalThis.lifecycle = [document.readyState];
         document.addEventListener('readystatechange', () => lifecycle.push(document.readyState));
         document.addEventListener('DOMContentLoaded', e => lifecycle.push('DOMContentLoaded:' + e.isTrusted));
@@ -816,21 +820,21 @@ fn load_events_and_ready_state_follow_the_page_lifecycle() {
         __appsLoaded();
         check('interactive first', () => lifecycle.join() === 'loading,interactive,DOMContentLoaded:true');
         "#,
-    );
-    for _ in 0..20 {
-        engine.tick().unwrap();
-    }
-    assert_eq!(
-        engine.eval("lifecycle.join()", "test").unwrap(),
-        "loading,interactive,DOMContentLoaded:true,complete,load"
-    );
+  );
+  for _ in 0..20 {
+    engine.tick().unwrap();
+  }
+  assert_eq!(
+    engine.eval("lifecycle.join()", "test").unwrap(),
+    "loading,interactive,DOMContentLoaded:true,complete,load"
+  );
 }
 
 #[test]
 fn events_trust_errors_listener_signals_and_shadow_paths() {
-    checked_page(
-        "<html><body><form id='f'><input id='cb' type='checkbox'></form></body></html>",
-        r#"
+  checked_page(
+    "<html><body><form id='f'><input id='cb' type='checkbox'></form></body></html>",
+    r#"
         const log = [], cb = document.getElementById('cb'), f = document.getElementById('f');
         for (const type of ['click', 'input', 'change', 'submit', 'reset', 'invalid']) f.addEventListener(type, e => log.push(type + ':' + e.isTrusted), true);
         cb.click(); f.requestSubmit(); f.reset(); cb.required = true; cb.checkValidity();
@@ -863,14 +867,14 @@ fn events_trust_errors_listener_signals_and_shadow_paths() {
         const mo = new MutationObserver(() => {}); mo.observe(d, { attributes: true });
         check('toggleAttribute keeps a present attribute', () => d.toggleAttribute('hidden', true) && d.getAttribute('hidden') === 'until-found' && mo.takeRecords().length === 0);
         "#,
-    );
+  );
 }
 
 #[test]
 fn form_controls_keep_radio_groups_values_and_clones() {
-    checked_page(
-        "<html><body><form id='f'><input type=radio name=r value=1 checked><input type=radio name=r value=2 checked><select id=s name=s><option>a</option><option>b</option></select></form></body></html>",
-        r#"
+  checked_page(
+    "<html><body><form id='f'><input type=radio name=r value=1 checked><input type=radio name=r value=2 checked><select id=s name=s><option>a</option><option>b</option></select></form></body></html>",
+    r#"
         const f = document.getElementById('f'), [r1, r2] = f.querySelectorAll('[type=radio]');
         check('the last parsed checked radio wins', () => !r1.checked && r2.checked && !r1.matches(':checked') && [...new FormData(f)].map(e => e.join('=')).join('&') === 'r=2&s=a');
         r1.checked = true; r2.removeAttribute('checked'); r2.setAttribute('checked', '');
@@ -888,14 +892,14 @@ fn form_controls_keep_radio_groups_values_and_clones() {
         check('an unknown value selects nothing', () => s.selectedIndex === -1);
         s.append(new Option('c')); check('new options select the first again', () => s.selectedIndex === 0);
         "#,
-    );
+  );
 }
 
 #[test]
 fn text_field_selection_follows_chrome_on_value_writes_and_tab_focus() {
-    checked_page(
-        "<html><body><button id=s>s</button><input id=a value=hello><textarea id=t>abc def</textarea><input id=n type=number value=12><div contenteditable id=ce>x</div><input id=d value=xyz></body></html>",
-        r#"
+  checked_page(
+    "<html><body><button id=s>s</button><input id=a value=hello><textarea id=t>abc def</textarea><input id=n type=number value=12><div contenteditable id=ce>x</div><input id=d value=xyz></body></html>",
+    r#"
         const $ = id => document.getElementById(id), sel = el => [el.selectionStart, el.selectionEnd].join();
         const a = $('a'), t = $('t');
         check('a fresh field has its caret at the start', () => sel(a) === '0,0' && sel(t) === '0,0');
@@ -924,14 +928,14 @@ fn text_field_selection_follows_chrome_on_value_writes_and_tab_focus() {
         fresh.defaultValue = 'abc'; form.reset();
         check('reset keeps the selection when the value stays', () => [same, dirty, area].every(field => sel(field) === '1,2') && fresh.value === 'abc' && sel(fresh) === '0,0');
         "#,
-    );
+  );
 }
 
 #[test]
 fn contenteditable_typing_edits_text_nodes_and_splits_paragraphs() {
-    checked_page(
-        "<html><body><div id='e' contenteditable='true'>ab</div></body></html>",
-        r#"
+  checked_page(
+    "<html><body><div id='e' contenteditable='true'>ab</div></body></html>",
+    r#"
         const e = document.getElementById('e'), text = e.firstChild;
         e.focus(); getSelection().collapse(text, 2);
         const types = [];
@@ -947,15 +951,15 @@ fn contenteditable_typing_edits_text_nodes_and_splits_paragraphs() {
         __appsDispatch('keydown', [], { key: 'Enter' });
         check('enter splits text ' + e.innerHTML, () => e.innerHTML === 'a<div>bc</div><div>d</div>');
         "#,
-    );
+  );
 }
 
 #[test]
 fn focus_visible_follows_the_input_modality() {
-    let (_, engine) = css_page(
-        "<html><head><style>:focus-visible{color:red}</style></head><body><button id=b>b</button><input id=i><button id=c>c</button></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><head><style>:focus-visible{color:red}</style></head><body><button id=b>b</button><input id=i><button id=c>c</button></body></html>",
+  );
+  engine.eval(r#"
         const b = document.getElementById('b'), i = document.getElementById('i'), c = document.getElementById('c');
         const down = node => __appsDispatch('pointerdown', [node._id], { pointerId: 1, pointerType: 'mouse', clientX: 1, clientY: 1, button: 0 });
         const up = node => __appsDispatch('pointerup', [node._id], { pointerId: 1, pointerType: 'mouse', clientX: 1, clientY: 1, button: 0 });
@@ -977,10 +981,10 @@ fn focus_visible_follows_the_input_modality() {
 
 #[test]
 fn script_focus_in_a_press_keeps_the_last_focus_modality() {
-    let (_, engine) = css_page(
-        "<html><body><div id=d tabindex=-1>d</div><button id=c>c</button><p id=p>p</p><input id=r type=range></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><body><div id=d tabindex=-1>d</div><button id=c>c</button><p id=p>p</p><input id=r type=range></body></html>",
+  );
+  engine.eval(r#"
         const $ = id => document.getElementById(id);
         const press = node => { __appsDispatch('pointerdown', [node._id], { pointerId: 1, pointerType: 'mouse', clientX: 1, clientY: 1, button: 0 }); __appsDispatch('pointerup', [node._id], { pointerId: 1, pointerType: 'mouse', clientX: 1, clientY: 1, button: 0 }); };
         $('d').addEventListener('pointerdown', () => $('d').focus());
@@ -998,10 +1002,10 @@ fn script_focus_in_a_press_keeps_the_last_focus_modality() {
 
 #[test]
 fn presses_and_labels_set_the_focus_modality_like_chrome() {
-    let (_, engine) = css_page(
-        "<html><body><button id=a>a</button><button id=b>b</button><p id=p>p</p><p id=x>x</p><label id=l>label <input id=c type=checkbox></label></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><body><button id=a>a</button><button id=b>b</button><p id=p>p</p><p id=x>x</p><label id=l>label <input id=c type=checkbox></label></body></html>",
+  );
+  engine.eval(r#"
         const $ = id => document.getElementById(id), shown = id => document.activeElement === $(id) && $(id).matches(':focus-visible');
         const send = (name, node) => __appsDispatch(name, [node._id], { pointerId: 1, pointerType: 'mouse', clientX: 1, clientY: 1, button: 0 });
         const click = node => { send('pointerdown', node); send('pointerup', node); __appsDispatch('click', [node._id], { clientX: 1, clientY: 1, button: 0, detail: 1 }); };
@@ -1028,8 +1032,8 @@ fn presses_and_labels_set_the_focus_modality_like_chrome() {
 
 #[test]
 fn shift_arrows_do_not_scroll_like_chrome() {
-    let (_, engine) = css_page("<html><body><p>p</p></body></html>");
-    engine.eval(r#"
+  let (_, engine) = css_page("<html><body><p>p</p></body></html>");
+  engine.eval(r#"
         const calls = [];
         document.scrollingElement.scrollBy = options => calls.push(Object.keys(options)[0]);
         for (const [key, shiftKey] of [['ArrowRight', true], ['ArrowDown', true], ['PageDown', true], ['ArrowRight', false], [' ', true]]) __appsDispatch('keydown', [], { key, code: key, shiftKey });
@@ -1039,10 +1043,10 @@ fn shift_arrows_do_not_scroll_like_chrome() {
 
 #[test]
 fn tab_goes_on_from_the_last_press_or_removed_focus() {
-    let (_, engine) = css_page(
-        "<html><body><button id=a>a</button><div><button id=b>b</button><button id=c>c</button></div><p id=p>p</p><button id=d>d</button><div id=e><button id=f>f</button></div><button id=g>g</button><div id=host></div><p id=q>q</p><button id=h>h</button></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><body><button id=a>a</button><div><button id=b>b</button><button id=c>c</button></div><p id=p>p</p><button id=d>d</button><div id=e><button id=f>f</button></div><button id=g>g</button><div id=host></div><p id=q>q</p><button id=h>h</button></body></html>",
+  );
+  engine.eval(r#"
         const $ = id => document.getElementById(id);
         const tab = (shiftKey = false) => { __appsDispatch('keydown', [], { key: 'Tab', code: 'Tab', shiftKey }); return document.activeElement.id; };
         const press = node => { __appsDispatch('pointerdown', [node._id], { pointerId: 1, pointerType: 'mouse', clientX: 1, clientY: 1, button: 0 }); __appsDispatch('pointerup', [node._id], { pointerId: 1, pointerType: 'mouse', clientX: 1, clientY: 1, button: 0 }); };
@@ -1075,9 +1079,9 @@ fn tab_goes_on_from_the_last_press_or_removed_focus() {
 
 #[test]
 fn indexes_follow_ids_labels_forms_and_bases() {
-    checked_page(
-        "<html><head><title> a  b </title></head><body><form id='f'><input id='in' name='r' type='radio'><label for='in'>one</label></form><label>two <input id='nested'></label><input form='f' id='out' name='r' type='radio'><template><i id='hidden'></i></template><a id='link' href='x/y'>l</a></body></html>",
-        r#"
+  checked_page(
+    "<html><head><title> a  b </title></head><body><form id='f'><input id='in' name='r' type='radio'><label for='in'>one</label></form><label>two <input id='nested'></label><input form='f' id='out' name='r' type='radio'><template><i id='hidden'></i></template><a id='link' href='x/y'>l</a></body></html>",
+    r#"
         const input = document.getElementById('in'), out = document.getElementById('out'), form = document.getElementById('f');
         check('ids', () => input?.localName === 'input' && document.getElementById('hidden') === null && document.getElementById('none') === null);
         const twin = document.createElement('b'); twin.id = 'in';
@@ -1105,16 +1109,16 @@ fn indexes_follow_ids_labels_forms_and_bases() {
         div.className = 'x'; div.classList.remove('x');
         check('an existing class attribute stays', () => div.getAttribute('class') === '');
         "#,
-    );
+  );
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 fn select_popup_picks_options() {
-    let (_, engine) = css_page(
-        "<select id='s'><option>One<optgroup label='G'><option disabled>Two<option>Three</optgroup><hr><option hidden>Four<option>Five</select>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<select id='s'><option>One<optgroup label='G'><option disabled>Two<option>Three</optgroup><hr><option hidden>Four<option>Five</select>",
+  );
+  engine.eval(r#"
         const s = document.getElementById('s'), seen = [];
         for (const type of ['input', 'change']) s.addEventListener(type, () => seen.push(type + ':' + s.value));
         const press = () => __appsDispatch('pointerdown', [s.selectedOptions[0]._id, s._id], {pointerId:1, pointerType:'mouse', clientX:1, clientY:1, button:0, buttons:1});
@@ -1134,10 +1138,10 @@ fn select_popup_picks_options() {
 
 #[test]
 fn tab_order_includes_custom_elements_with_their_own_tab_index() {
-    let (_, engine) = css_page(
-        "<html><body><button id='a'></button><x-pad id='pad' contenteditable='true'></x-pad><button id='b'></button></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><body><button id='a'></button><x-pad id='pad' contenteditable='true'></x-pad><button id='b'></button></body></html>",
+  );
+  engine.eval(r#"
         customElements.define('x-pad', class extends HTMLElement { get tabIndex() { return 0; } });
         const order = [];
         for (let n = 0; n < 3; n++) { __appsDispatch('keydown', [], { key: 'Tab' }); order.push(document.activeElement.id); }
@@ -1147,9 +1151,9 @@ fn tab_order_includes_custom_elements_with_their_own_tab_index() {
 
 #[test]
 fn events_like_chrome() {
-    checked_page(
-        "<html><body><form id='f'><input name='q' value='1'></form><span id='s'></span></body></html>",
-        r#"
+  checked_page(
+    "<html><body><form id='f'><input name='q' value='1'></form><span id='s'></span></body></html>",
+    r#"
         const s = document.getElementById('s'), f = document.getElementById('f');
         let seen;
         s.addEventListener('q', e => { seen = [e.srcElement, window.event === e]; });
@@ -1167,14 +1171,14 @@ fn events_like_chrome() {
         check('abort reason', () => new AbortController().signal.reason === undefined && (c => (c.abort(), c.signal.reason.message === 'signal is aborted without reason'))(new AbortController()));
         check('window.postMessage', () => typeof postMessage === 'function' && typeof requestIdleCallback === 'function');
     "#,
-    );
+  );
 }
 
 #[test]
 fn form_controls_like_chrome() {
-    checked_page(
-        "<html><body><form id='f'><input type='radio' name='r' value='x'><input type='radio' name='r' value='y' checked><input name='a'><input name='a'></form><input id='lv' type='hidden'></body></html>",
-        r#"
+  checked_page(
+    "<html><body><form id='f'><input type='radio' name='r' value='x'><input type='radio' name='r' value='y' checked><input name='a'><input name='a'></form><input id='lv' type='hidden'></body></html>",
+    r#"
         const f = document.getElementById('f'), input = type => Object.assign(document.createElement('input'), { type });
         check('radio node lists', () => f.elements.r instanceof RadioNodeList && f.elements.r.value === 'y' && f.elements.a.length === 2 && (f.elements.r.value = 'x', f.elements.r[0].checked));
         check('form fields', () => f.autocomplete === 'on' && f.encoding === 'application/x-www-form-urlencoded' && f.acceptCharset === '');
@@ -1192,14 +1196,14 @@ fn form_controls_like_chrome() {
         check('option selectedness', () => !new Option('t', 'v', true, false).selected);
         check('hidden inputs have no labels', () => document.getElementById('lv').labels === null);
     "#,
-    );
+  );
 }
 
 #[test]
 fn rendered_text_and_removed_focus_like_chrome() {
-    checked_page(
-        "<html><body><div id='t'><span style='text-transform:uppercase'>up</span> <span style='text-transform:lowercase'>LOW</span><textarea>ta</textarea><canvas>fallback</canvas></div><div id='box'><input id='i'></div></body></html>",
-        r#"
+  checked_page(
+    "<html><body><div id='t'><span style='text-transform:uppercase'>up</span> <span style='text-transform:lowercase'>LOW</span><textarea>ta</textarea><canvas>fallback</canvas></div><div id='box'><input id='i'></div></body></html>",
+    r#"
         const $ = id => document.getElementById(id), seen = [];
         check('innerText', () => $('t').innerText === 'UP low');
         const p = document.createElement('p'); p.innerHTML = '<b>a</b><b>b</b>'; document.body.append(p);
@@ -1211,14 +1215,14 @@ fn rendered_text_and_removed_focus_like_chrome() {
         const again = document.createElement('input'); again.id = 'j'; $('box').append(again); again.focus(); seen.length = 0; $('box').textContent = '';
         check('cleared parents blur too', () => seen.join() === 'blur:document:j,blur:box:j,focusout:document:j,focusout:box:j');
     "#,
-    );
+  );
 }
 
 #[test]
 fn native_mouse_and_key_events_carry_chrome_fields() {
-    checked_page(
-        "<body><div id=a></div><input id=t><label id=l for=c>l</label><input type=checkbox id=c></body>",
-        r#"
+  checked_page(
+    "<body><div id=a></div><input id=t><label id=l for=c>l</label><input type=checkbox id=c></body>",
+    r#"
         const [a, t, l, c] = ['a', 't', 'l', 'c'].map(id => document.getElementById(id)), log = [];
         for (const type of ['pointerover', 'mouseover', 'pointermove', 'mousemove', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'])
             a.addEventListener(type, e => log.push([type, e.button, e.which, e.detail, e.clientX, e.offsetX].join(' ')));
@@ -1243,15 +1247,15 @@ fn native_mouse_and_key_events_carry_chrome_fields() {
         check('which in the init', () => new KeyboardEvent('keydown', { keyCode: 13, which: 13 }).which === 13);
         check('key fields: ' + log.join(), () => typed && !blocked && log.join() === 'keydown a 65 0 65 0,keypress a 97 97 97 0,keydown x 88 0 88 0,keypress x 120 120 120 0,keydown ArrowLeft 37 0 37 0,keydown Shift 16 0 16 1');
         "#,
-    );
+  );
 }
 
 #[test]
 fn focus_tab_order_and_radio_keys_follow_chrome() {
-    checked_page(
-        "<body><input id=i1><div id=e contenteditable>ed</div><button id=h style='visibility:hidden'>h</button><a id=a0>a</a><dialog id=d open>d</dialog><input id=i2>\
+  checked_page(
+    "<body><input id=i1><div id=e contenteditable>ed</div><button id=h style='visibility:hidden'>h</button><a id=a0>a</a><dialog id=d open>d</dialog><input id=i2>\
          <input type=radio name=g id=r1><input type=radio name=g id=r2 disabled><input type=radio name=g id=r3></body>",
-        r#"
+    r#"
         const $ = id => document.getElementById(id), log = [];
         for (const type of ['focus', 'blur', 'focusout', 'change']) document.addEventListener(type, e => log.push(type + ':' + e.target.id + ':' + (document.activeElement.id || document.activeElement.localName)), true);
         $('i1').focus();
@@ -1272,14 +1276,14 @@ fn focus_tab_order_and_radio_keys_follow_chrome() {
         __appsDispatch('keyup', [], { key: ' ', keyCode: 32 });
         check('arrows move in the group: ' + clicks.join(), () => clicks.join() === 'click:r3,change:r3,click:r1,change:r1' && $('r1').checked && document.activeElement.id === 'r1');
         "#,
-    );
+  );
 }
 
 #[test]
 fn editing_keys_fire_input_events_like_chrome() {
-    checked_page(
-        "<body><input id=i value=ab><div id=e contenteditable>one <b id=b>two</b> three</div><label id=l for=i>l</label></body>",
-        r#"
+  checked_page(
+    "<body><input id=i value=ab><div id=e contenteditable>one <b id=b>two</b> three</div><label id=l for=i>l</label></body>",
+    r#"
         const $ = id => document.getElementById(id), log = [];
         for (const type of ['beforeinput', 'input']) document.addEventListener(type, e => log.push(type + ':' + e.inputType));
         $('i').focus(); $('i').setSelectionRange(0, 0);
@@ -1295,13 +1299,13 @@ fn editing_keys_fire_input_events_like_chrome() {
         const event = new MouseEvent('x', { clientX: 10.7, screenY: 3.5 });
         check('mouse events keep whole coordinates', () => event.clientX === 10 && event.screenY === 3 && new PointerEvent('x', { clientX: 10.7 }).clientX === 10.7);
         "#,
-    );
+  );
 }
 
 #[test]
 fn data_and_blob_requests_fire_each_event_once_with_their_url() {
-    let (.., result) = offscreen_page(
-        r#"
+  let (.., result) = offscreen_page(
+    r#"
         const blob = URL.createObjectURL(new Blob(['b']));
         for (const [url, text, final] of [['data:,abc#x', 'abc', 'data:,abc'], [blob + '#f', 'b', blob]]) {
           const response = await fetch(url);
@@ -1313,14 +1317,14 @@ fn data_and_blob_requests_fire_each_event_once_with_their_url() {
           same([xhr.responseURL, xhr.responseText, events.filter(type => type !== 'readystatechange')], [final, text, ['load', 'onload', 'loadend']], 'xhr ' + url);
         }
         "#,
-    );
-    assert_eq!(result, "ok");
+  );
+  assert_eq!(result, "ok");
 }
 
 #[test]
 fn an_xhr_aborted_mid_body_has_no_response_text() {
-    let (.., result) = offscreen_page(
-        r#"
+  let (.., result) = offscreen_page(
+    r#"
         const xhr = new XMLHttpRequest(), seen = [];
         xhr.onprogress = () => xhr.abort();
         await new Promise(resolve => {
@@ -1335,6 +1339,6 @@ fn an_xhr_aborted_mid_body_has_no_response_text() {
         xhr.abort();
         same([xhr.readyState, xhr.status, xhr.responseText, xhr.getResponseHeader('content-type')], [0, 0, '', null], 'abort when done');
         "#,
-    );
-    assert_eq!(result, "ok");
+  );
+  assert_eq!(result, "ok");
 }

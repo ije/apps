@@ -15,13 +15,13 @@ use crate::platform::lock;
 use crate::{Cursor, Rect, WindowOptions, platform::Callbacks};
 use anyhow::Result;
 use objc2::{
-    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
-    rc::{Retained, autoreleasepool},
-    runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject},
+  DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+  rc::{Retained, autoreleasepool},
+  runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject},
 };
 use objc2_app_kit::{
-    NSApp, NSApplicationActivationPolicy, NSApplicationDelegate, NSApplicationTerminateReply,
-    NSPasteboard, NSPasteboardTypeString, NSScreen,
+  NSApp, NSApplicationActivationPolicy, NSApplicationDelegate, NSApplicationTerminateReply,
+  NSPasteboard, NSPasteboardTypeString, NSScreen,
 };
 use objc2_foundation::{NSArray, NSString, NSURL, NSUserDefaults};
 use std::cell::RefCell;
@@ -30,8 +30,8 @@ pub use controls::control_size;
 pub(crate) use glass::available as supports_glass;
 pub(crate) use metal::{Atlas, Present, prewarm};
 pub(crate) use threads::{
-    AppThread, app_thread, ask, end_thread, native_after, native_post, native_sync, park_render,
-    post, run_after, spawn_render,
+  AppThread, app_thread, ask, end_thread, native_after, native_post, native_sync, park_render,
+  post, run_after, spawn_render,
 };
 pub(crate) use window::Window;
 pub use window::WindowControl;
@@ -43,12 +43,12 @@ pub(crate) struct Sendable<T>(T);
 unsafe impl<T> Send for Sendable<T> {}
 
 impl<T> Sendable<T> {
-    pub fn new(value: T) -> Self {
-        Self(value)
-    }
-    pub fn take(self) -> T {
-        self.0
-    }
+  pub fn new(value: T) -> Self {
+    Self(value)
+  }
+  pub fn take(self) -> T {
+    self.0
+  }
 }
 
 define_class!(
@@ -113,71 +113,71 @@ define_class!(
 pub(crate) struct Platform;
 
 impl Platform {
-    pub fn new() -> Self {
-        Self
-    }
+  pub fn new() -> Self {
+    Self
+  }
 
-    pub fn run(&self, on_launch: Box<dyn FnOnce()>) {
-        threads::main_source();
-        let mtm = MainThreadMarker::new().expect("the app must start on the main thread");
-        let delegate = Delegate::alloc(mtm).set_ivars(RefCell::new(Some(on_launch)));
-        // SAFETY: a plain NSObject init.
-        let delegate: Retained<Delegate> = unsafe { msg_send![super(delegate), init] };
-        // AppKit keeps only a weak reference, and `delegate` lives until the loop ends.
-        NSApp(mtm).setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-        autoreleasepool(|_| NSApp(mtm).run());
-    }
+  pub fn run(&self, on_launch: Box<dyn FnOnce()>) {
+    threads::main_source();
+    let mtm = MainThreadMarker::new().expect("the app must start on the main thread");
+    let delegate = Delegate::alloc(mtm).set_ivars(RefCell::new(Some(on_launch)));
+    // SAFETY: a plain NSObject init.
+    let delegate: Retained<Delegate> = unsafe { msg_send![super(delegate), init] };
+    // AppKit keeps only a weak reference, and `delegate` lives until the loop ends.
+    NSApp(mtm).setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+    autoreleasepool(|_| NSApp(mtm).run());
+  }
 
-    pub fn quit() {
-        // After the current event: terminating closes windows, and their callbacks need the app.
-        native_post(Box::new(|| {
-            threads::post_local(|| NSApp(MainThreadMarker::new().unwrap()).terminate(None))
-        }));
-    }
+  pub fn quit() {
+    // After the current event: terminating closes windows, and their callbacks need the app.
+    native_post(Box::new(|| {
+      threads::post_local(|| NSApp(MainThreadMarker::new().unwrap()).terminate(None))
+    }));
+  }
 
-    pub fn activate(ignoring_other_apps: bool) {
-        native_post(Box::new(move || {
-            #[allow(deprecated)]
-            NSApp(MainThreadMarker::new().unwrap()).activateIgnoringOtherApps(ignoring_other_apps);
-        }));
-    }
+  pub fn activate(ignoring_other_apps: bool) {
+    native_post(Box::new(move || {
+      #[allow(deprecated)]
+      NSApp(MainThreadMarker::new().unwrap()).activateIgnoringOtherApps(ignoring_other_apps);
+    }));
+  }
 
-    pub fn read_clipboard(&self) -> Option<String> {
-        // SAFETY: the type is an AppKit constant.
-        native_sync(|| unsafe {
-            NSPasteboard::generalPasteboard()
-                .stringForType(NSPasteboardTypeString)
-                .map(|text| text.to_string())
-        })
-    }
+  pub fn read_clipboard(&self) -> Option<String> {
+    // SAFETY: the type is an AppKit constant.
+    native_sync(|| unsafe {
+      NSPasteboard::generalPasteboard()
+        .stringForType(NSPasteboardTypeString)
+        .map(|text| text.to_string())
+    })
+  }
 
-    pub fn write_clipboard(&self, text: &str) {
-        native_sync(|| {
-            let board = NSPasteboard::generalPasteboard();
-            board.clearContents();
-            // SAFETY: the type is an AppKit constant.
-            unsafe { board.setString_forType(&NSString::from_str(text), NSPasteboardTypeString) };
-        });
-    }
+  pub fn write_clipboard(&self, text: &str) {
+    native_sync(|| {
+      let board = NSPasteboard::generalPasteboard();
+      board.clearContents();
+      // SAFETY: the type is an AppKit constant.
+      unsafe { board.setString_forType(&NSString::from_str(text), NSPasteboardTypeString) };
+    });
+  }
 
-    pub fn set_cursor(&self, cursor: Cursor) {
-        native_post(Box::new(move || nswindow::set_cursor(cursor)));
-    }
+  pub fn set_cursor(&self, cursor: Cursor) {
+    native_post(Box::new(move || nswindow::set_cursor(cursor)));
+  }
 
-    // The cached screen saves a wait for main, which is busy while the app launches.
-    pub fn primary_display_bounds(&self) -> Option<Rect> {
-        screen::work_area().or_else(|| {
-            native_sync(|| {
-                let primary = NSScreen::screens(MainThreadMarker::new().unwrap()).firstObject()?;
-                Some(screen::flip(
-                    primary.visibleFrame(),
-                    primary.frame().size.height,
-                ))
-            })
-        })
-    }
+  // The cached screen saves a wait for main, which is busy while the app launches.
+  pub fn primary_display_bounds(&self) -> Option<Rect> {
+    screen::work_area().or_else(|| {
+      native_sync(|| {
+        let primary = NSScreen::screens(MainThreadMarker::new().unwrap()).firstObject()?;
+        Some(screen::flip(
+          primary.visibleFrame(),
+          primary.frame().size.height,
+        ))
+      })
+    })
+  }
 
-    pub fn open_window(&self, options: &WindowOptions, callbacks: Callbacks) -> Result<Window> {
-        Window::open(options, callbacks)
-    }
+  pub fn open_window(&self, options: &WindowOptions, callbacks: Callbacks) -> Result<Window> {
+    Window::open(options, callbacks)
+  }
 }

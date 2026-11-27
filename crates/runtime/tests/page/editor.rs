@@ -1,73 +1,72 @@
 use apps_runtime::{
-    dom::Document, host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role,
-    render::Page,
+  dom::Document, host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role, render::Page,
 };
 use std::{
-    cell::RefCell,
-    rc::Rc,
-    time::{Duration, Instant},
+  cell::RefCell,
+  rc::Rc,
+  time::{Duration, Instant},
 };
 
 #[test]
 fn editor_selection_keyboard_and_input_events() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse(
-                "<html><body><test-editor></test-editor><textarea></textarea></body></html>",
-            ),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
+  let host = Rc::new(RefCell::new(Host::default()));
+  host.borrow().store.borrow_mut().pages.insert(
+    1,
+    Page {
+      doc: Document::parse(
+        "<html><body><test-editor></test-editor><textarea></textarea></body></html>",
+      ),
+      dirty: false,
+      ..Default::default()
+    },
+  );
+  let engine = JsContext::new(
+    JavaScriptCore::load().unwrap(),
+    host.clone(),
+    Role::Renderer(1),
+  )
+  .unwrap();
+  engine
+    .eval(include_str!("editor.js"), "editor-tests")
     .unwrap();
-    engine
-        .eval(include_str!("editor.js"), "editor-tests")
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        engine.tick().unwrap();
-        let result = engine.eval("editorResult", "test").unwrap();
-        if result != "pending" {
-            assert_eq!(result, "ok");
-            break;
-        }
-        assert!(Instant::now() < deadline, "Editor tests timed out");
-        std::thread::sleep(Duration::from_millis(1));
+  let deadline = Instant::now() + Duration::from_secs(60);
+  loop {
+    engine.tick().unwrap();
+    let result = engine.eval("editorResult", "test").unwrap();
+    if result != "pending" {
+      assert_eq!(result, "ok");
+      break;
     }
-    let composition = serde_json::json!({"op":"window","args":["composition",1]});
-    let ended = host
-        .borrow()
-        .commands
-        .iter()
-        .filter(|command| **command == composition)
-        .count();
-    assert_eq!(
-        ended, 7,
-        "Each finished composition asks the window to drop its own"
-    );
+    assert!(Instant::now() < deadline, "Editor tests timed out");
+    std::thread::sleep(Duration::from_millis(1));
+  }
+  let composition = serde_json::json!({"op":"window","args":["composition",1]});
+  let ended = host
+    .borrow()
+    .commands
+    .iter()
+    .filter(|command| **command == composition)
+    .count();
+  assert_eq!(
+    ended, 7,
+    "Each finished composition asks the window to drop its own"
+  );
 }
 
 #[test]
 fn page_text_selection_respects_user_select() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
+  let host = Rc::new(RefCell::new(Host::default()));
+  host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><body><p id='first'>alpha beta</p><p id='blocked' style='user-select:none'>hidden<span id='override' style='user-select:text'>visible</span></p><p id='last'>gamma delta</p><p id='all' style='user-select:all'>whole <span>group</span></p><p id='alias' style='-webkit-user-select:none'>alias</p><button>button</button></body></html>"),
         dirty: false, ..Default::default()
     });
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
-    engine.eval(r#"
+  let engine = JsContext::new(
+    JavaScriptCore::load().unwrap(),
+    host.clone(),
+    Role::Renderer(1),
+  )
+  .unwrap();
+  engine.eval(r#"
         const assert=(value,message)=>{if(!value)throw Error(message)};
         const first=document.getElementById('first').firstChild, last=document.getElementById('last').firstChild;
         const blocked=document.getElementById('blocked').firstChild, override=document.getElementById('override').firstChild;
@@ -122,269 +121,269 @@ fn page_text_selection_respects_user_select() {
         editor.focus();selected.selectAllChildren(editor);
         assert(selected.toString()==='editable','Editable content remains selectable under none');
     "#, "page-selection").unwrap();
-    assert_eq!(
-        host.borrow().store.borrow().pages[&1]
-            .state
-            .interaction
-            .selection_caret,
-        None
-    );
+  assert_eq!(
+    host.borrow().store.borrow().pages[&1]
+      .state
+      .interaction
+      .selection_caret,
+    None
+  );
 }
 
 #[test]
 fn selection_paint_ranges_and_native_text_offsets() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse("<div contenteditable><span>A😀</span><b>BC</b><i>文D</i></div>"),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
+  let host = Rc::new(RefCell::new(Host::default()));
+  host.borrow().store.borrow_mut().pages.insert(
+    1,
+    Page {
+      doc: Document::parse("<div contenteditable><span>A😀</span><b>BC</b><i>文D</i></div>"),
+      dirty: false,
+      ..Default::default()
+    },
+  );
+  let engine = JsContext::new(
+    JavaScriptCore::load().unwrap(),
+    host.clone(),
+    Role::Renderer(1),
+  )
+  .unwrap();
+  engine.eval("const editor=document.querySelector('div');editor.focus();const a=editor.firstChild.firstChild,b=editor.children[1].firstChild,c=editor.lastChild.firstChild;getSelection().setBaseAndExtent(c,1,a,1)", "test").unwrap();
+  let ranges = host.borrow().store.borrow().pages[&1]
+    .state
+    .interaction
+    .selection
+    .clone();
+  for (name, expected) in [("a", [1, 3]), ("b", [0, 2]), ("c", [0, 1])] {
+    let id: usize = engine
+      .eval(&format!("{name}._id"), "test")
+      .unwrap()
+      .parse()
+      .unwrap();
+    assert_eq!(ranges[&id], expected);
+  }
+  assert_eq!(
+    engine
+      .eval(
+        "JSON.stringify([__appsEditing().start,__appsEditing().end])",
+        "test"
+      )
+      .unwrap(),
+    "[6,1]"
+  );
+  engine
+    .eval("getSelection().removeAllRanges()", "test")
     .unwrap();
-    engine.eval("const editor=document.querySelector('div');editor.focus();const a=editor.firstChild.firstChild,b=editor.children[1].firstChild,c=editor.lastChild.firstChild;getSelection().setBaseAndExtent(c,1,a,1)", "test").unwrap();
-    let ranges = host.borrow().store.borrow().pages[&1]
-        .state
-        .interaction
-        .selection
-        .clone();
-    for (name, expected) in [("a", [1, 3]), ("b", [0, 2]), ("c", [0, 1])] {
-        let id: usize = engine
-            .eval(&format!("{name}._id"), "test")
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert_eq!(ranges[&id], expected);
-    }
-    assert_eq!(
-        engine
-            .eval(
-                "JSON.stringify([__appsEditing().start,__appsEditing().end])",
-                "test"
-            )
-            .unwrap(),
-        "[6,1]"
-    );
-    engine
-        .eval("getSelection().removeAllRanges()", "test")
-        .unwrap();
-    assert!(
-        host.borrow().store.borrow().pages[&1]
-            .state
-            .interaction
-            .selection
-            .is_empty()
-    );
-    engine
-        .eval("getSelection().collapse(c,1);__appsInput('x')", "test")
-        .unwrap();
-    assert_eq!(
-        engine.eval("editor.textContent", "test").unwrap(),
-        "A😀BC文xD"
-    );
+  assert!(
+    host.borrow().store.borrow().pages[&1]
+      .state
+      .interaction
+      .selection
+      .is_empty()
+  );
+  engine
+    .eval("getSelection().collapse(c,1);__appsInput('x')", "test")
+    .unwrap();
+  assert_eq!(
+    engine.eval("editor.textContent", "test").unwrap(),
+    "A😀BC文xD"
+  );
 }
 
 #[test]
 fn empty_selection_fragments_are_not_carets() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
+  let host = Rc::new(RefCell::new(Host::default()));
+  host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<div contenteditable><span>A</span><span></span><span>\n</span><span>B</span></div><textarea>A\n\nB</textarea><pre>read only</pre>"),
         dirty: false, ..Default::default()
     });
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
+  let engine = JsContext::new(
+    JavaScriptCore::load().unwrap(),
+    host.clone(),
+    Role::Renderer(1),
+  )
+  .unwrap();
+  engine.eval("const editor=document.querySelector('div');editor.children[1].append(document.createTextNode(''));editor.focus();getSelection().selectAllChildren(editor)", "test").unwrap();
+  let empty: usize = engine
+    .eval("editor.children[1].firstChild._id", "test")
+    .unwrap()
+    .parse()
+    .unwrap();
+  assert_eq!(
+    host.borrow().store.borrow().pages[&1]
+      .state
+      .interaction
+      .selection[&empty],
+    [0, 0]
+  );
+  assert_eq!(
+    host.borrow().store.borrow().pages[&1]
+      .state
+      .interaction
+      .selection_caret,
+    None
+  );
+  engine
+    .eval(
+      "getSelection().collapse(editor.children[1].firstChild,0)",
+      "test",
     )
     .unwrap();
-    engine.eval("const editor=document.querySelector('div');editor.children[1].append(document.createTextNode(''));editor.focus();getSelection().selectAllChildren(editor)", "test").unwrap();
-    let empty: usize = engine
-        .eval("editor.children[1].firstChild._id", "test")
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert_eq!(
-        host.borrow().store.borrow().pages[&1]
-            .state
-            .interaction
-            .selection[&empty],
-        [0, 0]
-    );
-    assert_eq!(
-        host.borrow().store.borrow().pages[&1]
-            .state
-            .interaction
-            .selection_caret,
-        None
-    );
-    engine
-        .eval(
-            "getSelection().collapse(editor.children[1].firstChild,0)",
-            "test",
-        )
-        .unwrap();
-    assert_eq!(
-        host.borrow().store.borrow().pages[&1]
-            .state
-            .interaction
-            .selection_caret,
-        Some(empty)
-    );
-    engine
-        .eval(
-            "getSelection().collapse(document.querySelector('pre').firstChild,4)",
-            "test",
-        )
-        .unwrap();
-    assert_eq!(
-        host.borrow().store.borrow().pages[&1]
-            .state
-            .interaction
-            .selection_caret,
-        None
-    );
-    engine
-        .eval("getSelection().removeAllRanges()", "test")
-        .unwrap();
-    assert_eq!(
-        host.borrow().store.borrow().pages[&1]
-            .state
-            .interaction
-            .selection_caret,
-        None
-    );
-    engine
-        .eval(
-            "const input=document.querySelector('textarea');input.focus();input.select()",
-            "test",
-        )
-        .unwrap();
-    assert_eq!(
-        host.borrow().store.borrow().pages[&1]
-            .state
-            .interaction
-            .selection_caret,
-        None
-    );
-    engine.eval("input.setSelectionRange(2,2)", "test").unwrap();
-    let input: usize = engine.eval("input._id", "test").unwrap().parse().unwrap();
-    assert_eq!(
-        host.borrow().store.borrow().pages[&1]
-            .state
-            .interaction
-            .selection_caret,
-        Some(input)
-    );
+  assert_eq!(
+    host.borrow().store.borrow().pages[&1]
+      .state
+      .interaction
+      .selection_caret,
+    Some(empty)
+  );
+  engine
+    .eval(
+      "getSelection().collapse(document.querySelector('pre').firstChild,4)",
+      "test",
+    )
+    .unwrap();
+  assert_eq!(
+    host.borrow().store.borrow().pages[&1]
+      .state
+      .interaction
+      .selection_caret,
+    None
+  );
+  engine
+    .eval("getSelection().removeAllRanges()", "test")
+    .unwrap();
+  assert_eq!(
+    host.borrow().store.borrow().pages[&1]
+      .state
+      .interaction
+      .selection_caret,
+    None
+  );
+  engine
+    .eval(
+      "const input=document.querySelector('textarea');input.focus();input.select()",
+      "test",
+    )
+    .unwrap();
+  assert_eq!(
+    host.borrow().store.borrow().pages[&1]
+      .state
+      .interaction
+      .selection_caret,
+    None
+  );
+  engine.eval("input.setSelectionRange(2,2)", "test").unwrap();
+  let input: usize = engine.eval("input._id", "test").unwrap().parse().unwrap();
+  assert_eq!(
+    host.borrow().store.borrow().pages[&1]
+      .state
+      .interaction
+      .selection_caret,
+    Some(input)
+  );
 }
 
 #[test]
 fn native_ranges_respect_element_boundaries_and_utf16_offsets() {
-    let mut doc = Document::parse("<div><span>A😀</span><b>BC</b><i>文D</i><em>outside</em></div>");
-    let mut state = apps_runtime::render::PageState::default();
-    let parent = doc.nodes.iter().position(|node| node.tag == "div").unwrap();
-    let children = doc.nodes[parent].children.clone();
-    let text: Vec<_> = children
-        .iter()
-        .map(|&id| doc.nodes[id].children[0])
-        .collect();
-    for (bounds, expected) in [
-        (
-            [text[0], 1, text[2], 1],
-            serde_json::json!([[text[0], 1, 3], [text[1], 0, 2], [text[2], 0, 1]]),
-        ),
-        (
-            [parent, 1, parent, 3],
-            serde_json::json!([[text[1], 0, 2], [text[2], 0, 2]]),
-        ),
-        ([parent, 1, parent, 1], serde_json::json!([])),
-        (
-            [text[1], 1, text[1], 1],
-            serde_json::json!([[text[1], 1, 1]]),
-        ),
-        (
-            [text[1], 1, parent, 2],
-            serde_json::json!([[text[1], 1, 2]]),
-        ),
-    ] {
-        let actual = apps_runtime::dom_call(
-            "dom.rangeNodes",
-            &serde_json::json!(bounds),
-            &mut doc,
-            &mut state,
-            [800., 600.],
-        )
-        .unwrap();
-        assert_eq!(actual, expected);
-    }
+  let mut doc = Document::parse("<div><span>A😀</span><b>BC</b><i>文D</i><em>outside</em></div>");
+  let mut state = apps_runtime::render::PageState::default();
+  let parent = doc.nodes.iter().position(|node| node.tag == "div").unwrap();
+  let children = doc.nodes[parent].children.clone();
+  let text: Vec<_> = children
+    .iter()
+    .map(|&id| doc.nodes[id].children[0])
+    .collect();
+  for (bounds, expected) in [
+    (
+      [text[0], 1, text[2], 1],
+      serde_json::json!([[text[0], 1, 3], [text[1], 0, 2], [text[2], 0, 1]]),
+    ),
+    (
+      [parent, 1, parent, 3],
+      serde_json::json!([[text[1], 0, 2], [text[2], 0, 2]]),
+    ),
+    ([parent, 1, parent, 1], serde_json::json!([])),
+    (
+      [text[1], 1, text[1], 1],
+      serde_json::json!([[text[1], 1, 1]]),
+    ),
+    (
+      [text[1], 1, parent, 2],
+      serde_json::json!([[text[1], 1, 2]]),
+    ),
+  ] {
+    let actual = apps_runtime::dom_call(
+      "dom.rangeNodes",
+      &serde_json::json!(bounds),
+      &mut doc,
+      &mut state,
+      [800., 600.],
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
+  }
 }
 
 #[test]
 fn caret_hit_testing_uses_the_nearest_visible_text() {
-    let mut doc = Document::parse(
-        "<html><body><div contenteditable><span>first</span><span>second</span><span style='visibility:hidden'>hidden</span></div></body></html>",
+  let mut doc = Document::parse(
+    "<html><body><div contenteditable><span>first</span><span>second</span><span style='visibility:hidden'>hidden</span></div></body></html>",
+  );
+  let mut state = apps_runtime::render::PageState::default();
+  for (id, node) in doc.nodes.iter().enumerate() {
+    let text = if node.tag == "span" {
+      &doc.nodes[node.children[0]].text
+    } else {
+      &node.text
+    };
+    let top = match text.as_str() {
+      "first" => 0.,
+      "second" => 20.,
+      _ => 40.,
+    };
+    let rect = match node.tag.as_str() {
+      "#text" => [0., top, 40., 20.],
+      "span" => [0., top, 100., 20.],
+      _ => [0., 0., 100., 100.],
+    };
+    state.geometry.mirror.insert(id, rect);
+  }
+  for (point, expected) in [
+    ([10, 10], Some("first")),
+    ([90, 30], Some("second")),
+    ([90, 80], Some("second")),
+    ([-1, 10], None),
+  ] {
+    let actual = apps_runtime::dom_call(
+      "dom.hitTest",
+      &serde_json::json!([point[0], point[1], true, true]),
+      &mut doc,
+      &mut state,
+      [800., 600.],
+    )
+    .unwrap();
+    assert_eq!(
+      actual
+        .as_u64()
+        .map(|id| doc.nodes[id as usize].text.as_str()),
+      expected
     );
-    let mut state = apps_runtime::render::PageState::default();
-    for (id, node) in doc.nodes.iter().enumerate() {
-        let text = if node.tag == "span" {
-            &doc.nodes[node.children[0]].text
-        } else {
-            &node.text
-        };
-        let top = match text.as_str() {
-            "first" => 0.,
-            "second" => 20.,
-            _ => 40.,
-        };
-        let rect = match node.tag.as_str() {
-            "#text" => [0., top, 40., 20.],
-            "span" => [0., top, 100., 20.],
-            _ => [0., 0., 100., 100.],
-        };
-        state.geometry.mirror.insert(id, rect);
-    }
-    for (point, expected) in [
-        ([10, 10], Some("first")),
-        ([90, 30], Some("second")),
-        ([90, 80], Some("second")),
-        ([-1, 10], None),
-    ] {
-        let actual = apps_runtime::dom_call(
-            "dom.hitTest",
-            &serde_json::json!([point[0], point[1], true, true]),
-            &mut doc,
-            &mut state,
-            [800., 600.],
-        )
-        .unwrap();
-        assert_eq!(
-            actual
-                .as_u64()
-                .map(|id| doc.nodes[id as usize].text.as_str()),
-            expected
-        );
-    }
+  }
 }
 
 #[test]
 fn contenteditable_spaces_block_joins_and_typing_style_like_chrome() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
+  let host = Rc::new(RefCell::new(Host::default()));
+  host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><body><div id=a contenteditable>ab</div><div id=b contenteditable><p>one</p><p>two <i>it</i></p></div><div id=c contenteditable>x <b id=cb>bold</b></div><div id=e contenteditable>one <b id=eb>twZo</b> three</div><div id=g contenteditable>x <b>bold</b> rest</div><div id=h contenteditable><p>one</p><p>two</p></div><div id=k contenteditable>start</div><div id=m contenteditable><p>a <b>b</b></p><p>c <i>d</i></p></div><div id=n contenteditable><p id=n0>alpha one</p><p>beta</p><p>gamma</p></div><div id=r contenteditable><p>one</p><p>two</p></div><div id=t contenteditable><p>bee</p></div><div id=q contenteditable>\n<p>one</p>\n<blockquote>\n<p>two</p>\n</blockquote>\n</div></body></html>"),
         dirty: false, ..Default::default()
     });
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
-    engine.eval(r#"
+  let engine = JsContext::new(
+    JavaScriptCore::load().unwrap(),
+    host.clone(),
+    Role::Renderer(1),
+  )
+  .unwrap();
+  engine.eval(r#"
         const assert=(value,message)=>{if(!value)throw Error(message)};
         const $=id=>document.getElementById(id), s=getSelection(), key=nativeKey=>__appsDispatch('keydown',[],{nativeKey});
         const steps=(el,list)=>list.map(step=>{if(step.length===1)__appsInput(step);else key(step);return el.innerHTML;}).join('|');
@@ -437,39 +436,39 @@ fn contenteditable_spaces_block_joins_and_typing_style_like_chrome() {
 
 #[test]
 fn focused_fields_keep_their_caret_when_the_tree_changes() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse("<div contenteditable>x</div><input value=abc>"),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
-    // The removal moves the document selection in a microtask, after the field has the focus.
-    let id: usize = engine
+  let host = Rc::new(RefCell::new(Host::default()));
+  host.borrow().store.borrow_mut().pages.insert(
+    1,
+    Page {
+      doc: Document::parse("<div contenteditable>x</div><input value=abc>"),
+      dirty: false,
+      ..Default::default()
+    },
+  );
+  let engine = JsContext::new(
+    JavaScriptCore::load().unwrap(),
+    host.clone(),
+    Role::Renderer(1),
+  )
+  .unwrap();
+  // The removal moves the document selection in a microtask, after the field has the focus.
+  let id: usize = engine
         .eval("const editor=document.querySelector('div'),field=document.querySelector('input');editor.focus();getSelection().collapse(editor.firstChild,1);editor.remove();field.focus();field._id", "test")
         .unwrap()
         .parse()
         .unwrap();
-    engine.eval("0", "test").unwrap();
-    let at: usize = engine
-        .eval("field.selectionStart", "test")
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert_eq!(
-        host.borrow().store.borrow().pages[&1]
-            .state
-            .interaction
-            .selection
-            .get(&id),
-        Some(&[at, at])
-    );
+  engine.eval("0", "test").unwrap();
+  let at: usize = engine
+    .eval("field.selectionStart", "test")
+    .unwrap()
+    .parse()
+    .unwrap();
+  assert_eq!(
+    host.borrow().store.borrow().pages[&1]
+      .state
+      .interaction
+      .selection
+      .get(&id),
+    Some(&[at, at])
+  );
 }

@@ -3,8 +3,8 @@ use super::*;
 #[test]
 #[ignore = "requires the macOS window server"]
 fn canvases_draw_their_drawable_elements() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const frames = async (done, what) => {
             for (let n = 0; n < 60; n++) { await win.webContents.capturePage(); if (await run(done)) return; }
@@ -43,9 +43,9 @@ fn canvases_draw_their_drawable_elements() {
         await run('c.clearElementGeometry(box)');
         await frames('at(110, 50) === "c"', 'cleared geometry still takes the pointer');
         "#,
-        &[(
-            "page.html",
-            "<body style='margin:0;background:white'>\
+    &[(
+      "page.html",
+      "<body style='margin:0;background:white'>\
              <canvas id=c width=200 height=100 content=drawable style='display:block;width:200px;height:100px'>\
              <div id=box drawable style='width:50px;height:30px;background:rgb(255,0,0)'></div>\
              <div id=plain style='width:50px;height:30px;background:rgb(0,0,255)'></div>\
@@ -59,15 +59,15 @@ fn canvases_draw_their_drawable_elements() {
                return { paints, changed, empty: pixel(10, 10), rect: [r.x, r.y, r.width, r.height].join(), matrix: m.e + ',' + m.f, plain, size: size.width + ',' + size.height }; };\
              c.onpaint = event => { paints++; changed = event.changedElements.map(element => element.id).join(); ctx.reset(); ctx.drawElementImage(box, 100, 40); ctx.drawElementImage(field, 20, 75); };\
              </script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn svg_text_takes_its_decoration_from_css() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         await win.webContents.capturePage();
         // Counts the dark device pixels of each 60 px row: plain text, an attribute, CSS, and text in a link,
@@ -76,26 +76,26 @@ fn svg_text_takes_its_decoration_from_css() {
         const [plain, attribute, css, linked] = [await ink(0), await ink(60), await ink(120), await ink(180)];
         if (!(attribute > plain) || css !== attribute || linked !== plain) fail('underline ink: ' + [plain, attribute, css, linked].join());
         "#,
-        &[(
-            "page.html",
-            "<body style='margin:0;background:#fff'><style>svg{display:block}.u{text-decoration:underline}</style>\
+    &[(
+      "page.html",
+      "<body style='margin:0;background:#fff'><style>svg{display:block}.u{text-decoration:underline}</style>\
              <svg width=300 height=60><text x=10 y=40 font-size=30>mmmm</text></svg>\
              <svg width=300 height=60><text x=10 y=40 font-size=30 text-decoration=underline>mmmm</text></svg>\
              <svg width=300 height=60><text x=10 y=40 font-size=30 class=u>mmmm</text></svg>\
              <a href='#x' style='text-decoration:underline;color:#000'><svg width=300 height=60><text x=10 y=40 font-size=30>mmmm</text></svg></a></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn video_frames_keep_the_boxes_around_them() {
-    let clip = url::Url::from_file_path(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/media/clip.mp4"),
-    )
-    .unwrap();
-    let page = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("video.html");
-    std::fs::write(
+  let clip = url::Url::from_file_path(
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/media/clip.mp4"),
+  )
+  .unwrap();
+  let page = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("video.html");
+  std::fs::write(
         &page,
         format!(
             "<body id=body style='margin:0'><div id=outer>\
@@ -104,9 +104,9 @@ fn video_frames_keep_the_boxes_around_them() {
         ),
     )
     .unwrap();
-    let text = run_hidden(
-        &format!(
-            r#"{STEPS}
+  let text = run_hidden(
+    &format!(
+      r#"{STEPS}
             await win.loadFile({page:?});
             await run("globalThis.v = document.getElementById('v'); v.play().catch(error => console.error(String(error))); 1");
             for (let tries = 0; tries < 200 && !(await run('v.currentTime') > 0.2); tries++) {{
@@ -123,38 +123,39 @@ fn video_frames_keep_the_boxes_around_them() {
             console.log('PLAYED ' + start + ' ' + await run('v.currentTime'));
             console.log('VIDEO ' + await pixel(30, 20));
             "#
-        ),
-        &[("package.json", r#"{"features":["media"]}"#)],
-    );
-    let line = |name: &str| {
-        text.lines()
-            .find_map(|line| line.strip_prefix(name))
-            .unwrap_or_else(|| panic!("{text}"))
-            .trim()
-            .to_owned()
-    };
-    let played: Vec<f64> = line("PLAYED")
-        .split(' ')
-        .map(|time| time.parse().unwrap())
-        .collect();
-    assert!(played[0] > 0.2 && played[1] != played[0], "{text}");
-    assert_eq!(built(&text, "video"), [""; 0], "{text}");
-    let video: Vec<u8> = line("VIDEO")
-        .split(',')
-        .map(|value| value.parse().unwrap())
-        .collect();
-    assert!(
-        video[2] > 180 && (90..170).contains(&video[1]) && video[0] < 80,
-        "the clip's orange frame shows: {video:?}"
-    );
+    ),
+    &[("package.json", r#"{"features":["media"]}"#)],
+  );
+  let line = |name: &str| {
+    text
+      .lines()
+      .find_map(|line| line.strip_prefix(name))
+      .unwrap_or_else(|| panic!("{text}"))
+      .trim()
+      .to_owned()
+  };
+  let played: Vec<f64> = line("PLAYED")
+    .split(' ')
+    .map(|time| time.parse().unwrap())
+    .collect();
+  assert!(played[0] > 0.2 && played[1] != played[0], "{text}");
+  assert_eq!(built(&text, "video"), [""; 0], "{text}");
+  let video: Vec<u8> = line("VIDEO")
+    .split(',')
+    .map(|value| value.parse().unwrap())
+    .collect();
+  assert!(
+    video[2] > 180 && (90..170).contains(&video[1]) && video[0] < 80,
+    "the clip's orange frame shows: {video:?}"
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn canvases_keep_the_ratio_of_their_attributes() {
-    let text = run_hidden(
-        &format!(
-            r#"{RECTS}
+  let text = run_hidden(
+    &format!(
+      r#"{RECTS}
             await load('canvas.html');
             await run("const x = document.getElementById('p').getContext('2d'); x.fillStyle = 'red'; x.fillRect(0, 0, 40, 20);\
                 createImageBitmap(new OffscreenCanvas(50, 40)).then(bitmap => document.getElementById('b').getContext('bitmaprenderer').transferFromImageBitmap(bitmap))");
@@ -165,10 +166,10 @@ fn canvases_keep_the_ratio_of_their_attributes() {
             const [x, y] = JSON.parse(await run("(r => JSON.stringify([r.x, r.y]))(document.getElementById('p').getBoundingClientRect())"));
             console.log('PADDING ' + await pixel(x + 8, y + 8) + ' ' + await pixel(x + 16, y + 16) + ' ' + await pixel(x + 16, y + 52));
             "#
-        ),
-        &[(
-            "canvas.html",
-            "<body style='margin:0'><style>.w{display:flow-root;width:400px}</style>\
+    ),
+    &[(
+      "canvas.html",
+      "<body style='margin:0'><style>.w{display:flow-root;width:400px}</style>\
              <div class=w><canvas id=p width=40 height=20 style='display:block;padding:10px;border:4px solid black;background:blue;width:80px;height:auto'></canvas></div>\
              <div class=w><canvas id=a width=200 height=100 style='display:block;width:100%;height:auto'></canvas></div>\
              <div class=w style='width:100px'><canvas id=m width=200 height=100 style='display:block;max-width:100%;height:auto'></canvas></div>\
@@ -180,42 +181,42 @@ fn canvases_keep_the_ratio_of_their_attributes() {
              <div class=w><canvas id=h width=200 height=100 style='display:block;height:50px'></canvas></div>\
              <div class=w><canvas id=b width=200 height=100 style='display:block;width:100px;height:auto'></canvas></div>\
              </body>",
-        )],
-    );
-    let rects = rects(&text);
-    for (id, rect) in [
-        ("a", "0,0,400,200"),
-        ("m", "0,0,100,50"),
-        ("r", "0,0,100,100"),
-        ("n", "0,0,100,50"),
-        ("d", "0,0,400,200"),
-        ("f", "0,0,400,200"),
-        ("g", "0,0,300,150"),
-        ("h", "0,0,100,50"),
-        ("b", "0,0,100,50"),
-        ("p", "0,0,108,68"),
-    ] {
-        assert_eq!(rects[id], rect, "canvas {id}, as in Chrome: {text}");
-    }
-    let padding: Vec<_> = text
-        .lines()
-        .find_map(|line| line.strip_prefix("PADDING "))
-        .unwrap_or_else(|| panic!("{text}"))
-        .split(' ')
-        .collect();
-    assert_eq!(
-        padding,
-        ["255,0,0", "0,0,255", "0,0,255"],
-        "the drawing fills the content box, not the padding: {text}"
-    );
+    )],
+  );
+  let rects = rects(&text);
+  for (id, rect) in [
+    ("a", "0,0,400,200"),
+    ("m", "0,0,100,50"),
+    ("r", "0,0,100,100"),
+    ("n", "0,0,100,50"),
+    ("d", "0,0,400,200"),
+    ("f", "0,0,400,200"),
+    ("g", "0,0,300,150"),
+    ("h", "0,0,100,50"),
+    ("b", "0,0,100,50"),
+    ("p", "0,0,108,68"),
+  ] {
+    assert_eq!(rects[id], rect, "canvas {id}, as in Chrome: {text}");
+  }
+  let padding: Vec<_> = text
+    .lines()
+    .find_map(|line| line.strip_prefix("PADDING "))
+    .unwrap_or_else(|| panic!("{text}"))
+    .split(' ')
+    .collect();
+  assert_eq!(
+    padding,
+    ["255,0,0", "0,0,255", "0,0,255"],
+    "the drawing fills the content box, not the padding: {text}"
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn failed_images_show_their_alt_text_like_chrome() {
-    let (text, rects) = picture_rects(
-        "alt.html",
-        "<body style='margin:0;font:16px/18px sans-serif'><style>.w{width:300px}.g{display:grid;grid-template-columns:min-content}</style>\
+  let (text, rects) = picture_rects(
+    "alt.html",
+    "<body style='margin:0;font:16px/18px sans-serif'><style>.w{width:300px}.g{display:grid;grid-template-columns:min-content}</style>\
          <div class=w><img id=a0 src='missing.png' alt='Hello'></div>\
          <div class=w><img id=a1 src='missing.png' alt='Hello' width=120 height=40 style='width:90px'></div>\
          <div class=w><img id=a2 src='missing.png' alt='Hello' width=150 height=40 style='display:block'></div>\
@@ -232,67 +233,67 @@ fn failed_images_show_their_alt_text_like_chrome() {
          <div class='w g' style='grid-template-columns:max-content'><span id=g5>Hello world</span></div>\
          <div class='w g'><img id=g6 src='missing.png' alt='Hello world' style='white-space:nowrap'></div>\
          <div class=w style='width:40px'><img id=a11 src='missing.png' alt='Hello world'></div></body>",
-    );
-    let width = |id: &str| rects[id].split(',').nth(2).unwrap().parse::<f32>().unwrap();
-    assert!(width("a0") > 40., "alt text: {text}");
-    assert!(rects["a0"].ends_with(",18"), "one line high: {text}");
-    for id in ["a1", "a8"] {
-        assert_eq!(width(id), width("a0"), "{id} ignores its size: {text}");
-    }
-    for (id, rect) in [
-        ("a2", "0,0,150,40"),
-        ("a4", "0,0,16,16"),
-        ("a5", "0,0,16,16"),
-        ("a6", "0,0,60,30"),
-        ("a7", "0,0,60,30"),
-        ("a9", "0,0,120,40"),
-    ] {
-        assert_eq!(rects[id], rect, "{id}, as in Chrome: {text}");
-    }
-    assert!(rects["a3"].ends_with(",0,0"), "empty alt text: {text}");
-    assert!(
-        rects["w1"].starts_with(&format!("{},0,", width("w0"))),
-        "inline after inline: {text}"
-    );
-    let height = |id: &str| rects[id].split(',').nth(3).unwrap().parse::<f32>().unwrap();
-    assert!(
-        rects["a10"].starts_with("0,18,60,") && height("a10") >= 36.,
-        "long alt text wraps in its line: {text}"
-    );
-    for (id, word, high) in [("g0", "g1", 52.), ("g2", "g3", 36.)] {
-        assert_eq!(
-            width(id),
-            width(word),
-            "{id} is as wide as its longest word: {text}"
-        );
-        assert_eq!(
-            height(id),
-            high,
-            "{id} text goes below the icon only when its first word doesn't fit beside it: {text}"
-        );
-    }
-    assert!(
-        (width("g4") - width("g5") - 16.).abs() < 0.02 && height("g4") == 18.,
-        "the max-content width holds the icon: {text}"
-    );
-    assert!(
-        (width("g6") - width("g5")).abs() < 0.02 && height("g6") == 18.,
-        "the icon doesn't widen the min-content width of text that can't wrap: {text}"
+  );
+  let width = |id: &str| rects[id].split(',').nth(2).unwrap().parse::<f32>().unwrap();
+  assert!(width("a0") > 40., "alt text: {text}");
+  assert!(rects["a0"].ends_with(",18"), "one line high: {text}");
+  for id in ["a1", "a8"] {
+    assert_eq!(width(id), width("a0"), "{id} ignores its size: {text}");
+  }
+  for (id, rect) in [
+    ("a2", "0,0,150,40"),
+    ("a4", "0,0,16,16"),
+    ("a5", "0,0,16,16"),
+    ("a6", "0,0,60,30"),
+    ("a7", "0,0,60,30"),
+    ("a9", "0,0,120,40"),
+  ] {
+    assert_eq!(rects[id], rect, "{id}, as in Chrome: {text}");
+  }
+  assert!(rects["a3"].ends_with(",0,0"), "empty alt text: {text}");
+  assert!(
+    rects["w1"].starts_with(&format!("{},0,", width("w0"))),
+    "inline after inline: {text}"
+  );
+  let height = |id: &str| rects[id].split(',').nth(3).unwrap().parse::<f32>().unwrap();
+  assert!(
+    rects["a10"].starts_with("0,18,60,") && height("a10") >= 36.,
+    "long alt text wraps in its line: {text}"
+  );
+  for (id, word, high) in [("g0", "g1", 52.), ("g2", "g3", 36.)] {
+    assert_eq!(
+      width(id),
+      width(word),
+      "{id} is as wide as its longest word: {text}"
     );
     assert_eq!(
-        rects["a11"], "0,0,40,52",
-        "an image wider than its line stays on it: {text}"
+      height(id),
+      high,
+      "{id} text goes below the icon only when its first word doesn't fit beside it: {text}"
     );
+  }
+  assert!(
+    (width("g4") - width("g5") - 16.).abs() < 0.02 && height("g4") == 18.,
+    "the max-content width holds the icon: {text}"
+  );
+  assert!(
+    (width("g6") - width("g5")).abs() < 0.02 && height("g6") == 18.,
+    "the icon doesn't widen the min-content width of text that can't wrap: {text}"
+  );
+  assert_eq!(
+    rects["a11"], "0,0,40,52",
+    "an image wider than its line stays on it: {text}"
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn images_that_fail_after_a_frame_show_their_alt_text() {
-    let page = "<body style='margin:0;font:16px/18px sans-serif'><style>.w{width:300px}.g{display:grid;grid-template-columns:min-content}</style>\
+  let page = "<body style='margin:0;font:16px/18px sans-serif'><style>.w{width:300px}.g{display:grid;grid-template-columns:min-content}</style>\
          <div class=w><img id=a0 src='PICTURE' alt='Hello'></div><div class=w><img id=a1 src='missing.png' alt='Hello'></div>\
          <div class=w><img id=a2 alt='Hello'></div><div class='w g'><img id=g0 src='PICTURE' alt='a verylongword'></div><div class='w g'><span id=g1>a verylongword</span></div>\
          <div class='w g'><input id=s0 type=Submit></div><div class='w g'><input id=s1 type=submit></div></body>";
-    let text = run_hidden(
+  let text = run_hidden(
         &format!(
             "{RECTS}{STEPS} const server = __apps.http
                 .createServer((request, response) => setTimeout(() => {{ response.statusCode = 404; response.end(); }}, 300))
@@ -316,55 +317,55 @@ fn images_that_fail_after_a_frame_show_their_alt_text() {
         ),
         &[("late.html", &page.replace("PICTURE", PICTURE))],
     );
-    let other = built(&text, "other");
-    assert!(
-        !other.contains(&"a0") && !other.contains(&"g0"),
-        "{other:?}"
-    );
-    let rects = rects(&text);
-    assert_eq!(
-        rects["a0"], rects["a1"],
-        "alt text after the picture: {text}"
-    );
-    assert_eq!(
-        rects["a2"], rects["a1"],
-        "alt text after a first frame without the picture: {text}"
-    );
-    let width = |id: &str| rects[id].split(',').nth(2).unwrap().parse::<f32>().unwrap();
-    assert_eq!(
-        width("g0"),
-        width("g1"),
-        "no size from the old picture: {text}"
-    );
-    assert!(
-        width("s0") > 20. && width("s0") == width("s1"),
-        "Submit label: {text}"
-    );
+  let other = built(&text, "other");
+  assert!(
+    !other.contains(&"a0") && !other.contains(&"g0"),
+    "{other:?}"
+  );
+  let rects = rects(&text);
+  assert_eq!(
+    rects["a0"], rects["a1"],
+    "alt text after the picture: {text}"
+  );
+  assert_eq!(
+    rects["a2"], rects["a1"],
+    "alt text after a first frame without the picture: {text}"
+  );
+  let width = |id: &str| rects[id].split(',').nth(2).unwrap().parse::<f32>().unwrap();
+  assert_eq!(
+    width("g0"),
+    width("g1"),
+    "no size from the old picture: {text}"
+  );
+  assert!(
+    width("s0") > 20. && width("s0") == width("s1"),
+    "Submit label: {text}"
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn videos_without_frames_take_the_ratio_of_their_attributes_like_chrome() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('video.html');
         // The attributes are an `aspect-ratio: auto 20 / 10` hint, which author styles replace.
         const heights = JSON.parse(await run(`JSON.stringify([...document.querySelectorAll('video')].map(v => v.getBoundingClientRect().height))`));
         if (heights[0] !== 10 || heights[1] !== 100) fail('heights: ' + heights);
         "#,
-        &[(
-            "video.html",
-            "<body style='margin:0'><video width=20 height=10 style='height:auto'></video>\
+    &[(
+      "video.html",
+      "<body style='margin:0'><video width=20 height=10 style='height:auto'></video>\
              <video width=20 height=10 style='width:100px;height:auto;aspect-ratio:auto 1/1'></video>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn images_take_object_position_and_image_rendering_like_chrome() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap().subarray(0, 3)].reverse();
         await load('images.html');
         const red = c => c[0] > 230 && c[1] < 20 && c[2] < 20, blue = c => c[2] > 230 && c[0] < 20 && c[1] < 20;
@@ -381,39 +382,39 @@ fn images_take_object_position_and_image_rendering_like_chrome() {
         [left, right] = [await pixel(100, 70), await pixel(163, 70)];
         if (!red(left) || !blue(right)) fail('smooth edges: ' + left + ' ' + right);
         "#,
-        &[(
-            "images.html",
-            "<style>body{margin:0}img{display:block;background:#ddd}</style>\
+    &[(
+      "images.html",
+      "<style>body{margin:0}img{display:block;background:#ddd}</style>\
              <div style='display:flex'><img src='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFElEQVR4nGP4z8DAwPCfCUQyMAAAFQcCATPcN/oAAAAASUVORK5CYII=' style='width:100px;height:40px;object-fit:contain;object-position:left'>\
              <img src='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFElEQVR4nGP4z8DAwPCfCUQyMAAAFQcCATPcN/oAAAAASUVORK5CYII=' style='width:100px;height:40px;object-fit:none;object-position:right 5px bottom 0px'></div>\
              <div style='display:flex'><img src='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFElEQVR4nGP4z8DAwPCfCUQyMAAAFQcCATPcN/oAAAAASUVORK5CYII=' style='width:64px;height:32px;image-rendering:pixelated'>\
              <img src='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFElEQVR4nGP4z8DAwPCfCUQyMAAAFQcCATPcN/oAAAAASUVORK5CYII=' style='margin-left:36px;width:64px;height:32px'></div>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn svg_grid_items_size_by_their_view_box_like_chrome() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         await load('t.html');
         console.log('SIZES ' + await run("[...'abcde'].map(id => { const r = document.getElementById(id).getBoundingClientRect(); return r.width + 'x' + r.height }).join(' ')"));
         "#,
-        &[(
-            "t.html",
-            "<body style='margin:0'><style>.g{display:grid;grid-template-columns:auto 1fr}</style>\
+    &[(
+      "t.html",
+      "<body style='margin:0'><style>.g{display:grid;grid-template-columns:auto 1fr}</style>\
              <div class=g><svg id=a viewBox='-50 -50 100 100' style='width:128px;height:auto'><circle r='40'/></svg><div>x</div></div>\
              <div class=g><svg id=b viewBox='0 0 100 50' style='width:60px'></svg></div>\
              <div class=g><svg id=c viewBox='0 0 100 50' width=40></svg></div>\
              <div class=g><svg id=d viewBox='0 0 100 50' style='height:10px'></svg></div>\
              <div class=g><svg id=e width=30 height=20></svg></div></body>",
-        )],
-    );
-    let sizes = text
-        .lines()
-        .find_map(|line| line.strip_prefix("SIZES "))
-        .unwrap_or_else(|| panic!("{text}"));
-    // Chrome's values: the CSS size and the view box ratio give the other side.
-    assert_eq!(sizes, "128x128 60x30 40x20 20x10 30x20");
+    )],
+  );
+  let sizes = text
+    .lines()
+    .find_map(|line| line.strip_prefix("SIZES "))
+    .unwrap_or_else(|| panic!("{text}"));
+  // Chrome's values: the CSS size and the view box ratio give the other side.
+  assert_eq!(sizes, "128x128 60x30 40x20 20x10 30x20");
 }

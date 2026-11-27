@@ -3,13 +3,13 @@ use std::{cell::RefCell, rc::Rc};
 
 #[test]
 fn sqlite_statements_values_and_lifecycle() {
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        Rc::new(RefCell::new(Host::default())),
-        Role::Main,
-    )
-    .unwrap();
-    engine.eval(r#"
+  let engine = JsContext::new(
+    JavaScriptCore::load().unwrap(),
+    Rc::new(RefCell::new(Host::default())),
+    Role::Main,
+  )
+  .unwrap();
+  engine.eval(r#"
         const { DatabaseSync, StatementSync } = __apps.sqlite;
         const assert = (value, message) => { if (!value) throw Error(message); };
         const throws = (fn, message) => {
@@ -124,13 +124,13 @@ fn sqlite_statements_values_and_lifecycle() {
 
 #[test]
 fn sqlite_iterators_release_statements_and_read_incrementally() {
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        Rc::new(RefCell::new(Host::default())),
-        Role::Preload(1),
-    )
-    .unwrap();
-    engine.eval(r#"
+  let engine = JsContext::new(
+    JavaScriptCore::load().unwrap(),
+    Rc::new(RefCell::new(Host::default())),
+    Role::Preload(1),
+  )
+  .unwrap();
+  engine.eval(r#"
         const assert = (value, message) => { if (!value) throw Error(message); };
         const db = new __apps.sqlite.DatabaseSync(':memory:');
         const query = db.prepare('WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1000000000) SELECT x FROM n');
@@ -167,13 +167,13 @@ fn sqlite_iterators_release_statements_and_read_incrementally() {
 
 #[test]
 fn sqlite_errors_match_node() {
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        Rc::new(RefCell::new(Host::default())),
-        Role::Main,
-    )
-    .unwrap();
-    engine.eval(r#"
+  let engine = JsContext::new(
+    JavaScriptCore::load().unwrap(),
+    Rc::new(RefCell::new(Host::default())),
+    Role::Main,
+  )
+  .unwrap();
+  engine.eval(r#"
         const db = new __apps.sqlite.DatabaseSync(':memory:');
         db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)');
         const insert = db.prepare('INSERT INTO t (name) VALUES (?)');
@@ -197,15 +197,15 @@ fn sqlite_errors_match_node() {
 
 #[test]
 fn sqlite_statement_of_a_reopened_database_is_finalized() {
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        Rc::new(RefCell::new(Host::default())),
-        Role::Main,
-    )
-    .unwrap();
-    engine
-        .eval(
-            r#"
+  let engine = JsContext::new(
+    JavaScriptCore::load().unwrap(),
+    Rc::new(RefCell::new(Host::default())),
+    Role::Main,
+  )
+  .unwrap();
+  engine
+    .eval(
+      r#"
         const db = new __apps.sqlite.DatabaseSync(':memory:');
         const query = db.prepare('SELECT 1 AS x');
         db.close();
@@ -215,7 +215,7 @@ fn sqlite_statement_of_a_reopened_database_is_finalized() {
         if (code !== 'ERR_INVALID_STATE|statement has been finalized') throw Error(code);
         db.close();
     "#,
-            "sqlite-reopen",
-        )
-        .unwrap();
+      "sqlite-reopen",
+    )
+    .unwrap();
 }

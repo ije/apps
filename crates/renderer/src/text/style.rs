@@ -28,75 +28,75 @@ keywords! {
 /// `font-size-adjust`: the size that makes `metric` this many times as large.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SizeAdjust {
-    pub metric: AdjustMetric,
-    pub value: f32,
+  pub metric: AdjustMetric,
+  pub value: f32,
 }
 
 #[derive(Clone, Default, PartialEq)]
 pub struct TextRun {
-    pub len: usize,
-    pub font: Font,
-    pub color: Color,
-    pub background_color: Option<Color>,
-    pub underline: Option<Decoration>,
-    pub strikethrough: Option<Decoration>,
-    pub overline: Option<Decoration>,
-    pub letter_spacing: Pixels,
-    pub word_spacing: Pixels,
-    pub font_size: Option<Pixels>,
-    pub inset: [Pixels; 2],
-    pub nowrap: bool,
-    /// Spaces at the end of a row stay.
-    pub preserve: bool,
-    /// `None` breaks at soft hyphens.
-    pub hyphenation: Option<Rc<Hyphenation>>,
-    /// The text is in a right-to-left paragraph.
-    pub rtl: bool,
-    /// `unicode-bidi: plaintext`: each line has the direction of its first letter.
-    pub plaintext: bool,
-    pub embedding: Option<Rc<Embedding>>,
-    /// The `Flow` sides of the floats that a line break clears.
-    pub clear: u8,
-    /// Spaces per tab stop, or pixels when negative.
-    pub tab_size: f32,
-    /// `-webkit-text-stroke`: the width and color of a line centered on the glyph outlines.
-    pub stroke: Option<(Pixels, Color)>,
-    pub emphasis: Option<Rc<Emphasis>>,
+  pub len: usize,
+  pub font: Font,
+  pub color: Color,
+  pub background_color: Option<Color>,
+  pub underline: Option<Decoration>,
+  pub strikethrough: Option<Decoration>,
+  pub overline: Option<Decoration>,
+  pub letter_spacing: Pixels,
+  pub word_spacing: Pixels,
+  pub font_size: Option<Pixels>,
+  pub inset: [Pixels; 2],
+  pub nowrap: bool,
+  /// Spaces at the end of a row stay.
+  pub preserve: bool,
+  /// `None` breaks at soft hyphens.
+  pub hyphenation: Option<Rc<Hyphenation>>,
+  /// The text is in a right-to-left paragraph.
+  pub rtl: bool,
+  /// `unicode-bidi: plaintext`: each line has the direction of its first letter.
+  pub plaintext: bool,
+  pub embedding: Option<Rc<Embedding>>,
+  /// The `Flow` sides of the floats that a line break clears.
+  pub clear: u8,
+  /// Spaces per tab stop, or pixels when negative.
+  pub tab_size: f32,
+  /// `-webkit-text-stroke`: the width and color of a line centered on the glyph outlines.
+  pub stroke: Option<(Pixels, Color)>,
+  pub emphasis: Option<Rc<Emphasis>>,
 }
 
 /// `text-emphasis`: the text of the mark over or under each letter, and its color.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Emphasis {
-    pub mark: Rc<str>,
-    pub color: Color,
-    pub under: bool,
+  pub mark: Rc<str>,
+  pub color: Color,
+  pub under: bool,
 }
 
 impl TextRun {
-    // A clone is large code.
-    #[inline(never)]
-    pub(super) fn part(&self, len: usize, inset: [Pixels; 2]) -> Self {
-        Self {
-            len,
-            inset,
-            ..self.clone()
-        }
+  // A clone is large code.
+  #[inline(never)]
+  pub(super) fn part(&self, len: usize, inset: [Pixels; 2]) -> Self {
+    Self {
+      len,
+      inset,
+      ..self.clone()
     }
+  }
 }
 
 /// Strikethroughs have no offset.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Decoration {
-    pub thickness: Pixels,
-    /// The text color when `None`.
-    pub color: Option<Color>,
-    pub style: DecorationStyle,
-    /// From the baseline, instead of the default place under it.
-    pub offset: Option<Pixels>,
-    /// Below the descenders, for `text-underline-position: under`.
-    pub under: bool,
-    /// The line leaves gaps around the ink that it would cross.
-    pub skip_ink: bool,
+  pub thickness: Pixels,
+  /// The text color when `None`.
+  pub color: Option<Color>,
+  pub style: DecorationStyle,
+  /// From the baseline, instead of the default place under it.
+  pub offset: Option<Pixels>,
+  /// Below the descenders, for `text-underline-position: under`.
+  pub under: bool,
+  /// The line leaves gaps around the ink that it would cross.
+  pub skip_ink: bool,
 }
 
 /// Declares `TextStyle` and its overrides from one list, so the two cannot drift.
@@ -174,107 +174,103 @@ text_style! {
 }
 
 impl TextStyle {
-    /// The indent in a paragraph of this width.
-    pub fn indent(&self, width: Pixels) -> Indent {
-        let indent = self.text_indent + width * self.text_indent_percent;
-        let [hanging, each] = self.text_indent_rows;
-        let [first, rest] = match hanging {
-            true => [Pixels::ZERO, indent],
-            false => [indent, Pixels::ZERO],
-        };
-        Indent { first, rest, each }
-    }
+  /// The indent in a paragraph of this width.
+  pub fn indent(&self, width: Pixels) -> Indent {
+    let indent = self.text_indent + width * self.text_indent_percent;
+    let [hanging, each] = self.text_indent_rows;
+    let [first, rest] = match hanging {
+      true => [Pixels::ZERO, indent],
+      false => [indent, Pixels::ZERO],
+    };
+    Indent { first, rest, each }
+  }
 
-    pub fn font(&self) -> Font {
-        let (family, features) = (self.font_family.clone(), self.font_features.clone());
-        let (weight, style) = (self.font_weight, self.font_style);
-        Font {
-            family,
-            features,
-            weight,
-            style,
-            synthesis: self.font_synthesis,
-            size_adjust: self.font_size_adjust,
-            ..Font::default()
-        }
+  pub fn font(&self) -> Font {
+    let (family, features) = (self.font_family.clone(), self.font_features.clone());
+    let (weight, style) = (self.font_weight, self.font_style);
+    Font {
+      family,
+      features,
+      weight,
+      style,
+      synthesis: self.font_synthesis,
+      size_adjust: self.font_size_adjust,
+      ..Font::default()
     }
+  }
 
-    pub fn run(&self, len: usize) -> TextRun {
-        let &Self {
-            color,
-            background_color,
-            underline,
-            strikethrough,
-            letter_spacing,
-            word_spacing,
-            ..
-        } = self;
-        TextRun {
-            len,
-            font: self.font(),
-            color,
-            background_color,
-            underline,
-            strikethrough,
-            overline: None,
-            letter_spacing,
-            word_spacing,
-            font_size: None,
-            inset: [Pixels::ZERO; 2],
-            nowrap: false,
-            preserve: false,
-            hyphenation: None,
-            rtl: false,
-            plaintext: false,
-            embedding: None,
-            clear: 0,
-            tab_size: 8.,
-            stroke: None,
-            emphasis: None,
-        }
+  pub fn run(&self, len: usize) -> TextRun {
+    let &Self {
+      color,
+      background_color,
+      underline,
+      strikethrough,
+      letter_spacing,
+      word_spacing,
+      ..
+    } = self;
+    TextRun {
+      len,
+      font: self.font(),
+      color,
+      background_color,
+      underline,
+      strikethrough,
+      overline: None,
+      letter_spacing,
+      word_spacing,
+      font_size: None,
+      inset: [Pixels::ZERO; 2],
+      nowrap: false,
+      preserve: false,
+      hyphenation: None,
+      rtl: false,
+      plaintext: false,
+      embedding: None,
+      clear: 0,
+      tab_size: 8.,
+      stroke: None,
+      emphasis: None,
     }
+  }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+  use super::*;
 
-    #[test]
-    fn overrides_replace_their_field_and_make_fonts_and_runs() {
-        let mut overrides = TextOverrides::default();
-        assert!(overrides.inherits());
-        overrides
-            .set_font_size(px(12.))
-            .set_color(Color::WHITE)
-            .set_font_size(px(14.));
-        overrides
-            .set_font_family("Menlo".into())
-            .set_font_weight(700.)
-            .set_font_style(FontStyle::Italic);
-        overrides
-            .set_letter_spacing(px(2.))
-            .set_text_overflow(Some("…".into()));
-        assert!(overrides.font_size == Some(px(14.)) && overrides.line_clamp.is_none());
-        let mut text = TextStyle::default();
-        let initial = text.clone();
-        text.refine(&overrides);
-        assert!(
-            text.font_size == px(14.)
-                && text.color == Color::WHITE
-                && text.line_height == initial.line_height
-        );
-        let font = text.font();
-        assert!(&*font.family == "Menlo" && font.weight == 700. && font.style == FontStyle::Italic);
-        let run = text.run(5);
-        assert!(
-            run.len == 5
-                && run.font == font
-                && run.letter_spacing == px(2.)
-                && run.font_size.is_none()
-        );
-        assert!(
-            text.text_overflow.as_deref() == Some("…")
-                && &*initial.font().family == ".SystemUIFont"
-        );
-    }
+  #[test]
+  fn overrides_replace_their_field_and_make_fonts_and_runs() {
+    let mut overrides = TextOverrides::default();
+    assert!(overrides.inherits());
+    overrides
+      .set_font_size(px(12.))
+      .set_color(Color::WHITE)
+      .set_font_size(px(14.));
+    overrides
+      .set_font_family("Menlo".into())
+      .set_font_weight(700.)
+      .set_font_style(FontStyle::Italic);
+    overrides
+      .set_letter_spacing(px(2.))
+      .set_text_overflow(Some("…".into()));
+    assert!(overrides.font_size == Some(px(14.)) && overrides.line_clamp.is_none());
+    let mut text = TextStyle::default();
+    let initial = text.clone();
+    text.refine(&overrides);
+    assert!(
+      text.font_size == px(14.)
+        && text.color == Color::WHITE
+        && text.line_height == initial.line_height
+    );
+    let font = text.font();
+    assert!(&*font.family == "Menlo" && font.weight == 700. && font.style == FontStyle::Italic);
+    let run = text.run(5);
+    assert!(
+      run.len == 5 && run.font == font && run.letter_spacing == px(2.) && run.font_size.is_none()
+    );
+    assert!(
+      text.text_overflow.as_deref() == Some("…") && &*initial.font().family == ".SystemUIFont"
+    );
+  }
 }

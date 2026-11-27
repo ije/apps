@@ -2,8 +2,8 @@ use super::*;
 
 #[test]
 fn window_scroll_moves_the_page() {
-    let (host, engine) = css_page("<html><body><main></main></body></html>");
-    engine.eval(r#"
+  let (host, engine) = css_page("<html><body><main></main></body></html>");
+  engine.eval(r#"
         const received = [];
         addEventListener('scroll', e => received.push([e.target === document, e.bubbles, scrollX, scrollY]));
         scrollTo(0, 40); scrollBy({top: 10});
@@ -20,44 +20,44 @@ fn window_scroll_moves_the_page() {
         document.documentElement.style.scrollBehavior = '';
         scrollTo(0, 50);
     "#, "test").unwrap();
-    host.borrow().store.borrow().pages[&1].state.geometry.scroll[&0]
-        .set_offset(renderer::point(renderer::px(0.), renderer::px(-120.)));
-    engine
-        .eval(
-            "__appsLayout(); if (scrollY !== 120) throw Error(String(scrollY));",
-            "test",
-        )
-        .unwrap();
+  host.borrow().store.borrow().pages[&1].state.geometry.scroll[&0]
+    .set_offset(renderer::point(renderer::px(0.), renderer::px(-120.)));
+  engine
+    .eval(
+      "__appsLayout(); if (scrollY !== 120) throw Error(String(scrollY));",
+      "test",
+    )
+    .unwrap();
 }
 
 #[test]
 fn hit_testing_follows_paint_order_clipping_and_shadow_trees() {
-    let (host, engine) = css_page(
-        "<html><body><div id='back'></div><div id='front'></div><div id='clip' style='overflow:hidden'><span id='child'></span></div><test-hit></test-hit></body></html>",
-    );
-    engine.eval("const shadowHost=document.querySelector('test-hit');shadowHost.attachShadow({mode:'open'}).innerHTML='<span id=\"inside\"></span>';", "test").unwrap();
-    {
-        let host = host.borrow().store.clone();
-        let mut host = host.borrow_mut();
-        let bounds: Vec<_> = host.pages[&1]
-            .doc
-            .nodes
-            .iter()
-            .enumerate()
-            .map(|(id, node)| {
-                let bounds = match node.attrs.get("id").map(String::as_str) {
-                    Some("clip") => [0., 0., 20., 20.],
-                    Some("child") => [10., 10., 50., 50.],
-                    Some("inside") => [70., 70., 20., 20.],
-                    _ if node.tag == "test-hit" => [70., 70., 20., 20.],
-                    _ => [0., 0., 100., 100.],
-                };
-                (id, bounds)
-            })
-            .collect();
-        host.state(1).geometry.mirror.extend(bounds);
-    }
-    engine.eval(r#"
+  let (host, engine) = css_page(
+    "<html><body><div id='back'></div><div id='front'></div><div id='clip' style='overflow:hidden'><span id='child'></span></div><test-hit></test-hit></body></html>",
+  );
+  engine.eval("const shadowHost=document.querySelector('test-hit');shadowHost.attachShadow({mode:'open'}).innerHTML='<span id=\"inside\"></span>';", "test").unwrap();
+  {
+    let host = host.borrow().store.clone();
+    let mut host = host.borrow_mut();
+    let bounds: Vec<_> = host.pages[&1]
+      .doc
+      .nodes
+      .iter()
+      .enumerate()
+      .map(|(id, node)| {
+        let bounds = match node.attrs.get("id").map(String::as_str) {
+          Some("clip") => [0., 0., 20., 20.],
+          Some("child") => [10., 10., 50., 50.],
+          Some("inside") => [70., 70., 20., 20.],
+          _ if node.tag == "test-hit" => [70., 70., 20., 20.],
+          _ => [0., 0., 100., 100.],
+        };
+        (id, bounds)
+      })
+      .collect();
+    host.state(1).geometry.mirror.extend(bounds);
+  }
+  engine.eval(r#"
         const front=document.getElementById('front'),back=document.getElementById('back');
         if(document.elementFromPoint(15,15).id!=='child')throw Error('Child hit order');
         if(document.elementFromPoint(40,40)!==front)throw Error('Overflow clipping');
@@ -80,41 +80,41 @@ fn hit_testing_follows_paint_order_clipping_and_shadow_trees() {
 
 #[test]
 fn hit_testing_takes_the_box_painted_last() {
-    let (host, engine) = css_page(
-        "<html><body><div id='panel' style='height:0'><button id='button'></button></div><pre id='code'><span id='line'>x</span></pre></body></html>",
-    );
-    let ids: Vec<usize> = ["body", "#panel", "#button", "#code", "#line"]
-        .iter()
-        .map(|selector| {
-            engine
-                .eval(&format!("document.querySelector('{selector}')._id"), "test")
-                .unwrap()
-                .parse()
-                .unwrap()
-        })
-        .collect();
-    {
-        let host = host.borrow().store.clone();
-        let mut host = host.borrow_mut();
-        let dom = host.state(1);
-        for (&id, bounds) in ids.iter().zip([
-            [0., 0., 100., 100.],
-            [0., 0., 100., 0.],
-            [10., 10., 40., 20.],
-            [0., 0., 100., 100.],
-            [0., 0., 100., 20.],
-        ]) {
-            dom.geometry.mirror.insert(id, bounds);
-        }
-        dom.layout.painted = vec![0; ids.iter().max().unwrap() + 1];
-        for (order, id) in [ids[0], ids[3], ids[4], ids[1], ids[2]]
-            .into_iter()
-            .enumerate()
-        {
-            dom.layout.painted[id] = order as u64 + 1;
-        }
+  let (host, engine) = css_page(
+    "<html><body><div id='panel' style='height:0'><button id='button'></button></div><pre id='code'><span id='line'>x</span></pre></body></html>",
+  );
+  let ids: Vec<usize> = ["body", "#panel", "#button", "#code", "#line"]
+    .iter()
+    .map(|selector| {
+      engine
+        .eval(&format!("document.querySelector('{selector}')._id"), "test")
+        .unwrap()
+        .parse()
+        .unwrap()
+    })
+    .collect();
+  {
+    let host = host.borrow().store.clone();
+    let mut host = host.borrow_mut();
+    let dom = host.state(1);
+    for (&id, bounds) in ids.iter().zip([
+      [0., 0., 100., 100.],
+      [0., 0., 100., 0.],
+      [10., 10., 40., 20.],
+      [0., 0., 100., 100.],
+      [0., 0., 100., 20.],
+    ]) {
+      dom.geometry.mirror.insert(id, bounds);
     }
-    engine.eval(r#"
+    dom.layout.painted = vec![0; ids.iter().max().unwrap() + 1];
+    for (order, id) in [ids[0], ids[3], ids[4], ids[1], ids[2]]
+      .into_iter()
+      .enumerate()
+    {
+      dom.layout.painted[id] = order as u64 + 1;
+    }
+  }
+  engine.eval(r#"
         if (document.elementFromPoint(20, 15).id !== 'button') throw Error('Later sibling hid a box painted above it');
         if (document.elementFromPoint(80, 15).id !== 'line') throw Error('Hit outside the button');
         if (document.elementsFromPoint(20, 15).map(node => node.id).slice(0, 3).join() !== 'button,line,code') throw Error('Stack order');
@@ -123,32 +123,33 @@ fn hit_testing_takes_the_box_painted_last() {
 
 #[test]
 fn scrolling_snaps_to_device_pixels_and_respects_scroll_margins() {
-    let (host, engine) = css_page(
-        "<html><body><div id='box' style='overflow:scroll;scroll-padding:0 10px 0 20%'><i id='caret' style='scroll-margin:0 8px 0 50px'></i><i id='plain'></i></div></body></html>",
-    );
-    let ids: Vec<usize> = ["#box", "#caret", "#plain"]
+  let (host, engine) = css_page(
+    "<html><body><div id='box' style='overflow:scroll;scroll-padding:0 10px 0 20%'><i id='caret' style='scroll-margin:0 8px 0 50px'></i><i id='plain'></i></div></body></html>",
+  );
+  let ids: Vec<usize> = ["#box", "#caret", "#plain"]
+    .iter()
+    .map(|selector| {
+      engine
+        .eval(&format!("document.querySelector('{selector}')._id"), "test")
+        .unwrap()
+        .parse()
+        .unwrap()
+    })
+    .collect();
+  {
+    let host = host.borrow().store.clone();
+    let mut host = host.borrow_mut();
+    let dom = host.state(1);
+    dom.pixel_ratio = 2.;
+    for (&id, bounds) in
+      ids
         .iter()
-        .map(|selector| {
-            engine
-                .eval(&format!("document.querySelector('{selector}')._id"), "test")
-                .unwrap()
-                .parse()
-                .unwrap()
-        })
-        .collect();
+        .zip([[0., 0., 200., 50.], [300., 0., 2., 20.], [40., 0., 2., 20.]])
     {
-        let host = host.borrow().store.clone();
-        let mut host = host.borrow_mut();
-        let dom = host.state(1);
-        dom.pixel_ratio = 2.;
-        for (&id, bounds) in
-            ids.iter()
-                .zip([[0., 0., 200., 50.], [300., 0., 2., 20.], [40., 0., 2., 20.]])
-        {
-            dom.geometry.mirror.insert(id, bounds);
-        }
+      dom.geometry.mirror.insert(id, bounds);
     }
-    engine.eval(r#"
+  }
+  engine.eval(r#"
         const box = document.getElementById('box');
         for (const [value, snapped] of [[12.367, 12.5], [12.25, 12.5], [12.75, 13]]) {
             box.scrollLeft = value;
@@ -162,8 +163,8 @@ fn scrolling_snaps_to_device_pixels_and_respects_scroll_margins() {
 
 #[test]
 fn screen_describes_the_viewport_without_a_window() {
-    let (.., result) = offscreen_page(
-        r#"
+  let (.., result) = offscreen_page(
+    r#"
         same([screen.width, screen.height, screen.availWidth, screen.availHeight, screen.availLeft, screen.availTop], [800, 600, 800, 600, 0, 0], 'size');
         same([screenX, screenY, screenLeft, screenTop, outerWidth, outerHeight], [0, 0, 0, 0, 800, 600], 'window frame');
         same([screen.colorDepth, screen.pixelDepth, screen.orientation.type, screen.orientation.angle], [24, 24, 'landscape-primary', 0], 'depth');
@@ -173,17 +174,17 @@ fn screen_describes_the_viewport_without_a_window() {
         const inner = await reply(worker(`postMessage([typeof screen, typeof screenX, typeof OffscreenCanvas, typeof createImageBitmap, typeof ImageBitmap])`));
         same(inner, ['undefined', 'undefined', 'function', 'function', 'function'], 'worker globals');
     "#,
-    );
-    assert_eq!(result, "ok");
+  );
+  assert_eq!(result, "ok");
 }
 
 #[test]
 fn mirror_follows_random_mutations_and_releases() {
-    for seed in 1..17u32 {
-        let (host, engine) = css_page(
-            "<html><body><div id=a class='x y'>t<!--c-->u<p>p</p></div><ul><li>1</li><li>2</li></ul></body></html>",
-        );
-        engine.eval(&format!(r#"
+  for seed in 1..17u32 {
+    let (host, engine) = css_page(
+      "<html><body><div id=a class='x y'>t<!--c-->u<p>p</p></div><ul><li>1</li><li>2</li></ul></body></html>",
+    );
+    engine.eval(&format!(r#"
           let seed = {seed};
           const rand = n => {{ seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; }};
           const root = document.body, pool = [], all = () => {{ const list = []; const walk = n => {{ list.push(n); for (const c of n.childNodes) walk(c); }}; walk(root); return list; }};
@@ -215,92 +216,93 @@ fn mirror_follows_random_mutations_and_releases() {
           globalThis.dumpMirror = () => {{ let out = ''; const walk = n => {{ out += '(' + (n.nodeType === 1 ? n.localName : n.nodeType === 11 ? '#fragment' : n.nodeName); if (n.nodeType === 3 || n.nodeType === 8) out += '|' + n.data; if (n.nodeType === 1) for (const name of n.getAttributeNames()) out += ' ' + name + '=' + n.getAttribute(name); if (n.shadowRoot) {{ out += '['; walk(n.shadowRoot); out += ']'; }} for (const c of n.childNodes) walk(c); out += ')'; }}; walk(document); return out; }};
           step();
         "#), "test").unwrap();
-        for round in 0..4 {
-            let rust = {
-                let host = host.borrow().store.clone();
-                let host = host.borrow();
-                let (doc, shadows) = (&host.pages[&1].doc, &host.pages[&1].state.tree.shadows);
-                let (mut out, mut pending) = (String::new(), vec![Ok(0)]);
-                while let Some(item) = pending.pop() {
-                    let id = match item {
-                        Ok(id) => id,
-                        Err(text) => {
-                            out.push_str(text);
-                            continue;
-                        }
-                    };
-                    let node = &doc.nodes[id];
-                    out.push('(');
-                    out.push_str(&node.tag);
-                    if matches!(node.tag.as_str(), "#text" | "#comment") {
-                        out.push('|');
-                        out.push_str(&node.text);
-                    }
-                    for (key, value) in &node.attrs {
-                        out.push_str(&format!(" {key}={value}"));
-                    }
-                    assert!(
-                        node.children
-                            .iter()
-                            .all(|&child| doc.nodes[child].parent == Some(id))
-                    );
-                    pending.push(Err(")"));
-                    pending.extend(node.children.iter().rev().map(|&child| Ok(child)));
-                    if let Some(&root) = shadows.get(&id) {
-                        pending.extend([Err("]"), Ok(root), Err("[")]);
-                    }
-                }
-                out
-            };
-            assert_eq!(
-                engine.eval("dumpMirror()", "test").unwrap(),
-                rust,
-                "seed {seed} round {round}"
-            );
-            engine.collect_garbage();
-            engine
-                .eval("__appsDomSweep(true); step(); __appsDomSweep(true)", "test")
-                .unwrap();
+    for round in 0..4 {
+      let rust = {
+        let host = host.borrow().store.clone();
+        let host = host.borrow();
+        let (doc, shadows) = (&host.pages[&1].doc, &host.pages[&1].state.tree.shadows);
+        let (mut out, mut pending) = (String::new(), vec![Ok(0)]);
+        while let Some(item) = pending.pop() {
+          let id = match item {
+            Ok(id) => id,
+            Err(text) => {
+              out.push_str(text);
+              continue;
+            }
+          };
+          let node = &doc.nodes[id];
+          out.push('(');
+          out.push_str(&node.tag);
+          if matches!(node.tag.as_str(), "#text" | "#comment") {
+            out.push('|');
+            out.push_str(&node.text);
+          }
+          for (key, value) in &node.attrs {
+            out.push_str(&format!(" {key}={value}"));
+          }
+          assert!(
+            node
+              .children
+              .iter()
+              .all(|&child| doc.nodes[child].parent == Some(id))
+          );
+          pending.push(Err(")"));
+          pending.extend(node.children.iter().rev().map(|&child| Ok(child)));
+          if let Some(&root) = shadows.get(&id) {
+            pending.extend([Err("]"), Ok(root), Err("[")]);
+          }
         }
+        out
+      };
+      assert_eq!(
+        engine.eval("dumpMirror()", "test").unwrap(),
+        rust,
+        "seed {seed} round {round}"
+      );
+      engine.collect_garbage();
+      engine
+        .eval("__appsDomSweep(true); step(); __appsDomSweep(true)", "test")
+        .unwrap();
     }
+  }
 }
 
 #[test]
 fn layout_mirror_feeds_observers_offsets_and_scrolling() {
-    let (host, engine) = css_page(
-        "<html><body><div id='clip' style='overflow:hidden'><p id='a'>a</p><p id='b'>b</p></div><div id='rel' style='position:relative'><span id='c'>c</span></div><div id='gone' style='display:none'></div></body></html>",
-    );
-    let place = |rects: &[(&str, [f32; 4])]| {
-        let host = host.borrow().store.clone();
-        let mut host = host.borrow_mut();
-        let host = &mut *host;
-        let page = host.pages.get_mut(&1).unwrap();
-        let (doc, state) = (&page.doc, &mut page.state);
-        for (name, rect) in rects {
-            let id = doc
-                .nodes
-                .iter()
-                .position(|node| node.attrs.get("id").map(String::as_str) == Some(name))
-                .unwrap();
-            state.geometry.mirror.insert(id, *rect);
-        }
-    };
-    place(&[
-        ("clip", [0., 0., 100., 100.]),
-        ("a", [0., 50., 100., 100.]),
-        ("b", [0., 200., 100., 50.]),
-        ("rel", [10., 300., 200., 100.]),
-        ("c", [30., 320., 20., 10.]),
-    ]);
-    // Intersection observers note their changes after the layout of a frame, and their callbacks run in a task.
-    let observe = |code: &str| {
-        engine
-            .eval(&format!("{code}; __appsObserve(true)"), "test")
-            .unwrap();
-        engine.tick().unwrap();
-    };
-    observe(
-        r#"
+  let (host, engine) = css_page(
+    "<html><body><div id='clip' style='overflow:hidden'><p id='a'>a</p><p id='b'>b</p></div><div id='rel' style='position:relative'><span id='c'>c</span></div><div id='gone' style='display:none'></div></body></html>",
+  );
+  let place = |rects: &[(&str, [f32; 4])]| {
+    let host = host.borrow().store.clone();
+    let mut host = host.borrow_mut();
+    let host = &mut *host;
+    let page = host.pages.get_mut(&1).unwrap();
+    let (doc, state) = (&page.doc, &mut page.state);
+    for (name, rect) in rects {
+      let id = doc
+        .nodes
+        .iter()
+        .position(|node| node.attrs.get("id").map(String::as_str) == Some(name))
+        .unwrap();
+      state.geometry.mirror.insert(id, *rect);
+    }
+  };
+  place(&[
+    ("clip", [0., 0., 100., 100.]),
+    ("a", [0., 50., 100., 100.]),
+    ("b", [0., 200., 100., 50.]),
+    ("rel", [10., 300., 200., 100.]),
+    ("c", [30., 320., 20., 10.]),
+  ]);
+  // Intersection observers note their changes after the layout of a frame, and their callbacks run in a task.
+  let observe = |code: &str| {
+    engine
+      .eval(&format!("{code}; __appsObserve(true)"), "test")
+      .unwrap();
+    engine.tick().unwrap();
+  };
+  observe(
+    r#"
         globalThis.seen = [];
         let margin; try { new IntersectionObserver(() => {}, { rootMargin: 'foo' }); } catch (e) { margin = e.name; }
         if (margin !== 'SyntaxError' || new IntersectionObserver(() => {}, { rootMargin: '10px 5%' }).rootMargin !== '10px 5% 10px 5%') throw Error('rootMargin ' + margin);
@@ -308,19 +310,19 @@ fn layout_mirror_feeds_observers_offsets_and_scrolling() {
         new IntersectionObserver(() => { throw Error('failing observer'); }).observe(document.getElementById('a'));
         globalThis.io = new IntersectionObserver(entries => seen.push(...entries.map(e => [e.target.id, e.isIntersecting, e.intersectionRatio, e.intersectionRect.y, e.intersectionRect.height].join())), { threshold: [0, 0.5, 1] });
         for (const id of ['a', 'b', 'c', 'gone']) io.observe(document.getElementById(id))"#,
-    );
-    observe(
-        r#"
+  );
+  observe(
+    r#"
         if (seen.join(';') !== 'a,true,0.5,50,50;b,false,0,200,0;c,true,1,320,10;gone,false,0,0,0' || reported !== 'failing observer') throw Error(seen.join(';'));
         seen.length = 0"#,
-    );
-    observe(
-        r#"
+  );
+  observe(
+    r#"
         if (seen.length) throw Error('Unchanged targets reported');
         globalThis.pageObserver = new IntersectionObserver(([e]) => globalThis.entry = e, { root: document });
         pageObserver.observe(document.getElementById('a'))"#,
-    );
-    engine.eval(r#"
+  );
+  engine.eval(r#"
         if (entry?.intersectionRatio !== 0.5 || entry.rootBounds.width !== innerWidth || entry.rootBounds.height !== innerHeight) throw Error('Document root bounds');
         pageObserver.disconnect();
         const c = document.getElementById('c'), clip = document.getElementById('clip');
@@ -334,9 +336,9 @@ fn layout_mirror_feeds_observers_offsets_and_scrolling() {
         globalThis.late = []; for (let i = 0; i < 3000; i++) late.push(document.body.appendChild(document.createElement('i')));
         late.at(-1).id = 'late';
     "#, "test").unwrap();
-    place(&[("a", [0., 0., 100., 100.]), ("late", [1., 2., 3., 4.])]);
-    observe("");
-    engine.eval(r#"
+  place(&[("a", [0., 0., 100., 100.]), ("late", [1., 2., 3., 4.])]);
+  observe("");
+  engine.eval(r#"
         if (seen.join(';') !== 'a,true,1,0,100') throw Error(seen.join(';'));
         if (late.at(-1).getBoundingClientRect().height !== 4 || document.getElementById('c').getBoundingClientRect().x !== 30) throw Error('Grown mirror');
     "#, "test").unwrap();
@@ -344,52 +346,52 @@ fn layout_mirror_feeds_observers_offsets_and_scrolling() {
 
 #[test]
 fn scroll_sizes_hold_the_out_of_flow_boxes_whose_containing_block_is_inside() {
-    let (host, engine) = css_page(
-        "<html><body><div id='s'><div id='a' style='position:absolute'></div></div><div id='r' style='position:relative'><div id='b' style='position:absolute'></div></div><div id='n'><div id='p' style='position:relative'><div id='c' style='position:absolute'></div></div></div><div id='t' style='transform:scale(1)'><div id='f' style='position:fixed'></div></div><div id='u'><div id='g' style='position:fixed'></div></div></body></html>",
-    );
-    engine.eval("document.body.offsetWidth", "test").unwrap();
-    let place = |rects: &[(&str, [f32; 4])]| {
-        let store = host.borrow().store.clone();
-        let mut store = store.borrow_mut();
-        let page = store.pages.get_mut(&1).unwrap();
-        let (doc, state) = (&page.doc, &mut page.state);
-        for &(name, rect) in rects {
-            let id = doc
-                .nodes
-                .iter()
-                .position(|node| node.attrs.get("id").map(String::as_str) == Some(name))
-                .unwrap();
-            state.geometry.mirror.insert(id, rect);
-        }
-    };
-    place(&[
-        ("s", [0., 0., 100., 20.]),
-        ("a", [150., 30., 40., 60.]),
-        ("r", [0., 20., 100., 20.]),
-        ("b", [150., 50., 40., 60.]),
-        ("n", [0., 40., 100., 20.]),
-        ("p", [0., 40., 100., 10.]),
-        ("c", [150., 70., 40., 60.]),
-        ("t", [0., 60., 100., 20.]),
-        ("f", [500., 360., 40., 60.]),
-        ("u", [0., 80., 100., 20.]),
-        ("g", [500., 300., 40., 60.]),
-    ]);
-    engine.eval(r#"
+  let (host, engine) = css_page(
+    "<html><body><div id='s'><div id='a' style='position:absolute'></div></div><div id='r' style='position:relative'><div id='b' style='position:absolute'></div></div><div id='n'><div id='p' style='position:relative'><div id='c' style='position:absolute'></div></div></div><div id='t' style='transform:scale(1)'><div id='f' style='position:fixed'></div></div><div id='u'><div id='g' style='position:fixed'></div></div></body></html>",
+  );
+  engine.eval("document.body.offsetWidth", "test").unwrap();
+  let place = |rects: &[(&str, [f32; 4])]| {
+    let store = host.borrow().store.clone();
+    let mut store = store.borrow_mut();
+    let page = store.pages.get_mut(&1).unwrap();
+    let (doc, state) = (&page.doc, &mut page.state);
+    for &(name, rect) in rects {
+      let id = doc
+        .nodes
+        .iter()
+        .position(|node| node.attrs.get("id").map(String::as_str) == Some(name))
+        .unwrap();
+      state.geometry.mirror.insert(id, rect);
+    }
+  };
+  place(&[
+    ("s", [0., 0., 100., 20.]),
+    ("a", [150., 30., 40., 60.]),
+    ("r", [0., 20., 100., 20.]),
+    ("b", [150., 50., 40., 60.]),
+    ("n", [0., 40., 100., 20.]),
+    ("p", [0., 40., 100., 10.]),
+    ("c", [150., 70., 40., 60.]),
+    ("t", [0., 60., 100., 20.]),
+    ("f", [500., 360., 40., 60.]),
+    ("u", [0., 80., 100., 20.]),
+    ("g", [500., 300., 40., 60.]),
+  ]);
+  engine.eval(r#"
         const sizes = () => ['s', 'r', 'n', 't', 'u'].map(id => { const e = document.getElementById(id); return e.scrollWidth + 'x' + e.scrollHeight; }).join();
         if (sizes() !== '100x20,190x90,190x90,540x360,100x20' || sizes() !== '100x20,190x90,190x90,540x360,100x20') throw Error(sizes());
         document.getElementById('s').style.position = 'relative';
         if (sizes() !== '190x90,190x90,190x90,540x360,100x20') throw Error('style ' + sizes());
     "#, "test").unwrap();
-    place(&[("b", [150., 50., 40., 100.])]);
-    engine.eval(r#"if (sizes() !== '190x90,190x130,190x90,540x360,100x20') throw Error('layout ' + sizes());"#, "test").unwrap();
+  place(&[("b", [150., 50., 40., 100.])]);
+  engine.eval(r#"if (sizes() !== '190x90,190x130,190x90,540x360,100x20') throw Error('layout ' + sizes());"#, "test").unwrap();
 }
 
 #[test]
 fn child_node_methods_reactions_and_observers_follow_the_standard() {
-    let (_, engine) = checked_page(
-        "<html><body><div id='box'></div></body></html>",
-        r#"
+  let (_, engine) = checked_page(
+    "<html><body><div id='box'></div></body></html>",
+    r#"
         const p = document.createElement('p'), [a, b, c] = ['a', 'b', 'c'].map(tag => document.createElement(tag));
         p.append(a, b);
         a.after(b, c);
@@ -445,16 +447,16 @@ fn child_node_methods_reactions_and_observers_follow_the_standard() {
         sized.setAttribute('width', 'x'); sized.setAttribute('height', '2147483648');
         check('invalid canvas sizes use the defaults', () => sized.width === 300 && sized.height === 150);
         "#,
-    );
-    engine.tick().unwrap();
-    assert_eq!(engine.eval("seen.join()", "test").unwrap(), "1,2");
+  );
+  engine.tick().unwrap();
+  assert_eq!(engine.eval("seen.join()", "test").unwrap(), "1,2");
 }
 
 #[test]
 fn observers_hold_targets_weakly_and_batches_keep_split_surrogates() {
-    let (host, engine) = checked_page(
-        "<html><body><p id='one'>a</p><p id='two'>b</p><ul id='list'></ul></body></html>",
-        r#"
+  let (host, engine) = checked_page(
+    "<html><body><p id='one'>a</p><p id='two'>b</p><ul id='list'></ul></body></html>",
+    r#"
         const [one, two] = ['one', 'two'].map(id => document.getElementById(id).firstChild), text = 'a\u{1F600}b';
         one.data = text.slice(0, 2); two.data = text.slice(2); one.parentNode.setAttribute('data-after', 'kept');
         const list = document.getElementById('list'), rows = document.createDocumentFragment();
@@ -462,117 +464,118 @@ fn observers_hold_targets_weakly_and_batches_keep_split_surrogates() {
         list.append(rows); list.prepend(...['x', 'y'].map(id => Object.assign(document.createElement('li'), { id })));
         check('mirror order', () => list.firstChild.id === 'x' && list.children[2].textContent === '0' && list.childElementCount === 3002);
         "#,
+  );
+  {
+    let host = host.borrow().store.clone();
+    let host = host.borrow();
+    let doc = &host.pages[&1].doc;
+    let text = |id: &str| {
+      let p = doc
+        .nodes
+        .iter()
+        .position(|node| node.attrs.get("id").is_some_and(|value| value == id))
+        .unwrap();
+      doc.nodes[doc.nodes[p].children[0]].text.clone()
+    };
+    assert_eq!(
+      (text("one"), text("two")),
+      ("a\u{fffd}".to_owned(), "\u{fffd}b".to_owned())
     );
-    {
-        let host = host.borrow().store.clone();
-        let host = host.borrow();
-        let doc = &host.pages[&1].doc;
-        let text = |id: &str| {
-            let p = doc
-                .nodes
-                .iter()
-                .position(|node| node.attrs.get("id").is_some_and(|value| value == id))
-                .unwrap();
-            doc.nodes[doc.nodes[p].children[0]].text.clone()
-        };
-        assert_eq!(
-            (text("one"), text("two")),
-            ("a\u{fffd}".to_owned(), "\u{fffd}b".to_owned())
-        );
-        assert!(doc.nodes.iter().any(|node| {
-            node.attrs
-                .get("data-after")
-                .is_some_and(|value| value == "kept")
-        }));
-        let list = doc
-            .nodes
-            .iter()
-            .position(|node| node.attrs.get("id").is_some_and(|value| value == "list"))
-            .unwrap();
-        let children = &doc.nodes[list].children;
-        assert_eq!(children.len(), 3002);
-        assert!(
-            children
-                .iter()
-                .all(|&child| doc.nodes[child].parent == Some(list))
-        );
-        assert_eq!(
-            doc.nodes[children[0]].attrs.get("id").map(String::as_str),
-            Some("x")
-        );
-        assert_eq!(doc.nodes[doc.nodes[children[2]].children[0]].text, "0");
-    }
-    engine.eval("const list = document.getElementById('list'); while (list.firstChild) list.removeChild(list.firstChild); list.append(document.createElement('hr'))", "test").unwrap();
-    {
-        let host = host.borrow().store.clone();
-        let host = host.borrow();
-        let doc = &host.pages[&1].doc;
-        let list = doc
-            .nodes
-            .iter()
-            .position(|node| node.attrs.get("id").is_some_and(|value| value == "list"))
-            .unwrap();
-        assert_eq!(doc.nodes[list].children.len(), 1);
-        assert_eq!(doc.nodes[doc.nodes[list].children[0]].tag, "hr");
-    }
-    for _ in 0..5 {
-        engine.eval("(() => { for (let i = 0; i < 2000; i++) { const el = document.createElement('div'); el.innerHTML = '<span>x</span>'; new MutationObserver(() => el.id).observe(el, { attributes: true }); new ResizeObserver(() => el.id).observe(el); new IntersectionObserver(() => el.id).observe(el); } })()", "test").unwrap();
-        engine.collect_garbage();
-        engine
-            .eval(
-                "__appsDomSweep(true); __appsLayout(); document.body.setAttribute('data-x', '1')",
-                "test",
-            )
-            .unwrap();
-    }
-    let nodes = host.borrow().store.borrow().pages[&1].doc.nodes.len();
-    assert!(nodes < 20000, "{nodes} nodes");
+    assert!(doc.nodes.iter().any(|node| {
+      node
+        .attrs
+        .get("data-after")
+        .is_some_and(|value| value == "kept")
+    }));
+    let list = doc
+      .nodes
+      .iter()
+      .position(|node| node.attrs.get("id").is_some_and(|value| value == "list"))
+      .unwrap();
+    let children = &doc.nodes[list].children;
+    assert_eq!(children.len(), 3002);
+    assert!(
+      children
+        .iter()
+        .all(|&child| doc.nodes[child].parent == Some(list))
+    );
+    assert_eq!(
+      doc.nodes[children[0]].attrs.get("id").map(String::as_str),
+      Some("x")
+    );
+    assert_eq!(doc.nodes[doc.nodes[children[2]].children[0]].text, "0");
+  }
+  engine.eval("const list = document.getElementById('list'); while (list.firstChild) list.removeChild(list.firstChild); list.append(document.createElement('hr'))", "test").unwrap();
+  {
+    let host = host.borrow().store.clone();
+    let host = host.borrow();
+    let doc = &host.pages[&1].doc;
+    let list = doc
+      .nodes
+      .iter()
+      .position(|node| node.attrs.get("id").is_some_and(|value| value == "list"))
+      .unwrap();
+    assert_eq!(doc.nodes[list].children.len(), 1);
+    assert_eq!(doc.nodes[doc.nodes[list].children[0]].tag, "hr");
+  }
+  for _ in 0..5 {
+    engine.eval("(() => { for (let i = 0; i < 2000; i++) { const el = document.createElement('div'); el.innerHTML = '<span>x</span>'; new MutationObserver(() => el.id).observe(el, { attributes: true }); new ResizeObserver(() => el.id).observe(el); new IntersectionObserver(() => el.id).observe(el); } })()", "test").unwrap();
+    engine.collect_garbage();
+    engine
+      .eval(
+        "__appsDomSweep(true); __appsLayout(); document.body.setAttribute('data-x', '1')",
+        "test",
+      )
+      .unwrap();
+  }
+  let nodes = host.borrow().store.borrow().pages[&1].doc.nodes.len();
+  assert!(nodes < 20000, "{nodes} nodes");
 }
 
 #[test]
 fn text_offsets_skip_comments_like_text_points() {
-    let (host, _engine) = checked_page(
-        "<html><body><div id='e' contenteditable>ab<!--?lit$123$-->cd<p>e<!--x-->f</p></div></body></html>",
-        "",
-    );
-    let editor = host.borrow().store.borrow().pages[&1]
-        .doc
-        .nodes
-        .iter()
-        .position(|node| node.tag == "div")
-        .unwrap();
-    let offset = |index: usize| {
-        host.borrow_mut()
-            .call(
-                Role::Renderer(1),
-                "dom.textOffset",
-                serde_json::json!([editor, editor, index]),
-            )
-            .unwrap()
-    };
-    assert_eq!(
-        (offset(3), offset(4)),
-        (serde_json::json!(4), serde_json::json!(6))
-    );
-    let point = host
-        .borrow_mut()
-        .call(
-            Role::Renderer(1),
-            "dom.textPoint",
-            serde_json::json!([editor, 6]),
-        )
-        .unwrap();
-    assert_eq!(point[1], serde_json::json!(1));
+  let (host, _engine) = checked_page(
+    "<html><body><div id='e' contenteditable>ab<!--?lit$123$-->cd<p>e<!--x-->f</p></div></body></html>",
+    "",
+  );
+  let editor = host.borrow().store.borrow().pages[&1]
+    .doc
+    .nodes
+    .iter()
+    .position(|node| node.tag == "div")
+    .unwrap();
+  let offset = |index: usize| {
+    host
+      .borrow_mut()
+      .call(
+        Role::Renderer(1),
+        "dom.textOffset",
+        serde_json::json!([editor, editor, index]),
+      )
+      .unwrap()
+  };
+  assert_eq!(
+    (offset(3), offset(4)),
+    (serde_json::json!(4), serde_json::json!(6))
+  );
+  let point = host
+    .borrow_mut()
+    .call(
+      Role::Renderer(1),
+      "dom.textPoint",
+      serde_json::json!([editor, 6]),
+    )
+    .unwrap();
+  assert_eq!(point[1], serde_json::json!(1));
 }
 
 #[test]
 fn throwing_resize_observer_does_not_stop_layout_callbacks() {
-    let (_, engine) = css_page(
-        "<html><body><main><div id='box' style='overflow:auto'></div></main></body></html>",
-    );
-    engine
-        .eval(
-            r#"
+  let (_, engine) =
+    css_page("<html><body><main><div id='box' style='overflow:auto'></div></main></body></html>");
+  engine
+    .eval(
+      r#"
         const box = document.getElementById('box'), seen = [];
         addEventListener('error', event => { seen.push('error'); event.preventDefault(); });
         new ResizeObserver(() => { throw Error('boom'); }).observe(box);
@@ -582,7 +585,7 @@ fn throwing_resize_observer_does_not_stop_layout_callbacks() {
         __appsLayout(); __appsObserve(true);
         if (seen.join() !== 'scroll,error,resize') throw Error(seen.join());
     "#,
-            "test",
-        )
-        .unwrap();
+      "test",
+    )
+    .unwrap();
 }

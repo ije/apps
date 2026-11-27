@@ -1,11 +1,10 @@
 use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType};
 use objc2_core_text::{
-    CTFont, CTFontDescriptor, CTFontTableOptions, kCTFontFeatureSelectorIdentifierKey,
-    kCTFontFeatureSettingsAttribute, kCTFontFeatureTypeIdentifierKey,
-    kCTFontFeatureTypeSelectorsKey, kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue,
-    kCTFontVariationAttribute, kCTFontVariationAxisDefaultValueKey,
-    kCTFontVariationAxisIdentifierKey, kCTFontVariationAxisMaximumValueKey,
-    kCTFontVariationAxisMinimumValueKey,
+  CTFont, CTFontDescriptor, CTFontTableOptions, kCTFontFeatureSelectorIdentifierKey,
+  kCTFontFeatureSettingsAttribute, kCTFontFeatureTypeIdentifierKey, kCTFontFeatureTypeSelectorsKey,
+  kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue, kCTFontVariationAttribute,
+  kCTFontVariationAxisDefaultValueKey, kCTFontVariationAxisIdentifierKey,
+  kCTFontVariationAxisMaximumValueKey, kCTFontVariationAxisMinimumValueKey,
 };
 use std::ptr;
 
@@ -14,182 +13,184 @@ pub(super) const WDTH: u32 = u32::from_be_bytes(*b"wdth");
 pub(super) const OPSZ: u32 = u32::from_be_bytes(*b"opsz");
 
 fn descriptor(key: &CFString, value: &CFType) -> CFRetained<CTFontDescriptor> {
-    let attributes = CFDictionary::<CFString, CFType>::from_slices(&[key], &[value]);
-    // SAFETY: the dictionary holds a valid font attribute.
-    unsafe { CTFontDescriptor::with_attributes(attributes.as_opaque()) }
+  let attributes = CFDictionary::<CFString, CFType>::from_slices(&[key], &[value]);
+  // SAFETY: the dictionary holds a valid font attribute.
+  unsafe { CTFontDescriptor::with_attributes(attributes.as_opaque()) }
 }
 
 pub(super) fn with_features(font: &CTFont, features: &[(String, u32)]) -> CFRetained<CTFont> {
-    let settings: Vec<_> = features
-        .iter()
-        .map(|(tag, value)| {
-            let (tag, value) = (CFString::from_str(tag), CFNumber::new_i32(*value as i32));
-            // SAFETY: the keys are CoreText constants.
-            let keys = unsafe { [kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue] };
-            CFDictionary::<CFString, CFType>::from_slices(&keys, &[&tag, &value])
-        })
-        // CoreText doesn't map the tag to the small capitals of the oldest fonts.
-        .chain(features.iter().filter(|(tag, _)| tag == "smcp").map(|_| {
-            let three = CFNumber::new_i32(3);
-            // SAFETY: the keys are CoreText constants.
-            let keys = unsafe {
-                [
-                    kCTFontFeatureTypeIdentifierKey,
-                    kCTFontFeatureSelectorIdentifierKey,
-                ]
-            };
-            CFDictionary::<CFString, CFType>::from_slices(&keys, &[&three, &three])
-        }))
-        .collect();
-    let settings = CFArray::from_retained_objects(&settings);
-    // SAFETY: a size of 0 keeps the font's size, and the descriptor only adds feature settings.
-    unsafe {
-        let attributes = descriptor(kCTFontFeatureSettingsAttribute, &settings);
-        font.copy_with_attributes(0., ptr::null(), Some(&attributes))
-    }
+  let settings: Vec<_> = features
+    .iter()
+    .map(|(tag, value)| {
+      let (tag, value) = (CFString::from_str(tag), CFNumber::new_i32(*value as i32));
+      // SAFETY: the keys are CoreText constants.
+      let keys = unsafe { [kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue] };
+      CFDictionary::<CFString, CFType>::from_slices(&keys, &[&tag, &value])
+    })
+    // CoreText doesn't map the tag to the small capitals of the oldest fonts.
+    .chain(features.iter().filter(|(tag, _)| tag == "smcp").map(|_| {
+      let three = CFNumber::new_i32(3);
+      // SAFETY: the keys are CoreText constants.
+      let keys = unsafe {
+        [
+          kCTFontFeatureTypeIdentifierKey,
+          kCTFontFeatureSelectorIdentifierKey,
+        ]
+      };
+      CFDictionary::<CFString, CFType>::from_slices(&keys, &[&three, &three])
+    }))
+    .collect();
+  let settings = CFArray::from_retained_objects(&settings);
+  // SAFETY: a size of 0 keeps the font's size, and the descriptor only adds feature settings.
+  unsafe {
+    let attributes = descriptor(kCTFontFeatureSettingsAttribute, &settings);
+    font.copy_with_attributes(0., ptr::null(), Some(&attributes))
+  }
 }
 
 pub(super) fn with_variations(font: &CTFont, axes: &[(u32, f32)]) -> CFRetained<CTFont> {
-    let keys: Vec<_> = axes
-        .iter()
-        .map(|&(tag, _)| CFNumber::new_i64(tag.into()))
-        .collect();
-    let values: Vec<_> = axes
-        .iter()
-        .map(|&(_, value)| CFNumber::new_f64(value.into()))
-        .collect();
-    let variation = CFDictionary::<CFNumber, CFNumber>::from_slices(
-        &keys.iter().map(|key| &**key).collect::<Vec<_>>(),
-        &values.iter().map(|value| &**value).collect::<Vec<_>>(),
-    );
-    // SAFETY: the variation dictionary maps axis identifiers to values, as CoreText expects.
-    unsafe {
-        let attributes = descriptor(kCTFontVariationAttribute, &variation);
-        font.copy_with_attributes(font.size(), ptr::null(), Some(&attributes))
-    }
+  let keys: Vec<_> = axes
+    .iter()
+    .map(|&(tag, _)| CFNumber::new_i64(tag.into()))
+    .collect();
+  let values: Vec<_> = axes
+    .iter()
+    .map(|&(_, value)| CFNumber::new_f64(value.into()))
+    .collect();
+  let variation = CFDictionary::<CFNumber, CFNumber>::from_slices(
+    &keys.iter().map(|key| &**key).collect::<Vec<_>>(),
+    &values.iter().map(|value| &**value).collect::<Vec<_>>(),
+  );
+  // SAFETY: the variation dictionary maps axis identifiers to values, as CoreText expects.
+  unsafe {
+    let attributes = descriptor(kCTFontVariationAttribute, &variation);
+    font.copy_with_attributes(font.size(), ptr::null(), Some(&attributes))
+  }
 }
 
 /// Tag, minimum, default and maximum of each variation axis.
 pub(super) fn axes(font: &CTFont) -> Vec<(u32, [f32; 3])> {
-    // SAFETY: CoreText returns an array of axis dictionaries or nothing.
-    let Some(axes) = (unsafe { font.variation_axes() }) else {
-        return Vec::new();
-    };
-    let axes = unsafe { axes.cast_unchecked::<CFDictionary<CFString, CFType>>() };
-    // SAFETY: the keys are CoreText constants.
-    let keys = unsafe {
-        [
-            kCTFontVariationAxisIdentifierKey,
-            kCTFontVariationAxisMinimumValueKey,
-            kCTFontVariationAxisDefaultValueKey,
-            kCTFontVariationAxisMaximumValueKey,
-        ]
-    };
-    axes.iter()
-        .filter_map(|axis| {
-            let number = |key: &CFString| axis.get(key)?.downcast::<CFNumber>().ok();
-            let tag = u32::try_from(number(keys[0])?.as_i64()?).ok()?;
-            let [min, default, max] = [1, 2, 3].map(|at| number(keys[at]).and_then(|n| n.as_f32()));
-            Some((tag, [min?, default?, max?]))
-        })
-        .collect()
+  // SAFETY: CoreText returns an array of axis dictionaries or nothing.
+  let Some(axes) = (unsafe { font.variation_axes() }) else {
+    return Vec::new();
+  };
+  let axes = unsafe { axes.cast_unchecked::<CFDictionary<CFString, CFType>>() };
+  // SAFETY: the keys are CoreText constants.
+  let keys = unsafe {
+    [
+      kCTFontVariationAxisIdentifierKey,
+      kCTFontVariationAxisMinimumValueKey,
+      kCTFontVariationAxisDefaultValueKey,
+      kCTFontVariationAxisMaximumValueKey,
+    ]
+  };
+  axes
+    .iter()
+    .filter_map(|axis| {
+      let number = |key: &CFString| axis.get(key)?.downcast::<CFNumber>().ok();
+      let tag = u32::try_from(number(keys[0])?.as_i64()?).ok()?;
+      let [min, default, max] = [1, 2, 3].map(|at| number(keys[at]).and_then(|n| n.as_f32()));
+      Some((tag, [min?, default?, max?]))
+    })
+    .collect()
 }
 
 /// The axis values that the font sets.
 pub(super) fn variation(font: &CTFont) -> Vec<(u32, f32)> {
-    // SAFETY: CoreText returns a dictionary of numbers or nothing.
-    let Some(variation) = (unsafe { font.variation() }) else {
-        return Vec::new();
-    };
-    let variation = unsafe { variation.cast_unchecked::<CFNumber, CFNumber>() };
-    let (keys, values) = variation.to_vecs();
-    keys.iter()
-        .zip(&values)
-        .filter_map(|(tag, value)| Some((u32::try_from(tag.as_i64()?).ok()?, value.as_f32()?)))
-        .collect()
+  // SAFETY: CoreText returns a dictionary of numbers or nothing.
+  let Some(variation) = (unsafe { font.variation() }) else {
+    return Vec::new();
+  };
+  let variation = unsafe { variation.cast_unchecked::<CFNumber, CFNumber>() };
+  let (keys, values) = variation.to_vecs();
+  keys
+    .iter()
+    .zip(&values)
+    .filter_map(|(tag, value)| Some((u32::try_from(tag.as_i64()?).ok()?, value.as_f32()?)))
+    .collect()
 }
 
 /// The default of the `wght` axis when it is on the CSS scale. Old Apple fonts like Skia use 0.5 to 3.2 and
 /// keep their named faces.
 pub(super) fn default_weight(font: &CTFont) -> Option<f32> {
-    // SAFETY: CoreText returns an array of axis dictionaries or nothing.
-    let axes = unsafe { font.variation_axes()? };
-    let axes = unsafe { axes.cast_unchecked::<CFDictionary<CFString, CFType>>() };
-    let number = |axis: &CFDictionary<CFString, CFType>, key: &CFString| {
-        axis.get(key)?.downcast::<CFNumber>().ok()
-    };
-    axes.iter()
-        .find_map(|axis| {
-            // SAFETY: the keys are CoreText constants.
-            let (id, default) = unsafe {
-                (
-                    kCTFontVariationAxisIdentifierKey,
-                    kCTFontVariationAxisDefaultValueKey,
-                )
-            };
-            (number(&axis, id)?.as_i64()? == WGHT.into())
-                .then(|| number(&axis, default)?.as_f32())?
-        })
-        .filter(|weight| *weight >= 100.)
+  // SAFETY: CoreText returns an array of axis dictionaries or nothing.
+  let axes = unsafe { font.variation_axes()? };
+  let axes = unsafe { axes.cast_unchecked::<CFDictionary<CFString, CFType>>() };
+  let number = |axis: &CFDictionary<CFString, CFType>, key: &CFString| {
+    axis.get(key)?.downcast::<CFNumber>().ok()
+  };
+  axes
+    .iter()
+    .find_map(|axis| {
+      // SAFETY: the keys are CoreText constants.
+      let (id, default) = unsafe {
+        (
+          kCTFontVariationAxisIdentifierKey,
+          kCTFontVariationAxisDefaultValueKey,
+        )
+      };
+      (number(&axis, id)?.as_i64()? == WGHT.into()).then(|| number(&axis, default)?.as_f32())?
+    })
+    .filter(|weight| *weight >= 100.)
 }
 
 /// The tags of the AAT small capitals of a font.
 pub(super) fn small_caps(font: &CTFont) -> Vec<[u8; 4]> {
-    // SAFETY: CoreText returns an array of dictionaries for features, with an array of dictionaries of selectors.
-    let Some(features) = (unsafe { font.features() }) else {
-        return Vec::new();
+  // SAFETY: CoreText returns an array of dictionaries for features, with an array of dictionaries of selectors.
+  let Some(features) = (unsafe { font.features() }) else {
+    return Vec::new();
+  };
+  let features = unsafe { features.cast_unchecked::<CFDictionary<CFString, CFType>>() };
+  // SAFETY: the keys are CoreText constants.
+  let keys = unsafe {
+    [
+      kCTFontFeatureTypeIdentifierKey,
+      kCTFontFeatureSelectorIdentifierKey,
+    ]
+  };
+  let mut tags = Vec::new();
+  for feature in features.iter() {
+    let number = |from: &CFDictionary<CFString, CFType>, key: &CFString| {
+      from.get(key)?.downcast::<CFNumber>().ok()?.as_i32()
     };
-    let features = unsafe { features.cast_unchecked::<CFDictionary<CFString, CFType>>() };
-    // SAFETY: the keys are CoreText constants.
-    let keys = unsafe {
-        [
-            kCTFontFeatureTypeIdentifierKey,
-            kCTFontFeatureSelectorIdentifierKey,
-        ]
+    let Some(selectors) = (unsafe { feature.get(kCTFontFeatureTypeSelectorsKey) })
+      .and_then(|list| list.downcast::<CFArray>().ok())
+    else {
+      continue;
     };
-    let mut tags = Vec::new();
-    for feature in features.iter() {
-        let number = |from: &CFDictionary<CFString, CFType>, key: &CFString| {
-            from.get(key)?.downcast::<CFNumber>().ok()?.as_i32()
-        };
-        let Some(selectors) = (unsafe { feature.get(kCTFontFeatureTypeSelectorsKey) })
-            .and_then(|list| list.downcast::<CFArray>().ok())
-        else {
-            continue;
-        };
-        let selectors = unsafe { selectors.cast_unchecked::<CFDictionary<CFString, CFType>>() };
-        for selector in selectors.iter() {
-            let pair = [number(&feature, keys[0]), number(&selector, keys[1])];
-            tags.extend(match pair.map(|value| value.unwrap_or(-1)) {
-                [3, 3] | [37, 1] => Some(*b"smcp"),
-                [38, 1] => Some(*b"c2sc"),
-                [37, 2] => Some(*b"pcap"),
-                [38, 2] => Some(*b"c2pc"),
-                _ => None,
-            });
-        }
+    let selectors = unsafe { selectors.cast_unchecked::<CFDictionary<CFString, CFType>>() };
+    for selector in selectors.iter() {
+      let pair = [number(&feature, keys[0]), number(&selector, keys[1])];
+      tags.extend(match pair.map(|value| value.unwrap_or(-1)) {
+        [3, 3] | [37, 1] => Some(*b"smcp"),
+        [38, 1] => Some(*b"c2sc"),
+        [37, 2] => Some(*b"pcap"),
+        [38, 2] => Some(*b"c2pc"),
+        _ => None,
+      });
     }
-    tags
+  }
+  tags
 }
 
 fn os2(font: &CTFont, len: usize) -> Option<CFRetained<objc2_core_foundation::CFData>> {
-    let tag = u32::from_be_bytes(*b"OS/2");
-    // SAFETY: the table is copied out of the font. CoreText ignores the option to exclude synthetic tables.
-    let table = unsafe { font.table(tag, CTFontTableOptions::NoOptions)? };
-    (table.len() >= len).then_some(table)
+  let tag = u32::from_be_bytes(*b"OS/2");
+  // SAFETY: the table is copied out of the font. CoreText ignores the option to exclude synthetic tables.
+  let table = unsafe { font.table(tag, CTFontTableOptions::NoOptions)? };
+  (table.len() >= len).then_some(table)
 }
 
 /// `usWeightClass`. CoreText puts fonts loaded from data on another weight scale (0.2 for Medium), so their
 /// matching reads the class.
 pub(super) fn weight_class(font: &CTFont) -> Option<f32> {
-    let table = os2(font, 6)?;
-    let bytes = table.to_vec();
-    Some(f32::from(u16::from_be_bytes([bytes[4], bytes[5]])))
-        .filter(|class| (1. ..=1000.).contains(class))
+  let table = os2(font, 6)?;
+  let bytes = table.to_vec();
+  Some(f32::from(u16::from_be_bytes([bytes[4], bytes[5]])))
+    .filter(|class| (1. ..=1000.).contains(class))
 }
 
 pub(super) fn typo_metrics(font: &CTFont) -> Option<[f32; 2]> {
-    let bytes = os2(font, 72)?.to_vec();
-    Some([68, 70].map(|at| f32::from(i16::from_be_bytes([bytes[at], bytes[at + 1]]))))
-        .filter(|[ascent, descent]| *ascent > 0. && *descent < 0.)
+  let bytes = os2(font, 72)?.to_vec();
+  Some([68, 70].map(|at| f32::from(i16::from_be_bytes([bytes[at], bytes[at + 1]]))))
+    .filter(|[ascent, descent]| *ascent > 0. && *descent < 0.)
 }

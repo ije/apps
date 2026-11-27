@@ -2,10 +2,10 @@ use super::*;
 
 #[test]
 fn visibility_observers_option_lists_and_canvas_current_color_follow_chrome() {
-    let (_, engine) = css_page(
-        "<html><body><div id=v>v</div><canvas id=k style='color: rgb(255, 0, 0)'></canvas><select id=s><option>A</option><option>B</option></select></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><body><div id=v>v</div><canvas id=k style='color: rgb(255, 0, 0)'></canvas><select id=s><option>A</option><option>B</option></select></body></html>",
+  );
+  engine.eval(r#"
         const $ = id => document.getElementById(id), check = (got, want, what) => { if (JSON.stringify(got) !== JSON.stringify(want)) throw Error(what + ': ' + JSON.stringify(got)); };
         check([typeof $('v').checkVisibility(null), typeof $('v').checkVisibility(undefined)], ['boolean', 'boolean'], 'null options');
         for (const Type of [ResizeObserver, IntersectionObserver, MutationObserver]) { let threw = null; try { new Type(5); } catch (error) { threw = error.constructor.name; } check(threw, 'TypeError', Type.name); }
@@ -40,8 +40,8 @@ fn visibility_observers_option_lists_and_canvas_current_color_follow_chrome() {
 
 #[test]
 fn canvas_pixels_survive_partial_updates_and_clipping() {
-    let (_, engine) = css_page("<html><body></body></html>");
-    engine.eval(r#"
+  let (_, engine) = css_page("<html><body></body></html>");
+  engine.eval(r#"
       const canvas=document.createElement('canvas');canvas.width=8;canvas.height=8;
       const ctx=canvas.getContext('2d');ctx.fillStyle='#ff0000';ctx.fillRect(0,0,8,8);
       ctx.clearRect(2,2,2,2);let pixels=ctx.getImageData(0,0,8,8).data;
@@ -71,10 +71,10 @@ fn canvas_pixels_survive_partial_updates_and_clipping() {
 
 #[test]
 fn hostile_selectors_canvas_data_and_traversal() {
-    let (_, engine) = css_page(
-        "<html><body><ul id='list'><li id='a'>1</li><li id=\"it's\">2</li><li id='c'>3</li></ul><svg><g><circle></circle></g><foreignObject><div id='html'></div></foreignObject></svg></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><body><ul id='list'><li id='a'>1</li><li id=\"it's\">2</li><li id='c'>3</li></ul><svg><g><circle></circle></g><foreignObject><div id='html'></div></foreignObject></svg></body></html>",
+  );
+  engine.eval(r#"
         const deep=':not('.repeat(100000)+'li'+')'.repeat(100000);
         if(document.querySelector(deep)!==null||document.querySelector(':is(:not(#a))#c')?.id!=='c'||document.querySelectorAll('li:not(:first-child)').length!==2)throw Error('Selector nesting');
         if(document.getElementById('')!==null||document.getElementById("it's")?.textContent!=='2'||document.getElementById('c')?.textContent!=='3')throw Error('getElementById');
@@ -96,8 +96,8 @@ fn hostile_selectors_canvas_data_and_traversal() {
 
 #[test]
 fn shadow_cycles_child_access_release_and_retired_images() {
-    let (host, engine) = css_page("<html><body><div id='box'></div></body></html>");
-    engine.eval(r#"
+  let (host, engine) = css_page("<html><body><div id='box'></div></body></html>");
+  engine.eval(r#"
         const el = document.createElement('div'); document.body.append(el);
         const root = el.attachShadow({mode:'open'}), inner = document.createElement('span'); root.append(inner);
         let rejected = 0;
@@ -121,77 +121,79 @@ fn shadow_cycles_child_access_release_and_retired_images() {
         __appsDomSweep(true);
         document.getElementById('box').textContent = '';
     "#, "test").unwrap();
-    let [p, canvas] = ["p", "canvas"].map(|tag| {
-        host.borrow().store.borrow().pages[&1]
-            .doc
-            .nodes
-            .iter()
-            .position(|node| node.tag == tag && node.parent.is_none())
-            .unwrap()
-    });
-    host.borrow()
-        .store
-        .borrow_mut()
-        .pages
-        .get_mut(&1)
-        .unwrap()
-        .dirty = false;
-    let freed = host
+  let [p, canvas] = ["p", "canvas"].map(|tag| {
+    host.borrow().store.borrow().pages[&1]
+      .doc
+      .nodes
+      .iter()
+      .position(|node| node.tag == tag && node.parent.is_none())
+      .unwrap()
+  });
+  host
+    .borrow()
+    .store
+    .borrow_mut()
+    .pages
+    .get_mut(&1)
+    .unwrap()
+    .dirty = false;
+  let freed = host
+    .borrow_mut()
+    .call(
+      Role::Renderer(1),
+      "dom.release",
+      serde_json::json!([[], []]),
+    )
+    .unwrap();
+  assert_eq!(freed[0], serde_json::json!([canvas]));
+  assert!(
+    host.borrow().store.borrow().pages[&1].doc.nodes[p]
+      .tag
+      .is_empty()
+  );
+  assert!(!host.borrow().store.borrow().pages[&1].dirty);
+  let image: usize = engine.eval("image._id", "test").unwrap().parse().unwrap();
+  {
+    use base64::Engine as _;
+    let png = base64::engine::general_purpose::STANDARD
+      .encode(std::fs::read("tests/images/sample.png").unwrap());
+    for _ in 0..2 {
+      host
         .borrow_mut()
         .call(
-            Role::Renderer(1),
-            "dom.release",
-            serde_json::json!([[], []]),
+          Role::Renderer(1),
+          "dom.image",
+          serde_json::json!([image, png]),
         )
         .unwrap();
-    assert_eq!(freed[0], serde_json::json!([canvas]));
-    assert!(
-        host.borrow().store.borrow().pages[&1].doc.nodes[p]
-            .tag
-            .is_empty()
-    );
-    assert!(!host.borrow().store.borrow().pages[&1].dirty);
-    let image: usize = engine.eval("image._id", "test").unwrap().parse().unwrap();
-    {
-        use base64::Engine as _;
-        let png = base64::engine::general_purpose::STANDARD
-            .encode(std::fs::read("tests/images/sample.png").unwrap());
-        for _ in 0..2 {
-            host.borrow_mut()
-                .call(
-                    Role::Renderer(1),
-                    "dom.image",
-                    serde_json::json!([image, png]),
-                )
-                .unwrap();
-            let started = std::time::Instant::now();
-            while host
-                .borrow_mut()
-                .call(Role::Renderer(1), "dom.decoded", serde_json::json!([]))
-                .unwrap()
-                .as_array()
-                .unwrap()
-                .is_empty()
-            {
-                assert!(started.elapsed() < std::time::Duration::from_secs(60));
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-        }
+      let started = std::time::Instant::now();
+      while host
+        .borrow_mut()
+        .call(Role::Renderer(1), "dom.decoded", serde_json::json!([]))
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .is_empty()
+      {
+        assert!(started.elapsed() < std::time::Duration::from_secs(60));
+        std::thread::sleep(std::time::Duration::from_millis(1));
+      }
     }
-    assert_eq!(
-        host.borrow().store.borrow().pages[&1]
-            .state
-            .media
-            .retired
-            .len(),
-        3
-    );
+  }
+  assert_eq!(
+    host.borrow().store.borrow().pages[&1]
+      .state
+      .media
+      .retired
+      .len(),
+    3
+  );
 }
 
 #[test]
 fn canvas_paths_matrices_patterns_and_shadows() {
-    let (.., result) = offscreen_page(
-        r#"
+  let (.., result) = offscreen_page(
+    r#"
         const canvas = new OffscreenCanvas(20, 20), ctx = canvas.getContext('2d'), at = (x, y) => [...ctx.getImageData(x, y, 1, 1).data];
         ctx.font = 'bold 12pt/2 Arial'; const font = ctx.font; ctx.font = 'bogus'; same([font, ctx.font], ['bold 16px Arial', 'bold 16px Arial'], 'font');
         const square = new Path2D('M2 2h6v6H2z'), copy = new Path2D(square); copy.rect(12, 2, 6, 6);
@@ -226,14 +228,14 @@ fn canvas_paths_matrices_patterns_and_shadows() {
         ctx.shadowColor = 'transparent';
         same(await reply(worker(`postMessage([typeof Path2D, typeof DOMMatrix, typeof DOMPoint])`)), ['function', 'function', 'function'], 'worker globals');
     "#,
-    );
-    assert_eq!(result, "ok");
+  );
+  assert_eq!(result, "ok");
 }
 
 #[test]
 fn canvas_sources_flush_their_readers_before_their_pixels_change() {
-    let (.., result) = offscreen_page(
-        r#"
+  let (.., result) = offscreen_page(
+    r#"
         const source = new OffscreenCanvas(2, 2), from = source.getContext('2d'), target = new OffscreenCanvas(10, 2), to = target.getContext('2d');
         const at = x => [...to.getImageData(x, 0, 1, 1).data];
         from.fillStyle = '#ff0000'; from.fillRect(0, 0, 2, 2); to.drawImage(source, 0, 0);
@@ -251,14 +253,14 @@ fn canvas_sources_flush_their_readers_before_their_pixels_change() {
         ac.fillStyle = '#ff0000'; ac.fillRect(0, 0, 1, 1); bc.drawImage(a, 0, 0); ac.drawImage(b, 0, 0); ac.clearRect(0, 0, 1, 1); bc.fillStyle = '#0000ff'; bc.fillRect(0, 0, 1, 1); ac.drawImage(b, 0, 0);
         same([[...ac.getImageData(0, 0, 1, 1).data], [...bc.getImageData(0, 0, 1, 1).data]], [[0, 0, 255, 255], [0, 0, 255, 255]], 'cycle');
     "#,
-    );
-    assert_eq!(result, "ok");
+  );
+  assert_eq!(result, "ok");
 }
 
 #[test]
 fn offscreen_canvas_draws_reads_and_resizes() {
-    let (.., result) = offscreen_page(
-        r#"
+  let (.., result) = offscreen_page(
+    r#"
         same(typeof OffscreenCanvas, 'function', 'global');
         const canvas = new OffscreenCanvas(4.7, 2), context = canvas.getContext('2d');
         same([canvas.width, canvas.height, String(canvas), context.canvas === canvas, context instanceof OffscreenCanvasRenderingContext2D, canvas.getContext('2d') === context, canvas.getContext('webgpu'), new OffscreenCanvas(1, 1).getContext('webgl2')], [4, 2, '[object OffscreenCanvas]', true, true, true, null, null], 'object');
@@ -290,14 +292,14 @@ fn offscreen_canvas_draws_reads_and_resizes() {
         drawing.fillRect(0, 1, 1, 1);
         same([...drawing.getImageData(1, 1, 1, 1).data], [0, 0, 255, 255], 'the drawing state survives the transfer');
     "#,
-    );
-    assert_eq!(result, "ok");
+  );
+  assert_eq!(result, "ok");
 }
 
 #[test]
 fn create_image_bitmap_takes_all_sources() {
-    let (.., result) = offscreen_page(
-        r#"
+  let (.., result) = offscreen_page(
+    r#"
         const sample = new OffscreenCanvas(2, 1); sample.getContext('2d').fillRect(0, 0, 1, 1);
         const png = new Uint8Array(await (await sample.convertToBlob()).arrayBuffer());
         const fromBlob = await createImageBitmap(new Blob([png], { type: 'image/png' }));
@@ -361,14 +363,14 @@ fn create_image_bitmap_takes_all_sources() {
         same([...reader.getImageData(1, 0, 1, 1).data], [0, 0, 0, 0], 'bitmaprenderer clears');
         try { renderer.transferFromImageBitmap({}); throw Error('object'); } catch (error) { if (!(error instanceof TypeError)) throw error; }
     "#,
-    );
-    assert_eq!(result, "ok");
+  );
+  assert_eq!(result, "ok");
 }
 
 #[test]
 fn huge_svg_images_draw_at_their_canvas_size() {
-    let (.., result) = offscreen_page(
-        r#"
+  let (.., result) = offscreen_page(
+    r#"
         const huge = new Image(); huge.src = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="30000" height="30000"><rect width="15000" height="30000" fill="red"/><rect x="15000" width="15000" height="30000" fill="blue"/></svg>');
         await huge.decode();
         same([huge.naturalWidth, huge.naturalHeight], [30000, 30000], 'natural size');
@@ -380,14 +382,14 @@ fn huge_svg_images_draw_at_their_canvas_size() {
         drawing.drawImage(huge, 0, 0, 10, 10); drawing.drawImage(huge, 0, 0, 10, 10);
         same([...drawing.getImageData(2, 5, 1, 1).data], [255, 0, 0, 255], 'again');
     "#,
-    );
-    assert_eq!(result, "ok");
+  );
+  assert_eq!(result, "ok");
 }
 
 #[test]
 fn page_workers_report_errors_and_get_files() {
-    let (.., result) = offscreen_page(
-        r#"
+  let (.., result) = offscreen_page(
+    r#"
         const inner = worker(`onmessage = ({ data }) => {
             if (data === 'throw') throw new TypeError('bad');
             if (data === 'later') return setTimeout(() => { throw new Error('late'); });
@@ -417,14 +419,14 @@ fn page_workers_report_errors_and_get_files() {
         const missing = new Worker('apps:///missing.js');
         same(await new Promise(resolve => { missing.onerror = event => resolve(event.message); }), 'Missing bundled worker: missing.js', 'a missing worker fails with an event');
     "#,
-    );
-    assert_eq!(result, "ok");
+  );
+  assert_eq!(result, "ok");
 }
 
 #[test]
 fn bitmaps_and_canvases_move_between_threads() {
-    let (host, engine, result) = offscreen_page(
-        r#"
+  let (host, engine, result) = offscreen_page(
+    r#"
         const data = new ImageData(new Uint8ClampedArray([255,0,0,128, 0,255,0,255]), 2, 1);
         const original = await createImageBitmap(data);
         const before = rgba(original);
@@ -480,147 +482,149 @@ fn bitmaps_and_canvases_move_between_threads() {
         ownContext.fillStyle = '#ff00ff'; ownContext.fillRect(0, 0, 2, 2); ownContext._flush();
         globalThis.local = local._id;
     "#,
-    );
-    assert_eq!(result, "ok");
-    let node = |name: &str| -> usize { engine.eval(name, "test").unwrap().parse().unwrap() };
-    let host = host.borrow().store.clone();
-    let host = host.borrow();
-    let dom = &host.pages[&1].state;
-    assert_eq!(
-        dom.media.images[&node("placeholder")].size().width as u32,
-        16
-    );
-    assert!(host.pages[&1].dirty);
-    let local = &dom.media.canvases[&node("local")];
-    assert_eq!(local.image.bytes()[..4], [255, 0, 255, 255]);
+  );
+  assert_eq!(result, "ok");
+  let node = |name: &str| -> usize { engine.eval(name, "test").unwrap().parse().unwrap() };
+  let host = host.borrow().store.clone();
+  let host = host.borrow();
+  let dom = &host.pages[&1].state;
+  assert_eq!(
+    dom.media.images[&node("placeholder")].size().width as u32,
+    16
+  );
+  assert!(host.pages[&1].dirty);
+  let local = &dom.media.canvases[&node("local")];
+  assert_eq!(local.image.bytes()[..4], [255, 0, 255, 255]);
 }
 
 #[test]
 fn bitmaps_free_their_pixels() {
-    let (host, engine, result) = offscreen_page(
-        r#"
+  let (host, engine, result) = offscreen_page(
+    r#"
         globalThis.closed = await createImageBitmap(new ImageData(1, 1));
         globalThis.closedId = closed._id;
         closed.close();
     "#,
+  );
+  assert_eq!(result, "ok");
+  let id: usize = engine.eval("closedId", "test").unwrap().parse().unwrap();
+  assert!(
+    !host.borrow().store.borrow().pages[&1]
+      .state
+      .media
+      .canvases
+      .contains_key(&id)
+  );
+  host
+    .borrow()
+    .store
+    .borrow_mut()
+    .pages
+    .get_mut(&1)
+    .unwrap()
+    .dirty = false;
+  engine.eval("globalThis.kept = new OffscreenCanvas(1, 1); kept.getContext('2d').fillRect(0, 0, 1, 1); kept._context._flush();", "test").unwrap();
+  let kept: usize = engine.eval("kept._id", "test").unwrap().parse().unwrap();
+  {
+    let host = host.borrow().store.clone();
+    let host = host.borrow();
+    assert!(!host.pages[&1].dirty);
+    assert!(!host.pages[&1].state.media.canvases[&kept].present);
+    assert_eq!(
+      host.pages[&1].state.media.canvases[&kept].pixels.pixels()[0].alpha(),
+      255
     );
-    assert_eq!(result, "ok");
-    let id: usize = engine.eval("closedId", "test").unwrap().parse().unwrap();
-    assert!(
-        !host.borrow().store.borrow().pages[&1]
-            .state
-            .media
-            .canvases
-            .contains_key(&id)
-    );
-    host.borrow()
-        .store
-        .borrow_mut()
-        .pages
-        .get_mut(&1)
-        .unwrap()
-        .dirty = false;
-    engine.eval("globalThis.kept = new OffscreenCanvas(1, 1); kept.getContext('2d').fillRect(0, 0, 1, 1); kept._context._flush();", "test").unwrap();
-    let kept: usize = engine.eval("kept._id", "test").unwrap().parse().unwrap();
-    {
-        let host = host.borrow().store.clone();
-        let host = host.borrow();
-        assert!(!host.pages[&1].dirty);
-        assert!(!host.pages[&1].state.media.canvases[&kept].present);
-        assert_eq!(
-            host.pages[&1].state.media.canvases[&kept].pixels.pixels()[0].alpha(),
-            255
-        );
-    }
-    engine
+  }
+  engine
         .eval(
             r#"globalThis.source = new OffscreenCanvas(1024, 1024); source.getContext('2d').fillRect(0, 0, 1024, 1024);
             globalThis.drop = () => { createImageBitmap(source).catch(error => console.error(error)); };"#,
             "test",
         )
         .unwrap();
-    let (mut most, mut made) = (0, 0);
-    let started = std::time::Instant::now();
-    // A loaded machine makes few bitmaps in a debug build, so it makes at least 40.
-    while started.elapsed().as_secs() < 3
-        || (made < 40 || most * 2 >= made) && started.elapsed().as_secs() < 60
-    {
-        engine.eval("drop()", "test").unwrap();
-        made += 1;
-        engine.tick().unwrap();
-        most = most.max(
-            host.borrow().store.borrow().pages[&1]
-                .state
-                .media
-                .canvases
-                .len(),
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    assert!(
-        most * 2 < made,
-        "{most} of {made} unclosed bitmaps stayed alive"
+  let (mut most, mut made) = (0, 0);
+  let started = std::time::Instant::now();
+  // A loaded machine makes few bitmaps in a debug build, so it makes at least 40.
+  while started.elapsed().as_secs() < 3
+    || (made < 40 || most * 2 >= made) && started.elapsed().as_secs() < 60
+  {
+    engine.eval("drop()", "test").unwrap();
+    made += 1;
+    engine.tick().unwrap();
+    most = most.max(
+      host.borrow().store.borrow().pages[&1]
+        .state
+        .media
+        .canvases
+        .len(),
     );
+    std::thread::sleep(std::time::Duration::from_millis(5));
+  }
+  assert!(
+    most * 2 < made,
+    "{most} of {made} unclosed bitmaps stayed alive"
+  );
 }
 
 #[test]
 fn images_decode_on_workers_and_load_after_a_wake() {
-    let (wake, woken) = std::sync::mpsc::channel();
-    apps_runtime::jsc::Waker::install(move || {
-        let _ = wake.send(());
-    });
-    let directory = tempfile::tempdir().unwrap();
-    std::fs::copy(
-        "tests/images/sample.png",
-        directory.path().join("sample.png"),
-    )
+  let (wake, woken) = std::sync::mpsc::channel();
+  apps_runtime::jsc::Waker::install(move || {
+    let _ = wake.send(());
+  });
+  let directory = tempfile::tempdir().unwrap();
+  std::fs::copy(
+    "tests/images/sample.png",
+    directory.path().join("sample.png"),
+  )
+  .unwrap();
+  image::GrayImage::new(16385, 1)
+    .save(directory.path().join("wide.png"))
     .unwrap();
-    image::GrayImage::new(16385, 1)
-        .save(directory.path().join("wide.png"))
+  let host = Rc::new(RefCell::new(Host::default()));
+  host.borrow().store.borrow_mut().pages.insert(
+    1,
+    Page {
+      doc: Document::parse("<body></body>"),
+      ..Default::default()
+    },
+  );
+  let base = url::Url::from_directory_path(directory.path()).unwrap();
+  host
+    .borrow()
+    .store
+    .borrow_mut()
+    .pages
+    .get_mut(&1)
+    .unwrap()
+    .state
+    .base = Some(base.clone());
+  let engine = JsContext::new(
+    JavaScriptCore::load().unwrap(),
+    host.clone(),
+    Role::Renderer(1),
+  )
+  .unwrap();
+  let settle = |count: usize| {
+    let started = std::time::Instant::now();
+    while engine
+      .eval("events.length", "test")
+      .unwrap()
+      .parse::<usize>()
+      .unwrap()
+      < count
+    {
+      woken
+        .recv_timeout(std::time::Duration::from_secs(10))
         .unwrap();
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse("<body></body>"),
-            ..Default::default()
-        },
-    );
-    let base = url::Url::from_directory_path(directory.path()).unwrap();
-    host.borrow()
-        .store
-        .borrow_mut()
-        .pages
-        .get_mut(&1)
-        .unwrap()
-        .state
-        .base = Some(base.clone());
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
-    let settle = |count: usize| {
-        let started = std::time::Instant::now();
-        while engine
-            .eval("events.length", "test")
-            .unwrap()
-            .parse::<usize>()
-            .unwrap()
-            < count
-        {
-            woken
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .unwrap();
-            engine.tick().unwrap();
-            assert!(started.elapsed() < std::time::Duration::from_secs(60));
-        }
-        engine
-            .eval("JSON.stringify(events.splice(0).sort())", "test")
-            .unwrap()
-    };
-    engine.eval(&format!(r#"
+      engine.tick().unwrap();
+      assert!(started.elapsed() < std::time::Duration::from_secs(60));
+    }
+    engine
+      .eval("JSON.stringify(events.splice(0).sort())", "test")
+      .unwrap()
+  };
+  engine.eval(&format!(r#"
         globalThis.base = {}; globalThis.events = [];
         globalThis.image = new Image(); globalThis.wide = new Image(); document.body.append(image, wide);
         image.addEventListener('load', () => events.push('load:' + image.naturalWidth + ':' + image.complete));
@@ -631,39 +635,40 @@ fn images_decode_on_workers_and_load_after_a_wake() {
         image.decode().then(() => events.push('decoded:' + image.naturalHeight));
         if (image.complete || wide.complete || image.naturalWidth || events.length) throw Error('Image loaded synchronously');
     "#, serde_json::json!(base.as_str())), "test").unwrap();
-    host.borrow()
-        .store
-        .borrow_mut()
-        .pages
-        .get_mut(&1)
-        .unwrap()
-        .dirty = false;
-    assert_eq!(
-        settle(3),
-        r#"["decoded:3","load:4:true","wide:error:true:0"]"#
-    );
-    let id: usize = engine.eval("image._id", "test").unwrap().parse().unwrap();
-    {
-        let host = host.borrow().store.clone();
-        let host = host.borrow();
-        assert!(host.pages[&1].dirty && host.pages[&1].state.media.images.contains_key(&id));
-        assert!(host.pages[&1].state.media.retired.is_empty());
-    }
-    engine.eval(r#"
+  host
+    .borrow()
+    .store
+    .borrow_mut()
+    .pages
+    .get_mut(&1)
+    .unwrap()
+    .dirty = false;
+  assert_eq!(
+    settle(3),
+    r#"["decoded:3","load:4:true","wide:error:true:0"]"#
+  );
+  let id: usize = engine.eval("image._id", "test").unwrap().parse().unwrap();
+  {
+    let host = host.borrow().store.clone();
+    let host = host.borrow();
+    assert!(host.pages[&1].dirty && host.pages[&1].state.media.images.contains_key(&id));
+    assert!(host.pages[&1].state.media.retired.is_empty());
+  }
+  engine.eval(r#"
         const svg = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="30" height="12"></svg>');
         image.src = base + 'wide.png'; image.src = base + 'sample.png'; image.src = svg;
     "#, "test").unwrap();
-    assert_eq!(settle(1), r#"["load:30:true"]"#);
-    engine
-        .eval("image.src = base + 'sample.png'", "test")
-        .unwrap();
-    assert_eq!(settle(1), r#"["load:4:true"]"#);
-    engine
-        .eval("image.src = base + 'missing.png'", "test")
-        .unwrap();
-    assert_eq!(settle(1), r#"["error"]"#);
-    let host = host.borrow().store.clone();
-    let host = host.borrow();
-    assert_eq!(host.pages[&1].state.media.retired.len(), 1);
-    assert!(host.pages[&1].state.media.images.contains_key(&id));
+  assert_eq!(settle(1), r#"["load:30:true"]"#);
+  engine
+    .eval("image.src = base + 'sample.png'", "test")
+    .unwrap();
+  assert_eq!(settle(1), r#"["load:4:true"]"#);
+  engine
+    .eval("image.src = base + 'missing.png'", "test")
+    .unwrap();
+  assert_eq!(settle(1), r#"["error"]"#);
+  let host = host.borrow().store.clone();
+  let host = host.borrow();
+  assert_eq!(host.pages[&1].state.media.retired.len(), 1);
+  assert!(host.pages[&1].state.media.images.contains_key(&id));
 }

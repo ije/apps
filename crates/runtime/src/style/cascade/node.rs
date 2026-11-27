@@ -4,9 +4,9 @@ use crate::css::value::units::{FontUnits, Lengths};
 use crate::css::value::{anchor, color::color};
 use crate::dom::Document;
 use crate::style::cascade::computed::{
-    AGENT_DISPLAY, CAPTION, CELL, COUNTED, ComputedStyles, DISPLAY_CONTENTS, DISPLAY_NONE, Extras,
-    INVISIBLE, NO_EXTRAS, SELECT_ALL, SELECT_NONE, SELECT_TEXT, TABLE_DISPLAYS, empty, rare,
-    table_box,
+  AGENT_DISPLAY, CAPTION, CELL, COUNTED, ComputedStyles, DISPLAY_CONTENTS, DISPLAY_NONE, Extras,
+  INVISIBLE, NO_EXTRAS, SELECT_ALL, SELECT_NONE, SELECT_TEXT, TABLE_DISPLAYS, empty, rare,
+  table_box,
 };
 use crate::style::cascade::container::{ContainerQuery, query_containers};
 use crate::style::cascade::counters::{list_item, listed};
@@ -15,7 +15,7 @@ use crate::style::cascade::moves::mark_moves;
 use crate::style::cascade::rank::{AGENT, CascadeRank, physical, put};
 use crate::style::cascade::scope::{MatchedRules, PSEUDO, SELECTOR, intern};
 use crate::style::cascade::shadow::{
-    ELEMENT, HIGHLIGHT, PART, SLOTTED, STARTING, ShadowRule, Shadowed, TRANSITION, exported_parts,
+  ELEMENT, HIGHLIGHT, PART, SLOTTED, STARTING, ShadowRule, Shadowed, TRANSITION, exported_parts,
 };
 use crate::style::cascade::used_values::Element;
 use crate::style::cascade::{Container, Passed, TreeWalk};
@@ -30,144 +30,143 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::rc::Rc;
 pub(crate) struct NodePass<'a> {
-    pub(crate) doc: &'a Document,
-    pub(crate) context: Option<&'a StyleContext>,
-    pub(crate) walk: &'a TreeWalk,
-    pub(crate) scopes: &'a [usize],
-    pub(crate) shadows: &'a Shadows,
-    pub(crate) previous: Option<&'a ComputedStyles>,
-    pub(crate) registry: &'a Rc<Registry>,
-    pub(crate) theme: Option<Rc<Style>>,
-    pub(crate) text_system: Option<&'a renderer::TextSystem>,
-    pub(crate) viewport: [f32; 2],
-    pub(crate) scale: f32,
-    pub(crate) native_theme: u32,
-    pub(crate) fast: bool,
-    pub(crate) stored: bool,
+  pub(crate) doc: &'a Document,
+  pub(crate) context: Option<&'a StyleContext>,
+  pub(crate) walk: &'a TreeWalk,
+  pub(crate) scopes: &'a [usize],
+  pub(crate) shadows: &'a Shadows,
+  pub(crate) previous: Option<&'a ComputedStyles>,
+  pub(crate) registry: &'a Rc<Registry>,
+  pub(crate) theme: Option<Rc<Style>>,
+  pub(crate) text_system: Option<&'a renderer::TextSystem>,
+  pub(crate) viewport: [f32; 2],
+  pub(crate) scale: f32,
+  pub(crate) native_theme: u32,
+  pub(crate) fast: bool,
+  pub(crate) stored: bool,
 }
 
 impl NodePass<'_> {
-    // Styles the dirty nodes and the nodes below them, or all nodes. Returns whether list numbers must be counted
-    // again, and whether any node uses counters.
-    pub(crate) fn run(
-        &self,
-        style_cache: &mut StyleCache,
-        out: &mut ComputedStyles,
-        orphans: &mut Vec<usize>,
-    ) -> (bool, bool) {
-        let (doc, context, walk, scopes, shadows, previous, registry, theme) = (
-            self.doc,
-            self.context,
-            self.walk,
-            self.scopes,
-            self.shadows,
-            self.previous,
-            self.registry,
-            &self.theme,
-        );
-        let ([width, height], native_theme, fast, stored) =
-            (self.viewport, self.native_theme, self.fast, self.stored);
-        let order = walk.walk.order();
-        // The generation and revision of each dependency key in the list of the current node.
-        let mut inheritable = std::mem::take(&mut style_cache.inheritable);
-        let mut local: Vec<Prop> = registry
-            .iter()
-            .filter(|(_, (_, inherits, _))| !inherits)
-            .map(|(&prop, _)| prop)
-            .collect();
-        local.sort_unstable();
-        let mut inherit = |vars: &Vars| -> Vars {
-            if local.is_empty() {
-                return vars.clone();
+  // Styles the dirty nodes and the nodes below them, or all nodes. Returns whether list numbers must be counted
+  // again, and whether any node uses counters.
+  pub(crate) fn run(
+    &self,
+    style_cache: &mut StyleCache,
+    out: &mut ComputedStyles,
+    orphans: &mut Vec<usize>,
+  ) -> (bool, bool) {
+    let (doc, context, walk, scopes, shadows, previous, registry, theme) = (
+      self.doc,
+      self.context,
+      self.walk,
+      self.scopes,
+      self.shadows,
+      self.previous,
+      self.registry,
+      &self.theme,
+    );
+    let ([width, height], native_theme, fast, stored) =
+      (self.viewport, self.native_theme, self.fast, self.stored);
+    let order = walk.walk.order();
+    // The generation and revision of each dependency key in the list of the current node.
+    let mut inheritable = std::mem::take(&mut style_cache.inheritable);
+    let mut local: Vec<Prop> = registry
+      .iter()
+      .filter(|(_, (_, inherits, _))| !inherits)
+      .map(|(&prop, _)| prop)
+      .collect();
+    local.sort_unstable();
+    let mut inherit = |vars: &Vars| -> Vars {
+      if local.is_empty() {
+        return vars.clone();
+      }
+      inheritable
+        .entry(Rc::as_ptr(vars))
+        .or_insert_with(|| {
+          // Both lists are in order. Most lists hold no local property, so they are not copied.
+          let (mut rest, mut kept) = (&local[..], None::<Vec<_>>);
+          for (index, entry) in vars.iter().enumerate() {
+            while rest.first().is_some_and(|&prop| prop < entry.0) {
+              rest = &rest[1..];
             }
-            inheritable
-                .entry(Rc::as_ptr(vars))
-                .or_insert_with(|| {
-                    // Both lists are in order. Most lists hold no local property, so they are not copied.
-                    let (mut rest, mut kept) = (&local[..], None::<Vec<_>>);
-                    for (index, entry) in vars.iter().enumerate() {
-                        while rest.first().is_some_and(|&prop| prop < entry.0) {
-                            rest = &rest[1..];
-                        }
-                        if rest.first() == Some(&entry.0) {
-                            kept.get_or_insert_with(|| vars[..index].to_vec());
-                        } else if let Some(kept) = &mut kept {
-                            kept.push(entry.clone());
-                        }
-                    }
-                    (vars.clone(), kept.map(Rc::new))
-                })
-                .1
-                .clone()
-                .unwrap_or_else(|| vars.clone())
-        };
-        let (unstyled, empty) = empty();
-        let matches = &mut style_cache.matches;
-        matches.set_hosts(&shadows.hosts);
-        matches.update(doc, &walk.walk);
-        let mut candidates: Vec<usize> = Vec::new();
-        let mut shares: FxHashMap<(usize, [u32; 7]), Share> = FxHashMap::default();
-        let no_pseudos: Rc<[usize]> = Rc::new([]);
-        let unshared = style_cache.unshared;
-        let mut changed = std::mem::take(&mut style_cache.changed);
-        style_cache.stamp += 1;
-        let stamp = style_cache.stamp << 8;
-        // A fast pass numbers the counters again only when one of their inputs changed.
-        let mut recount = false;
-        if fast {
-            mark_moves(
-                doc,
-                walk,
-                shadows,
-                style_cache.styled.as_ref(),
-                matches,
-                out,
-                &mut changed,
-                &mut recount,
-                (&unstyled, &empty),
-            );
+            if rest.first() == Some(&entry.0) {
+              kept.get_or_insert_with(|| vars[..index].to_vec());
+            } else if let Some(kept) = &mut kept {
+              kept.push(entry.clone());
+            }
+          }
+          (vars.clone(), kept.map(Rc::new))
+        })
+        .1
+        .clone()
+        .unwrap_or_else(|| vars.clone())
+    };
+    let (unstyled, empty) = empty();
+    let matches = &mut style_cache.matches;
+    matches.set_hosts(&shadows.hosts);
+    matches.update(doc, &walk.walk);
+    let mut candidates: Vec<usize> = Vec::new();
+    let mut shares: FxHashMap<(usize, [u32; 7]), Share> = FxHashMap::default();
+    let no_pseudos: Rc<[usize]> = Rc::new([]);
+    let unshared = style_cache.unshared;
+    let mut changed = std::mem::take(&mut style_cache.changed);
+    style_cache.stamp += 1;
+    let stamp = style_cache.stamp << 8;
+    // A fast pass numbers the counters again only when one of their inputs changed.
+    let mut recount = false;
+    if fast {
+      mark_moves(
+        doc,
+        walk,
+        shadows,
+        style_cache.styled.as_ref(),
+        matches,
+        out,
+        &mut changed,
+        &mut recount,
+        (&unstyled, &empty),
+      );
+    }
+    let ComputedStyles {
+      values: styles,
+      vars: custom,
+      flags: style_flags,
+      lengths,
+      extras,
+      containers,
+      revision,
+      ..
+    } = out;
+    *revision = doc.nodes.latest();
+    const CHANGED: u8 = 1;
+    const DEEP: u8 = 2;
+    macro_rules! changed {
+      ($id:expr) => {
+        match changed[$id] ^ stamp {
+          value if value < 256 => value as u8,
+          _ => 0,
         }
-        let ComputedStyles {
-            values: styles,
-            vars: custom,
-            flags: style_flags,
-            lengths,
-            extras,
-            containers,
-            revision,
-            ..
-        } = out;
-        *revision = doc.nodes.latest();
-        const CHANGED: u8 = 1;
-        const DEEP: u8 = 2;
-        macro_rules! changed {
-            ($id:expr) => {
-                match changed[$id] ^ stamp {
-                    value if value < 256 => value as u8,
-                    _ => 0,
-                }
-            };
-        }
-        let mut counters = false;
-        let html: Vec<usize> = walk.special[0]
-            .iter()
-            .copied()
-            .filter(|&id| doc.nodes[id].tag == "html")
-            .collect();
-        // Named `style()` queries put the values of containers into the chain, so all chains change with them.
-        let named_queries = style_cache.scopes.iter().any(|scope| scope.named);
-        let mut all = std::mem::replace(&mut style_cache.named, named_queries) != named_queries;
-        let mut root = FontUnits::new(16.);
-        let mut font_metrics = HashMap::new();
-        let mut passed_on = FxHashMap::default();
-        let mut merges = FxHashMap::default();
-        let last = context.and_then(|context| context.previous.as_deref());
-        let address =
-            |list: Option<&Option<Rc<Container>>>| list.map(|list| list.as_ref().map(Rc::as_ptr));
-        let mut hosted: Vec<Passed> = Vec::new();
-        let mut texts =
-            FxHashMap::<_, (Rc<Style>, Vars, u16, Lengths, Option<Rc<Extras>>)>::default();
-        macro_rules! settle {
+      };
+    }
+    let mut counters = false;
+    let html: Vec<usize> = walk.special[0]
+      .iter()
+      .copied()
+      .filter(|&id| doc.nodes[id].tag == "html")
+      .collect();
+    // Named `style()` queries put the values of containers into the chain, so all chains change with them.
+    let named_queries = style_cache.scopes.iter().any(|scope| scope.named);
+    let mut all = std::mem::replace(&mut style_cache.named, named_queries) != named_queries;
+    let mut root = FontUnits::new(16.);
+    let mut font_metrics = HashMap::new();
+    let mut passed_on = FxHashMap::default();
+    let mut merges = FxHashMap::default();
+    let last = context.and_then(|context| context.previous.as_deref());
+    let address =
+      |list: Option<&Option<Rc<Container>>>| list.map(|list| list.as_ref().map(Rc::as_ptr));
+    let mut hosted: Vec<Passed> = Vec::new();
+    let mut texts = FxHashMap::<_, (Rc<Style>, Vars, u16, Lengths, Option<Rc<Extras>>)>::default();
+    macro_rules! settle {
             (@changed $id:expr, $up:expr) => {
                 let (id, up): (usize, Option<usize>) = ($id, $up);
                 if shadows.roots.contains_key(&id) {
@@ -240,392 +239,388 @@ impl NodePass<'_> {
                 settle!(@changed id, $up);
             };
         }
-        // A pass with animated values must leave the dirty marks, as the next stored pass starts again from the
-        // last stored one.
-        let mut moving = Vec::new();
-        if fast && !stored {
-            moving.resize(doc.nodes.len(), false);
-            for &id in context
-                .into_iter()
-                .flat_map(|context| context.animated.keys())
-            {
-                if let Some(slot) = moving.get_mut(id) {
-                    *slot = true;
-                }
-            }
+    // A pass with animated values must leave the dirty marks, as the next stored pass starts again from the
+    // last stored one.
+    let mut moving = Vec::new();
+    if fast && !stored {
+      moving.resize(doc.nodes.len(), false);
+      for &id in context
+        .into_iter()
+        .flat_map(|context| context.animated.keys())
+      {
+        if let Some(slot) = moving.get_mut(id) {
+          *slot = true;
         }
-        // A fast pass visits only the dirty and moving nodes and the nodes below a changed one. The document and
-        // the root elements are in the list because they set the root font size.
-        let mut seeds: Vec<u32> = Vec::new();
-        if fast {
-            let animated = context.filter(|_| !stored);
-            let animated = animated
-                .into_iter()
-                .flat_map(|context| context.animated.keys().copied());
-            let roots = std::iter::once(0).chain(html.iter().copied());
-            let mut gone = Vec::new();
-            let dirty = matches.dirty_nodes().filter_map(|id| {
-                let at = walk.walk.place(id);
-                if at.is_none() && stored {
-                    gone.push(id);
-                }
-                at
-            });
-            let places = roots.chain(animated).filter_map(|id| walk.walk.place(id));
-            seeds = places.chain(dirty).collect();
-            seeds.sort_unstable();
-            // A node that joins the walk gets a dirty mark again, so the nodes outside it need none.
-            for id in gone {
-                matches.clean(id);
-            }
+      }
+    }
+    // A fast pass visits only the dirty and moving nodes and the nodes below a changed one. The document and
+    // the root elements are in the list because they set the root font size.
+    let mut seeds: Vec<u32> = Vec::new();
+    if fast {
+      let animated = context.filter(|_| !stored);
+      let animated = animated
+        .into_iter()
+        .flat_map(|context| context.animated.keys().copied());
+      let roots = std::iter::once(0).chain(html.iter().copied());
+      let mut gone = Vec::new();
+      let dirty = matches.dirty_nodes().filter_map(|id| {
+        let at = walk.walk.place(id);
+        if at.is_none() && stored {
+          gone.push(id);
         }
-        let (mut next, mut seed, mut scan) = (0, 0, 0);
-        let mut visited: Option<(usize, usize)> = None;
-        loop {
-            if let Some((at, id)) = visited.take()
-                && changed!(id) != 0
-            {
-                scan = scan.max(at + walk.walk.span(id));
+        at
+      });
+      let places = roots.chain(animated).filter_map(|id| walk.walk.place(id));
+      seeds = places.chain(dirty).collect();
+      seeds.sort_unstable();
+      // A node that joins the walk gets a dirty mark again, so the nodes outside it need none.
+      for id in gone {
+        matches.clean(id);
+      }
+    }
+    let (mut next, mut seed, mut scan) = (0, 0, 0);
+    let mut visited: Option<(usize, usize)> = None;
+    loop {
+      if let Some((at, id)) = visited.take()
+        && changed!(id) != 0
+      {
+        scan = scan.max(at + walk.walk.span(id));
+      }
+      let mut reached = true;
+      if fast && !all && next >= scan {
+        while seeds.get(seed).is_some_and(|&at| (at as usize) < next) {
+          seed += 1;
+        }
+        // Debug builds visit every node, to check that the skipped ones need no new style.
+        match seeds.get(seed) {
+          _ if cfg!(debug_assertions) => reached = seeds.get(seed) == Some(&(next as u32)),
+          Some(&at) => next = at as usize,
+          None => break,
+        }
+      }
+      let Some(&(id, up)) = order.get(next) else {
+        break;
+      };
+      let at = next;
+      next += 1;
+      let id = id as usize;
+      if fast {
+        if !all
+          && !matches.is_dirty(id)
+          && moving.get(id) != Some(&true)
+          && (up == u32::MAX || changed!(up as usize) == 0)
+        {
+          if id == 0 || html.contains(&id) {
+            root = lengths[id].font;
+          }
+          continue;
+        }
+        assert!(
+          reached || all,
+          "node {id} needs a style outside the dirty list"
+        );
+        visited = Some((at, id));
+        if stored {
+          matches.clean(id);
+        }
+        extras.remove(id);
+      }
+      let up = (up != u32::MAX).then_some(up as usize);
+      // A patched walk without shadow trees leaves `tree` as it was.
+      let tree = match walk.trees.len() {
+        1 => 0,
+        _ => walk.tree[id] as usize,
+      };
+      let node = &doc.nodes[id];
+      if tree != 0 && walk.trees[tree].0 == id {
+        let host = walk.trees[tree].1;
+        styles.set(id, styles[host].clone(), Rc::ptr_eq);
+        custom.set(id, custom[host].clone(), Rc::ptr_eq);
+        style_flags.set(id, style_flags[host], u16::eq);
+        lengths.set(id, lengths[host]);
+        containers.set(id, containers[host].clone(), |a, b| {
+          address(Some(a)) == address(Some(b))
+        });
+        let selection = extras.get(host).and_then(|host| host.selection.clone());
+        if selection.is_some() {
+          let kept = Extras {
+            selection,
+            ..Extras::default()
+          };
+          extras.put(id, Rc::new(kept));
+        }
+        settle!(@changed id, up);
+        continue;
+      }
+      let seen = up.and_then(|up| containers[up].clone());
+      let parent_style = up.map(|up| &styles[up]);
+      // Children of a `display: contents` box are items of the nearest ancestor that has a box.
+      let parent_role = up.map_or(0, |up| style_flags[up] >> 8);
+      let (item, table_item) = {
+        let (mut at, mut display) = (
+          up,
+          parent_style.and_then(|parent| parent.get(Prop::DISPLAY)),
+        );
+        while display == Some("contents") {
+          at = at
+            .and_then(|at| walk.walk.parent(at))
+            .filter(|&at| at != u32::MAX)
+            .map(|at| at as usize);
+          display = at.and_then(|at| styles[at].get(Prop::DISPLAY));
+        }
+        (
+          matches!(
+            display,
+            Some("flex" | "inline-flex" | "grid" | "inline-grid")
+          ) || at.is_some_and(|at| drawable_canvas(&doc.nodes[at], &styles[at])),
+          at.is_some_and(|at| table_box(style_flags[at] >> 8)),
+        )
+      };
+      let parent_vars = up
+        .map(|up| &custom[up])
+        .filter(|_| !matches!(node.tag.as_str(), "#text" | "#comment"));
+      // Custom properties of the parent that `style()` queries read.
+      let style_reads = std::cell::RefCell::new(Vec::new());
+      let parent = up.map_or(FontUnits::new(16.), |up| lengths[up].font);
+      let inputs = Inputs::new(parent, root);
+      let mut waiting: Vec<(usize, usize, ContainerQuery)> = Vec::new();
+      let mut shadow: Vec<ShadowRule> = Vec::new();
+      let mut contained =
+        |rule: &mut ShadowRule, key: (usize, usize), conditions: &ContainerQuery| {
+          let applies = query_containers(
+            conditions,
+            seen.as_deref(),
+            key,
+            &style_cache.containers,
+            |container| lengths[container],
+            &mut style_cache.queries,
+            (parent_vars, &style_reads),
+          );
+          if matches!(rule.kind, ELEMENT | STARTING) {
+            return applies;
+          }
+          waiting.push((key.0, key.1, conditions.clone()));
+          rule.query = Some((key.0, key.1, applies));
+          true
+        };
+      hosted.clear();
+      if let Some(&root) = shadows.roots.get(&id)
+        && let Some(&index) = walk
+          .tree
+          .get(root)
+          .and_then(|&tree| scopes.get(tree as usize))
+      {
+        let inner = &mut style_cache.scopes[index];
+        if !inner.nodes[root]
+          .as_ref()
+          .is_some_and(|matched| matches.valid_since(&matched.dependencies, &matched.checked))
+        {
+          matches.begin();
+          matches.depend(root, 0);
+          let mut matched: Vec<(usize, [usize; 3])> = Vec::new();
+          for &entry in inner.universal.iter().filter(|&&entry| entry < PSEUDO) {
+            let (order, index) = (entry >> SELECTOR, entry & ((1 << SELECTOR) - 1));
+            let selector = &inner.rules[order].0[index];
+            if matches.matches(selector, doc, root, None) {
+              match matched.last_mut() {
+                Some(last) if last.0 == order => last.1 = last.1.max(selector.specificity),
+                _ => matched.push((order, selector.specificity)),
+              }
             }
-            let mut reached = true;
-            if fast && !all && next >= scan {
-                while seeds.get(seed).is_some_and(|&at| (at as usize) < next) {
-                    seed += 1;
-                }
-                // Debug builds visit every node, to check that the skipped ones need no new style.
-                match seeds.get(seed) {
-                    _ if cfg!(debug_assertions) => {
-                        reached = seeds.get(seed) == Some(&(next as u32))
-                    }
-                    Some(&at) => next = at as usize,
-                    None => break,
-                }
+          }
+          let pseudos = inner
+            .universal
+            .iter()
+            .filter(|&&index| index >= PSEUDO)
+            .map(|&index| index & !PSEUDO)
+            .filter(|&index| {
+              let (kind, selector, _, key) = &inner.pseudos[index];
+              key.is_empty()
+                && !matches!(*kind, SLOTTED | HIGHLIGHT)
+                && matches.matches(selector, doc, root, None)
+            })
+            .collect();
+          matches.finish(id);
+          inner.nodes[root] = Some(MatchedRules {
+            checked: std::cell::Cell::new(matches.epoch),
+            cached: None,
+            dependencies: matches.recorded().into(),
+            rules: matched.into(),
+            pseudos,
+          });
+        }
+        let inner = &*inner;
+        for (kind, order, specificity, pseudo) in inner.nodes[root].iter().flat_map(|matched| {
+          matched
+            .rules
+            .iter()
+            .map(|&(order, specificity)| (ELEMENT, order, specificity, 0))
+            .chain(matched.pseudos.iter().map(|&index| {
+              let (kind, selector, order, _) = &inner.pseudos[index];
+              (*kind, *order, selector.specificity, index)
+            }))
+        }) {
+          if inner.medias[order]
+            .as_ref()
+            .is_some_and(|stack| stack.iter().any(|block| !block.matched.get()))
+          {
+            continue;
+          }
+          let (_, declarations, layer) = &inner.rules[order];
+          let mut rule = ShadowRule {
+            kind,
+            context: -1,
+            layer: *layer,
+            specificity,
+            order: inner.keys[order],
+            declarations: declarations.clone(),
+            query: None,
+          };
+          if kind == PART {
+            if let Some((name, compound, target)) = inner.arguments.get(&pseudo) {
+              rule.kind = *target;
+              rule.context = 0;
+              hosted.push(Passed {
+                name: name.clone(),
+                compound: compound.clone(),
+                conditions: inner.containers[order]
+                  .clone()
+                  .map(|conditions| (inner.id, order, conditions)),
+                rule,
+              });
             }
-            let Some(&(id, up)) = order.get(next) else {
-                break;
-            };
-            let at = next;
-            next += 1;
-            let id = id as usize;
-            if fast {
-                if !all
-                    && !matches.is_dirty(id)
-                    && moving.get(id) != Some(&true)
-                    && (up == u32::MAX || changed!(up as usize) == 0)
+            continue;
+          }
+          if let Some(conditions) = &inner.containers[order]
+            && !contained(&mut rule, (inner.id, order), conditions)
+          {
+            continue;
+          }
+          shadow.push(rule);
+        }
+      }
+      let selection = up.and_then(|up| extras.get(up)?.selection.as_ref());
+      let assigned = up
+        .filter(|&up| node.parent != Some(up))
+        .and_then(|up| extras.get(up)?.slotted.as_ref());
+      let names = (tree != 0).then(|| node.attrs.get("part")).flatten();
+      let named = names.and_then(|_| extras.get(walk.trees[tree].1)?.exported.as_ref());
+      if assigned.is_some() || named.is_some() {
+        matches.begin();
+        for passed in assigned.into_iter().flat_map(|list| list.iter()).chain(
+          named
+            .into_iter()
+            .flat_map(|list| list.iter())
+            .filter(|passed| {
+              names.is_some_and(|names| {
+                !passed.name.is_empty()
+                  && passed
+                    .name
+                    .split_ascii_whitespace()
+                    .all(|name| names.split_ascii_whitespace().any(|part| part == name))
+              })
+            }),
+        ) {
+          if !passed
+            .compound
+            .iter()
+            .any(|selector| matches.matches(selector, doc, id, None))
+          {
+            continue;
+          }
+          let mut rule = passed.rule.clone();
+          if let Some((scope, order, conditions)) = &passed.conditions
+            && !contained(&mut rule, (*scope, *order), conditions)
+          {
+            continue;
+          }
+          shadow.push(rule);
+        }
+        matches.finish(id);
+      }
+      let shadow: Option<Rc<[ShadowRule]>> = (!shadow.is_empty()).then(|| shadow.into());
+      let animated = context.and_then(|context| context.animated.get(&id));
+      let text = (matches!(node.tag.as_str(), "#text" | "#comment")
+        && shadow.is_none()
+        && animated.is_none()
+        && !unshared)
+        .then(|| {
+          (
+            scopes[tree],
+            node.tag == "#comment",
+            parent_style.map(Rc::as_ptr),
+            inputs.units,
+            selection.map(Rc::as_ptr),
+          )
+        });
+      if let Some((style, vars, flags, units, kept)) =
+        text.as_ref().and_then(|text| texts.get(text))
+      {
+        styles.set(id, style.clone(), Rc::ptr_eq);
+        custom.set(id, vars.clone(), Rc::ptr_eq);
+        style_flags.set(id, *flags, u16::eq);
+        lengths.set(id, *units);
+        if let Some(kept) = kept {
+          extras.put(id, kept.clone());
+        }
+        settle!(id, up, seen);
+        continue;
+      }
+      let scoped = &mut style_cache.scopes[scopes[tree]];
+      let scope = scoped.id;
+      let mut key = None;
+      let mut passed = None;
+      let mut written = None;
+      let mut moved = false;
+      let mut contained = false;
+      let mut reuse =
+        |value: &CachedStyle, old: Option<&Vars>, vars: &Vars| match (old, parent_vars) {
+          (None, None) => Some((vars.clone(), false)),
+          (Some(old), Some(new)) if Rc::ptr_eq(old, new) => Some((vars.clone(), false)),
+          (Some(_), Some(new)) => {
+            let reads = value.reads.as_ref()?;
+            (value
+              .missing
+              .iter()
+              .all(|name| Prop::find(name).is_none_or(|prop| var(new, prop).is_none()))
+              && reads
+                .iter()
+                .all(|(prop, value)| var(new, *prop) == value.as_ref()))
+            .then(|| {
+              if value.own.is_empty() {
+                return (inherit(new), true);
+              }
+              // Nodes with one style and one parent list must share the new list, or the
+              // nodes below them cannot share their styles.
+              let key = (Rc::as_ptr(new), value.own.as_ptr());
+              let merge = || {
+                let vars = inherit(new);
+                if value
+                  .own
+                  .iter()
+                  .all(|(prop, own)| var(&vars, *prop) == own.as_ref())
                 {
-                    if id == 0 || html.contains(&id) {
-                        root = lengths[id].font;
-                    }
-                    continue;
+                  return vars;
                 }
-                assert!(
-                    reached || all,
-                    "node {id} needs a style outside the dirty list"
-                );
-                visited = Some((at, id));
-                if stored {
-                    matches.clean(id);
+                let mut list = (*vars).clone();
+                for (prop, own) in &value.own {
+                  match (list.binary_search_by_key(prop, |entry| entry.0), own) {
+                    (Ok(index), Some(own)) => list[index].1 = own.clone(),
+                    (Err(index), Some(own)) => list.insert(index, (*prop, own.clone())),
+                    (Ok(index), None) => {
+                      list.remove(index);
+                    }
+                    (Err(_), None) => {}
+                  }
                 }
-                extras.remove(id);
-            }
-            let up = (up != u32::MAX).then_some(up as usize);
-            // A patched walk without shadow trees leaves `tree` as it was.
-            let tree = match walk.trees.len() {
-                1 => 0,
-                _ => walk.tree[id] as usize,
-            };
-            let node = &doc.nodes[id];
-            if tree != 0 && walk.trees[tree].0 == id {
-                let host = walk.trees[tree].1;
-                styles.set(id, styles[host].clone(), Rc::ptr_eq);
-                custom.set(id, custom[host].clone(), Rc::ptr_eq);
-                style_flags.set(id, style_flags[host], u16::eq);
-                lengths.set(id, lengths[host]);
-                containers.set(id, containers[host].clone(), |a, b| {
-                    address(Some(a)) == address(Some(b))
-                });
-                let selection = extras.get(host).and_then(|host| host.selection.clone());
-                if selection.is_some() {
-                    let kept = Extras {
-                        selection,
-                        ..Extras::default()
-                    };
-                    extras.put(id, Rc::new(kept));
-                }
-                settle!(@changed id, up);
-                continue;
-            }
-            let seen = up.and_then(|up| containers[up].clone());
-            let parent_style = up.map(|up| &styles[up]);
-            // Children of a `display: contents` box are items of the nearest ancestor that has a box.
-            let parent_role = up.map_or(0, |up| style_flags[up] >> 8);
-            let (item, table_item) = {
-                let (mut at, mut display) = (
-                    up,
-                    parent_style.and_then(|parent| parent.get(Prop::DISPLAY)),
-                );
-                while display == Some("contents") {
-                    at = at
-                        .and_then(|at| walk.walk.parent(at))
-                        .filter(|&at| at != u32::MAX)
-                        .map(|at| at as usize);
-                    display = at.and_then(|at| styles[at].get(Prop::DISPLAY));
-                }
-                (
-                    matches!(
-                        display,
-                        Some("flex" | "inline-flex" | "grid" | "inline-grid")
-                    ) || at.is_some_and(|at| drawable_canvas(&doc.nodes[at], &styles[at])),
-                    at.is_some_and(|at| table_box(style_flags[at] >> 8)),
-                )
-            };
-            let parent_vars = up
-                .map(|up| &custom[up])
-                .filter(|_| !matches!(node.tag.as_str(), "#text" | "#comment"));
-            // Custom properties of the parent that `style()` queries read.
-            let style_reads = std::cell::RefCell::new(Vec::new());
-            let parent = up.map_or(FontUnits::new(16.), |up| lengths[up].font);
-            let inputs = Inputs::new(parent, root);
-            let mut waiting: Vec<(usize, usize, ContainerQuery)> = Vec::new();
-            let mut shadow: Vec<ShadowRule> = Vec::new();
-            let mut contained =
-                |rule: &mut ShadowRule, key: (usize, usize), conditions: &ContainerQuery| {
-                    let applies = query_containers(
-                        conditions,
-                        seen.as_deref(),
-                        key,
-                        &style_cache.containers,
-                        |container| lengths[container],
-                        &mut style_cache.queries,
-                        (parent_vars, &style_reads),
-                    );
-                    if matches!(rule.kind, ELEMENT | STARTING) {
-                        return applies;
-                    }
-                    waiting.push((key.0, key.1, conditions.clone()));
-                    rule.query = Some((key.0, key.1, applies));
-                    true
-                };
-            hosted.clear();
-            if let Some(&root) = shadows.roots.get(&id)
-                && let Some(&index) = walk
-                    .tree
-                    .get(root)
-                    .and_then(|&tree| scopes.get(tree as usize))
-            {
-                let inner = &mut style_cache.scopes[index];
-                if !inner.nodes[root].as_ref().is_some_and(|matched| {
-                    matches.valid_since(&matched.dependencies, &matched.checked)
-                }) {
-                    matches.begin();
-                    matches.depend(root, 0);
-                    let mut matched: Vec<(usize, [usize; 3])> = Vec::new();
-                    for &entry in inner.universal.iter().filter(|&&entry| entry < PSEUDO) {
-                        let (order, index) = (entry >> SELECTOR, entry & ((1 << SELECTOR) - 1));
-                        let selector = &inner.rules[order].0[index];
-                        if matches.matches(selector, doc, root, None) {
-                            match matched.last_mut() {
-                                Some(last) if last.0 == order => {
-                                    last.1 = last.1.max(selector.specificity)
-                                }
-                                _ => matched.push((order, selector.specificity)),
-                            }
-                        }
-                    }
-                    let pseudos = inner
-                        .universal
-                        .iter()
-                        .filter(|&&index| index >= PSEUDO)
-                        .map(|&index| index & !PSEUDO)
-                        .filter(|&index| {
-                            let (kind, selector, _, key) = &inner.pseudos[index];
-                            key.is_empty()
-                                && !matches!(*kind, SLOTTED | HIGHLIGHT)
-                                && matches.matches(selector, doc, root, None)
-                        })
-                        .collect();
-                    matches.finish(id);
-                    inner.nodes[root] = Some(MatchedRules {
-                        checked: std::cell::Cell::new(matches.epoch),
-                        cached: None,
-                        dependencies: matches.recorded().into(),
-                        rules: matched.into(),
-                        pseudos,
-                    });
-                }
-                let inner = &*inner;
-                for (kind, order, specificity, pseudo) in
-                    inner.nodes[root].iter().flat_map(|matched| {
-                        matched
-                            .rules
-                            .iter()
-                            .map(|&(order, specificity)| (ELEMENT, order, specificity, 0))
-                            .chain(matched.pseudos.iter().map(|&index| {
-                                let (kind, selector, order, _) = &inner.pseudos[index];
-                                (*kind, *order, selector.specificity, index)
-                            }))
-                    })
-                {
-                    if inner.medias[order]
-                        .as_ref()
-                        .is_some_and(|stack| stack.iter().any(|block| !block.matched.get()))
-                    {
-                        continue;
-                    }
-                    let (_, declarations, layer) = &inner.rules[order];
-                    let mut rule = ShadowRule {
-                        kind,
-                        context: -1,
-                        layer: *layer,
-                        specificity,
-                        order: inner.keys[order],
-                        declarations: declarations.clone(),
-                        query: None,
-                    };
-                    if kind == PART {
-                        if let Some((name, compound, target)) = inner.arguments.get(&pseudo) {
-                            rule.kind = *target;
-                            rule.context = 0;
-                            hosted.push(Passed {
-                                name: name.clone(),
-                                compound: compound.clone(),
-                                conditions: inner.containers[order]
-                                    .clone()
-                                    .map(|conditions| (inner.id, order, conditions)),
-                                rule,
-                            });
-                        }
-                        continue;
-                    }
-                    if let Some(conditions) = &inner.containers[order]
-                        && !contained(&mut rule, (inner.id, order), conditions)
-                    {
-                        continue;
-                    }
-                    shadow.push(rule);
-                }
-            }
-            let selection = up.and_then(|up| extras.get(up)?.selection.as_ref());
-            let assigned = up
-                .filter(|&up| node.parent != Some(up))
-                .and_then(|up| extras.get(up)?.slotted.as_ref());
-            let names = (tree != 0).then(|| node.attrs.get("part")).flatten();
-            let named = names.and_then(|_| extras.get(walk.trees[tree].1)?.exported.as_ref());
-            if assigned.is_some() || named.is_some() {
-                matches.begin();
-                for passed in assigned.into_iter().flat_map(|list| list.iter()).chain(
-                    named
-                        .into_iter()
-                        .flat_map(|list| list.iter())
-                        .filter(|passed| {
-                            names.is_some_and(|names| {
-                                !passed.name.is_empty()
-                                    && passed.name.split_ascii_whitespace().all(|name| {
-                                        names.split_ascii_whitespace().any(|part| part == name)
-                                    })
-                            })
-                        }),
-                ) {
-                    if !passed
-                        .compound
-                        .iter()
-                        .any(|selector| matches.matches(selector, doc, id, None))
-                    {
-                        continue;
-                    }
-                    let mut rule = passed.rule.clone();
-                    if let Some((scope, order, conditions)) = &passed.conditions
-                        && !contained(&mut rule, (*scope, *order), conditions)
-                    {
-                        continue;
-                    }
-                    shadow.push(rule);
-                }
-                matches.finish(id);
-            }
-            let shadow: Option<Rc<[ShadowRule]>> = (!shadow.is_empty()).then(|| shadow.into());
-            let animated = context.and_then(|context| context.animated.get(&id));
-            let text = (matches!(node.tag.as_str(), "#text" | "#comment")
-                && shadow.is_none()
-                && animated.is_none()
-                && !unshared)
-                .then(|| {
-                    (
-                        scopes[tree],
-                        node.tag == "#comment",
-                        parent_style.map(Rc::as_ptr),
-                        inputs.units,
-                        selection.map(Rc::as_ptr),
-                    )
-                });
-            if let Some((style, vars, flags, units, kept)) =
-                text.as_ref().and_then(|text| texts.get(text))
-            {
-                styles.set(id, style.clone(), Rc::ptr_eq);
-                custom.set(id, vars.clone(), Rc::ptr_eq);
-                style_flags.set(id, *flags, u16::eq);
-                lengths.set(id, *units);
-                if let Some(kept) = kept {
-                    extras.put(id, kept.clone());
-                }
-                settle!(id, up, seen);
-                continue;
-            }
-            let scoped = &mut style_cache.scopes[scopes[tree]];
-            let scope = scoped.id;
-            let mut key = None;
-            let mut passed = None;
-            let mut written = None;
-            let mut moved = false;
-            let mut contained = false;
-            let mut reuse =
-                |value: &CachedStyle, old: Option<&Vars>, vars: &Vars| match (old, parent_vars) {
-                    (None, None) => Some((vars.clone(), false)),
-                    (Some(old), Some(new)) if Rc::ptr_eq(old, new) => Some((vars.clone(), false)),
-                    (Some(_), Some(new)) => {
-                        let reads = value.reads.as_ref()?;
-                        (value.missing.iter().all(|name| {
-                            Prop::find(name).is_none_or(|prop| var(new, prop).is_none())
-                        }) && reads
-                            .iter()
-                            .all(|(prop, value)| var(new, *prop) == value.as_ref()))
-                        .then(|| {
-                            if value.own.is_empty() {
-                                return (inherit(new), true);
-                            }
-                            // Nodes with one style and one parent list must share the new list, or the
-                            // nodes below them cannot share their styles.
-                            let key = (Rc::as_ptr(new), value.own.as_ptr());
-                            let merge = || {
-                                let vars = inherit(new);
-                                if value
-                                    .own
-                                    .iter()
-                                    .all(|(prop, own)| var(&vars, *prop) == own.as_ref())
-                                {
-                                    return vars;
-                                }
-                                let mut list = (*vars).clone();
-                                for (prop, own) in &value.own {
-                                    match (list.binary_search_by_key(prop, |entry| entry.0), own) {
-                                        (Ok(index), Some(own)) => list[index].1 = own.clone(),
-                                        (Err(index), Some(own)) => {
-                                            list.insert(index, (*prop, own.clone()))
-                                        }
-                                        (Ok(index), None) => {
-                                            list.remove(index);
-                                        }
-                                        (Err(_), None) => {}
-                                    }
-                                }
-                                Rc::new(list)
-                            };
-                            (merges.entry(key).or_insert_with(merge).clone(), true)
-                        })
-                    }
-                    _ => None,
-                };
-            let cached = scoped.nodes[id]
+                Rc::new(list)
+              };
+              (merges.entry(key).or_insert_with(merge).clone(), true)
+            })
+          }
+          _ => None,
+        };
+      let cached = scoped.nodes[id]
                 .as_ref()
                 .filter(|node| {
                     animated.is_none() && matches.valid_since(&node.dependencies, &node.checked)
@@ -977,697 +972,691 @@ impl NodePass<'_> {
                     written = source;
                     value
                 });
-            if let Some((cached, vars)) = cached {
-                cached.used.set(style_cache.pass);
-                style_cache.anchoring |= cached.positions;
-                if let Some(node) = scoped.nodes[id].as_mut() {
-                    if let Some(key) = &key {
-                        node.cached = Some(CachedNode::new(
-                            key,
-                            parent_style,
-                            cached.clone(),
-                            parent_vars,
-                            &vars,
-                            contained.then(|| seen.clone()),
-                        ));
-                    } else if let Some(node) = node.cached.as_mut() {
-                        if let Some(parent) = parent_style {
-                            node.parent = Some(StyleRef(parent.clone()));
-                        }
-                        if moved {
-                            node.inherited = parent_vars.cloned();
-                            node.vars = vars.clone();
-                            *cached.vars.borrow_mut() = (parent_vars.cloned(), vars.clone());
-                        }
-                    }
-                }
-                styles.set(id, cached.style.clone(), Rc::ptr_eq);
-                custom.set(id, vars, Rc::ptr_eq);
-                style_flags.set(id, cached.flags, u16::eq);
-                lengths.set(
-                    id,
-                    Lengths {
-                        viewport: [width, height],
-                        ..cached.lengths
-                    },
-                );
-                if id == 0 || node.tag == "html" {
-                    root = cached.lengths.font;
-                }
-                if let Some(values) = &cached.extras {
-                    extras.put(id, values.clone());
-                }
-                if let Some(text) = text {
-                    let outputs = (
-                        styles[id].clone(),
-                        custom[id].clone(),
-                        style_flags[id],
-                        lengths[id],
-                        cached.extras.clone(),
-                    );
-                    texts.insert(text, outputs);
-                }
-                settle!(id, up, seen);
-                continue;
-            }
-            let mut key = key.unwrap();
-            let mut extra = Extras::default();
-            let mut style = match &theme {
-                Some(theme) if id == 0 => (**theme).clone(),
-                _ => Style::new(),
-            };
+      if let Some((cached, vars)) = cached {
+        cached.used.set(style_cache.pass);
+        style_cache.anchoring |= cached.positions;
+        if let Some(node) = scoped.nodes[id].as_mut() {
+          if let Some(key) = &key {
+            node.cached = Some(CachedNode::new(
+              key,
+              parent_style,
+              cached.clone(),
+              parent_vars,
+              &vars,
+              contained.then(|| seen.clone()),
+            ));
+          } else if let Some(node) = node.cached.as_mut() {
             if let Some(parent) = parent_style {
-                style.extend(
-                    parent
-                        .own()
-                        .filter(|(prop, _)| prop.inherited())
-                        .map(|(prop, value)| (prop, value.clone())),
-                );
+              node.parent = Some(StyleRef(parent.clone()));
             }
-            if let Some(vars) = parent_vars {
-                style.set_vars(inherit(vars));
+            if moved {
+              node.inherited = parent_vars.cloned();
+              node.vars = vars.clone();
+              *cached.vars.borrow_mut() = (parent_vars.cloned(), vars.clone());
             }
-            let (cascade, decorating) = self.cascade(
-                node,
-                &key,
-                scoped,
-                shadow.as_ref(),
-                animated,
-                style_cache.environment.scheme.as_ref(),
-                &mut style,
-            );
-            let explicit_size = cascade.contains_key(&Prop::FONT_SIZE);
-            let mut reads = Some(style_reads.take());
-            let mut missing = Vec::new();
-            let mut owned = Vec::new();
-            // An invalid value of a registered inheriting property takes the parent's value.
-            let mut fallback = Vec::new();
-            for (prop, (_, value)) in &cascade {
-                if prop.is_custom() {
-                    if matches!(
-                        &**value,
-                        "inherit" | "initial" | "unset" | "revert" | "revert-layer"
-                    ) {
-                        reads = None;
-                    }
-                    owned.push(*prop);
-                    if registry.get(prop).is_some_and(|entry| entry.1) {
-                        fallback.push(*prop);
-                    }
-                }
-                references(value, &mut reads, &mut missing);
+          }
+        }
+        styles.set(id, cached.style.clone(), Rc::ptr_eq);
+        custom.set(id, vars, Rc::ptr_eq);
+        style_flags.set(id, cached.flags, u16::eq);
+        lengths.set(
+          id,
+          Lengths {
+            viewport: [width, height],
+            ..cached.lengths
+          },
+        );
+        if id == 0 || node.tag == "html" {
+          root = cached.lengths.font;
+        }
+        if let Some(values) = &cached.extras {
+          extras.put(id, values.clone());
+        }
+        if let Some(text) = text {
+          let outputs = (
+            styles[id].clone(),
+            custom[id].clone(),
+            style_flags[id],
+            lengths[id],
+            cached.extras.clone(),
+          );
+          texts.insert(text, outputs);
+        }
+        settle!(id, up, seen);
+        continue;
+      }
+      let mut key = key.unwrap();
+      let mut extra = Extras::default();
+      let mut style = match &theme {
+        Some(theme) if id == 0 => (**theme).clone(),
+        _ => Style::new(),
+      };
+      if let Some(parent) = parent_style {
+        style.extend(
+          parent
+            .own()
+            .filter(|(prop, _)| prop.inherited())
+            .map(|(prop, value)| (prop, value.clone())),
+        );
+      }
+      if let Some(vars) = parent_vars {
+        style.set_vars(inherit(vars));
+      }
+      let (cascade, decorating) = self.cascade(
+        node,
+        &key,
+        scoped,
+        shadow.as_ref(),
+        animated,
+        style_cache.environment.scheme.as_ref(),
+        &mut style,
+      );
+      let explicit_size = cascade.contains_key(&Prop::FONT_SIZE);
+      let mut reads = Some(style_reads.take());
+      let mut missing = Vec::new();
+      let mut owned = Vec::new();
+      // An invalid value of a registered inheriting property takes the parent's value.
+      let mut fallback = Vec::new();
+      for (prop, (_, value)) in &cascade {
+        if prop.is_custom() {
+          if matches!(
+            &**value,
+            "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+          ) {
+            reads = None;
+          }
+          owned.push(*prop);
+          if registry.get(prop).is_some_and(|entry| entry.1) {
+            fallback.push(*prop);
+          }
+        }
+        references(value, &mut reads, &mut missing);
+      }
+      let agent_display = cascade
+        .get(&Prop::DISPLAY)
+        .is_some_and(|(rank, _)| rank.level == AGENT);
+      // Like Chrome, a header cell in text that starts at its start is centered.
+      let centered = node.tag == "th" && !cascade.contains_key(&Prop::TEXT_ALIGN);
+      let mut declared = Vec::new();
+      let mut strong = Vec::new();
+      style.extend(cascade.into_iter().filter_map(|(prop, (rank, value))| {
+        if rank.important() {
+          strong.push(prop);
+        }
+        if prop.is_custom() {
+          declared.push((prop, value));
+          return None;
+        }
+        Some((prop, value))
+      }));
+      resolve_style(
+        &mut style,
+        parent_style.map(Rc::as_ref),
+        parent_vars,
+        &declared,
+        registry,
+        native_theme,
+      );
+      let parent_units = up.map(|up| lengths[up]);
+      let mut keyword = resolve_keywords(
+        &mut style,
+        parent_style.map(Rc::as_ref),
+        parent_units.as_ref(),
+      );
+      if decorating
+        && style
+          .get(Prop::TEXT_DECORATION_COLOR)
+          .is_none_or(|value| value.eq_ignore_ascii_case("currentcolor"))
+        && let Some(ink) = style.value(Prop::COLOR).cloned()
+      {
+        style.insert_current(Prop::TEXT_DECORATION_COLOR, ink);
+      }
+      if centered {
+        let inherited = parent_style
+          .and_then(|parent| parent.get(Prop::TEXT_ALIGN))
+          .filter(|value| *value != "start")
+          .unwrap_or("center")
+          .to_owned();
+        style.insert(Prop::TEXT_ALIGN, inherited);
+      }
+      if node.tag == "table"
+        && style
+          .get(Prop::TEXT_ALIGN)
+          .is_some_and(|value| value.starts_with("-webkit-"))
+      {
+        style.insert(Prop::TEXT_ALIGN, "start");
+      }
+      if style
+        .get(Prop::DISPLAY)
+        .is_some_and(|value| matches!(value, "-webkit-box" | "-webkit-inline-box"))
+        && style
+          .get(Prop::WEBKIT_BOX_ORIENT)
+          .is_some_and(|value| value == "vertical")
+        && style
+          .get(Prop::WEBKIT_LINE_CLAMP)
+          .is_some_and(|value| value != "none")
+      {
+        let display = if style.get(Prop::DISPLAY) == Some("-webkit-box") {
+          "flow-root"
+        } else {
+          "inline-block"
+        };
+        style.insert(Prop::DISPLAY, display);
+      }
+      // AppKit draws the control, so the box has no padding, border or background.
+      if node.native_control(&style).is_some() {
+        for prop in crate::css::properties::PADDING
+          .into_iter()
+          .chain(
+            crate::css::properties::BORDERS
+              .into_iter()
+              .flat_map(|side| [side[0], side[1]]),
+          )
+          .chain([Prop::BACKGROUND_COLOR, Prop::BACKGROUND_IMAGE])
+        {
+          style.remove(prop);
+        }
+      }
+      let positions = anchor::positions(&style);
+      style_cache.anchoring |= positions;
+      let (role, units, queried, viewport) = self.used_values(
+        &mut style,
+        Element {
+          id,
+          node,
+          parent_style,
+          parent,
+          parent_role,
+          item,
+          table_item,
+          seen: &seen,
+        },
+        explicit_size,
+        &mut style_cache.sized,
+        &style_cache.containers,
+        &mut font_metrics,
+        &mut root,
+      );
+      let mut pseudo_cascade: [BBTreeMap<Prop, (CascadeRank, &Rc<str>)>; 17] = Default::default();
+      let mut groups: [Vec<Passed>; 2] = Default::default();
+      let own = Container::of(
+        id,
+        &style,
+        named_queries.then(|| style.vars()),
+        seen.clone(),
+      );
+      let mut deferred = false;
+      let mut query = |conditions: &ContainerQuery, key: (usize, usize)| {
+        deferred = true;
+        query_containers(
+          conditions,
+          own.as_ref().or(seen.as_deref()),
+          key,
+          &style_cache.containers,
+          |container| {
+            if container == id {
+              units
+            } else {
+              lengths[container]
             }
-            let agent_display = cascade
-                .get(&Prop::DISPLAY)
-                .is_some_and(|(rank, _)| rank.level == AGENT);
-            // Like Chrome, a header cell in text that starts at its start is centered.
-            let centered = node.tag == "th" && !cascade.contains_key(&Prop::TEXT_ALIGN);
-            let mut declared = Vec::new();
-            let mut strong = Vec::new();
-            style.extend(cascade.into_iter().filter_map(|(prop, (rank, value))| {
-                if rank.important() {
-                    strong.push(prop);
-                }
-                if prop.is_custom() {
-                    declared.push((prop, value));
-                    return None;
-                }
-                Some((prop, value))
-            }));
-            resolve_style(
-                &mut style,
-                parent_style.map(Rc::as_ref),
-                parent_vars,
-                &declared,
-                registry,
-                native_theme,
-            );
-            let parent_units = up.map(|up| lengths[up]);
-            let mut keyword = resolve_keywords(
-                &mut style,
-                parent_style.map(Rc::as_ref),
-                parent_units.as_ref(),
-            );
-            if decorating
-                && style
-                    .get(Prop::TEXT_DECORATION_COLOR)
-                    .is_none_or(|value| value.eq_ignore_ascii_case("currentcolor"))
-                && let Some(ink) = style.value(Prop::COLOR).cloned()
-            {
-                style.insert_current(Prop::TEXT_DECORATION_COLOR, ink);
+          },
+          &mut style_cache.queries,
+          (Some(style.vars()), &style_reads),
+        )
+      };
+      // Pseudo-elements query their own element, so their conditional rules are checked again here.
+      let again: Option<Vec<usize>> = (own.is_some()
+        || scoped.nodes[id].iter().any(|matched| {
+          matched
+            .pseudos
+            .iter()
+            .any(|&index| scoped.containers[scoped.pseudos[index].2].is_some())
+        }))
+      .then(|| {
+        scoped.nodes[id]
+          .iter()
+          .flat_map(|matched| matched.pseudos.iter().copied())
+          .filter(|&index| {
+            let (kind, _, order, _) = &scoped.pseudos[index];
+            match &scoped.containers[*order] {
+              Some(conditions) if !matches!(kind, SLOTTED..=STARTING) => {
+                !scoped.medias[*order]
+                  .as_ref()
+                  .is_some_and(|stack| stack.iter().any(|block| !block.matched.get()))
+                  && query(conditions, (scope, *order))
+              }
+              _ => key.pseudos.binary_search(&index).is_ok(),
             }
-            if centered {
-                let inherited = parent_style
-                    .and_then(|parent| parent.get(Prop::TEXT_ALIGN))
-                    .filter(|value| *value != "start")
-                    .unwrap_or("center")
-                    .to_owned();
-                style.insert(Prop::TEXT_ALIGN, inherited);
-            }
-            if node.tag == "table"
-                && style
-                    .get(Prop::TEXT_ALIGN)
-                    .is_some_and(|value| value.starts_with("-webkit-"))
-            {
-                style.insert(Prop::TEXT_ALIGN, "start");
-            }
-            if style
-                .get(Prop::DISPLAY)
-                .is_some_and(|value| matches!(value, "-webkit-box" | "-webkit-inline-box"))
-                && style
-                    .get(Prop::WEBKIT_BOX_ORIENT)
-                    .is_some_and(|value| value == "vertical")
-                && style
-                    .get(Prop::WEBKIT_LINE_CLAMP)
-                    .is_some_and(|value| value != "none")
-            {
-                let display = if style.get(Prop::DISPLAY) == Some("-webkit-box") {
-                    "flow-root"
-                } else {
-                    "inline-block"
-                };
-                style.insert(Prop::DISPLAY, display);
-            }
-            // AppKit draws the control, so the box has no padding, border or background.
-            if node.native_control(&style).is_some() {
-                for prop in crate::css::properties::PADDING
-                    .into_iter()
-                    .chain(
-                        crate::css::properties::BORDERS
-                            .into_iter()
-                            .flat_map(|side| [side[0], side[1]]),
-                    )
-                    .chain([Prop::BACKGROUND_COLOR, Prop::BACKGROUND_IMAGE])
-                {
-                    style.remove(prop);
-                }
-            }
-            let positions = anchor::positions(&style);
-            style_cache.anchoring |= positions;
-            let (role, units, queried, viewport) = self.used_values(
-                &mut style,
-                Element {
-                    id,
-                    node,
-                    parent_style,
-                    parent,
-                    parent_role,
-                    item,
-                    table_item,
-                    seen: &seen,
-                },
-                explicit_size,
-                &mut style_cache.sized,
-                &style_cache.containers,
-                &mut font_metrics,
-                &mut root,
-            );
-            let mut pseudo_cascade: [BBTreeMap<Prop, (CascadeRank, &Rc<str>)>; 17] =
-                Default::default();
-            let mut groups: [Vec<Passed>; 2] = Default::default();
-            let own = Container::of(
-                id,
-                &style,
-                named_queries.then(|| style.vars()),
-                seen.clone(),
-            );
-            let mut deferred = false;
-            let mut query = |conditions: &ContainerQuery, key: (usize, usize)| {
-                deferred = true;
-                query_containers(
-                    conditions,
-                    own.as_ref().or(seen.as_deref()),
-                    key,
-                    &style_cache.containers,
-                    |container| {
-                        if container == id {
-                            units
-                        } else {
-                            lengths[container]
-                        }
-                    },
-                    &mut style_cache.queries,
-                    (Some(style.vars()), &style_reads),
-                )
-            };
-            // Pseudo-elements query their own element, so their conditional rules are checked again here.
-            let again: Option<Vec<usize>> = (own.is_some()
-                || scoped.nodes[id].iter().any(|matched| {
-                    matched
-                        .pseudos
-                        .iter()
-                        .any(|&index| scoped.containers[scoped.pseudos[index].2].is_some())
-                }))
-            .then(|| {
-                scoped.nodes[id]
-                    .iter()
-                    .flat_map(|matched| matched.pseudos.iter().copied())
-                    .filter(|&index| {
-                        let (kind, _, order, _) = &scoped.pseudos[index];
-                        match &scoped.containers[*order] {
-                            Some(conditions) if !matches!(kind, SLOTTED..=STARTING) => {
-                                !scoped.medias[*order].as_ref().is_some_and(|stack| {
-                                    stack.iter().any(|block| !block.matched.get())
-                                }) && query(conditions, (scope, *order))
-                            }
-                            _ => key.pseudos.binary_search(&index).is_ok(),
-                        }
-                    })
-                    .collect()
+          })
+          .collect()
+      });
+      if let Some(reads) = &mut reads {
+        reads.extend(style_reads.take());
+      }
+      for &index in again.as_deref().unwrap_or(&key.pseudos) {
+        let (pseudo, selector, order, _) = &scoped.pseudos[index];
+        let (_, declarations, layer) = &scoped.rules[*order];
+        if *pseudo == HIGHLIGHT || *pseudo >= TRANSITION {
+          continue;
+        }
+        if matches!(*pseudo, SLOTTED | PART) {
+          if let Some((name, compound, target)) = scoped.arguments.get(&index) {
+            groups[usize::from(*pseudo == PART)].push(Passed {
+              name: name.clone(),
+              compound: compound.clone(),
+              conditions: scoped.containers[*order]
+                .clone()
+                .map(|conditions| (scope, *order, conditions)),
+              rule: ShadowRule {
+                kind: *target,
+                context: if *pseudo == PART { 1 } else { -1 },
+                layer: *layer,
+                specificity: selector.specificity,
+                order: scoped.keys[*order],
+                declarations: declarations.clone(),
+                query: None,
+              },
             });
-            if let Some(reads) = &mut reads {
-                reads.extend(style_reads.take());
+          }
+          continue;
+        }
+        for &(prop, ref value, important, position) in declarations.iter() {
+          let rank = CascadeRank::rule(
+            *layer,
+            important,
+            selector.specificity,
+            scoped.keys[*order],
+            position,
+          );
+          put(&mut pseudo_cascade[*pseudo], prop, rank, value);
+        }
+      }
+      for rule in shadow
+        .iter()
+        .flat_map(|rules| rules.iter())
+        .filter(|rule| rule.kind != ELEMENT)
+      {
+        if let Some((scope, order, applies)) = rule.query
+          && !match own {
+            Some(_) => waiting
+              .iter()
+              .find(|waits| (waits.0, waits.1) == (scope, order))
+              .is_some_and(|waits| query(&waits.2, (scope, order))),
+            None => applies,
+          }
+        {
+          continue;
+        }
+        for (prop, value, important, position) in rule.declarations.iter() {
+          let rank = CascadeRank::shadowed(rule, *important, *position);
+          put(&mut pseudo_cascade[rule.kind], *prop, rank, value);
+        }
+      }
+      for (prop, (_, value)) in pseudo_cascade.iter().flatten() {
+        if prop.is_custom() {
+          reads = None;
+        }
+        references(value, &mut reads, &mut missing);
+      }
+      let keep = [
+        Prop::ANIMATION,
+        Prop::ANIMATION_NAME,
+        Prop::TRANSITION,
+        Prop::TRANSITION_PROPERTY,
+      ]
+      .into_iter()
+      .any(|prop| {
+        style.contains(prop)
+          || pseudo_cascade[..2]
+            .iter()
+            .any(|cascade| cascade.contains_key(&prop))
+      });
+      let [
+        before,
+        after,
+        selected,
+        marker,
+        letter,
+        line,
+        placeholder,
+        bar,
+        track,
+        thumb,
+        corner,
+        mut hovered,
+        _,
+        _,
+        starting,
+        backdrop,
+        backdrop_starting,
+      ] = pseudo_cascade;
+      let starting = (!starting.is_empty()).then(|| {
+        let mut values = style.clone();
+        let mut declared = Vec::new();
+        values.extend(starting.into_iter().filter_map(|(prop, (_, value))| {
+          if prop.is_custom() {
+            declared.push((prop, value.clone()));
+            return None;
+          }
+          Some((prop, value.clone()))
+        }));
+        resolve_style(
+          &mut values,
+          parent_style.map(Rc::as_ref),
+          parent_vars,
+          &declared,
+          registry,
+          native_theme,
+        );
+        keyword |= resolve_keywords(
+          &mut values,
+          parent_style.map(Rc::as_ref),
+          parent_units.as_ref(),
+        );
+        if !keep && declared.is_empty() {
+          values.set_vars(empty.clone());
+        }
+        Rc::new(values)
+      });
+      // A pseudo-element inherits custom properties from its element, like a child.
+      let handed = inherit(style.vars());
+      let derive = |mut cascade: BBTreeMap<Prop, (CascadeRank, &Rc<str>)>| {
+        (!cascade.is_empty()).then(|| {
+          physical(&mut cascade, &style);
+          let mut values: Style = style
+            .own()
+            .filter(|(prop, _)| prop.inherited())
+            .map(|(prop, value)| (prop, value.clone()))
+            .collect();
+          values.set_vars(handed.clone());
+          let mut declared = Vec::new();
+          values.extend(cascade.into_iter().filter_map(|(prop, (_, value))| {
+            if prop.is_custom() {
+              declared.push((prop, value.clone()));
+              return None;
             }
-            for &index in again.as_deref().unwrap_or(&key.pseudos) {
-                let (pseudo, selector, order, _) = &scoped.pseudos[index];
-                let (_, declarations, layer) = &scoped.rules[*order];
-                if *pseudo == HIGHLIGHT || *pseudo >= TRANSITION {
-                    continue;
-                }
-                if matches!(*pseudo, SLOTTED | PART) {
-                    if let Some((name, compound, target)) = scoped.arguments.get(&index) {
-                        groups[usize::from(*pseudo == PART)].push(Passed {
-                            name: name.clone(),
-                            compound: compound.clone(),
-                            conditions: scoped.containers[*order]
-                                .clone()
-                                .map(|conditions| (scope, *order, conditions)),
-                            rule: ShadowRule {
-                                kind: *target,
-                                context: if *pseudo == PART { 1 } else { -1 },
-                                layer: *layer,
-                                specificity: selector.specificity,
-                                order: scoped.keys[*order],
-                                declarations: declarations.clone(),
-                                query: None,
-                            },
-                        });
-                    }
-                    continue;
-                }
-                for &(prop, ref value, important, position) in declarations.iter() {
-                    let rank = CascadeRank::rule(
-                        *layer,
-                        important,
-                        selector.specificity,
-                        scoped.keys[*order],
-                        position,
-                    );
-                    put(&mut pseudo_cascade[*pseudo], prop, rank, value);
-                }
-            }
-            for rule in shadow
-                .iter()
-                .flat_map(|rules| rules.iter())
-                .filter(|rule| rule.kind != ELEMENT)
-            {
-                if let Some((scope, order, applies)) = rule.query
-                    && !match own {
-                        Some(_) => waiting
-                            .iter()
-                            .find(|waits| (waits.0, waits.1) == (scope, order))
-                            .is_some_and(|waits| query(&waits.2, (scope, order))),
-                        None => applies,
-                    }
-                {
-                    continue;
-                }
-                for (prop, value, important, position) in rule.declarations.iter() {
-                    let rank = CascadeRank::shadowed(rule, *important, *position);
-                    put(&mut pseudo_cascade[rule.kind], *prop, rank, value);
-                }
-            }
-            for (prop, (_, value)) in pseudo_cascade.iter().flatten() {
-                if prop.is_custom() {
-                    reads = None;
-                }
-                references(value, &mut reads, &mut missing);
-            }
-            let keep = [
-                Prop::ANIMATION,
-                Prop::ANIMATION_NAME,
-                Prop::TRANSITION,
-                Prop::TRANSITION_PROPERTY,
-            ]
+            Some((prop, value.clone()))
+          }));
+          resolve_style(
+            &mut values,
+            Some(&style),
+            None,
+            &declared,
+            registry,
+            native_theme,
+          );
+          resolve_keywords(&mut values, Some(&style), Some(&units));
+          if !keep && declared.is_empty() {
+            values.set_vars(empty.clone());
+          }
+          values
+        })
+      };
+      let layered =
+        node.state & (crate::dom::TOP_LAYER | crate::dom::LEAVING) != 0 && node.tag != "html";
+      if layered && !backdrop_starting.is_empty() {
+        let mut first = backdrop.clone();
+        for (prop, (rank, value)) in backdrop_starting {
+          put(&mut first, prop, rank, value);
+        }
+        extra.backdrop_start = derive(first).map(Rc::new);
+      }
+      if layered {
+        extra.backdrop = derive(backdrop).map(Rc::new);
+      }
+      if [&marker, &letter, &line, &placeholder]
+        .iter()
+        .any(|cascade| !cascade.is_empty())
+      {
+        extra.text = Some(Rc::new([marker, letter, line, placeholder].map(&derive)));
+      }
+      if [&bar, &track, &thumb, &corner, &hovered]
+        .iter()
+        .any(|cascade| !cascade.is_empty())
+        && (matches!(node.tag.as_str(), "html" | "body" | "progress")
+          || node.tag == "input"
+            && ["range", "file"]
+              .iter()
+              .any(|kind| node.input_type().eq_ignore_ascii_case(kind))
+          || [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
             .into_iter()
             .any(|prop| {
-                style.contains(prop)
-                    || pseudo_cascade[..2]
-                        .iter()
-                        .any(|cascade| cascade.contains_key(&prop))
-            });
-            let [
-                before,
-                after,
-                selected,
-                marker,
-                letter,
-                line,
-                placeholder,
-                bar,
-                track,
-                thumb,
-                corner,
-                mut hovered,
-                _,
-                _,
-                starting,
-                backdrop,
-                backdrop_starting,
-            ] = pseudo_cascade;
-            let starting = (!starting.is_empty()).then(|| {
-                let mut values = style.clone();
-                let mut declared = Vec::new();
-                values.extend(starting.into_iter().filter_map(|(prop, (_, value))| {
-                    if prop.is_custom() {
-                        declared.push((prop, value.clone()));
-                        return None;
-                    }
-                    Some((prop, value.clone()))
-                }));
-                resolve_style(
-                    &mut values,
-                    parent_style.map(Rc::as_ref),
-                    parent_vars,
-                    &declared,
-                    registry,
-                    native_theme,
-                );
-                keyword |= resolve_keywords(
-                    &mut values,
-                    parent_style.map(Rc::as_ref),
-                    parent_units.as_ref(),
-                );
-                if !keep && declared.is_empty() {
-                    values.set_vars(empty.clone());
-                }
-                Rc::new(values)
-            });
-            // A pseudo-element inherits custom properties from its element, like a child.
-            let handed = inherit(style.vars());
-            let derive = |mut cascade: BBTreeMap<Prop, (CascadeRank, &Rc<str>)>| {
-                (!cascade.is_empty()).then(|| {
-                    physical(&mut cascade, &style);
-                    let mut values: Style = style
-                        .own()
-                        .filter(|(prop, _)| prop.inherited())
-                        .map(|(prop, value)| (prop, value.clone()))
-                        .collect();
-                    values.set_vars(handed.clone());
-                    let mut declared = Vec::new();
-                    values.extend(cascade.into_iter().filter_map(|(prop, (_, value))| {
-                        if prop.is_custom() {
-                            declared.push((prop, value.clone()));
-                            return None;
-                        }
-                        Some((prop, value.clone()))
-                    }));
-                    resolve_style(
-                        &mut values,
-                        Some(&style),
-                        None,
-                        &declared,
-                        registry,
-                        native_theme,
-                    );
-                    resolve_keywords(&mut values, Some(&style), Some(&units));
-                    if !keep && declared.is_empty() {
-                        values.set_vars(empty.clone());
-                    }
-                    values
-                })
-            };
-            let layered = node.state & (crate::dom::TOP_LAYER | crate::dom::LEAVING) != 0
-                && node.tag != "html";
-            if layered && !backdrop_starting.is_empty() {
-                let mut first = backdrop.clone();
-                for (prop, (rank, value)) in backdrop_starting {
-                    put(&mut first, prop, rank, value);
-                }
-                extra.backdrop_start = derive(first).map(Rc::new);
-            }
-            if layered {
-                extra.backdrop = derive(backdrop).map(Rc::new);
-            }
-            if [&marker, &letter, &line, &placeholder]
-                .iter()
-                .any(|cascade| !cascade.is_empty())
-            {
-                extra.text = Some(Rc::new([marker, letter, line, placeholder].map(&derive)));
-            }
-            if [&bar, &track, &thumb, &corner, &hovered]
-                .iter()
-                .any(|cascade| !cascade.is_empty())
-                && (matches!(node.tag.as_str(), "html" | "body" | "progress")
-                    || node.tag == "input"
-                        && ["range", "file"]
-                            .iter()
-                            .any(|kind| node.input_type().eq_ignore_ascii_case(kind))
-                    || [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
-                        .into_iter()
-                        .any(|prop| {
-                            style
-                                .get(prop)
-                                .is_some_and(|value| matches!(value, "auto" | "scroll"))
-                        })
-                    || style.get(Prop::OVERFLOW_Y) == Some("hidden")
-                        && (style.get(Prop::SCROLLBAR_GUTTER))
-                            .is_some_and(|value| value.starts_with("stable")))
-            {
-                if !hovered.is_empty() {
-                    for (prop, value) in &thumb {
-                        hovered.entry(*prop).or_insert(*value);
-                    }
-                }
-                extra.scrollbars = Some(Rc::new([bar, track, thumb, corner, hovered].map(&derive)));
-            }
-            if !selected.is_empty() || selection.is_some() {
-                let parent = selection;
-                let mut values = parent.map(|parent| (**parent).clone()).unwrap_or_default();
-                values.set_vars(handed.clone());
-                if let Some(scheme) = style.value(Prop::COLOR_SCHEME) {
-                    values.insert(Prop::COLOR_SCHEME, scheme.clone());
-                }
-                let fallback = |prop: Prop| -> Rc<str> {
-                    parent
-                        .and_then(|parent| parent.value(prop))
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            if prop == Prop::BACKGROUND_COLOR {
-                                "transparent"
-                            } else {
-                                "currentColor"
-                            }
-                            .into()
-                        })
-                };
-                let painted = |prop: Prop| {
-                    matches!(
-                        prop,
-                        Prop::COLOR | Prop::BACKGROUND_COLOR | Prop::WEBKIT_TEXT_FILL_COLOR
-                    )
-                };
-                for (prop, (_, value)) in selected {
-                    if painted(prop) {
-                        values.insert(
-                            prop,
-                            if matches!(&**value, "inherit" | "unset") {
-                                fallback(prop)
-                            } else {
-                                value.clone()
-                            },
-                        );
-                    }
-                }
-                let colored = values.contains(Prop::COLOR);
-                resolve_style(
-                    &mut values,
-                    parent.map(|parent| &**parent),
-                    None,
-                    &[],
-                    registry,
-                    native_theme,
-                );
-                if !keep {
-                    values.set_vars(empty.clone());
-                }
-                if !colored {
-                    values.remove(Prop::COLOR);
-                }
-                values.retain(|prop, value| {
-                    if !painted(prop) {
-                        return false;
-                    }
-                    if matches!(&**value, "inherit" | "unset") {
-                        *value = fallback(prop);
-                    } else if &**value == "initial" {
-                        *value = if prop == Prop::BACKGROUND_COLOR {
-                            "transparent"
-                        } else {
-                            "currentColor"
-                        }
-                        .into();
-                    }
-                    if value.eq_ignore_ascii_case("currentcolor") || color(value).is_some() {
-                        true
-                    } else if let Some(inherited) = parent.and_then(|parent| parent.value(prop)) {
-                        *value = inherited.clone();
-                        true
-                    } else {
-                        false
-                    }
-                });
-                if !values.is_empty() {
-                    let values = match parent {
-                        Some(parent) if **parent == values => parent.clone(),
-                        _ => Rc::new(values),
-                    };
-                    extra.selection = Some(values);
-                }
-            }
-            if [&before, &after]
-                .iter()
-                .any(|values| values.contains_key(&Prop::CONTENT))
-            {
-                extra.generated = Some(Rc::new([before, after].map(|cascade| {
-                    let mut values = derive(cascade).unwrap_or_default();
-                    if values.contains(Prop::CONTENT) {
-                        let display = style.get(Prop::DISPLAY);
-                        let flex = matches!(
-                            display,
-                            Some("flex" | "inline-flex" | "grid" | "inline-grid")
-                        );
-                        blockify(
-                            &mut values,
-                            flex || item && display == Some("contents"),
-                            false,
-                        );
-                    }
-                    values
-                })));
-            }
-            if node.tag != "slot" {
-                groups[0].clear();
-            }
-            let [inner, outer] = groups;
-            let store = |list: Vec<Passed>, part: bool| {
-                (!list.is_empty()).then(|| {
-                    last.map(|last| last.extras(id))
-                        .and_then(|last| if part { &last.parts } else { &last.slotted }.as_ref())
-                        .filter(|old| ***old == list)
-                        .cloned()
-                        .unwrap_or_else(|| Rc::new(list))
-                })
-            };
-            extra.slotted = store(inner, false);
-            extra.parts = store(outer, true);
-            let kept = previous.filter(|_| animated.is_some());
-            if let Some(previous) = kept {
-                extra.animations = previous.extras(id).animations.clone();
+              style
+                .get(prop)
+                .is_some_and(|value| matches!(value, "auto" | "scroll"))
+            })
+          || style.get(Prop::OVERFLOW_Y) == Some("hidden")
+            && (style.get(Prop::SCROLLBAR_GUTTER)).is_some_and(|value| value.starts_with("stable")))
+      {
+        if !hovered.is_empty() {
+          for (prop, value) in &thumb {
+            hovered.entry(*prop).or_insert(*value);
+          }
+        }
+        extra.scrollbars = Some(Rc::new([bar, track, thumb, corner, hovered].map(&derive)));
+      }
+      if !selected.is_empty() || selection.is_some() {
+        let parent = selection;
+        let mut values = parent.map(|parent| (**parent).clone()).unwrap_or_default();
+        values.set_vars(handed.clone());
+        if let Some(scheme) = style.value(Prop::COLOR_SCHEME) {
+          values.insert(Prop::COLOR_SCHEME, scheme.clone());
+        }
+        let fallback = |prop: Prop| -> Rc<str> {
+          parent
+            .and_then(|parent| parent.value(prop))
+            .cloned()
+            .unwrap_or_else(|| {
+              if prop == Prop::BACKGROUND_COLOR {
+                "transparent"
+              } else {
+                "currentColor"
+              }
+              .into()
+            })
+        };
+        let painted = |prop: Prop| {
+          matches!(
+            prop,
+            Prop::COLOR | Prop::BACKGROUND_COLOR | Prop::WEBKIT_TEXT_FILL_COLOR
+          )
+        };
+        for (prop, (_, value)) in selected {
+          if painted(prop) {
+            values.insert(
+              prop,
+              if matches!(&**value, "inherit" | "unset") {
+                fallback(prop)
+              } else {
+                value.clone()
+              },
+            );
+          }
+        }
+        let colored = values.contains(Prop::COLOR);
+        resolve_style(
+          &mut values,
+          parent.map(|parent| &**parent),
+          None,
+          &[],
+          registry,
+          native_theme,
+        );
+        if !keep {
+          values.set_vars(empty.clone());
+        }
+        if !colored {
+          values.remove(Prop::COLOR);
+        }
+        values.retain(|prop, value| {
+          if !painted(prop) {
+            return false;
+          }
+          if matches!(&**value, "inherit" | "unset") {
+            *value = fallback(prop);
+          } else if &**value == "initial" {
+            *value = if prop == Prop::BACKGROUND_COLOR {
+              "transparent"
             } else {
-                let mut effects =
-                    if style.contains(Prop::ANIMATION) || style.contains(Prop::ANIMATION_NAME) {
-                        Animation::parse(&style, &scoped.keyframes, registry, native_theme)
-                    } else {
-                        Vec::new()
-                    };
-                for (slot, pseudo) in extra
-                    .generated
-                    .iter()
-                    .flat_map(|pair| pair.iter().enumerate())
-                {
-                    if pseudo.contains(Prop::ANIMATION) || pseudo.contains(Prop::ANIMATION_NAME) {
-                        effects.extend(
-                            Animation::parse(pseudo, &scoped.keyframes, registry, native_theme)
-                                .into_iter()
-                                .map(|mut effect| {
-                                    effect.pseudo = slot as u8 + 1;
-                                    effect.name = format!(
-                                        "{}\0{}",
-                                        ["::before", "::after"][slot],
-                                        effect.name
-                                    );
-                                    effect
-                                }),
-                        );
-                    }
-                }
-                if !effects.is_empty() {
-                    extra.animations = Some(effects.into());
-                }
+              "currentColor"
             }
-            // Reuse equal styles from the previous frame. Pointer changes invalidate layout caches.
-            let units_bits = |units: &Lengths| [units.font.bits(), units.root.bits()];
-            let vars = match context
-                .and_then(|context| context.previous.as_deref())
-                .and_then(|previous| previous.vars.get(id))
-            {
-                Some(old) if !Rc::ptr_eq(old, style.vars()) && **old == **style.vars() => {
-                    old.clone()
-                }
-                _ => style.vars().clone(),
-            };
-            let reads = reads.filter(|_| !keep).map(|mut names| {
-                names.sort_unstable();
-                names.dedup();
-                names
-                    .into_iter()
-                    .filter(|prop| !owned.contains(prop))
-                    .chain(fallback)
-                    .map(|prop| (prop, parent_vars.and_then(|vars| var(vars, prop)).cloned()))
-                    .collect()
-            });
-            let own = owned
+            .into();
+          }
+          if value.eq_ignore_ascii_case("currentcolor") || color(value).is_some() {
+            true
+          } else if let Some(inherited) = parent.and_then(|parent| parent.value(prop)) {
+            *value = inherited.clone();
+            true
+          } else {
+            false
+          }
+        });
+        if !values.is_empty() {
+          let values = match parent {
+            Some(parent) if **parent == values => parent.clone(),
+            _ => Rc::new(values),
+          };
+          extra.selection = Some(values);
+        }
+      }
+      if [&before, &after]
+        .iter()
+        .any(|values| values.contains_key(&Prop::CONTENT))
+      {
+        extra.generated = Some(Rc::new([before, after].map(|cascade| {
+          let mut values = derive(cascade).unwrap_or_default();
+          if values.contains(Prop::CONTENT) {
+            let display = style.get(Prop::DISPLAY);
+            let flex = matches!(
+              display,
+              Some("flex" | "inline-flex" | "grid" | "inline-grid")
+            );
+            blockify(
+              &mut values,
+              flex || item && display == Some("contents"),
+              false,
+            );
+          }
+          values
+        })));
+      }
+      if node.tag != "slot" {
+        groups[0].clear();
+      }
+      let [inner, outer] = groups;
+      let store = |list: Vec<Passed>, part: bool| {
+        (!list.is_empty()).then(|| {
+          last
+            .map(|last| last.extras(id))
+            .and_then(|last| if part { &last.parts } else { &last.slotted }.as_ref())
+            .filter(|old| ***old == list)
+            .cloned()
+            .unwrap_or_else(|| Rc::new(list))
+        })
+      };
+      extra.slotted = store(inner, false);
+      extra.parts = store(outer, true);
+      let kept = previous.filter(|_| animated.is_some());
+      if let Some(previous) = kept {
+        extra.animations = previous.extras(id).animations.clone();
+      } else {
+        let mut effects = if style.contains(Prop::ANIMATION) || style.contains(Prop::ANIMATION_NAME)
+        {
+          Animation::parse(&style, &scoped.keyframes, registry, native_theme)
+        } else {
+          Vec::new()
+        };
+        for (slot, pseudo) in extra
+          .generated
+          .iter()
+          .flat_map(|pair| pair.iter().enumerate())
+        {
+          if pseudo.contains(Prop::ANIMATION) || pseudo.contains(Prop::ANIMATION_NAME) {
+            effects.extend(
+              Animation::parse(pseudo, &scoped.keyframes, registry, native_theme)
                 .into_iter()
-                .map(|prop| (prop, var(&vars, prop).cloned()))
-                .collect();
-            style.set_vars(if keep { vars.clone() } else { empty.clone() });
-            let get = |prop| style.get(prop).unwrap_or("");
-            let flag = |set, value| if set { value } else { 0 };
-            let counted = [
-                Prop::COUNTER_RESET,
-                Prop::COUNTER_INCREMENT,
-                Prop::COUNTER_SET,
-            ]
-            .into_iter()
-            .any(|prop| style.contains(prop))
-                || extra.generated.as_ref().is_some_and(|pseudos| {
-                    pseudos.iter().any(|pseudo| {
-                        pseudo
-                            .get(Prop::CONTENT)
-                            .is_some_and(|content| content.contains("counter"))
-                            || pseudo.contains(Prop::COUNTER_INCREMENT)
-                            || pseudo.contains(Prop::COUNTER_RESET)
-                    })
-                });
-            let bits = flag(get(Prop::DISPLAY) == "none", DISPLAY_NONE)
-                | flag(get(Prop::DISPLAY) == "contents", DISPLAY_CONTENTS)
-                | flag(
-                    matches!(get(Prop::VISIBILITY), "hidden" | "collapse"),
-                    INVISIBLE,
-                )
-                | match get(Prop::USER_SELECT) {
-                    "none" => SELECT_NONE,
-                    "all" => SELECT_ALL,
-                    "text" => SELECT_TEXT,
-                    _ => 0,
-                }
-                | flag(counted, COUNTED)
-                | flag(agent_display, AGENT_DISPLAY)
-                | role << 8;
-            style_flags.set(id, bits, u16::eq);
-            extra.starting = starting;
-            extra.important = (!strong.is_empty()).then(|| strong.into());
-            let style = match context
-                .and_then(|context| context.previous.as_deref())
-                .and_then(|previous| {
-                    Some((
-                        previous,
-                        previous.authored.get(&id).or(previous.values.get(id))?,
-                    ))
-                }) {
-                Some((previous, old))
-                    if **old == style
+                .map(|mut effect| {
+                  effect.pseudo = slot as u8 + 1;
+                  effect.name = format!("{}\0{}", ["::before", "::after"][slot], effect.name);
+                  effect
+                }),
+            );
+          }
+        }
+        if !effects.is_empty() {
+          extra.animations = Some(effects.into());
+        }
+      }
+      // Reuse equal styles from the previous frame. Pointer changes invalidate layout caches.
+      let units_bits = |units: &Lengths| [units.font.bits(), units.root.bits()];
+      let vars = match context
+        .and_then(|context| context.previous.as_deref())
+        .and_then(|previous| previous.vars.get(id))
+      {
+        Some(old) if !Rc::ptr_eq(old, style.vars()) && **old == **style.vars() => old.clone(),
+        _ => style.vars().clone(),
+      };
+      let reads = reads.filter(|_| !keep).map(|mut names| {
+        names.sort_unstable();
+        names.dedup();
+        names
+          .into_iter()
+          .filter(|prop| !owned.contains(prop))
+          .chain(fallback)
+          .map(|prop| (prop, parent_vars.and_then(|vars| var(vars, prop)).cloned()))
+          .collect()
+      });
+      let own = owned
+        .into_iter()
+        .map(|prop| (prop, var(&vars, prop).cloned()))
+        .collect();
+      style.set_vars(if keep { vars.clone() } else { empty.clone() });
+      let get = |prop| style.get(prop).unwrap_or("");
+      let flag = |set, value| if set { value } else { 0 };
+      let counted = [
+        Prop::COUNTER_RESET,
+        Prop::COUNTER_INCREMENT,
+        Prop::COUNTER_SET,
+      ]
+      .into_iter()
+      .any(|prop| style.contains(prop))
+        || extra.generated.as_ref().is_some_and(|pseudos| {
+          pseudos.iter().any(|pseudo| {
+            pseudo
+              .get(Prop::CONTENT)
+              .is_some_and(|content| content.contains("counter"))
+              || pseudo.contains(Prop::COUNTER_INCREMENT)
+              || pseudo.contains(Prop::COUNTER_RESET)
+          })
+        });
+      let bits = flag(get(Prop::DISPLAY) == "none", DISPLAY_NONE)
+        | flag(get(Prop::DISPLAY) == "contents", DISPLAY_CONTENTS)
+        | flag(
+          matches!(get(Prop::VISIBILITY), "hidden" | "collapse"),
+          INVISIBLE,
+        )
+        | match get(Prop::USER_SELECT) {
+          "none" => SELECT_NONE,
+          "all" => SELECT_ALL,
+          "text" => SELECT_TEXT,
+          _ => 0,
+        }
+        | flag(counted, COUNTED)
+        | flag(agent_display, AGENT_DISPLAY)
+        | role << 8;
+      style_flags.set(id, bits, u16::eq);
+      extra.starting = starting;
+      extra.important = (!strong.is_empty()).then(|| strong.into());
+      let style = match context
+        .and_then(|context| context.previous.as_deref())
+        .and_then(|previous| {
+          Some((
+            previous,
+            previous.authored.get(&id).or(previous.values.get(id))?,
+          ))
+        }) {
+        Some((previous, old))
+          if **old == style
                         && previous.anonymous.get(&id).or(previous.flags.get(id))
                             == Some(&style_flags[id])
                         && previous.lengths.get(id).is_some_and(|old| {
@@ -1689,59 +1678,59 @@ impl NodePass<'_> {
                         }
                         // A `contents` box needs a new style when its ancestors change the items below it.
                         && style_flags[id] & DISPLAY_CONTENTS == 0 =>
-                {
-                    old.clone()
-                }
-                _ => Rc::new(style),
-            };
-            let cached = Rc::new(CachedStyle {
-                used: std::cell::Cell::new(style_cache.pass),
-                inline: written.map(Into::into),
-                style: style.clone(),
-                vars: std::cell::RefCell::new((parent_vars.cloned(), vars.clone())),
-                reads,
-                own,
-                missing: missing.into_boxed_slice(),
-                flags: style_flags[id],
-                lengths: units,
-                extras: rare(&extra).then(|| Rc::new(extra)),
-                viewport,
-                keyword,
-                positions,
-            });
-            if let Some(values) = &cached.extras {
-                extras.put(id, values.clone());
-            }
-            if animated.is_none() {
-                if let Some(node) = scoped.nodes[id].as_mut() {
-                    node.cached = Some(CachedNode::new(
-                        &key,
-                        parent_style,
-                        cached.clone(),
-                        parent_vars,
-                        &vars,
-                        (contained || queried || deferred).then(|| seen.clone()),
-                    ));
-                }
-                // The key doesn't hold the container, so styles with container units are not shared.
-                if !queried && !deferred {
-                    if !keyword && passed.is_some() {
-                        key.inputs.parent = passed.map(|passed| (passed, false));
-                    }
-                    let values = style_cache.values.entry(key).or_default();
-                    if values.len() == 8 {
-                        values.remove(0);
-                    }
-                    values.push(cached);
-                }
-            }
-            styles.set(id, style, Rc::ptr_eq);
-            custom.set(id, vars, Rc::ptr_eq);
-            lengths.set(id, units);
-            settle!(id, up, seen);
+        {
+          old.clone()
         }
-        style_cache.inheritable = inheritable;
-        style_cache.changed = changed;
-        (recount, counters)
+        _ => Rc::new(style),
+      };
+      let cached = Rc::new(CachedStyle {
+        used: std::cell::Cell::new(style_cache.pass),
+        inline: written.map(Into::into),
+        style: style.clone(),
+        vars: std::cell::RefCell::new((parent_vars.cloned(), vars.clone())),
+        reads,
+        own,
+        missing: missing.into_boxed_slice(),
+        flags: style_flags[id],
+        lengths: units,
+        extras: rare(&extra).then(|| Rc::new(extra)),
+        viewport,
+        keyword,
+        positions,
+      });
+      if let Some(values) = &cached.extras {
+        extras.put(id, values.clone());
+      }
+      if animated.is_none() {
+        if let Some(node) = scoped.nodes[id].as_mut() {
+          node.cached = Some(CachedNode::new(
+            &key,
+            parent_style,
+            cached.clone(),
+            parent_vars,
+            &vars,
+            (contained || queried || deferred).then(|| seen.clone()),
+          ));
+        }
+        // The key doesn't hold the container, so styles with container units are not shared.
+        if !queried && !deferred {
+          if !keyword && passed.is_some() {
+            key.inputs.parent = passed.map(|passed| (passed, false));
+          }
+          let values = style_cache.values.entry(key).or_default();
+          if values.len() == 8 {
+            values.remove(0);
+          }
+          values.push(cached);
+        }
+      }
+      styles.set(id, style, Rc::ptr_eq);
+      custom.set(id, vars, Rc::ptr_eq);
+      lengths.set(id, units);
+      settle!(id, up, seen);
     }
+    style_cache.inheritable = inheritable;
+    style_cache.changed = changed;
+    (recount, counters)
+  }
 }

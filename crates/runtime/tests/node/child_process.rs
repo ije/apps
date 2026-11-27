@@ -1,34 +1,35 @@
 use apps_runtime::{host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role};
 use std::{
-    cell::RefCell,
-    rc::Rc,
-    time::{Duration, Instant},
+  cell::RefCell,
+  rc::Rc,
+  time::{Duration, Instant},
 };
 
 fn run(source: &str) {
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        Rc::new(RefCell::new(Host::default())),
-        Role::Preload(1),
-    )
-    .unwrap();
-    engine.eval(&format!("globalThis.testResult = 'pending'; (async () => {{ {source} }})().then(() => testResult = 'ok', error => testResult = error.stack || String(error));"), "child-test").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        engine.tick().unwrap();
-        let result = engine.eval("testResult", "child-result").unwrap();
-        if result != "pending" {
-            assert_eq!(result, "ok");
-            break;
-        }
-        assert!(Instant::now() < deadline, "Child process test timed out");
-        std::thread::sleep(Duration::from_millis(1));
+  let engine = JsContext::new(
+    JavaScriptCore::load().unwrap(),
+    Rc::new(RefCell::new(Host::default())),
+    Role::Preload(1),
+  )
+  .unwrap();
+  engine.eval(&format!("globalThis.testResult = 'pending'; (async () => {{ {source} }})().then(() => testResult = 'ok', error => testResult = error.stack || String(error));"), "child-test").unwrap();
+  let deadline = Instant::now() + Duration::from_secs(60);
+  loop {
+    engine.tick().unwrap();
+    let result = engine.eval("testResult", "child-result").unwrap();
+    if result != "pending" {
+      assert_eq!(result, "ok");
+      break;
     }
+    assert!(Instant::now() < deadline, "Child process test timed out");
+    std::thread::sleep(Duration::from_millis(1));
+  }
 }
 
 #[test]
 fn events_once_resolves_rejects_and_cleans_up() {
-    run(r#"
+  run(
+    r#"
         const { EventEmitter, once } = __apps.events;
         const assert = (condition, message) => { if (!condition) throw Error(message); };
         const emitter = new EventEmitter();
@@ -64,13 +65,15 @@ fn events_once_resolves_rejects_and_cleans_up() {
         const ready = once(target, 'ready');
         target.dispatchEvent(event);
         assert((await ready)[0] === event, 'EventTarget support');
-    "#);
+    "#,
+  );
 }
 
 #[cfg(unix)]
 #[test]
 fn child_process_output_stdin_errors_and_signals() {
-    run(r#"
+  run(
+    r#"
         const { spawn } = __apps.child_process;
         const { once } = __apps.events;
         const assert = (condition, message) => { if (!condition) throw Error(message); };
@@ -124,13 +127,15 @@ fn child_process_output_stdin_errors_and_signals() {
         assert(environment.stdin === null && environment.stderr === null, 'Stdio options');
         await once(environment, 'close');
         assert(value === 'value:/usr', 'Environment and cwd');
-    "#);
+    "#,
+  );
 }
 
 #[cfg(unix)]
 #[test]
 fn file_flags_and_copies_never_lose_data() {
-    run(r#"
+  run(
+    r#"
         const { fs, path, os } = __apps;
         const assert = (condition, message) => { if (!condition) throw Error(message); };
         const code = action => { try { action(); } catch (error) { return error.code; } };
@@ -160,12 +165,14 @@ fn file_flags_and_copies_never_lose_data() {
         assert(failure?.code === 'ERR_FS_CP_EINVAL' && !fs.existsSync(path.join(dir, 'tree', 'inner')), 'cp into itself');
         assert(text() === 'hEllo world!', 'cp changed the source');
         fs.rmSync(dir, { recursive: true });
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn gcm_tags_must_be_complete() {
-    run(r#"
+  run(
+    r#"
         const { crypto } = __apps;
         const assert = (condition, message) => { if (!condition) throw Error(message); };
         const code = action => { try { action(); } catch (error) { return error.code; } };
@@ -183,12 +190,14 @@ fn gcm_tags_must_be_complete() {
         const short = crypto.createCipheriv('aes-256-gcm', key, iv, { authTagLength: 12 });
         short.update('x'); short.final();
         assert(short.getAuthTag().length === 12, 'cipher authTagLength');
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn piped_sources_wait_for_every_destination() {
-    run(r#"
+  run(
+    r#"
         const { Readable, Writable } = __apps.stream;
         const assert = (condition, message) => { if (!condition) throw Error(message); };
         let produced = 0, release = null;
@@ -202,13 +211,15 @@ fn piped_sources_wait_for_every_destination() {
         assert(produced <= 4 && writes.fast <= 3, `A fast destination resumed the source while a slow one waited: ${produced} ${writes.fast}`);
         for (let i = 0; i < 200 && writes.slow < 20; i++) { const next = release; release = null; next?.(); await new Promise(resolve => setTimeout(resolve, 2)); }
         assert(writes.slow === 20 && writes.fast === 20, `Every chunk reached both destinations: ${writes.slow} ${writes.fast}`);
-    "#);
+    "#,
+  );
 }
 
 #[cfg(unix)]
 #[test]
 fn child_process_streams_large_output_without_blocking_timers() {
-    run(r#"
+  run(
+    r#"
         const { spawn } = __apps.child_process;
         const child = spawn('/bin/sh', ['-c', 'head -c 262144 /dev/zero; head -c 131072 /dev/zero >&2; sleep 0.05']);
         let out = 0, err = 0, ticks = 0;
@@ -218,38 +229,40 @@ fn child_process_streams_large_output_without_blocking_timers() {
         const [code] = await __apps.events.once(child, 'close');
         clearInterval(timer);
         if (code !== 0 || out !== 262144 || err !== 131072 || ticks === 0) throw Error('Output lost or runtime blocked');
-    "#);
+    "#,
+  );
 }
 
 #[cfg(unix)]
 #[test]
 fn child_process_context_cleanup_reaps_running_children() {
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        Rc::new(RefCell::new(Host::default())),
-        Role::Main,
+  let engine = JsContext::new(
+    JavaScriptCore::load().unwrap(),
+    Rc::new(RefCell::new(Host::default())),
+    Role::Main,
+  )
+  .unwrap();
+  let pid: libc::pid_t = engine
+    .eval(
+      "__apps.child_process.spawn('/bin/sleep', ['30'], { stdio: 'ignore' }).pid",
+      "child-cleanup",
     )
+    .unwrap()
+    .parse()
     .unwrap();
-    let pid: libc::pid_t = engine
-        .eval(
-            "__apps.child_process.spawn('/bin/sleep', ['30'], { stdio: 'ignore' }).pid",
-            "child-cleanup",
-        )
-        .unwrap()
-        .parse()
-        .unwrap();
-    drop(engine);
-    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::ESRCH)
-    );
+  drop(engine);
+  assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+  assert_eq!(
+    std::io::Error::last_os_error().raw_os_error(),
+    Some(libc::ESRCH)
+  );
 }
 
 #[cfg(unix)]
 #[test]
 fn files_transfer_bytes_and_text() {
-    run(r#"
+  run(
+    r#"
         const assert = (condition, message) => { if (!condition) throw Error(message); };
         const fs = __apps.fs, all = Buffer.from(Array.from({ length: 256 }, (_, i) => i));
         const dir = fs.mkdtempSync('/tmp/apps-files-'), file = dir + '/data';
@@ -271,103 +284,107 @@ fn files_transfer_bytes_and_text() {
         await new Promise(resolve => terminal.onExit(resolve));
         for (let i = 0; i < 200 && !text.endsWith('�'); i++) await new Promise(resolve => setTimeout(resolve, 5));
         assert(text.includes('🌊é🌊é') && text.endsWith('�'), 'Terminal text');
-    "#);
+    "#,
+  );
 }
 
 #[cfg(unix)]
 #[test]
 fn native_events_wake_the_event_loop() {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-    let wakes = Arc::new(AtomicUsize::new(0));
-    let counter = wakes.clone();
-    apps_runtime::jsc::Waker::install(move || {
-        counter.fetch_add(1, Ordering::SeqCst);
-    });
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        Rc::new(RefCell::new(Host::default())),
-        Role::Main,
-    )
-    .unwrap();
-    for start in [
-        "__apps.child_process.spawn('/bin/sh',['-c','sleep 0.05'],{stdio:'ignore'}).on('exit',()=>done=true)",
-        "globalThis.out='';__apps.child_process.spawn('/bin/sh',['-c','sleep 0.05; printf hi']).stdout.on('data',data=>done=(out+=data)==='hi')",
-        "__apps.fs.promises.stat('/').then(()=>done=true)",
-        "__apps.zlib.gzip('wake',()=>done=true)",
-        "globalThis.out='';__apps.pty.spawn('/bin/sh',['-c','sleep 0.05; printf hi']).onData(data=>done=(out+=data).includes('hi'))",
-        "__apps.pty.spawn('/bin/sh',['-c','sleep 0.05']).onExit(()=>done=true)",
-    ] {
-        engine
-            .eval(&format!("globalThis.done=false;{start}"), "wake")
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            let seen = wakes.load(Ordering::SeqCst);
-            engine.tick().unwrap();
-            if engine.eval("done", "wake").unwrap() == "true" {
-                break;
-            }
-            while wakes.load(Ordering::SeqCst) == seen {
-                assert!(Instant::now() < deadline, "No wake for: {start}");
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
+  use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+  };
+  let wakes = Arc::new(AtomicUsize::new(0));
+  let counter = wakes.clone();
+  apps_runtime::jsc::Waker::install(move || {
+    counter.fetch_add(1, Ordering::SeqCst);
+  });
+  let engine = JsContext::new(
+    JavaScriptCore::load().unwrap(),
+    Rc::new(RefCell::new(Host::default())),
+    Role::Main,
+  )
+  .unwrap();
+  for start in [
+    "__apps.child_process.spawn('/bin/sh',['-c','sleep 0.05'],{stdio:'ignore'}).on('exit',()=>done=true)",
+    "globalThis.out='';__apps.child_process.spawn('/bin/sh',['-c','sleep 0.05; printf hi']).stdout.on('data',data=>done=(out+=data)==='hi')",
+    "__apps.fs.promises.stat('/').then(()=>done=true)",
+    "__apps.zlib.gzip('wake',()=>done=true)",
+    "globalThis.out='';__apps.pty.spawn('/bin/sh',['-c','sleep 0.05; printf hi']).onData(data=>done=(out+=data).includes('hi'))",
+    "__apps.pty.spawn('/bin/sh',['-c','sleep 0.05']).onExit(()=>done=true)",
+  ] {
+    engine
+      .eval(&format!("globalThis.done=false;{start}"), "wake")
+      .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+      let seen = wakes.load(Ordering::SeqCst);
+      engine.tick().unwrap();
+      if engine.eval("done", "wake").unwrap() == "true" {
+        break;
+      }
+      while wakes.load(Ordering::SeqCst) == seen {
+        assert!(Instant::now() < deadline, "No wake for: {start}");
+        std::thread::sleep(Duration::from_millis(1));
+      }
     }
+  }
 }
 
 #[cfg(unix)]
 #[test]
 fn closing_terminals_does_not_block_on_kill() {
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        Rc::new(RefCell::new(Host::default())),
-        Role::Main,
+  let engine = JsContext::new(
+    JavaScriptCore::load().unwrap(),
+    Rc::new(RefCell::new(Host::default())),
+    Role::Main,
+  )
+  .unwrap();
+  let pid: libc::pid_t = engine
+    .eval(
+      "__apps.pty.spawn('/bin/sh',['-c','trap \"\" HUP; exec sleep 30']).pid",
+      "pty-close",
     )
+    .unwrap()
+    .parse()
     .unwrap();
-    let pid: libc::pid_t = engine
-        .eval(
-            "__apps.pty.spawn('/bin/sh',['-c','trap \"\" HUP; exec sleep 30']).pid",
-            "pty-close",
-        )
-        .unwrap()
-        .parse()
-        .unwrap();
-    std::thread::sleep(Duration::from_millis(50));
-    let start = Instant::now();
-    drop(engine);
-    assert!(
-        start.elapsed() < Duration::from_millis(150),
-        "Closing a terminal blocked for {:?}",
-        start.elapsed()
-    );
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while unsafe { libc::kill(pid, 0) } == 0 {
-        assert!(Instant::now() < deadline, "Terminal child was not killed");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+  std::thread::sleep(Duration::from_millis(50));
+  let start = Instant::now();
+  drop(engine);
+  assert!(
+    start.elapsed() < Duration::from_millis(150),
+    "Closing a terminal blocked for {:?}",
+    start.elapsed()
+  );
+  let deadline = Instant::now() + Duration::from_secs(60);
+  while unsafe { libc::kill(pid, 0) } == 0 {
+    assert!(Instant::now() < deadline, "Terminal child was not killed");
+    std::thread::sleep(Duration::from_millis(10));
+  }
 }
 
 #[cfg(unix)]
 #[test]
 fn terminals_start_in_the_current_directory_with_the_current_environment() {
-    // The test must not change the directory of the process: other tests run in it at the same time. Cargo
-    // runs tests in the crate folder, which is not the home folder that a terminal used to start in.
-    run(r#"
+  // The test must not change the directory of the process: other tests run in it at the same time. Cargo
+  // runs tests in the crate folder, which is not the home folder that a terminal used to start in.
+  run(
+    r#"
         process.env.APPS_PTY_TEST = 'set later';
         const terminal = __apps.pty.spawn('/bin/sh', ['-c', 'pwd; echo "[$APPS_PTY_TEST]"']);
         let output = '';
         await new Promise(resolve => terminal.onData(data => { output += data; if (output.includes(']')) resolve(); }));
         if (!output.includes(process.cwd() + '\r\n[set later]')) throw Error('Terminal started with ' + JSON.stringify(output));
-    "#);
+    "#,
+  );
 }
 
 #[cfg(unix)]
 #[test]
 fn child_output_applies_backpressure() {
-    run(r#"
+  run(
+    r#"
         const { spawn, spawnSync } = __apps.child_process;
         const child = spawn('/bin/sh', ['-c', 'head -c 4194304 /dev/zero']);
         await new Promise(resolve => setTimeout(resolve, 200));
@@ -378,13 +395,15 @@ fn child_output_applies_backpressure() {
         if (buffered > 524288 || total !== 4194304) throw Error(`Buffered ${buffered} bytes, received ${total}`);
         const result = spawnSync('/bin/sh', ['-c', 'head -c 2097152 /dev/zero'], { maxBuffer: Infinity });
         if (result.error || result.stdout.length !== 2097152) throw Error('maxBuffer: Infinity');
-    "#);
+    "#,
+  );
 }
 
 #[cfg(unix)]
 #[test]
 fn destroyed_child_output_closes_the_pipe() {
-    run(r#"
+  run(
+    r#"
         const { spawn } = __apps.child_process;
         const child = spawn('yes'), closed = __apps.events.once(child, 'close');
         for await (const chunk of child.stdout) break;
@@ -395,20 +414,22 @@ fn destroyed_child_output_closes_the_pipe() {
         paused.stdout.destroy();
         const [status, killed] = await __apps.events.once(paused, 'close');
         if (status !== null || killed !== 'SIGPIPE') throw Error(`Paused output closed with ${status} ${killed}`);
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn synchronous_children_honor_stdio_modes() {
-    run(
-        r#"for(const stdio of ['ignore','inherit',['ignore','ignore','ignore']]){const result=__apps.child_process.spawnSync(...process.platform==='win32'?['cmd.exe',['/c','exit 0']]:['/bin/sh',['-c','exit 0']],{stdio});if(result.status!==0||result.stdout!==null||result.stderr!==null)throw Error('sync stdio')}"#,
-    );
+  run(
+    r#"for(const stdio of ['ignore','inherit',['ignore','ignore','ignore']]){const result=__apps.child_process.spawnSync(...process.platform==='win32'?['cmd.exe',['/c','exit 0']]:['/bin/sh',['-c','exit 0']],{stdio});if(result.status!==0||result.stdout!==null||result.stderr!==null)throw Error('sync stdio')}"#,
+  );
 }
 
 #[cfg(unix)]
 #[test]
 fn extra_pipes_and_failed_spawns_keep_node_behavior() {
-    run(r#"
+  run(
+    r#"
         const { spawn, spawnSync } = __apps.child_process;
         const result = spawnSync('/bin/sh', ['-c', 'echo out; echo err >&2; echo extra >&3'], { stdio: ['pipe', 'pipe', 'pipe', 'pipe'] });
         if (String(result.stdout) !== 'out\n' || String(result.stderr) !== 'err\n') throw Error(`Extra pipe output leaked: ${result.stdout} ${result.stderr}`);
@@ -417,13 +438,15 @@ fn extra_pipes_and_failed_spawns_keep_node_behavior() {
         if (missing.unref() !== missing || missing.ref() !== missing) throw Error('ref and unref return the child');
         const [error] = await failed;
         if (error.code !== 'ENOENT') throw Error(`Spawn failed with ${error.code}`);
-    "#);
+    "#,
+  );
 }
 
 #[cfg(unix)]
 #[test]
 fn child_process_options_stdio_and_sync_errors() {
-    run(r#"
+  run(
+    r#"
         const { spawn, spawnSync, execFile } = __apps.child_process, { Writable } = __apps.stream, { once } = __apps.events;
         const assert = (condition, message) => { if (!condition) throw Error(message); };
         const missing = spawnSync('apps-missing-command', ['a']);
@@ -460,21 +483,25 @@ fn child_process_options_stdio_and_sync_errors() {
         assert((await once(sleeper, 'exit'))[1] === 'SIGKILL', 'numeric signal');
         const [limit, output] = await new Promise(resolve => execFile('/bin/sh', ['-c', 'printf 12345678'], { maxBuffer: 2 }, (error, stdout) => resolve([error, stdout])));
         assert(limit.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' && limit.message === 'stdout maxBuffer length exceeded' && output === '12', 'maxBuffer truncates');
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn preloads_cannot_change_the_process_cwd() {
-    run(r#"
+  run(
+    r#"
         try { process.chdir('/'); } catch (error) { if (error.code === 'ERR_WORKER_UNSUPPORTED_OPERATION') return; throw error; }
         throw Error('chdir worked in a preload');
-    "#);
+    "#,
+  );
 }
 
 #[cfg(unix)]
 #[test]
 fn detached_children_get_signals_alone_and_are_reaped() {
-    run(r#"
+  run(
+    r#"
         const { spawn } = __apps.child_process, { once } = __apps.events;
         const child = spawn('/bin/sh', ['-c', 'sleep 30 & echo $!; wait'], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
         const [line] = await once(child.stdout, 'data');
@@ -485,14 +512,15 @@ fn detached_children_get_signals_alone_and_are_reaped() {
         try { process.kill(grandchild, 0); } catch { alive = false; }
         process.kill(grandchild, 'SIGKILL');
         if (!alive) throw Error('kill() signaled the whole process group');
-    "#);
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        Rc::new(RefCell::new(Host::default())),
-        Role::Main,
-    )
-    .unwrap();
-    let pid: libc::pid_t = engine
+    "#,
+  );
+  let engine = JsContext::new(
+    JavaScriptCore::load().unwrap(),
+    Rc::new(RefCell::new(Host::default())),
+    Role::Main,
+  )
+  .unwrap();
+  let pid: libc::pid_t = engine
         .eval(
             "const child = __apps.child_process.spawn('/bin/sleep', ['0.05'], { stdio: 'ignore', detached: true }); child.unref(); child.pid",
             "detached-reap",
@@ -500,54 +528,54 @@ fn detached_children_get_signals_alone_and_are_reaped() {
         .unwrap()
         .parse()
         .unwrap();
-    drop(engine);
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while unsafe { libc::kill(pid, 0) } == 0 {
-        assert!(Instant::now() < deadline, "Detached child stayed a zombie");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+  drop(engine);
+  let deadline = Instant::now() + Duration::from_secs(60);
+  while unsafe { libc::kill(pid, 0) } == 0 {
+    assert!(Instant::now() < deadline, "Detached child stayed a zombie");
+    std::thread::sleep(Duration::from_millis(5));
+  }
 }
 
 // A failure kills the process by SIGPIPE, so the test runs in a child.
 #[cfg(unix)]
 #[test]
 fn removed_signal_listener_keeps_sigpipe_ignored() {
-    if std::env::var_os("APPS_SIGPIPE_TEST").is_none() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "removed_signal_listener_keeps_sigpipe_ignored",
-                "--test-threads=1",
-            ])
-            .env("APPS_SIGPIPE_TEST", "1")
-            .stdout(std::process::Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success(), "Child test ended with {status}");
-        return;
-    }
-    extern "C" fn handler(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {}
-    let read = || unsafe {
-        let mut action: libc::sigaction = std::mem::zeroed();
-        libc::sigaction(libc::SIGUSR2, std::ptr::null(), &mut action);
-        (action.sa_sigaction, action.sa_flags)
-    };
-    let before = unsafe {
-        let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = handler as *const () as libc::sighandler_t;
-        action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-        libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut());
-        read()
-    };
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        Rc::new(RefCell::new(Host::default())),
-        Role::Main,
-    )
-    .unwrap();
-    engine
-        .eval(
-            r#"globalThis.testResult = 'pending'; (async () => {
+  if std::env::var_os("APPS_SIGPIPE_TEST").is_none() {
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+      .args([
+        "--exact",
+        "removed_signal_listener_keeps_sigpipe_ignored",
+        "--test-threads=1",
+      ])
+      .env("APPS_SIGPIPE_TEST", "1")
+      .stdout(std::process::Stdio::null())
+      .status()
+      .unwrap();
+    assert!(status.success(), "Child test ended with {status}");
+    return;
+  }
+  extern "C" fn handler(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {}
+  let read = || unsafe {
+    let mut action: libc::sigaction = std::mem::zeroed();
+    libc::sigaction(libc::SIGUSR2, std::ptr::null(), &mut action);
+    (action.sa_sigaction, action.sa_flags)
+  };
+  let before = unsafe {
+    let mut action: libc::sigaction = std::mem::zeroed();
+    action.sa_sigaction = handler as *const () as libc::sighandler_t;
+    action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+    libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut());
+    read()
+  };
+  let engine = JsContext::new(
+    JavaScriptCore::load().unwrap(),
+    Rc::new(RefCell::new(Host::default())),
+    Role::Main,
+  )
+  .unwrap();
+  engine
+    .eval(
+      r#"globalThis.testResult = 'pending'; (async () => {
         const { once } = __apps.events;
         const listener = () => {};
         process.on('SIGPIPE', listener).off('SIGPIPE', listener);
@@ -558,29 +586,31 @@ fn removed_signal_listener_keeps_sigpipe_ignored() {
         const [error] = await once(child.stdin, 'error');
         if (error.code !== 'EPIPE') throw error;
     })().then(() => testResult = 'ok', error => testResult = error.stack || String(error));"#,
-            "sigpipe",
-        )
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        engine.tick().unwrap();
-        let result = engine.eval("testResult", "sigpipe-result").unwrap();
-        if result != "pending" {
-            assert_eq!(result, "ok");
-            break;
-        }
-        assert!(Instant::now() < deadline, "SIGPIPE test timed out");
-        std::thread::sleep(Duration::from_millis(1));
+      "sigpipe",
+    )
+    .unwrap();
+  let deadline = Instant::now() + Duration::from_secs(60);
+  loop {
+    engine.tick().unwrap();
+    let result = engine.eval("testResult", "sigpipe-result").unwrap();
+    if result != "pending" {
+      assert_eq!(result, "ok");
+      break;
     }
-    assert_eq!(read(), before, "SIGUSR2 handler and flags");
+    assert!(Instant::now() < deadline, "SIGPIPE test timed out");
+    std::thread::sleep(Duration::from_millis(1));
+  }
+  assert_eq!(read(), before, "SIGUSR2 handler and flags");
 }
 
 #[cfg(unix)]
 #[test]
 fn synchronous_timeout_sends_a_numeric_kill_signal() {
-    run(r#"
+  run(
+    r#"
         const start = Date.now();
         const result = __apps.child_process.spawnSync('/bin/sh', ['-c', 'trap "" TERM; sleep 5'], { timeout: 100, killSignal: 9 });
         if (result.signal !== 'SIGKILL' || Date.now() - start > 3000) throw Error(`Ended by ${result.signal} after ${Date.now() - start} ms`);
-    "#);
+    "#,
+  );
 }

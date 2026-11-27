@@ -1,15 +1,15 @@
 use super::*;
 use super::{
-    css::{css, urls},
-    resolve::{BUILTINS, PACKAGES},
+  css::{css, urls},
+  resolve::{BUILTINS, PACKAGES},
 };
 
 fn linked_css(page: &str) -> String {
-    Document::parse(page)
-        .nodes
-        .iter()
-        .find_map(|node| node.attrs.get(apps_runtime::bundle::LINK_SHEET).cloned())
-        .unwrap_or_default()
+  Document::parse(page)
+    .nodes
+    .iter()
+    .find_map(|node| node.attrs.get(apps_runtime::bundle::LINK_SHEET).cloned())
+    .unwrap_or_default()
 }
 
 mod cache;

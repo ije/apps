@@ -18,8 +18,8 @@ const PAGE: &str = "<head><style>body{margin:0}.s{width:160px;height:120px;overf
 #[test]
 #[ignore = "requires the macOS window server"]
 fn boxes_follow_their_anchors_like_chrome() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         await load('anchor.html');
         const step = async (name, code) => console.log('ANCHOR ' + name + ' ' + await run(code));
         await step('fn', "at(fn)");
@@ -46,35 +46,35 @@ fn boxes_follow_their_anchors_like_chrome() {
         await step('none', "pop.hidePopover(); pop.showPopover(); at(pop)");
         await step('gone', "a.remove(); at(fn)");
         "#,
-        &[("anchor.html", PAGE)],
-    );
-    for line in [
-        "fn 110 82 24 16",
-        "used 110px 82px",
-        "area 110 57 24 16",
-        "center 70 5 40 16",
-        "flip 78 10 24 40",
-        "rule 110 50 30 16",
-        "moved 110 52 24 16,110 27 24 16,78 50 24 40,bottom",
-        "kept 78 80 24 40",
-        "fits 78 90 24 40",
-        "back 78 10 24 40",
-        "width 400,400",
-        "scrolled 90 52 24 16,90 27 24 16,400,400",
-        "layout 110px",
-        "hidden false,1",
-        "shown true",
-        "popover 115 84 20 10",
-    ] {
-        assert!(text.contains(&format!("ANCHOR {line}\n")), "{line}: {text}");
-    }
+    &[("anchor.html", PAGE)],
+  );
+  for line in [
+    "fn 110 82 24 16",
+    "used 110px 82px",
+    "area 110 57 24 16",
+    "center 70 5 40 16",
+    "flip 78 10 24 40",
+    "rule 110 50 30 16",
+    "moved 110 52 24 16,110 27 24 16,78 50 24 40,bottom",
+    "kept 78 80 24 40",
+    "fits 78 90 24 40",
+    "back 78 10 24 40",
+    "width 400,400",
+    "scrolled 90 52 24 16,90 27 24 16,400,400",
+    "layout 110px",
+    "hidden false,1",
+    "shown true",
+    "popover 115 84 20 10",
+  ] {
+    assert!(text.contains(&format!("ANCHOR {line}\n")), "{line}: {text}");
+  }
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn position_try_rules_are_in_the_cssom() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('rules.html');
         const read = code => run(`(() => { const rule = document.styleSheets[0].cssRules[0]; ${code} })()`);
         const first = await read("return [rule.constructor.name, rule.name, rule.cssText].join('|')");
@@ -82,21 +82,21 @@ fn position_try_rules_are_in_the_cssom() {
         const changed = await read("rule.style.color = 'red'; rule.style.width = '9px'; return rule.style.cssText + getComputedStyle(x).width");
         if (changed !== 'position-area: top; width: 9px;9px') fail(changed);
         "#,
-        &[(
-            "rules.html",
-            "<style>@position-try --p{position-area:top;color:red;width:5px;height:1px!important}</style>\
+    &[(
+      "rules.html",
+      "<style>@position-try --p{position-area:top;color:red;width:5px;height:1px!important}</style>\
              <body style='margin:0'><div style='position:absolute;left:100px;top:calc(100vh - 30px);width:20px;height:20px;anchor-name:--a'></div>\
              <div id=x style='position:absolute;position-anchor:--a;position-area:bottom;width:100px;height:90px;position-try-fallbacks:--p'></div>\
              <script>x = document.getElementById('x');</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn position_options_and_names_follow_chrome() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         await load('options.html');
         const step = async (name, code) => console.log('OPTION ' + name + ' ' + await run(code));
         await step('own', "at(own)");
@@ -111,9 +111,9 @@ fn position_options_and_names_follow_chrome() {
         await step('vars', "v.style.setProperty('--w', '50px'); at(varied)");
         await step('none', "getComputedStyle(closed).left");
         "#,
-        &[(
-            "options.html",
-            "<head><style id=rules>@position-try --e{position-area:right;width:50px;height:50px}</style>\
+    &[(
+      "options.html",
+      "<head><style id=rules>@position-try --e{position-area:right;width:50px;height:50px}</style>\
              <style>body{margin:0}.o{position:relative;width:240px;height:180px}\
              .a{position:relative;left:70px;top:50px;width:40px;height:30px;anchor-name:--a}\
              .x{position:absolute;position-anchor:--a}.r{anchor-scope:--r;position:relative;height:20px}\
@@ -132,30 +132,30 @@ fn position_options_and_names_follow_chrome() {
              <script>for (const el of document.querySelectorAll('[id]')) globalThis[el.id] = el;\
              globalThis.at = el => { const r = el.getBoundingClientRect(), o = el.offsetParent.getBoundingClientRect(); return [r.x - o.x, r.y - o.y, r.width, r.height].map(Math.round).join(' '); };\
              </script></body>",
-        )],
-    );
-    for line in [
-        "own 0 0 200 150",
-        "last 110 55 20 20",
-        "limit 0 0 500 500",
-        "image 30 80 120 40",
-        "ratio 60 80 60 30",
-        "scope 30 0 5 5,60 0 5 5",
-        "edit 110 40 30 50",
-        "gone 40 0 100 400",
-        "var 110 55 40 20",
-        "vars 110 55 50 20",
-        "none 9px",
-    ] {
-        assert!(text.contains(&format!("OPTION {line}\n")), "{line}: {text}");
-    }
+    )],
+  );
+  for line in [
+    "own 0 0 200 150",
+    "last 110 55 20 20",
+    "limit 0 0 500 500",
+    "image 30 80 120 40",
+    "ratio 60 80 60 30",
+    "scope 30 0 5 5,60 0 5 5",
+    "edit 110 40 30 50",
+    "gone 40 0 100 400",
+    "var 110 55 40 20",
+    "vars 110 55 50 20",
+    "none 9px",
+  ] {
+    assert!(text.contains(&format!("OPTION {line}\n")), "{line}: {text}");
+  }
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn late_boxes_and_new_scrollers_follow_chrome() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         await load('late.html');
         const step = async (name, code) => { await run(code); await win.webContents.capturePage(); console.log('LATE ' + name + ' ' + await run("[at(late), at(box)].join()")); };
         await step('hidden', "0");
@@ -175,9 +175,9 @@ fn late_boxes_and_new_scrollers_follow_chrome() {
         await step('clip', "a.style.left = ''; s.style.overflow = ''; s.scrollTop = 200");
         console.log('LATE clipped ' + await run("document.elementFromPoint(205, 155)?.id"));
         "#,
-        &[(
-            "late.html",
-            "<body style='margin:0'><style>#o{position:relative;width:240px;height:400px}#s{width:160px;height:120px;overflow:auto}#g{height:400px}\
+    &[(
+      "late.html",
+      "<body style='margin:0'><style>#o{position:relative;width:240px;height:400px}#s{width:160px;height:120px;overflow:auto}#g{height:400px}\
              #a{position:relative;left:70px;top:50px;width:40px;height:30px;anchor-name:--a}\
              .x{position:absolute;position-anchor:--a;position-area:bottom right;width:20px;height:10px}</style>\
              <div id=o><div id=s><div id=g><div id=a></div></div></div>\
@@ -186,25 +186,25 @@ fn late_boxes_and_new_scrollers_follow_chrome() {
              <script>for (const el of document.querySelectorAll('[id]')) globalThis[el.id] = el;\
              globalThis.at = el => { const r = el.getBoundingClientRect(); return [r.x, r.y, r.width, r.height].map(Math.round).join(' '); };\
              </script></body>",
-        )],
-    );
-    for line in [
-        "hidden 0 0 0 0,80 80 20 10",
-        "shown 110 80 40 10,80 80 20 10",
-        "block 9 127 20 10,80 80 20 10",
-        "scope 9 127 20 10,80 80 20 10",
-        "transform 9 127 20 10,80 80 20 10",
-        "static 110 80 40 10,80 80 20 10",
-        "free 110 80 40 10,80 80 20 10",
-        "plain 110 80 40 10,80 80 20 10",
-        "scrolled 110 40 40 10,80 40 20 10",
-        "spilled 110 80 40 10,80 80 20 10",
-        "moved 60 80 40 10,30 80 20 10",
-        "closed 20px",
-        "reopened 60 80 40 10,30 80 20 10",
-        "fixed deep",
-    ] {
-        assert!(text.contains(&format!("LATE {line}\n")), "{line}: {text}");
-    }
-    assert!(!text.contains("LATE clipped deep"), "{text}");
+    )],
+  );
+  for line in [
+    "hidden 0 0 0 0,80 80 20 10",
+    "shown 110 80 40 10,80 80 20 10",
+    "block 9 127 20 10,80 80 20 10",
+    "scope 9 127 20 10,80 80 20 10",
+    "transform 9 127 20 10,80 80 20 10",
+    "static 110 80 40 10,80 80 20 10",
+    "free 110 80 40 10,80 80 20 10",
+    "plain 110 80 40 10,80 80 20 10",
+    "scrolled 110 40 40 10,80 40 20 10",
+    "spilled 110 80 40 10,80 80 20 10",
+    "moved 60 80 40 10,30 80 20 10",
+    "closed 20px",
+    "reopened 60 80 40 10,30 80 20 10",
+    "fixed deep",
+  ] {
+    assert!(text.contains(&format!("LATE {line}\n")), "{line}: {text}");
+  }
+  assert!(!text.contains("LATE clipped deep"), "{text}");
 }

@@ -1,371 +1,364 @@
 use super::{
-    Decoration, DecorationStyle, FontId, GlyphId, Line, Look, TextAlign, TextLine, TextSystem,
+  Decoration, DecorationStyle, FontId, GlyphId, Line, Look, TextAlign, TextLine, TextSystem,
 };
 use crate::{Clip, Color, Pixels, Point, Rect, Scalar, Size, point, px};
 
 /// What text paints into.
 pub trait TextCanvas {
-    fn text_system(&self) -> &TextSystem;
-    fn content_mask(&self) -> Clip<Pixels>;
-    /// Paint left out content, so a copy of it can't move.
-    fn cull(&mut self);
-    fn draw_rect(&mut self, bounds: Rect<Pixels>, color: Color);
-    fn draw_line(
-        &mut self,
-        origin: Point<Pixels>,
-        width: Pixels,
-        thickness: Pixels,
-        color: Color,
-        style: DecorationStyle,
-    );
-    #[allow(clippy::too_many_arguments)]
-    fn draw_glyph(
-        &mut self,
-        origin: Point<Pixels>,
-        font: FontId,
-        glyph: GlyphId,
-        size: Pixels,
-        color: Color,
-        emoji: bool,
-        stroke: Pixels,
-    );
+  fn text_system(&self) -> &TextSystem;
+  fn content_mask(&self) -> Clip<Pixels>;
+  /// Paint left out content, so a copy of it can't move.
+  fn cull(&mut self);
+  fn draw_rect(&mut self, bounds: Rect<Pixels>, color: Color);
+  fn draw_line(
+    &mut self,
+    origin: Point<Pixels>,
+    width: Pixels,
+    thickness: Pixels,
+    color: Color,
+    style: DecorationStyle,
+  );
+  #[allow(clippy::too_many_arguments)]
+  fn draw_glyph(
+    &mut self,
+    origin: Point<Pixels>,
+    font: FontId,
+    glyph: GlyphId,
+    size: Pixels,
+    color: Color,
+    emoji: bool,
+    stroke: Pixels,
+  );
 }
 
 struct Rows<'a> {
-    line: &'a Line,
-    breaks: &'a [u32],
-    origin: Point<Pixels>,
-    align: TextAlign,
-    align_width: Pixels,
+  line: &'a Line,
+  breaks: &'a [u32],
+  origin: Point<Pixels>,
+  align: TextAlign,
+  align_width: Pixels,
 }
 
 impl Rows<'_> {
-    fn left(&self, start: Pixels, row: usize) -> Pixels {
-        let end =
-            (self.breaks.get(row)).map_or(self.line.width, |&at| self.line.glyphs[at as usize].x);
-        let width = end - start;
-        let x = self.origin.x;
-        match self.align {
-            TextAlign::Left => x,
-            TextAlign::Center => (x * 2. + self.align_width - width) / 2.,
-            TextAlign::Right => x + self.align_width - width,
-        }
+  fn left(&self, start: Pixels, row: usize) -> Pixels {
+    let end = (self.breaks.get(row)).map_or(self.line.width, |&at| self.line.glyphs[at as usize].x);
+    let width = end - start;
+    let x = self.origin.x;
+    match self.align {
+      TextAlign::Left => x,
+      TextAlign::Center => (x * 2. + self.align_width - width) / 2.,
+      TextAlign::Right => x + self.align_width - width,
     }
+  }
 }
 
 struct Cursor<'a> {
-    looks: std::slice::Iter<'a, Look>,
-    end: usize,
-    len: usize,
+  looks: std::slice::Iter<'a, Look>,
+  end: usize,
+  len: usize,
 }
 
 impl<'a> Cursor<'a> {
-    /// `None` while `index` stays in the current look. Past it, the look that holds `index` with
-    /// its start, or `None` after the last one.
-    fn step(&mut self, index: usize) -> Option<Option<(usize, &'a Look)>> {
-        if index < self.end {
-            return None;
-        }
-        let mut next = self.looks.next();
-        while let Some(look) = next
-            && index >= self.end + look.len
-        {
-            self.end += look.len;
-            next = self.looks.next();
-        }
-        Some(match next {
-            Some(look) => {
-                let start = self.end;
-                self.end += look.len;
-                Some((start, look))
-            }
-            None => {
-                self.end = self.len;
-                None
-            }
-        })
+  /// `None` while `index` stays in the current look. Past it, the look that holds `index` with
+  /// its start, or `None` after the last one.
+  fn step(&mut self, index: usize) -> Option<Option<(usize, &'a Look)>> {
+    if index < self.end {
+      return None;
     }
+    let mut next = self.looks.next();
+    while let Some(look) = next
+      && index >= self.end + look.len
+    {
+      self.end += look.len;
+      next = self.looks.next();
+    }
+    Some(match next {
+      Some(look) => {
+        let start = self.end;
+        self.end += look.len;
+        Some((start, look))
+      }
+      None => {
+        self.end = self.len;
+        None
+      }
+    })
+  }
 }
 
 #[derive(Default)]
 struct Ink {
-    key: Option<(FontId, Pixels)>,
-    size: Size<Pixels>,
-    // From the baseline to the top left of the font box.
-    lift: Point<Pixels>,
+  key: Option<(FontId, Pixels)>,
+  size: Size<Pixels>,
+  // From the baseline to the top left of the font box.
+  lift: Point<Pixels>,
 }
 
 impl Ink {
-    fn update(&mut self, glyph: &super::Glyph, text: &TextSystem) {
-        let key = (glyph.font, glyph.size);
-        if self.key != Some(key) {
-            self.key = Some(key);
-            let bounds = text.glyph_box(key.0, key.1);
-            (self.size, self.lift) = (bounds.size, point(bounds.left(), -bounds.bottom()));
-        }
+  fn update(&mut self, glyph: &super::Glyph, text: &TextSystem) {
+    let key = (glyph.font, glyph.size);
+    if self.key != Some(key) {
+      self.key = Some(key);
+      let bounds = text.glyph_box(key.0, key.1);
+      (self.size, self.lift) = (bounds.size, point(bounds.left(), -bounds.bottom()));
     }
+  }
 }
 
 impl TextLine {
-    fn placed(&self, origin: Point<Pixels>, align: TextAlign, width: Option<Pixels>) -> Rows<'_> {
-        Rows {
-            line: &self.line,
-            breaks: &self.breaks,
-            origin,
-            align,
-            align_width: width.or(self.wrap).unwrap_or(self.line.width),
-        }
+  fn placed(&self, origin: Point<Pixels>, align: TextAlign, width: Option<Pixels>) -> Rows<'_> {
+    Rows {
+      line: &self.line,
+      breaks: &self.breaks,
+      origin,
+      align,
+      align_width: width.or(self.wrap).unwrap_or(self.line.width),
     }
+  }
 
-    /// How far the ink of a glyph reaches above or below its row.
-    pub(crate) fn reach(&self, line_height: Pixels, text: &TextSystem) -> Pixels {
-        let line = &*self.line;
-        let baseline = (line_height - line.ascent - line.descent) / 2. + line.ascent;
-        let mut ink = Ink::default();
-        line.glyphs.iter().fold(px(0.), |reach, glyph| {
-            ink.update(glyph, text);
-            let top = baseline + glyph.y + ink.lift.y;
-            reach.max(-top).max(top + ink.size.height - line_height)
-        })
-    }
+  /// How far the ink of a glyph reaches above or below its row.
+  pub(crate) fn reach(&self, line_height: Pixels, text: &TextSystem) -> Pixels {
+    let line = &*self.line;
+    let baseline = (line_height - line.ascent - line.descent) / 2. + line.ascent;
+    let mut ink = Ink::default();
+    line.glyphs.iter().fold(px(0.), |reach, glyph| {
+      ink.update(glyph, text);
+      let top = baseline + glyph.y + ink.lift.y;
+      reach.max(-top).max(top + ink.size.height - line_height)
+    })
+  }
 
-    pub fn paint<C: TextCanvas>(
-        &self,
-        origin: Point<Pixels>,
-        line_height: Pixels,
-        align: TextAlign,
-        width: Option<Pixels>,
-        canvas: &mut C,
-    ) {
-        self.paint_rows(origin, line_height, align, width, 0..self.rows(), canvas);
-    }
+  pub fn paint<C: TextCanvas>(
+    &self,
+    origin: Point<Pixels>,
+    line_height: Pixels,
+    align: TextAlign,
+    width: Option<Pixels>,
+    canvas: &mut C,
+  ) {
+    self.paint_rows(origin, line_height, align, width, 0..self.rows(), canvas);
+  }
 
-    /// Glyphs draw only in `visible` rows.
-    pub(crate) fn paint_rows<C: TextCanvas>(
-        &self,
-        origin: Point<Pixels>,
-        line_height: Pixels,
-        align: TextAlign,
-        width: Option<Pixels>,
-        visible: std::ops::Range<usize>,
-        canvas: &mut C,
-    ) {
-        let rows = self.placed(origin, align, width);
-        let line = &*self.line;
-        let row_glyph = |row: usize| match row {
-            0 => 0,
-            _ => (rows.breaks.get(row - 1)).map_or(line.glyphs.len(), |&at| at as usize),
-        };
-        let shown = row_glyph(visible.start)..row_glyph(visible.end);
-        if shown.len() < line.glyphs.len() {
-            // A copy of this paint can't move: it lacks the glyphs of the other rows.
-            canvas.cull();
-        }
-        let decorated = self
-            .looks
-            .iter()
-            .any(|look| look.underline.is_some() || look.strikethrough.is_some());
-        let padding = (line_height - line.ascent - line.descent) / 2.;
-        let baseline = padding + line.ascent;
-        let underline_y = padding + line.ascent + line.descent * 0.618;
-        let strike_y = (line.ascent * 0.5 + baseline) * 0.5;
-        // Decorations draw before the glyphs, so a line under the text never covers it.
-        for glyphs in [false, true] {
-            if !glyphs && !decorated {
-                continue;
-            }
-            let draw = |canvas: &mut C, start: Point<Pixels>, width: Pixels, style: &Decoration| {
-                if !glyphs {
-                    let color = style.color.unwrap_or_default();
-                    canvas.draw_line(start, width, style.thickness, color, style.style);
-                }
-            };
-            let mut cursor = Cursor {
-                looks: self.looks.iter(),
-                end: 0,
-                len: line.len,
-            };
-            let mut ink = Ink::default();
-            let mut kept: [Option<(Point<Pixels>, Decoration)>; 2] = [None; 2];
-            let mut color = Color::BLACK;
-            // The glyph pass starts at the break before the first visible row, which places the pen.
-            let (from, to, first) = match glyphs {
-                true => (shown.start, shown.end, visible.start.saturating_sub(1)),
-                false => (0, line.glyphs.len(), 0),
-            };
-            let (mut row, mut last_x) = (first, px(0.));
-            let mut pen = point(rows.left(px(0.), 0), origin.y + line_height * first);
-            let mut first_x = origin.x;
-            for (at, glyph) in line.glyphs[from..to].iter().enumerate() {
-                let at = at + from;
-                ink.update(glyph, canvas.text_system());
-                let half = ink.size.width.half();
-                pen.x += glyph.x - last_x;
-                if at == 0 {
-                    first_x = pen.x;
-                }
-                if rows.breaks.get(row) == Some(&(at as u32)) {
-                    for (start, style) in kept.iter_mut().flatten() {
-                        if pen.x == start.x {
-                            start.x -= half;
-                        }
-                        draw(canvas, *start, pen.x - start.x, style);
-                        *start = point(origin.x, start.y + line_height);
-                    }
-                    if glyph.index as usize >= cursor.end {
-                        kept = [None; 2];
-                    }
-                    row += 1;
-                    pen = point(rows.left(glyph.x, row), pen.y + line_height);
-                }
-                last_x = glyph.x;
-                let mut ended = [None; 2];
-                match cursor.step(glyph.index as usize) {
-                    None => {}
-                    Some(Some((_, look))) => {
-                        for (at, wanted) in
-                            [look.underline, look.strikethrough].into_iter().enumerate()
-                        {
-                            // The kept style has its color resolved, so a run without its own color restarts the line.
-                            if kept[at].is_some_and(|(_, style)| wanted != Some(style)) {
-                                ended[at] = kept[at].take();
-                            }
-                            if let Some(style) = wanted {
-                                let y = match at {
-                                    0 => {
-                                        style.offset.map_or(underline_y, |offset| baseline + offset)
-                                    }
-                                    _ => strike_y,
-                                };
-                                kept[at].get_or_insert((
-                                    point(pen.x, pen.y + y),
-                                    Decoration {
-                                        color: Some(style.color.unwrap_or(look.color)),
-                                        ..style
-                                    },
-                                ));
-                            }
-                        }
-                        color = look.color;
-                    }
-                    Some(None) => ended = std::mem::take(&mut kept),
-                }
-                for (mut start, style) in ended.into_iter().flatten() {
-                    if start.x == pen.x {
-                        start.x -= half;
-                    }
-                    draw(canvas, start, pen.x - start.x, &style);
-                }
-                let at = pen + point(px(0.), baseline) + point(px(0.), glyph.y);
-                if !glyphs {
-                } else if Rect::new(at + ink.lift, ink.size)
-                    .intersects(canvas.content_mask().bounds)
-                {
-                    canvas.draw_glyph(
-                        at,
-                        glyph.font,
-                        glyph.id,
-                        glyph.size,
-                        color,
-                        glyph.emoji,
-                        px(0.),
-                    );
-                } else {
-                    // A copy of this paint can't move: it lacks the glyph.
-                    canvas.cull();
-                }
-            }
-            let half = ink.size.width.half();
-            let mut end = first_x + line.width;
-            if let Some(&at) = rows.breaks.last() {
-                end -= line.glyphs[at as usize].x;
-            }
-            for (mut start, style) in kept.into_iter().flatten() {
-                if end == start.x {
-                    start.x -= half;
-                }
-                draw(canvas, start, end - start.x, &style);
-            }
-        }
+  /// Glyphs draw only in `visible` rows.
+  pub(crate) fn paint_rows<C: TextCanvas>(
+    &self,
+    origin: Point<Pixels>,
+    line_height: Pixels,
+    align: TextAlign,
+    width: Option<Pixels>,
+    visible: std::ops::Range<usize>,
+    canvas: &mut C,
+  ) {
+    let rows = self.placed(origin, align, width);
+    let line = &*self.line;
+    let row_glyph = |row: usize| match row {
+      0 => 0,
+      _ => (rows.breaks.get(row - 1)).map_or(line.glyphs.len(), |&at| at as usize),
+    };
+    let shown = row_glyph(visible.start)..row_glyph(visible.end);
+    if shown.len() < line.glyphs.len() {
+      // A copy of this paint can't move: it lacks the glyphs of the other rows.
+      canvas.cull();
     }
+    let decorated = self
+      .looks
+      .iter()
+      .any(|look| look.underline.is_some() || look.strikethrough.is_some());
+    let padding = (line_height - line.ascent - line.descent) / 2.;
+    let baseline = padding + line.ascent;
+    let underline_y = padding + line.ascent + line.descent * 0.618;
+    let strike_y = (line.ascent * 0.5 + baseline) * 0.5;
+    // Decorations draw before the glyphs, so a line under the text never covers it.
+    for glyphs in [false, true] {
+      if !glyphs && !decorated {
+        continue;
+      }
+      let draw = |canvas: &mut C, start: Point<Pixels>, width: Pixels, style: &Decoration| {
+        if !glyphs {
+          let color = style.color.unwrap_or_default();
+          canvas.draw_line(start, width, style.thickness, color, style.style);
+        }
+      };
+      let mut cursor = Cursor {
+        looks: self.looks.iter(),
+        end: 0,
+        len: line.len,
+      };
+      let mut ink = Ink::default();
+      let mut kept: [Option<(Point<Pixels>, Decoration)>; 2] = [None; 2];
+      let mut color = Color::BLACK;
+      // The glyph pass starts at the break before the first visible row, which places the pen.
+      let (from, to, first) = match glyphs {
+        true => (shown.start, shown.end, visible.start.saturating_sub(1)),
+        false => (0, line.glyphs.len(), 0),
+      };
+      let (mut row, mut last_x) = (first, px(0.));
+      let mut pen = point(rows.left(px(0.), 0), origin.y + line_height * first);
+      let mut first_x = origin.x;
+      for (at, glyph) in line.glyphs[from..to].iter().enumerate() {
+        let at = at + from;
+        ink.update(glyph, canvas.text_system());
+        let half = ink.size.width.half();
+        pen.x += glyph.x - last_x;
+        if at == 0 {
+          first_x = pen.x;
+        }
+        if rows.breaks.get(row) == Some(&(at as u32)) {
+          for (start, style) in kept.iter_mut().flatten() {
+            if pen.x == start.x {
+              start.x -= half;
+            }
+            draw(canvas, *start, pen.x - start.x, style);
+            *start = point(origin.x, start.y + line_height);
+          }
+          if glyph.index as usize >= cursor.end {
+            kept = [None; 2];
+          }
+          row += 1;
+          pen = point(rows.left(glyph.x, row), pen.y + line_height);
+        }
+        last_x = glyph.x;
+        let mut ended = [None; 2];
+        match cursor.step(glyph.index as usize) {
+          None => {}
+          Some(Some((_, look))) => {
+            for (at, wanted) in [look.underline, look.strikethrough].into_iter().enumerate() {
+              // The kept style has its color resolved, so a run without its own color restarts the line.
+              if kept[at].is_some_and(|(_, style)| wanted != Some(style)) {
+                ended[at] = kept[at].take();
+              }
+              if let Some(style) = wanted {
+                let y = match at {
+                  0 => style.offset.map_or(underline_y, |offset| baseline + offset),
+                  _ => strike_y,
+                };
+                kept[at].get_or_insert((
+                  point(pen.x, pen.y + y),
+                  Decoration {
+                    color: Some(style.color.unwrap_or(look.color)),
+                    ..style
+                  },
+                ));
+              }
+            }
+            color = look.color;
+          }
+          Some(None) => ended = std::mem::take(&mut kept),
+        }
+        for (mut start, style) in ended.into_iter().flatten() {
+          if start.x == pen.x {
+            start.x -= half;
+          }
+          draw(canvas, start, pen.x - start.x, &style);
+        }
+        let at = pen + point(px(0.), baseline) + point(px(0.), glyph.y);
+        if !glyphs {
+        } else if Rect::new(at + ink.lift, ink.size).intersects(canvas.content_mask().bounds) {
+          canvas.draw_glyph(
+            at,
+            glyph.font,
+            glyph.id,
+            glyph.size,
+            color,
+            glyph.emoji,
+            px(0.),
+          );
+        } else {
+          // A copy of this paint can't move: it lacks the glyph.
+          canvas.cull();
+        }
+      }
+      let half = ink.size.width.half();
+      let mut end = first_x + line.width;
+      if let Some(&at) = rows.breaks.last() {
+        end -= line.glyphs[at as usize].x;
+      }
+      for (mut start, style) in kept.into_iter().flatten() {
+        if end == start.x {
+          start.x -= half;
+        }
+        draw(canvas, start, end - start.x, &style);
+      }
+    }
+  }
 
-    /// Paints under `paint`, so call it first.
-    pub fn paint_background<C: TextCanvas>(
-        &self,
-        origin: Point<Pixels>,
-        line_height: Pixels,
-        align: TextAlign,
-        width: Option<Pixels>,
-        canvas: &mut C,
-    ) {
-        if self.looks.iter().all(|look| look.background.is_none()) {
-            return;
-        }
-        let rows = self.placed(origin, align, width);
-        let line = &*self.line;
-        let quad = |canvas: &mut C, origin: Point<Pixels>, width: Pixels, color: Color| {
-            canvas.draw_rect(Rect::new(origin, Size::new(width, line_height)), color)
-        };
-        let mut cursor = Cursor {
-            looks: self.looks.iter(),
-            end: 0,
-            len: line.len,
-        };
-        let mut ink = Ink::default();
-        let mut background: Option<(Point<Pixels>, Color)> = None;
-        let (mut row, mut last_x) = (0, px(0.));
-        let mut pen = point(rows.left(px(0.), 0), origin.y);
-        for (at, glyph) in line.glyphs.iter().enumerate() {
-            ink.update(glyph, canvas.text_system());
-            let half = ink.size.width.half();
-            pen.x += glyph.x - last_x;
-            if rows.breaks.get(row) == Some(&(at as u32)) {
-                if let Some((start, color)) = &mut background {
-                    if pen.x == start.x {
-                        start.x -= half;
-                    }
-                    quad(canvas, *start, pen.x - start.x, *color);
-                    if (glyph.index as usize) < cursor.end {
-                        *start = point(origin.x, start.y + line_height);
-                    } else {
-                        background = None;
-                    }
-                }
-                row += 1;
-                pen = point(rows.left(glyph.x, row), pen.y + line_height);
-            }
-            last_x = glyph.x;
-            let ended = match cursor.step(glyph.index as usize) {
-                None => None,
-                Some(Some((_, look))) => {
-                    let ended = background
-                        .filter(|(_, color)| look.background != Some(*color))
-                        .and_then(|_| background.take());
-                    if let Some(color) = look.background {
-                        background.get_or_insert((pen, color));
-                    }
-                    ended
-                }
-                Some(None) => background.take(),
-            };
-            // The width is taken before an empty background moves left, unlike at row ends.
-            if let Some((mut start, color)) = ended {
-                let width = pen.x - start.x;
-                if start.x == pen.x {
-                    start.x -= half;
-                }
-                quad(canvas, start, width, color);
-            }
-        }
-        let mut end = origin.x + line.width;
-        if let Some(&at) = rows.breaks.last() {
-            end -= line.glyphs[at as usize].x;
-        }
-        if let Some((mut start, color)) = background {
-            if end == start.x {
-                start.x -= ink.size.width.half();
-            }
-            quad(canvas, start, end - start.x, color);
-        }
+  /// Paints under `paint`, so call it first.
+  pub fn paint_background<C: TextCanvas>(
+    &self,
+    origin: Point<Pixels>,
+    line_height: Pixels,
+    align: TextAlign,
+    width: Option<Pixels>,
+    canvas: &mut C,
+  ) {
+    if self.looks.iter().all(|look| look.background.is_none()) {
+      return;
     }
+    let rows = self.placed(origin, align, width);
+    let line = &*self.line;
+    let quad = |canvas: &mut C, origin: Point<Pixels>, width: Pixels, color: Color| {
+      canvas.draw_rect(Rect::new(origin, Size::new(width, line_height)), color)
+    };
+    let mut cursor = Cursor {
+      looks: self.looks.iter(),
+      end: 0,
+      len: line.len,
+    };
+    let mut ink = Ink::default();
+    let mut background: Option<(Point<Pixels>, Color)> = None;
+    let (mut row, mut last_x) = (0, px(0.));
+    let mut pen = point(rows.left(px(0.), 0), origin.y);
+    for (at, glyph) in line.glyphs.iter().enumerate() {
+      ink.update(glyph, canvas.text_system());
+      let half = ink.size.width.half();
+      pen.x += glyph.x - last_x;
+      if rows.breaks.get(row) == Some(&(at as u32)) {
+        if let Some((start, color)) = &mut background {
+          if pen.x == start.x {
+            start.x -= half;
+          }
+          quad(canvas, *start, pen.x - start.x, *color);
+          if (glyph.index as usize) < cursor.end {
+            *start = point(origin.x, start.y + line_height);
+          } else {
+            background = None;
+          }
+        }
+        row += 1;
+        pen = point(rows.left(glyph.x, row), pen.y + line_height);
+      }
+      last_x = glyph.x;
+      let ended = match cursor.step(glyph.index as usize) {
+        None => None,
+        Some(Some((_, look))) => {
+          let ended = background
+            .filter(|(_, color)| look.background != Some(*color))
+            .and_then(|_| background.take());
+          if let Some(color) = look.background {
+            background.get_or_insert((pen, color));
+          }
+          ended
+        }
+        Some(None) => background.take(),
+      };
+      // The width is taken before an empty background moves left, unlike at row ends.
+      if let Some((mut start, color)) = ended {
+        let width = pen.x - start.x;
+        if start.x == pen.x {
+          start.x -= half;
+        }
+        quad(canvas, start, width, color);
+      }
+    }
+    let mut end = origin.x + line.width;
+    if let Some(&at) = rows.breaks.last() {
+      end -= line.glyphs[at as usize].x;
+    }
+    if let Some((mut start, color)) = background {
+      if end == start.x {
+        start.x -= ink.size.width.half();
+      }
+      quad(canvas, start, end - start.x, color);
+    }
+  }
 }

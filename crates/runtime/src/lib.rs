@@ -11,18 +11,17 @@ macro_rules! packed {
 }
 
 macro_rules! js {
-    ($path:literal) => {
-        packed!("js/", $path)
-    };
+  ($path:literal) => {
+    packed!("js/", $path)
+  };
 }
 
 // The text is leaked on purpose, because JSC reads runtime scripts in place.
 #[inline(never)]
 fn inflate(bytes: &[u8]) -> &'static str {
-    let mut text = String::with_capacity(bytes.len() * 4);
-    std::io::Read::read_to_string(&mut flate2::read::DeflateDecoder::new(bytes), &mut text)
-        .unwrap();
-    Box::leak(text.into_boxed_str())
+  let mut text = String::with_capacity(bytes.len() * 4);
+  std::io::Read::read_to_string(&mut flate2::read::DeflateDecoder::new(bytes), &mut text).unwrap();
+  Box::leak(text.into_boxed_str())
 }
 
 #[cfg(target_os = "macos")]

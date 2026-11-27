@@ -2,10 +2,10 @@ use super::*;
 
 #[test]
 fn svg_presentation_attributes_links_and_attribute_nodes() {
-    let (_, engine) = css_page(
-        "<html><head><style>.c{fill:blue}</style></head><body><svg><g style='fill:red;stroke:blue'><path id=a fill=none /><path id=b stroke-width=5 /><path id=c class=c fill=green /></g><g fill=green><path id=d /></g></svg><p id=p fill=red></p></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><head><style>.c{fill:blue}</style></head><body><svg><g style='fill:red;stroke:blue'><path id=a fill=none /><path id=b stroke-width=5 /><path id=c class=c fill=green /></g><g fill=green><path id=d /></g></svg><p id=p fill=red></p></body></html>",
+  );
+  engine.eval(r#"
         const style = (id, name) => getComputedStyle(document.getElementById(id)).getPropertyValue(name);
         const got = [style('a', 'fill'), style('b', 'stroke-width'), style('c', 'fill'), style('d', 'fill'), style('p', 'fill')].join('|');
         if (got !== 'none|5px|rgb(0, 0, 255)|rgb(0, 128, 0)|rgb(0, 0, 0)') throw Error('presentation ' + got);
@@ -19,18 +19,18 @@ fn svg_presentation_attributes_links_and_attribute_nodes() {
         let thrown = false; try { link.removeAttributeNode(attr); } catch (error) { thrown = error.name === 'NotFoundError'; }
         if (!thrown || document.currentScript !== null) throw Error('attribute node removed twice');
     "#, "test").unwrap();
-    for _ in 0..10 {
-        engine.tick().unwrap();
-    }
-    assert_eq!(engine.eval("failed", "test").unwrap(), "1");
+  for _ in 0..10 {
+    engine.tick().unwrap();
+  }
+  assert_eq!(engine.eval("failed", "test").unwrap(), "1");
 }
 
 #[test]
 fn core_dom_interfaces_follow_the_standard() {
-    let (_, engine) = css_page(
-        "<html><body><div id='a' z='1' b='2' class='x y'>t<!--c-->u</div><template id='t'><p>hi</p></template></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><body><div id='a' z='1' b='2' class='x y'>t<!--c-->u</div><template id='t'><p>hi</p></template></body></html>",
+  );
+  engine.eval(r#"
       const fails = [];
       const check = (name, fn) => { try { if (!fn()) fails.push(name); } catch (e) { fails.push(name + ': ' + e.message); } };
       const a = document.getElementById('a');
@@ -110,8 +110,8 @@ fn core_dom_interfaces_follow_the_standard() {
 
 #[test]
 fn dom_matrix_math_keeps_nan_infinity_negative_zero_and_2d() {
-    let (.., result) = offscreen_page(
-        r#"
+  let (.., result) = offscreen_page(
+    r#"
         const bits = m => (m._m ?? m).map(v => Object.is(v, -0) ? '-0' : String(v)).join();
         const mul = (a, m) => a.map((_, i) => a[i & 3] * m[i & 12] + a[4 + (i & 3)] * m[(i & 12) + 1] + a[8 + (i & 3)] * m[(i & 12) + 2] + a[12 + (i & 3)] * m[(i & 12) + 3]);
         const a = [1, -0, 0, 0, Infinity, 2, 0, 0, 0, 0, 1, 0, NaN, 3, 0, 1], b = [-0, 1, 0, 0, 2, Infinity, 0, 0, 0, 0, 1, 0, 0, -1, 0, 1];
@@ -125,14 +125,14 @@ fn dom_matrix_math_keeps_nan_infinity_negative_zero_and_2d() {
         same([new DOMMatrix().rotate(30).is2D, new DOMMatrix().rotateAxisAngle(1, 0, 0, 90).is2D, new DOMMatrix().skewX(10).is2D, new DOMMatrix([1, 0, 0, 1, 0, 0]).multiply({ m33: 2 }).is2D, new DOMMatrix([1, 0, 0, 1, 0, 0]).multiply({ m33: 2, is2D: true }).is2D, new DOMMatrix().translate(0, 0, 1).multiply(new DOMMatrix()).is2D],
           [true, false, true, false, true, false], 'is2D products');
     "#,
-    );
-    assert_eq!(result, "ok");
+  );
+  assert_eq!(result, "ok");
 }
 
 #[test]
 fn sibling_walks_follow_mutations() {
-    let (_, engine) = css_page("<body><ul></ul><ol><li>a</li><li>b</li></ol></body>");
-    engine.eval(r#"
+  let (_, engine) = css_page("<body><ul></ul><ol><li>a</li><li>b</li></ol></body>");
+  engine.eval(r#"
         const list = document.querySelector('ul'), other = document.querySelector('ol');
         for (let i = 0; i < 6; i++) { const li = document.createElement('li'); li.id = 'i' + i; li.append('x'); list.append(li); }
         const seen = [];
@@ -150,9 +150,9 @@ fn sibling_walks_follow_mutations() {
 
 #[test]
 fn ranges_and_iterators_follow_moved_merged_and_removed_nodes() {
-    checked_page(
-        "<html><body><p id=p></p><div id=d><b>x</b><u>m</u><i>yz</i>w</div><div id=s><b>x</b><i>y</i></div><div id=r><a></a><b></b><i></i></div></body></html>",
-        r#"
+  checked_page(
+    "<html><body><p id=p></p><div id=d><b>x</b><u>m</u><i>yz</i>w</div><div id=s><b>x</b><i>y</i></div><div id=r><a></a><b></b><i></i></div></body></html>",
+    r#"
         const $ = id => document.getElementById(id), p = $('p'), d = $('d'), s = $('s'), r = $('r');
         const a = document.createTextNode('abc'), b = document.createTextNode('def'); p.append(a, b);
         const inner = document.createRange(), between = document.createRange(), wide = document.createRange();
@@ -179,14 +179,14 @@ fn ranges_and_iterators_follow_moved_merged_and_removed_nodes() {
         r.textContent = '';
         check('iterator clear', () => it.referenceNode === r && !it.pointerBeforeReferenceNode && it.nextNode() === null);
         "#,
-    );
+  );
 }
 
 #[test]
 fn parser_raw_text_tables_and_document_structure() {
-    checked_page(
-        "<!doctype html><title>x &amp; y</title><style>a>b{}</style><p>one<p>two<table><tr><td>cell</table>a &lt; b &notin; &#x80;",
-        r#"
+  checked_page(
+    "<!doctype html><title>x &amp; y</title><style>a>b{}</style><p>one<p>two<table><tr><td>cell</table>a &lt; b &notin; &#x80;",
+    r#"
         check('implied structure', () => document.head && document.body && document.documentElement && document.head.firstChild.localName === 'title' && document.title === 'x & y');
         const style = document.querySelector('style');
         check('style text child', () => style.firstChild?.nodeType === 3 && style.firstChild.data === 'a>b{}' && style.childNodes.length === 1);
@@ -206,37 +206,37 @@ fn parser_raw_text_tables_and_document_structure() {
         const svg = document.createElement('div'); svg.innerHTML = '<svg viewbox="0 0 1 1"><lineargradient id="g"/><foreignObject><p>x</p></foreignObject></svg>';
         check('svg case', () => svg.querySelector('linearGradient')?.id === 'g' && svg.firstChild.getAttribute('viewBox') === '0 0 1 1' && svg.querySelector('foreignObject p') !== null);
         "#,
-    );
+  );
 }
 
 #[test]
 fn created_svg_keeps_qualified_name_case() {
-    let (host, _) = checked_page(
-        "<html><body><svg id='s'></svg></body></html>",
-        r#"
+  let (host, _) = checked_page(
+    "<html><body><svg id='s'></svg></body></html>",
+    r#"
         const NS = 'http://www.w3.org/2000/svg', s = document.getElementById('s');
         const g = document.createElementNS(NS, 'linearGradient'); g.id = 'grad'; s.append(g);
         s.append(document.createElementNS(NS, 'feGaussianBlur'));
         check('tag names', () => g.tagName === 'linearGradient' && g.localName === 'linearGradient' && g instanceof SVGElement);
         check('serialization', () => s.innerHTML === '<linearGradient id="grad"></linearGradient><feGaussianBlur></feGaussianBlur>');
         "#,
-    );
-    let host = host.borrow().store.clone();
-    let host = host.borrow();
-    let tags: Vec<_> = host.pages[&1]
-        .doc
-        .nodes
-        .iter()
-        .map(|node| node.tag.as_str())
-        .collect();
-    assert!(tags.contains(&"linearGradient") && tags.contains(&"feGaussianBlur"));
+  );
+  let host = host.borrow().store.clone();
+  let host = host.borrow();
+  let tags: Vec<_> = host.pages[&1]
+    .doc
+    .nodes
+    .iter()
+    .map(|node| node.tag.as_str())
+    .collect();
+  assert!(tags.contains(&"linearGradient") && tags.contains(&"feGaussianBlur"));
 }
 
 #[test]
 fn every_dom_interface_has_its_string_tag() {
-    checked_page(
-        "<html><body><div id='d'>t</div></body></html>",
-        r#"
+  checked_page(
+    "<html><body><div id='d'>t</div></body></html>",
+    r#"
         const tag = value => Object.prototype.toString.call(value);
         const d = document.getElementById('d');
         check('element', () => tag(d) === '[object HTMLDivElement]');
@@ -246,14 +246,14 @@ fn every_dom_interface_has_its_string_tag() {
         check('collections', () => tag(d.childNodes) === '[object NodeList]' && tag(document.body.children) === '[object HTMLCollection]');
         check('others', () => tag(document.createRange()) === '[object Range]' && tag(document.createDocumentFragment()) === '[object DocumentFragment]' && tag(new MouseEvent('x')) === '[object MouseEvent]' && tag(document.createElementNS('http://www.w3.org/2000/svg', 'svg')) === '[object SVGSVGElement]');
         "#,
-    );
+  );
 }
 
 #[test]
 fn custom_element_reactions_and_slot_changes() {
-    let (_, engine) = checked_page(
-        "<html><body><div id='box'></div><div id='host'><span>a</span></div></body></html>",
-        r#"
+  let (_, engine) = checked_page(
+    "<html><body><div id='box'></div><div id='host'><span>a</span></div></body></html>",
+    r#"
         globalThis.log = [];
         customElements.define('x-item', class extends HTMLElement { connectedCallback() { log.push('in:' + this.id); } disconnectedCallback() { log.push('out:' + this.id); } });
         customElements.define('x-mover', class extends HTMLElement { connectedCallback() { log.push('in:' + this.id); } connectedMoveCallback() { log.push('move:' + this.id); } });
@@ -277,27 +277,27 @@ fn custom_element_reactions_and_slot_changes() {
         const side = document.createElement('b'); side.slot = 'side'; host.append(side);
         check('slotchange is async', () => slots.length === 0);
         "#,
-    );
-    engine.tick().unwrap();
-    assert_eq!(engine.eval("slots.join()", "test").unwrap(), "main,side");
-    engine
-        .eval(
-            "slots.length = 0; document.querySelector('#host b').slot = ''",
-            "test",
-        )
-        .unwrap();
-    engine.tick().unwrap();
-    assert_eq!(
-        engine.eval("slots.sort().join()", "test").unwrap(),
-        "main,side"
-    );
+  );
+  engine.tick().unwrap();
+  assert_eq!(engine.eval("slots.join()", "test").unwrap(), "main,side");
+  engine
+    .eval(
+      "slots.length = 0; document.querySelector('#host b').slot = ''",
+      "test",
+    )
+    .unwrap();
+  engine.tick().unwrap();
+  assert_eq!(
+    engine.eval("slots.sort().join()", "test").unwrap(),
+    "main,side"
+  );
 }
 
 #[test]
 fn child_lists_inline_shorthands_and_serialization_stay_current() {
-    checked_page(
-        "<html><body><div id='box'></div></body></html>",
-        r#"
+  checked_page(
+    "<html><body><div id='box'></div></body></html>",
+    r#"
         const p = document.getElementById('box');
         for (let i = 0; i < 4; i++) p.append(document.createElement('span'), 't');
         const kids = p.children, nodes = p.childNodes;
@@ -345,14 +345,14 @@ fn child_lists_inline_shorthands_and_serialization_stay_current() {
         const node = x.getAttributeNode('p'); x.setAttribute('p', '3');
         check('attribute nodes are kept and live', () => node === x.getAttributeNode('p') && node === x.attributes.p && node.value === '3');
         "#,
-    );
+  );
 }
 
 #[test]
 fn mutation_records_and_live_ranges_follow_the_dom_standard() {
-    let (_, engine) = checked_page(
-        "<html><body><div id='p'><i id='a'>a</i><b id='b'>b</b><span id='t'>hello</span></div></body></html>",
-        r#"
+  let (_, engine) = checked_page(
+    "<html><body><div id='p'><i id='a'>a</i><b id='b'>b</b><span id='t'>hello</span></div></body></html>",
+    r#"
         const p = document.getElementById('p'), a = document.getElementById('a'), b = document.getElementById('b');
         check('observe needs a kind', () => { try { new MutationObserver(() => {}).observe(p, {}); return false; } catch (e) { return e instanceof TypeError; } });
         {
@@ -403,15 +403,15 @@ fn mutation_records_and_live_ranges_follow_the_dom_standard() {
         const inner = document.createRange(); inner.selectNodeContents(a); a.remove();
         check('removed container moves to the parent', () => inner.startContainer === p && inner.endContainer === p);
         "#,
-    );
-    engine.tick().unwrap();
+  );
+  engine.tick().unwrap();
 }
 
 #[test]
 fn document_types_follow_the_parser_and_the_document() {
-    checked_page(
-        "<!DOCTYPE html><html><body><p>x</p></body></html>",
-        r#"
+  checked_page(
+    "<!DOCTYPE html><html><body><p>x</p></body></html>",
+    r#"
         const doctype = document.doctype;
         check('parsed', () => doctype instanceof DocumentType && doctype.nodeType === 10 && doctype.name === 'html' && doctype.publicId === '' && doctype.systemId === '' && doctype.nodeName === 'html' && doctype.textContent === null && document.firstChild === doctype && document.childNodes.length === 2);
         check('standards mode', () => document.compatMode === 'CSS1Compat');
@@ -425,14 +425,14 @@ fn document_types_follow_the_parser_and_the_document() {
         check('quirks', () => parse('<p>x').compatMode === 'BackCompat' && parse('<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"><p>').compatMode === 'BackCompat' && parse('<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd"><p>').compatMode === 'CSS1Compat' && parse('<!doctype html><p>').doctype.name === 'html');
         check('text skips doctypes', () => document.body.textContent === 'x');
         "#,
-    );
+  );
 }
 
 #[test]
 fn custom_element_reactions_wait_for_the_call_and_report_errors() {
-    let (_, engine) = checked_page(
-        "<html><body><div id='box'></div><x-bad id='bad'></x-bad></body></html>",
-        r#"
+  let (_, engine) = checked_page(
+    "<html><body><div id='box'></div><x-bad id='bad'></x-bad></body></html>",
+    r#"
         globalThis.log = []; globalThis.errors = [];
         addEventListener('error', event => { errors.push(event.error.message); event.preventDefault(); });
         customElements.define('x-throw', class extends HTMLElement { connectedCallback() { log.push('in:' + this.id); throw new Error('boom ' + this.id); } });
@@ -457,16 +457,16 @@ fn custom_element_reactions_wait_for_the_call_and_report_errors() {
         const clone = box.firstChild.cloneNode();
         check('clones upgrade after their attributes are copied', () => clone instanceof customElements.get('x-writer') && clone.getAttribute('data-on') === '1');
         "#,
-    );
-    engine.tick().unwrap();
-    assert_eq!(engine.eval("String(defined)", "test").unwrap(), "true");
+  );
+  engine.tick().unwrap();
+  assert_eq!(engine.eval("String(defined)", "test").unwrap(), "true");
 }
 
 #[test]
 fn svg_fragments_parse_in_their_context() {
-    checked_page(
-        "<html><body><svg id='s'><g id='g'></g></svg></body></html>",
-        r#"
+  checked_page(
+    "<html><body><svg id='s'><g id='g'></g></svg></body></html>",
+    r#"
         const NS = 'http://www.w3.org/2000/svg', g = document.getElementById('g');
         g.insertAdjacentHTML('beforeend', '<rect width="5" height="5"/><circle r="2"/><linearGradient id=lg></linearGradient><div>html</div>');
         check('self-closing tags close', () => g.children.length === 4 && g.children[0].localName === 'rect' && !g.children[0].firstChild && g.children[1].localName === 'circle');
@@ -481,14 +481,14 @@ fn svg_fragments_parse_in_their_context() {
         const object = document.createElementNS(NS, 'foreignObject'); object.innerHTML = '<p>x</p>';
         check('HTML integration points parse HTML', () => object.firstChild instanceof HTMLElement && object.firstChild.localName === 'p');
         "#,
-    );
+  );
 }
 
 #[test]
 fn range_contents_walk_only_the_boundary_paths() {
-    checked_page(
-        "<html><body><div id='root'><p id='one'>abc<b>def</b></p><p id='two'>ghi</p><p id='three'><i>jkl</i>mno</p></div></body></html>",
-        r#"
+  checked_page(
+    "<html><body><div id='root'><p id='one'>abc<b>def</b></p><p id='two'>ghi</p><p id='three'><i>jkl</i>mno</p></div></body></html>",
+    r#"
         const root = document.getElementById('root'), one = document.getElementById('one'), three = document.getElementById('three');
         const range = document.createRange(); range.setStart(one.firstChild, 1); range.setEnd(three.lastChild, 2);
         check('cloneContents', () => { const div = document.createElement('div'); div.append(range.cloneContents()); return div.innerHTML === '<p id="one">bc<b>def</b></p><p id="two">ghi</p><p id="three"><i>jkl</i>mn</p>'; });
@@ -507,38 +507,38 @@ fn range_contents_walk_only_the_boundary_paths() {
         const copy = far.cloneRange(); list.prepend(document.createElement('li'));
         check('clones are live too', () => copy.startOffset === 5 && copy.endOffset === 6);
         "#,
-    );
+  );
 }
 
 #[test]
 fn busy_hosts_keep_page_writes() {
-    let (host, engine) = checked_page("<html><body></body></html>", "");
-    {
-        let _busy = host.borrow_mut();
-        engine
-            .eval("document.body.setAttribute('data-kept', '1')", "test")
-            .unwrap();
-    }
-    engine.tick().unwrap();
-    let host = host.borrow().store.clone();
-    let host = host.borrow();
-    let doc = &host.pages[&1].doc;
-    let body = doc
-        .nodes
-        .iter()
-        .position(|node| node.tag == "body")
-        .unwrap();
-    assert_eq!(
-        doc.nodes[body].attrs.get("data-kept").map(String::as_str),
-        Some("1")
-    );
+  let (host, engine) = checked_page("<html><body></body></html>", "");
+  {
+    let _busy = host.borrow_mut();
+    engine
+      .eval("document.body.setAttribute('data-kept', '1')", "test")
+      .unwrap();
+  }
+  engine.tick().unwrap();
+  let host = host.borrow().store.clone();
+  let host = host.borrow();
+  let doc = &host.pages[&1].doc;
+  let body = doc
+    .nodes
+    .iter()
+    .position(|node| node.tag == "body")
+    .unwrap();
+  assert_eq!(
+    doc.nodes[body].attrs.get("data-kept").map(String::as_str),
+    Some("1")
+  );
 }
 
 #[test]
 fn reflected_attributes_like_chrome() {
-    checked_page(
-        "<html><body><a id='a'>x</a><img id='img'><div id='d' spellcheck='false'><p id='p'>t</p></div><textarea id='t'></textarea><progress id='pr'></progress></body></html>",
-        r#"
+  checked_page(
+    "<html><body><a id='a'>x</a><img id='img'><div id='d' spellcheck='false'><p id='p'>t</p></div><textarea id='t'></textarea><progress id='pr'></progress></body></html>",
+    r#"
         const $ = id => document.getElementById(id), el = tag => document.createElement(tag), d = el('div');
         check('draggable', () => !$('a').draggable && $('img').draggable && (d.draggable = true, d.getAttribute('draggable') === 'true') && (d.draggable = false, d.getAttribute('draggable') === 'false'));
         check('spellcheck inherits', () => el('div').spellcheck && !$('p').spellcheck && ($('p').spellcheck = true, $('p').getAttribute('spellcheck') === 'true'));
@@ -557,14 +557,14 @@ fn reflected_attributes_like_chrome() {
         check('newer methods', () => host.webkitMatchesSelector('div') && host.getHTML() === '<b>x</b>' && (host.setHTMLUnsafe('<i>y</i>'), host.innerHTML === '<i>y</i>') && typeof host.checkVisibility() === 'boolean' && (host.part.add('p'), host.getAttribute('part') === 'p'));
         check('outerText', () => (host.firstChild.outerText = 'plain', host.innerHTML === 'plain'));
     "#,
-    );
+  );
 }
 
 #[test]
 fn dom_api_edges_like_chrome() {
-    let (_, engine) = checked_page(
-        "<html><body><div id='h'></div><p id='p'>abc</p></body></html>",
-        r#"
+  let (_, engine) = checked_page(
+    "<html><body><div id='h'></div><p id='p'>abc</p></body></html>",
+    r#"
         const $ = id => document.getElementById(id), el = tag => document.createElement(tag);
         check('classList.supports throws', () => { try { el('div').classList.supports('x'); } catch (e) { return e instanceof TypeError; } });
         check('UIEvent view', () => new UIEvent('x').view === null && new MouseEvent('m', { view: window }).view === window);
@@ -595,21 +595,21 @@ fn dom_api_edges_like_chrome() {
         requestAnimationFrame(() => { order.push('raf1'); Promise.resolve().then(() => order.push('micro')); });
         requestAnimationFrame(() => order.push('raf2'));
     "#,
-    );
-    engine.eval("__appsAnimationFrame()", "test").unwrap();
-    assert_eq!(
-        engine
-            .eval("__order.join() + ' ' + __records()", "test")
-            .unwrap(),
-        "raf1,micro,raf2 0"
-    );
+  );
+  engine.eval("__appsAnimationFrame()", "test").unwrap();
+  assert_eq!(
+    engine
+      .eval("__order.join() + ' ' + __records()", "test")
+      .unwrap(),
+    "raf1,micro,raf2 0"
+  );
 }
 
 #[test]
 fn documents_like_chrome() {
-    checked_page(
-        "<!doctype html><html><body><form name='f1' id='f1'></form><img name='im'><a href='#x'>x</a><a name='n'>y</a><div id='dsd'><template shadowrootmode='open'><slot></slot></template><b>b</b></div></body></html>",
-        r#"
+  checked_page(
+    "<!doctype html><html><body><form name='f1' id='f1'></form><img name='im'><a href='#x'>x</a><a name='n'>y</a><div id='dsd'><template shadowrootmode='open'><slot></slot></template><b>b</b></div></body></html>",
+    r#"
         check('collections', () => document.forms.length === 1 && document.forms.f1.id === 'f1' && document.images.length === 1 && document.links.length === 1 && document.anchors.length === 1 && document.scripts.length === 0);
         check('fields', () => document.charset === 'UTF-8' && document.inputEncoding === 'UTF-8' && document.designMode === 'off' && document.referrer === '' && typeof document.lastModified === 'string' && document.contentType === 'text/html');
         document.cookie = 'a=1'; document.cookie = 'b=2; path=/'; document.cookie = 'a=; max-age=0';
@@ -627,14 +627,14 @@ fn documents_like_chrome() {
         check('ranges in other trees', () => { try { range.comparePoint(document.createElement('x'), 0); } catch (e) { return e.name === 'WrongDocumentError' && !range.isPointInRange(document.createElement('x'), 0); } });
         check('storage has', () => (localStorage.setItem('k', 'v'), 'k' in localStorage && !('nope' in localStorage)));
     "#,
-    );
+  );
 }
 
 #[test]
 fn link_activation_and_details_toggles_like_chrome() {
-    let (_, engine) = checked_page(
-        "<html><body><a id='same' href='#frag'>a</a><a id='blocked' href='#other'>b</a><a id='web' href='https://example.com/'>c</a><details id='d'><summary>s</summary>x</details></body></html>",
-        r#"
+  let (_, engine) = checked_page(
+    "<html><body><a id='same' href='#frag'>a</a><a id='blocked' href='#other'>b</a><a id='web' href='https://example.com/'>c</a><details id='d'><summary>s</summary>x</details></body></html>",
+    r#"
         const $ = id => document.getElementById(id);
         $('blocked').addEventListener('click', event => event.preventDefault());
         $('same').click();
@@ -645,24 +645,24 @@ fn link_activation_and_details_toggles_like_chrome() {
         $('d').addEventListener('toggle', event => toggles.push(event.oldState + '>' + event.newState));
         $('d').open = true; $('d').open = false;
     "#,
-    );
-    let started = std::time::Instant::now();
-    while engine.eval("toggles.length", "test").unwrap() == "0"
-        && started.elapsed() < std::time::Duration::from_secs(5)
-    {
-        engine.tick().unwrap();
-    }
-    assert_eq!(
-        engine.eval("toggles.join()", "test").unwrap(),
-        "closed>closed"
-    );
+  );
+  let started = std::time::Instant::now();
+  while engine.eval("toggles.length", "test").unwrap() == "0"
+    && started.elapsed() < std::time::Duration::from_secs(5)
+  {
+    engine.tick().unwrap();
+  }
+  assert_eq!(
+    engine.eval("toggles.join()", "test").unwrap(),
+    "closed>closed"
+  );
 }
 
 #[test]
 fn element_internals_like_chrome() {
-    checked_page(
-        "<html><body><form id='f'><input name='n' value='1'><object></object></form></body></html>",
-        r#"
+  checked_page(
+    "<html><body><form id='f'><input name='n' value='1'><object></object></form></body></html>",
+    r#"
         class XField extends HTMLElement { static formAssociated = true; constructor() { super(); this.internals = this.attachInternals(); } }
         customElements.define('x-field', XField);
         const f = document.getElementById('f'), x = document.createElement('x-field'), i = x.internals, error = fn => { try { fn(); } catch (e) { return e.name; } };
@@ -677,16 +677,16 @@ fn element_internals_like_chrome() {
         f.requestSubmit();
         check('valid again', () => i.validity.valid && i.validationMessage === '' && f.checkValidity() && submitted);
     "#,
-    );
+  );
 }
 
 #[test]
 fn table_parts_without_a_table_keep_their_displays_like_chrome() {
-    checked_page(
-        "<html><body><div id='p'><div class='c'>a</div> <div class='c'>b</div></div>\
+  checked_page(
+    "<html><body><div id='p'><div class='c'>a</div> <div class='c'>b</div></div>\
          <div id='q' style='display:inline-block'><div class='r'><div class='c'>c</div><div class='c'>d</div></div></div>\
          <style>.c{display:table-cell}.r{display:table-row}</style></body></html>",
-        r#"
+    r#"
         const p = document.getElementById('p'), q = document.getElementById('q');
         const display = node => getComputedStyle(node).display;
         const style = node => [display(node), getComputedStyle(node).justifyContent, getComputedStyle(node).rowGap].join();
@@ -704,31 +704,32 @@ fn table_parts_without_a_table_keep_their_displays_like_chrome() {
         q.firstChild.className = 'r';
         check('the row comes back', () => display(q.firstChild) === 'table-row' && q.innerText === 'c\td');
         "#,
-    );
+  );
 }
 
 #[test]
 fn same_text_writes_large_fragments_and_id_queries() {
-    let (host, engine) = css_page("<body><p id=label>a</p><div id=empty></div></body>");
-    let dirty = |source: &str| {
-        engine.tick().unwrap();
-        host.borrow()
-            .store
-            .borrow_mut()
-            .pages
-            .get_mut(&1)
-            .unwrap()
-            .dirty = false;
-        engine.eval(source, "test").unwrap();
-        engine.tick().unwrap();
-        host.borrow().store.borrow().pages[&1].dirty
-    };
-    assert!(!dirty(
-        "const label = document.getElementById('label'), text = label.firstChild; label.textContent = 'a'; text.data = 'a'; text.replaceData(0, 1, 'a'); document.getElementById('empty').textContent = ''; document.getElementById('empty').replaceChildren(); if (label.firstChild !== text) throw Error('kept text')"
-    ));
-    assert!(dirty("label.textContent = 'b'"));
-    assert!(dirty("label.firstChild.data = 'c'"));
-    let result = engine.eval(r#"
+  let (host, engine) = css_page("<body><p id=label>a</p><div id=empty></div></body>");
+  let dirty = |source: &str| {
+    engine.tick().unwrap();
+    host
+      .borrow()
+      .store
+      .borrow_mut()
+      .pages
+      .get_mut(&1)
+      .unwrap()
+      .dirty = false;
+    engine.eval(source, "test").unwrap();
+    engine.tick().unwrap();
+    host.borrow().store.borrow().pages[&1].dirty
+  };
+  assert!(!dirty(
+    "const label = document.getElementById('label'), text = label.firstChild; label.textContent = 'a'; text.data = 'a'; text.replaceData(0, 1, 'a'); document.getElementById('empty').textContent = ''; document.getElementById('empty').replaceChildren(); if (label.firstChild !== text) throw Error('kept text')"
+  ));
+  assert!(dirty("label.textContent = 'b'"));
+  assert!(dirty("label.firstChild.data = 'c'"));
+  let result = engine.eval(r#"
         const fails = [], check = (name, fn) => { try { if (!fn()) fails.push(name); } catch (error) { fails.push(name + ': ' + error); } };
         check('observed same text', () => { const observer = new MutationObserver(() => {}); observer.observe(label, { childList: true, characterData: true, subtree: true }); const old = label.firstChild; old.data = 'c'; label.textContent = 'c'; const records = observer.takeRecords(); observer.disconnect(); return records.map(r => r.type).join() === 'characterData,childList' && records[1].removedNodes[0] === old && label.firstChild !== old && label.textContent === 'c'; });
         const n = 5000;
@@ -751,14 +752,14 @@ fn same_text_writes_large_fragments_and_id_queries() {
         check('bad id selector', () => { try { document.querySelector('#1a'); } catch (error) { return error.name === 'SyntaxError'; } });
         fails.join('\n') || 'ok'
     "#, "test").unwrap();
-    assert_eq!(result, "ok");
+  assert_eq!(result, "ok");
 }
 
 #[test]
 fn live_collections_form_controls_and_custom_states() {
-    checked_page(
-        "<html><body><form id=f><input name=user id=u><input name=r type=radio value=1><input name=r type=radio value=2 checked><select name=s required><option value=''>a</select><x-f name=x></x-f></form><input form=f name=out><div id=d><p class='a b'></p>text</div></body></html>",
-        r#"
+  checked_page(
+    "<html><body><form id=f><input name=user id=u><input name=r type=radio value=1><input name=r type=radio value=2 checked><select name=s required><option value=''>a</select><x-f name=x></x-f></form><input form=f name=out><div id=d><p class='a b'></p>text</div></body></html>",
+    r#"
         const $ = id => document.getElementById(id), [f, d, u] = [$('f'), $('d'), $('u')], make = tag => document.createElement(tag);
         const tags = d.getElementsByTagName('i'), classes = d.getElementsByClassName('a'), kids = d.children, nodes = d.childNodes;
         d.append(make('i')); d.insertBefore(make('b'), d.firstChild);
@@ -798,14 +799,14 @@ fn live_collections_form_controls_and_custom_states() {
         f.addEventListener('submit', event => event.preventDefault()); u.required = true; check('user', () => !u.matches(':user-invalid'));
         f.requestSubmit(); check('submitted', () => u.matches(':user-invalid')); f.reset(); check('reset', () => !u.matches(':user-invalid'));
         "#,
-    );
+  );
 }
 
 #[test]
 fn xml_documents_attribute_nodes_and_highlights() {
-    checked_page(
-        "<html><body><div id=d a=1>some text</div></body></html>",
-        r#"
+  checked_page(
+    "<html><body><div id=d a=1>some text</div></body></html>",
+    r#"
         const parse = (source, type = 'text/xml') => new DOMParser().parseFromString(source, type), write = node => new XMLSerializer().serializeToString(node), d = document.getElementById('d');
         const source = '<?xml version="1.0"?><!DOCTYPE N><?p q?><N xmlns:x="u" A="&lt;"><x:I x:k="1"/>a&amp;b<![CDATA[<c>]]><b_d/></N>';
         const doc = parse(source), root = doc.documentElement, item = root.firstChild;
@@ -827,14 +828,14 @@ fn xml_documents_attribute_nodes_and_highlights() {
         check('style', () => { const style = getComputedStyle(d, '::highlight(x)'); return style.color === 'rgb(255, 0, 0)' && style.backgroundColor === 'rgb(0, 0, 255)'; });
         check('supports', () => CSS.supports('selector(::highlight(a))') && !CSS.supports('selector(::highlight())') && CSS.supports('at-rule(@scope)') && !CSS.supports('at-rule(@nope)'));
         "#,
-    );
+  );
 }
 
 #[test]
 fn form_states_restyle_with_the_order_of_the_tree() {
-    checked_page(
-        "<html><head><style>:default{left:1px}form:invalid{left:2px}:indeterminate{left:3px}</style></head><body><form id=f><button id=a type=button></button><input id=b type=submit></form><button id=x form=f></button><form id=p></form><form id=q></form><input id=o required form=w><form id=g><input type=radio name=r id=r1><input type=radio name=r id=r2></form><input type=radio name=r id=r3 form=g></body></html>",
-        r#"
+  checked_page(
+    "<html><head><style>:default{left:1px}form:invalid{left:2px}:indeterminate{left:3px}</style></head><body><form id=f><button id=a type=button></button><input id=b type=submit></form><button id=x form=f></button><form id=p></form><form id=q></form><input id=o required form=w><form id=g><input type=radio name=r id=r1><input type=radio name=r id=r2></form><input type=radio name=r id=r3 form=g></body></html>",
+    r#"
         const $ = id => document.getElementById(id), [f, a, b, x, p, q, g, r1, r2, r3] = ['f', 'a', 'b', 'x', 'p', 'q', 'g', 'r1', 'r2', 'r3'].map($);
         const all = [f, a, b, x, p, q, g, r1, r2, r3], is = (node, value) => getComputedStyle(node).left === value;
         const right = () => all.every(node => !node.isConnected || is(node, node.matches(':default') ? '1px' : node.matches('form:invalid') ? '2px' : node.matches(':indeterminate') ? '3px' : 'auto'));
@@ -864,5 +865,5 @@ fn form_states_restyle_with_the_order_of_the_tree() {
         step('read', () => box.firstChild.content, () => is(p, '2px'));
         step('into template', () => box.firstChild.append(box.lastChild), () => is(p, 'auto'));
         "#,
-    );
+  );
 }

@@ -1,627 +1,631 @@
 use super::*;
 
 extern "C" fn waker() -> *mut c_void {
-    std::ptr::null_mut()
+  std::ptr::null_mut()
 }
 
 extern "C" fn wake(_: *mut c_void) {}
 
 extern "C" fn alloc(output: *mut c_void, length: usize) -> *mut u8 {
-    let output = unsafe { &mut *output.cast::<Vec<u8>>() };
-    *output = vec![0; length];
-    output.as_mut_ptr()
+  let output = unsafe { &mut *output.cast::<Vec<u8>>() };
+  *output = vec![0; length];
+  output.as_mut_ptr()
 }
 
 // A decoder that makes one pixel from any data.
 extern "C" fn decode_png(
-    _: *const u8,
-    _: usize,
-    size: *mut u32,
-    output: *mut c_void,
-    alloc: Alloc,
+  _: *const u8,
+  _: usize,
+  size: *mut u32,
+  output: *mut c_void,
+  alloc: Alloc,
 ) -> bool {
-    let pixel = alloc(output, 4);
-    unsafe {
-        *size = 1;
-        *size.add(1) = 1;
-        pixel.copy_from(b"\x01\x02\x03\x04".as_ptr(), 4);
-    }
-    true
+  let pixel = alloc(output, 4);
+  unsafe {
+    *size = 1;
+    *size.add(1) = 1;
+    pixel.copy_from(b"\x01\x02\x03\x04".as_ptr(), 4);
+  }
+  true
 }
 
 struct Test(*mut Terminal);
 
 impl Drop for Test {
-    fn drop(&mut self) {
-        unsafe { apps_terminal_free(self.0) };
-    }
+  fn drop(&mut self) {
+    unsafe { apps_terminal_free(self.0) };
+  }
 }
 
 impl Test {
-    fn new(cols: u16, rows: u16) -> Self {
-        let host = Host {
-            waker,
-            wake,
-            drop_waker: wake,
-            decode_png,
-        };
-        let terminal = unsafe { apps_terminal_new(&host, cols, rows) };
-        assert!(!terminal.is_null());
-        Self(terminal)
-    }
+  fn new(cols: u16, rows: u16) -> Self {
+    let host = Host {
+      waker,
+      wake,
+      drop_waker: wake,
+      decode_png,
+    };
+    let terminal = unsafe { apps_terminal_new(&host, cols, rows) };
+    assert!(!terminal.is_null());
+    Self(terminal)
+  }
 
-    fn feed(&self, text: &str) {
-        unsafe { apps_terminal_write(self.0, OUTPUT, text.as_ptr(), text.len()) };
-    }
+  fn feed(&self, text: &str) {
+    unsafe { apps_terminal_write(self.0, OUTPUT, text.as_ptr(), text.len()) };
+  }
 
-    fn poll(&self) -> String {
-        let mut out = Vec::new();
-        unsafe { apps_terminal_poll(self.0, (&raw mut out).cast(), alloc) };
-        String::from_utf8(out).unwrap()
-    }
+  fn poll(&self) -> String {
+    let mut out = Vec::new();
+    unsafe { apps_terminal_poll(self.0, (&raw mut out).cast(), alloc) };
+    String::from_utf8(out).unwrap()
+  }
 
-    fn info(&self) -> String {
-        let mut out = Vec::new();
-        unsafe { apps_terminal_info(self.0, true, (&raw mut out).cast(), alloc) };
-        String::from_utf8(out).unwrap()
-    }
+  fn info(&self) -> String {
+    let mut out = Vec::new();
+    unsafe { apps_terminal_info(self.0, true, (&raw mut out).cast(), alloc) };
+    String::from_utf8(out).unwrap()
+  }
 
-    fn text(&self, selected: bool) -> Option<String> {
-        let mut out = Vec::new();
-        unsafe { apps_terminal_text(self.0, selected, (&raw mut out).cast(), alloc) }
-            .then(|| String::from_utf8(out).unwrap())
-    }
+  fn text(&self, selected: bool) -> Option<String> {
+    let mut out = Vec::new();
+    unsafe { apps_terminal_text(self.0, selected, (&raw mut out).cast(), alloc) }
+      .then(|| String::from_utf8(out).unwrap())
+  }
 
-    // The changed rows as (row, cells).
-    fn frame(&self) -> (Frame, Vec<(u16, Vec<Cell>)>) {
-        let mut frame: Frame = unsafe { std::mem::zeroed() };
-        assert!(unsafe { apps_terminal_frame(self.0, &mut frame) });
-        let cols = frame.cols as usize;
-        let rows = (0..frame.count as usize)
-            .map(|index| unsafe {
-                (
-                    *frame.ys.add(index),
-                    std::slice::from_raw_parts(frame.cells.add(index * cols), cols).to_vec(),
-                )
-            })
-            .collect();
-        (frame, rows)
-    }
+  // The changed rows as (row, cells).
+  fn frame(&self) -> (Frame, Vec<(u16, Vec<Cell>)>) {
+    let mut frame: Frame = unsafe { std::mem::zeroed() };
+    assert!(unsafe { apps_terminal_frame(self.0, &mut frame) });
+    let cols = frame.cols as usize;
+    let rows = (0..frame.count as usize)
+      .map(|index| unsafe {
+        (
+          *frame.ys.add(index),
+          std::slice::from_raw_parts(frame.cells.add(index * cols), cols).to_vec(),
+        )
+      })
+      .collect();
+    (frame, rows)
+  }
 
-    fn key(&self, name: &str, mods: u32, text: &str) -> bool {
-        unsafe {
-            apps_terminal_key(
-                self.0,
-                1,
-                name.as_ptr(),
-                name.len(),
-                mods,
-                text.as_ptr(),
-                text.len(),
-            )
-        }
+  fn key(&self, name: &str, mods: u32, text: &str) -> bool {
+    unsafe {
+      apps_terminal_key(
+        self.0,
+        1,
+        name.as_ptr(),
+        name.len(),
+        mods,
+        text.as_ptr(),
+        text.len(),
+      )
     }
+  }
 
-    fn spawn(&self, argv: &[&str], cwd: &str) -> u32 {
-        let argv: String = argv.iter().map(|arg| format!("{arg}\0")).collect();
-        let mut error = Vec::new();
-        let pid = unsafe {
-            apps_terminal_spawn(
-                self.0,
-                argv.as_ptr(),
-                argv.len(),
-                false,
-                std::ptr::null(),
-                0,
-                cwd.as_ptr(),
-                cwd.len(),
-                (&raw mut error).cast(),
-                alloc,
-            )
-        };
-        assert!(pid > 0, "{}", String::from_utf8_lossy(&error));
-        pid as u32
-    }
+  fn spawn(&self, argv: &[&str], cwd: &str) -> u32 {
+    let argv: String = argv.iter().map(|arg| format!("{arg}\0")).collect();
+    let mut error = Vec::new();
+    let pid = unsafe {
+      apps_terminal_spawn(
+        self.0,
+        argv.as_ptr(),
+        argv.len(),
+        false,
+        std::ptr::null(),
+        0,
+        cwd.as_ptr(),
+        cwd.len(),
+        (&raw mut error).cast(),
+        alloc,
+      )
+    };
+    assert!(pid > 0, "{}", String::from_utf8_lossy(&error));
+    pid as u32
+  }
 
-    fn wait(&self, what: &mut dyn FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while !what() {
-            assert!(Instant::now() < deadline, "{:?}", self.text(false));
-            std::thread::sleep(Duration::from_millis(5));
-        }
+  fn wait(&self, what: &mut dyn FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !what() {
+      assert!(Instant::now() < deadline, "{:?}", self.text(false));
+      std::thread::sleep(Duration::from_millis(5));
     }
+  }
 }
 
 #[test]
 fn frames_have_only_the_rows_that_changed() {
-    let test = Test::new(10, 4);
-    test.feed("hi \x1b[1;31mred\x1b[0m\r\n\x1b[48;2;1;2;3m \x1b[0m\u{4e2d}e\u{301}");
-    let (frame, rows) = test.frame();
-    assert_eq!((frame.cols, frame.rows, frame.full), (10, 4, 1));
-    assert_eq!(rows.len(), 4);
-    let first = &rows[0].1;
-    assert_eq!(first[0].ch, 'h' as u32);
-    assert_eq!((first[0].fg, first[0].flags), (0, 0));
-    assert_eq!(first[3].ch, 'r' as u32);
-    assert_eq!(first[3].flags & 1, 1);
-    assert_eq!(first[3].fg >> 24, 1);
-    let second = &rows[1].1;
-    assert_eq!(second[0].bg, 0x01010203);
-    assert_eq!(second[1].ch, 0x4e2d);
-    assert_eq!(second[1].flags & 1 << 11, 1 << 11);
-    assert_eq!(second[2].flags & 1 << 12, 1 << 12);
-    assert_eq!((second[3].ch, second[3].extra), ('e' as u32, 1));
-    assert_eq!(unsafe { *frame.extras }, 0x301);
-    assert_eq!((frame.cursor, frame.cursor_x, frame.cursor_y), (2, 4, 1));
+  let test = Test::new(10, 4);
+  test.feed("hi \x1b[1;31mred\x1b[0m\r\n\x1b[48;2;1;2;3m \x1b[0m\u{4e2d}e\u{301}");
+  let (frame, rows) = test.frame();
+  assert_eq!((frame.cols, frame.rows, frame.full), (10, 4, 1));
+  assert_eq!(rows.len(), 4);
+  let first = &rows[0].1;
+  assert_eq!(first[0].ch, 'h' as u32);
+  assert_eq!((first[0].fg, first[0].flags), (0, 0));
+  assert_eq!(first[3].ch, 'r' as u32);
+  assert_eq!(first[3].flags & 1, 1);
+  assert_eq!(first[3].fg >> 24, 1);
+  let second = &rows[1].1;
+  assert_eq!(second[0].bg, 0x01010203);
+  assert_eq!(second[1].ch, 0x4e2d);
+  assert_eq!(second[1].flags & 1 << 11, 1 << 11);
+  assert_eq!(second[2].flags & 1 << 12, 1 << 12);
+  assert_eq!((second[3].ch, second[3].extra), ('e' as u32, 1));
+  assert_eq!(unsafe { *frame.extras }, 0x301);
+  assert_eq!((frame.cursor, frame.cursor_x, frame.cursor_y), (2, 4, 1));
 
-    assert_eq!(test.frame().1.len(), 0);
-    test.feed("\x1b[4;1Hx");
-    let (frame, rows) = test.frame();
-    assert_eq!(frame.full, 0);
-    assert_eq!(rows.iter().map(|row| row.0).collect::<Vec<_>>(), [1, 3]);
-    assert_eq!(test.text(false).unwrap(), "hi red\n \u{4e2d}e\u{301}\n\nx");
-    assert_eq!(test.text(true), None);
+  assert_eq!(test.frame().1.len(), 0);
+  test.feed("\x1b[4;1Hx");
+  let (frame, rows) = test.frame();
+  assert_eq!(frame.full, 0);
+  assert_eq!(rows.iter().map(|row| row.0).collect::<Vec<_>>(), [1, 3]);
+  assert_eq!(test.text(false).unwrap(), "hi red\n \u{4e2d}e\u{301}\n\nx");
+  assert_eq!(test.text(true), None);
 }
 
 #[test]
 fn input_without_a_program_goes_to_the_page() {
-    let test = Test::new(20, 4);
-    assert!(test.key("a", 0, "a"));
-    assert!(test.key("c", 2, ""));
-    assert!(test.key("up", 0, ""));
-    assert!(test.key("enter", 0, "\n"));
-    assert!(test.key("f5", 0, ""));
-    // A modifier alone sends nothing.
-    assert!(!test.key("shift", 1, ""));
-    assert_eq!(
-        test.poll(),
-        r#"[["data","a"],["data","\u0003"],["data","\u001b[A"],["data","\u000d"],["data","\u001b[15~"]]"#
-    );
-    // Option types a character on macOS, or is an Alt key. Other platforms have no Option key, so Alt sends ESC and
-    // the text.
-    assert!(test.key("f", 4, "\u{192}"));
-    assert!(test.key("f", 4 | 16, "\u{192}"));
-    let [typed, alt] = if cfg!(target_os = "macos") {
-        ["\u{192}", "\\u001bf"]
-    } else {
-        ["\\u001b\u{192}"; 2]
-    };
-    assert_eq!(
-        test.poll(),
-        format!(r#"[["data","{typed}"],["data","{alt}"]]"#)
-    );
-    // Application cursor keys and a bracketed paste.
-    test.feed("\x1b[?1h\x1b[?2004h");
-    assert!(test.key("up", 0, ""));
-    unsafe { apps_terminal_write(test.0, PASTE, "a\nb".as_ptr(), 3) };
-    assert_eq!(
-        test.poll(),
-        r#"[["data","\u001bOA"],["data","\u001b[200~a\u000ab\u001b[201~"]]"#
-    );
-    // The terminal answers queries of the program.
-    test.feed("\x1b[6n\x1b]7501;?\x1b\\");
-    let replies = test.poll();
-    assert!(replies.contains(r#"\u001b[1;1R"#), "{replies}");
-    assert!(replies.contains(r#"\u001b]7501;?"#), "{replies}");
+  let test = Test::new(20, 4);
+  assert!(test.key("a", 0, "a"));
+  assert!(test.key("c", 2, ""));
+  assert!(test.key("up", 0, ""));
+  assert!(test.key("enter", 0, "\n"));
+  assert!(test.key("f5", 0, ""));
+  // A modifier alone sends nothing.
+  assert!(!test.key("shift", 1, ""));
+  assert_eq!(
+    test.poll(),
+    r#"[["data","a"],["data","\u0003"],["data","\u001b[A"],["data","\u000d"],["data","\u001b[15~"]]"#
+  );
+  // Option types a character on macOS, or is an Alt key. Other platforms have no Option key, so Alt sends ESC and
+  // the text.
+  assert!(test.key("f", 4, "\u{192}"));
+  assert!(test.key("f", 4 | 16, "\u{192}"));
+  let [typed, alt] = if cfg!(target_os = "macos") {
+    ["\u{192}", "\\u001bf"]
+  } else {
+    ["\\u001b\u{192}"; 2]
+  };
+  assert_eq!(
+    test.poll(),
+    format!(r#"[["data","{typed}"],["data","{alt}"]]"#)
+  );
+  // Application cursor keys and a bracketed paste.
+  test.feed("\x1b[?1h\x1b[?2004h");
+  assert!(test.key("up", 0, ""));
+  unsafe { apps_terminal_write(test.0, PASTE, "a\nb".as_ptr(), 3) };
+  assert_eq!(
+    test.poll(),
+    r#"[["data","\u001bOA"],["data","\u001b[200~a\u000ab\u001b[201~"]]"#
+  );
+  // The terminal answers queries of the program.
+  test.feed("\x1b[6n\x1b]7501;?\x1b\\");
+  let replies = test.poll();
+  assert!(replies.contains(r#"\u001b[1;1R"#), "{replies}");
+  assert!(replies.contains(r#"\u001b]7501;?"#), "{replies}");
 }
 
 #[test]
 fn events_report_the_title_the_directory_and_the_bell() {
-    let test = Test::new(20, 4);
-    test.feed("\x1b]2;my \"title\"\x07\x1b]7;file://host/tmp/a%20b\x07\x07");
-    assert_eq!(
-        test.poll(),
-        r#"[["title","my \"title\""],["cwd","/tmp/a b"],["bell"]]"#
-    );
-    let info = test.info();
-    assert!(info.contains(r#""title":"my \"title\"""#), "{info}");
-    assert!(info.contains(r#""cwd":"/tmp/a b""#), "{info}");
-    assert!(info.contains(r#""process":null"#), "{info}");
-    test.feed("\x1bc");
-    assert_eq!(test.poll(), r#"[["title",""],["cwd",""]]"#);
-    assert_eq!(test.poll(), "[]");
+  let test = Test::new(20, 4);
+  test.feed("\x1b]2;my \"title\"\x07\x1b]7;file://host/tmp/a%20b\x07\x07");
+  assert_eq!(
+    test.poll(),
+    r#"[["title","my \"title\""],["cwd","/tmp/a b"],["bell"]]"#
+  );
+  let info = test.info();
+  assert!(info.contains(r#""title":"my \"title\"""#), "{info}");
+  assert!(info.contains(r#""cwd":"/tmp/a b""#), "{info}");
+  assert!(info.contains(r#""process":null"#), "{info}");
+  test.feed("\x1bc");
+  assert_eq!(test.poll(), r#"[["title",""],["cwd",""]]"#);
+  assert_eq!(test.poll(), "[]");
 }
 
 #[test]
 fn program_status_records_follow_the_protocol() {
-    let test = Test::new(20, 4);
-    let status = || {
-        let events = test.poll();
-        events
-            .strip_prefix(r#"[["status","#)
-            .and_then(|rest| rest.strip_suffix("]]"))
-            .unwrap_or(&events)
-            .to_owned()
-    };
-    // "Deploying" and "Pushing image", as in the examples of the specification.
-    test.feed("\x1b]7501;state=working:app=deploy:msg=RGVwbG95aW5n\x1b\\");
-    test.feed("\x1b]7501;state=working:id=us-east:title=VVMgRWFzdA==:progress=40:msg=UHVzaGluZyBpbWFnZQ==\x07");
-    assert_eq!(
-        status(),
-        concat!(
-            r#"[{"id":"","state":"working","kind":null,"progress":null,"app":"deploy","title":"","message":"Deploying"},"#,
-            r#"{"id":"us-east","state":"working","kind":null,"progress":40,"app":"deploy","title":"US East","message":"Pushing image"}]"#
-        )
-    );
-    // A report replaces its record, and invalid reports change nothing.
-    test.feed("\x1b]7501;state=blocked:kind=auth:id=us-east\x07");
-    test.feed("\x1b]7501;state=unknown:id=us-east\x07\x1b]7501;state=done:msg=A\x07");
-    assert_eq!(
-        status(),
-        concat!(
-            r#"[{"id":"","state":"working","kind":null,"progress":null,"app":"deploy","title":"","message":"Deploying"},"#,
-            r#"{"id":"us-east","state":"blocked","kind":"auth","progress":null,"app":"deploy","title":"","message":""}]"#
-        )
-    );
-    assert_eq!(test.poll(), "[]");
-    // A clear removes the record and the records below it.
-    test.feed("\x1b]7501;state=done:id=us-east/a\x07\x1b]7501;state=done:id=us-eastern\x07");
-    test.feed("\x1b]7501;state=clear:id=us-east\x07");
-    assert_eq!(
-        status(),
-        concat!(
-            r#"[{"id":"","state":"working","kind":null,"progress":null,"app":"deploy","title":"","message":"Deploying"},"#,
-            r#"{"id":"us-eastern","state":"done","kind":null,"progress":null,"app":"deploy","title":"","message":""}]"#
-        )
-    );
-    // A new shell prompt ends the work, but what finished stays until the user types.
-    test.feed("\x1b]133;A\x07");
-    assert_eq!(
-        status(),
-        r#"[{"id":"us-eastern","state":"done","kind":null,"progress":null,"app":"","title":"","message":""}]"#
-    );
-    assert!(test.key("a", 0, "a"));
-    assert_eq!(test.poll(), r#"[["data","a"],["status",[]]]"#);
-    // A full reset removes all records.
-    test.feed("\x1b]7501;state=error\x07\x1bc");
-    assert_eq!(test.poll(), r#"[["title",""],["cwd",""],["status",[]]]"#);
-    test.feed("\x1bc");
-    assert_eq!(test.poll(), r#"[["title",""],["cwd",""]]"#);
-    // The oldest record leaves when there are too many.
-    for index in 0..RECORDS + 1 {
-        test.feed(&format!("\x1b]7501;state=idle:id=r{index}\x07"));
-    }
-    let records = status();
-    assert_eq!(records.matches("\"id\"").count(), RECORDS);
-    assert!(!records.contains(r#""id":"r0""#) && records.contains(r#""id":"r256""#));
+  let test = Test::new(20, 4);
+  let status = || {
+    let events = test.poll();
+    events
+      .strip_prefix(r#"[["status","#)
+      .and_then(|rest| rest.strip_suffix("]]"))
+      .unwrap_or(&events)
+      .to_owned()
+  };
+  // "Deploying" and "Pushing image", as in the examples of the specification.
+  test.feed("\x1b]7501;state=working:app=deploy:msg=RGVwbG95aW5n\x1b\\");
+  test.feed("\x1b]7501;state=working:id=us-east:title=VVMgRWFzdA==:progress=40:msg=UHVzaGluZyBpbWFnZQ==\x07");
+  assert_eq!(
+    status(),
+    concat!(
+      r#"[{"id":"","state":"working","kind":null,"progress":null,"app":"deploy","title":"","message":"Deploying"},"#,
+      r#"{"id":"us-east","state":"working","kind":null,"progress":40,"app":"deploy","title":"US East","message":"Pushing image"}]"#
+    )
+  );
+  // A report replaces its record, and invalid reports change nothing.
+  test.feed("\x1b]7501;state=blocked:kind=auth:id=us-east\x07");
+  test.feed("\x1b]7501;state=unknown:id=us-east\x07\x1b]7501;state=done:msg=A\x07");
+  assert_eq!(
+    status(),
+    concat!(
+      r#"[{"id":"","state":"working","kind":null,"progress":null,"app":"deploy","title":"","message":"Deploying"},"#,
+      r#"{"id":"us-east","state":"blocked","kind":"auth","progress":null,"app":"deploy","title":"","message":""}]"#
+    )
+  );
+  assert_eq!(test.poll(), "[]");
+  // A clear removes the record and the records below it.
+  test.feed("\x1b]7501;state=done:id=us-east/a\x07\x1b]7501;state=done:id=us-eastern\x07");
+  test.feed("\x1b]7501;state=clear:id=us-east\x07");
+  assert_eq!(
+    status(),
+    concat!(
+      r#"[{"id":"","state":"working","kind":null,"progress":null,"app":"deploy","title":"","message":"Deploying"},"#,
+      r#"{"id":"us-eastern","state":"done","kind":null,"progress":null,"app":"deploy","title":"","message":""}]"#
+    )
+  );
+  // A new shell prompt ends the work, but what finished stays until the user types.
+  test.feed("\x1b]133;A\x07");
+  assert_eq!(
+    status(),
+    r#"[{"id":"us-eastern","state":"done","kind":null,"progress":null,"app":"","title":"","message":""}]"#
+  );
+  assert!(test.key("a", 0, "a"));
+  assert_eq!(test.poll(), r#"[["data","a"],["status",[]]]"#);
+  // A full reset removes all records.
+  test.feed("\x1b]7501;state=error\x07\x1bc");
+  assert_eq!(test.poll(), r#"[["title",""],["cwd",""],["status",[]]]"#);
+  test.feed("\x1bc");
+  assert_eq!(test.poll(), r#"[["title",""],["cwd",""]]"#);
+  // The oldest record leaves when there are too many.
+  for index in 0..RECORDS + 1 {
+    test.feed(&format!("\x1b]7501;state=idle:id=r{index}\x07"));
+  }
+  let records = status();
+  assert_eq!(records.matches("\"id\"").count(), RECORDS);
+  assert!(!records.contains(r#""id":"r0""#) && records.contains(r#""id":"r256""#));
 }
 
 #[test]
 fn the_mouse_selects_text_or_goes_to_the_program() {
-    let test = Test::new(20, 4);
-    test.feed("hello world\r\nsecond line");
-    unsafe { apps_terminal_resize(test.0, 20, 4, 10, 20) };
-    let mouse = |kind, button, x: f64, y: f64, held| unsafe {
-        apps_terminal_mouse(test.0, kind, button, 0, x, y, held)
-    };
-    assert!(!mouse(0, 1, 2., 8., true));
-    assert!(!mouse(2, 0, 46., 8., true));
-    assert!(!mouse(1, 1, 46., 8., false));
-    assert_eq!(test.text(true).unwrap(), "hello");
-    let (_, rows) = test.frame();
-    let selected = |cells: &[Cell]| {
-        cells
-            .iter()
-            .filter(|cell| cell.flags & 1 << 13 != 0)
-            .count()
-    };
-    assert_eq!(selected(&rows[0].1), 5);
-    unsafe { apps_terminal_control(test.0, SELECT_ALL, 0.) };
-    assert_eq!(test.text(true).unwrap(), "hello world\nsecond line");
-    unsafe { apps_terminal_control(test.0, SELECT_NONE, 0.) };
-    assert_eq!(test.text(true), None);
-    assert_eq!(test.poll(), "[]");
-    // With mouse tracking, the program gets the buttons and the wheel.
-    test.feed("\x1b[?1000h\x1b[?1006h");
-    assert!(mouse(0, 1, 25., 30., true));
-    assert!(mouse(1, 1, 25., 30., false));
-    unsafe { apps_terminal_wheel(test.0, -1, 0, 25., 30.) };
-    assert_eq!(
-        test.poll(),
-        r#"[["data","\u001b[<0;3;2M"],["data","\u001b[<0;3;2m"],["data","\u001b[<64;3;2M"]]"#
-    );
+  let test = Test::new(20, 4);
+  test.feed("hello world\r\nsecond line");
+  unsafe { apps_terminal_resize(test.0, 20, 4, 10, 20) };
+  let mouse = |kind, button, x: f64, y: f64, held| unsafe {
+    apps_terminal_mouse(test.0, kind, button, 0, x, y, held)
+  };
+  assert!(!mouse(0, 1, 2., 8., true));
+  assert!(!mouse(2, 0, 46., 8., true));
+  assert!(!mouse(1, 1, 46., 8., false));
+  assert_eq!(test.text(true).unwrap(), "hello");
+  let (_, rows) = test.frame();
+  let selected = |cells: &[Cell]| {
+    cells
+      .iter()
+      .filter(|cell| cell.flags & 1 << 13 != 0)
+      .count()
+  };
+  assert_eq!(selected(&rows[0].1), 5);
+  unsafe { apps_terminal_control(test.0, SELECT_ALL, 0.) };
+  assert_eq!(test.text(true).unwrap(), "hello world\nsecond line");
+  unsafe { apps_terminal_control(test.0, SELECT_NONE, 0.) };
+  assert_eq!(test.text(true), None);
+  assert_eq!(test.poll(), "[]");
+  // With mouse tracking, the program gets the buttons and the wheel.
+  test.feed("\x1b[?1000h\x1b[?1006h");
+  assert!(mouse(0, 1, 25., 30., true));
+  assert!(mouse(1, 1, 25., 30., false));
+  unsafe { apps_terminal_wheel(test.0, -1, 0, 25., 30.) };
+  assert_eq!(
+    test.poll(),
+    r#"[["data","\u001b[<0;3;2M"],["data","\u001b[<0;3;2m"],["data","\u001b[<64;3;2M"]]"#
+  );
 }
 
 #[test]
 fn the_wheel_scrolls_the_scrollback() {
-    let test = Test::new(10, 2);
-    test.feed("1\r\n2\r\n3\r\n4");
-    let top = |test: &Test| char::from_u32(test.frame().1[0].1[0].ch).unwrap();
-    assert_eq!(top(&test), '3');
-    unsafe { apps_terminal_wheel(test.0, -2, 0, 0., 0.) };
-    assert_eq!(top(&test), '1');
-    assert!(
-        test.info()
-            .contains(r#""bottom":false,"total":4,"offset":0"#),
-        "{}",
-        test.info()
-    );
-    // Typing goes back to the newest rows.
-    assert!(test.key("a", 0, "a"));
-    assert_eq!(top(&test), '3');
-    unsafe { apps_terminal_control(test.0, RESET, 0.) };
-    assert_eq!(test.text(false).unwrap(), "");
+  let test = Test::new(10, 2);
+  test.feed("1\r\n2\r\n3\r\n4");
+  let top = |test: &Test| char::from_u32(test.frame().1[0].1[0].ch).unwrap();
+  assert_eq!(top(&test), '3');
+  unsafe { apps_terminal_wheel(test.0, -2, 0, 0., 0.) };
+  assert_eq!(top(&test), '1');
+  assert!(
+    test
+      .info()
+      .contains(r#""bottom":false,"total":4,"offset":0"#),
+    "{}",
+    test.info()
+  );
+  // Typing goes back to the newest rows.
+  assert!(test.key("a", 0, "a"));
+  assert_eq!(top(&test), '3');
+  unsafe { apps_terminal_control(test.0, RESET, 0.) };
+  assert_eq!(test.text(false).unwrap(), "");
 }
 
 #[test]
 fn the_scrollback_keeps_thousands_of_rows() {
-    let test = Test::new(113, 32);
-    for row in 1..=5000 {
-        test.feed(&format!("{row}\r\n"));
-    }
-    assert!(test.info().contains(r#""total":5001"#), "{}", test.info());
+  let test = Test::new(113, 32);
+  for row in 1..=5000 {
+    test.feed(&format!("{row}\r\n"));
+  }
+  assert!(test.info().contains(r#""total":5001"#), "{}", test.info());
 }
 
 #[test]
 fn frames_have_the_images_of_the_screen() {
-    let test = Test::new(10, 4);
-    unsafe { apps_terminal_resize(test.0, 10, 4, 10, 20) };
-    let placements = |test: &Test| {
-        let frame = test.frame().0;
-        (0..frame.placed as usize)
-            .map(|index| unsafe { *frame.placements.add(index) })
-            .collect::<Vec<_>>()
-    };
-    let pixels = |placement: &Placement, generation: u64| {
-        let (mut size, mut out) = ([0u32; 2], Vec::<u8>::new());
-        unsafe {
-            apps_terminal_image(
-                test.0,
-                placement.id,
-                generation,
-                size.as_mut_ptr(),
-                (&raw mut out).cast(),
-                alloc,
-            )
-        }
-        .then_some((size, out))
-    };
-    assert_eq!(placements(&test), []);
-    // Two RGBA pixels in two columns and one row, below the text, and a PNG image above it.
-    test.feed("\x1b_Ga=T,f=32,s=2,v=1,i=7,c=2,r=1,z=-1;/wAA/wD/AIA=\x1b\\");
-    test.feed("\x1b_Ga=T,f=100,i=8;iVBORw==\x1b\\");
-    let placed = placements(&test);
-    assert_eq!(placed.len(), 2, "{placed:?}");
-    let [below, above] = [placed[0], placed[1]];
-    assert_eq!((below.id, below.layer, below.col, below.row), (7, 1, 0, 0));
-    assert_eq!(
-        (below.width, below.height, below.source),
-        (20, 20, [0, 0, 2, 1])
-    );
-    assert_eq!(
-        pixels(&below, below.image),
-        Some(([2, 1], vec![0, 0, 255, 255, 0, 255, 0, 128]))
-    );
-    assert_eq!((above.id, above.layer, above.col), (8, 2, 2));
-    assert_eq!(
-        pixels(&above, above.image),
-        Some(([1, 1], vec![3, 2, 1, 4]))
-    );
-    assert_eq!(pixels(&above, below.image), None);
-    // RGB pixels get an alpha channel, and a new picture of an image blends over the old one.
-    test.feed("\x1b_Ga=T,f=24,s=1,v=1,i=11,C=1;/wAA\x1b\\");
-    let found = |test: &Test| {
-        *placements(test)
-            .iter()
-            .find(|image| image.id == 11)
-            .unwrap()
-    };
-    let rgb = found(&test);
-    assert_eq!(
-        pixels(&rgb, rgb.image),
-        Some(([1, 1], vec![0, 0, 255, 255]))
-    );
-    test.feed("\x1b_Ga=f,i=11,r=1,f=32,s=1,v=1;AP8AgA==\x1b\\");
-    let blended = found(&test);
-    assert_ne!(blended.image, rgb.image);
-    let (_, pixel) = pixels(&blended, blended.image).unwrap();
-    assert!(
-        pixel[0] == 0 && pixel[1] > 100 && pixel[2] > 100 && pixel[3] == 255,
-        "{pixel:?}"
-    );
-    test.feed("\x1b_Ga=d,d=I,i=11\x1b\\");
-    // New pixels for an image give it a new generation.
-    test.feed("\x1b_Ga=t,f=32,s=1,v=1,i=7;AAAAAA==\x1b\\");
-    assert_eq!(pixels(&below, below.image), None);
-    // Images move with the text.
-    test.feed("\x1b_Ga=d\x1b\\\x1b[2J\x1b[3;1H\x1b_Ga=T,f=100,i=9;iVBORw==\x1b\\\n\n\n");
-    let placed = placements(&test);
-    assert_eq!((placed.len(), placed[0].id, placed[0].row), (1, 9, 0));
-    // The cells of a placeholder draw the image, not the character.
-    test.feed("\x1b[2J\x1b[H\x1b_Ga=T,U=1,f=100,i=5,c=1,r=1;iVBORw==\x1b\\\x1b[38;5;5m\u{10EEEE}\u{305}\u{305}");
-    let (frame, rows) = test.frame();
-    assert_eq!(rows[0].1[0].ch, 0);
-    assert_eq!(frame.placed, 1);
+  let test = Test::new(10, 4);
+  unsafe { apps_terminal_resize(test.0, 10, 4, 10, 20) };
+  let placements = |test: &Test| {
+    let frame = test.frame().0;
+    (0..frame.placed as usize)
+      .map(|index| unsafe { *frame.placements.add(index) })
+      .collect::<Vec<_>>()
+  };
+  let pixels = |placement: &Placement, generation: u64| {
+    let (mut size, mut out) = ([0u32; 2], Vec::<u8>::new());
+    unsafe {
+      apps_terminal_image(
+        test.0,
+        placement.id,
+        generation,
+        size.as_mut_ptr(),
+        (&raw mut out).cast(),
+        alloc,
+      )
+    }
+    .then_some((size, out))
+  };
+  assert_eq!(placements(&test), []);
+  // Two RGBA pixels in two columns and one row, below the text, and a PNG image above it.
+  test.feed("\x1b_Ga=T,f=32,s=2,v=1,i=7,c=2,r=1,z=-1;/wAA/wD/AIA=\x1b\\");
+  test.feed("\x1b_Ga=T,f=100,i=8;iVBORw==\x1b\\");
+  let placed = placements(&test);
+  assert_eq!(placed.len(), 2, "{placed:?}");
+  let [below, above] = [placed[0], placed[1]];
+  assert_eq!((below.id, below.layer, below.col, below.row), (7, 1, 0, 0));
+  assert_eq!(
+    (below.width, below.height, below.source),
+    (20, 20, [0, 0, 2, 1])
+  );
+  assert_eq!(
+    pixels(&below, below.image),
+    Some(([2, 1], vec![0, 0, 255, 255, 0, 255, 0, 128]))
+  );
+  assert_eq!((above.id, above.layer, above.col), (8, 2, 2));
+  assert_eq!(
+    pixels(&above, above.image),
+    Some(([1, 1], vec![3, 2, 1, 4]))
+  );
+  assert_eq!(pixels(&above, below.image), None);
+  // RGB pixels get an alpha channel, and a new picture of an image blends over the old one.
+  test.feed("\x1b_Ga=T,f=24,s=1,v=1,i=11,C=1;/wAA\x1b\\");
+  let found = |test: &Test| {
+    *placements(test)
+      .iter()
+      .find(|image| image.id == 11)
+      .unwrap()
+  };
+  let rgb = found(&test);
+  assert_eq!(
+    pixels(&rgb, rgb.image),
+    Some(([1, 1], vec![0, 0, 255, 255]))
+  );
+  test.feed("\x1b_Ga=f,i=11,r=1,f=32,s=1,v=1;AP8AgA==\x1b\\");
+  let blended = found(&test);
+  assert_ne!(blended.image, rgb.image);
+  let (_, pixel) = pixels(&blended, blended.image).unwrap();
+  assert!(
+    pixel[0] == 0 && pixel[1] > 100 && pixel[2] > 100 && pixel[3] == 255,
+    "{pixel:?}"
+  );
+  test.feed("\x1b_Ga=d,d=I,i=11\x1b\\");
+  // New pixels for an image give it a new generation.
+  test.feed("\x1b_Ga=t,f=32,s=1,v=1,i=7;AAAAAA==\x1b\\");
+  assert_eq!(pixels(&below, below.image), None);
+  // Images move with the text.
+  test.feed("\x1b_Ga=d\x1b\\\x1b[2J\x1b[3;1H\x1b_Ga=T,f=100,i=9;iVBORw==\x1b\\\n\n\n");
+  let placed = placements(&test);
+  assert_eq!((placed.len(), placed[0].id, placed[0].row), (1, 9, 0));
+  // The cells of a placeholder draw the image, not the character.
+  test.feed("\x1b[2J\x1b[H\x1b_Ga=T,U=1,f=100,i=5,c=1,r=1;iVBORw==\x1b\\\x1b[38;5;5m\u{10EEEE}\u{305}\u{305}");
+  let (frame, rows) = test.frame();
+  assert_eq!(rows[0].1[0].ch, 0);
+  assert_eq!(frame.placed, 1);
 }
 
 #[test]
 fn a_program_runs_in_a_pty() {
-    let test = Test::new(40, 4);
-    let (argv, cwd): (&[&str], _) = if cfg!(windows) {
-        let line = "echo in !CD!& set /p line=& echo got !line!& exit 7";
-        (&["cmd.exe", "/d", "/v:on", "/c", line], "C:\\")
-    } else {
-        let line = "printf 'in %s' \"$PWD\"; read line; echo \"got $line\"; exit 7";
-        (&["/bin/sh", "-c", line], "/")
-    };
-    let pid = test.spawn(argv, cwd);
-    let shown = |what: &str| test.text(false).is_some_and(|text| text.contains(what));
-    test.wait(&mut || shown(&format!("in {cwd}")));
-    let info = test.info();
-    let name = if cfg!(windows) { "cmd" } else { "" };
-    assert!(
-        info.contains(&format!(r#""process":{{"pid":{pid},"name":"{name}"#)),
-        "{info}"
-    );
-    assert!(!info.contains(r#""name":"""#), "{info}");
-    let cwd = cwd.replace('\\', "\\\\");
-    assert!(info.contains(&format!(r#""cwd":"{cwd}""#)), "{info}");
-    unsafe { apps_terminal_write(test.0, INPUT, "hi\r".as_ptr(), 3) };
-    let mut events = String::new();
-    test.wait(&mut || {
-        events.push_str(&test.poll());
-        events.contains("exit")
-    });
-    assert!(events.contains(r#"["exit",7,null]"#), "{events}");
-    test.wait(&mut || shown("got hi"));
-    assert!(test.info().contains(r#""pid":null"#));
+  let test = Test::new(40, 4);
+  let (argv, cwd): (&[&str], _) = if cfg!(windows) {
+    let line = "echo in !CD!& set /p line=& echo got !line!& exit 7";
+    (&["cmd.exe", "/d", "/v:on", "/c", line], "C:\\")
+  } else {
+    let line = "printf 'in %s' \"$PWD\"; read line; echo \"got $line\"; exit 7";
+    (&["/bin/sh", "-c", line], "/")
+  };
+  let pid = test.spawn(argv, cwd);
+  let shown = |what: &str| test.text(false).is_some_and(|text| text.contains(what));
+  test.wait(&mut || shown(&format!("in {cwd}")));
+  let info = test.info();
+  let name = if cfg!(windows) { "cmd" } else { "" };
+  assert!(
+    info.contains(&format!(r#""process":{{"pid":{pid},"name":"{name}"#)),
+    "{info}"
+  );
+  assert!(!info.contains(r#""name":"""#), "{info}");
+  let cwd = cwd.replace('\\', "\\\\");
+  assert!(info.contains(&format!(r#""cwd":"{cwd}""#)), "{info}");
+  unsafe { apps_terminal_write(test.0, INPUT, "hi\r".as_ptr(), 3) };
+  let mut events = String::new();
+  test.wait(&mut || {
+    events.push_str(&test.poll());
+    events.contains("exit")
+  });
+  assert!(events.contains(r#"["exit",7,null]"#), "{events}");
+  test.wait(&mut || shown("got hi"));
+  assert!(test.info().contains(r#""pid":null"#));
 }
 
 #[cfg(unix)]
 #[test]
 fn closing_hangs_up_the_group_and_frees_the_state() {
-    let test = Test::new(40, 4);
-    // The leader ignores the hangup and keeps the PTY open. The other sleep is an orphan, so it is reaped
-    // when it ends.
-    let line = "trap '' HUP; ((trap - HUP; exec sleep 30) & echo \"bg $!\"); exec sleep 30";
-    let pid = test.spawn(&["/bin/sh", "-c", line], "");
-    let mut sleep = 0;
-    test.wait(&mut || {
-        sleep = test
-            .text(false)
-            .and_then(|text| {
-                text.split("bg ")
-                    .nth(1)?
-                    .split_whitespace()
-                    .next()?
-                    .parse()
-                    .ok()
-            })
-            .unwrap_or(0);
-        sleep > 0
-    });
-    let shared = Arc::downgrade(&unsafe { &*test.0 }.shared);
-    drop(test);
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while shared.strong_count() > 0 || unsafe { libc::kill(sleep, 0) } == 0 {
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+  let test = Test::new(40, 4);
+  // The leader ignores the hangup and keeps the PTY open. The other sleep is an orphan, so it is reaped
+  // when it ends.
+  let line = "trap '' HUP; ((trap - HUP; exec sleep 30) & echo \"bg $!\"); exec sleep 30";
+  let pid = test.spawn(&["/bin/sh", "-c", line], "");
+  let mut sleep = 0;
+  test.wait(&mut || {
+    sleep = test
+      .text(false)
+      .and_then(|text| {
+        text
+          .split("bg ")
+          .nth(1)?
+          .split_whitespace()
+          .next()?
+          .parse()
+          .ok()
+      })
+      .unwrap_or(0);
+    sleep > 0
+  });
+  let shared = Arc::downgrade(&unsafe { &*test.0 }.shared);
+  drop(test);
+  let deadline = Instant::now() + Duration::from_secs(60);
+  while shared.strong_count() > 0 || unsafe { libc::kill(sleep, 0) } == 0 {
+    assert!(Instant::now() < deadline);
+    std::thread::sleep(Duration::from_millis(5));
+  }
+  unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
 }
 
 #[cfg(windows)]
 #[test]
 fn closing_ends_the_programs_and_frees_the_state() {
-    let test = Test::new(80, 24);
-    test.spawn(&["cmd.exe", "/d", "/c", "ping -n 120 127.0.0.1"], "");
-    // The newest process of the shell is in the foreground.
-    let mut info = String::new();
-    test.wait(&mut || {
-        info = test.info();
-        info.to_lowercase().contains(r#""name":"ping""#)
-    });
-    let pid = info.split("\"process\":{\"pid\":").nth(1).unwrap();
-    let pid: u32 = pid.split(',').next().unwrap().parse().unwrap();
-    let shared = Arc::downgrade(&unsafe { &*test.0 }.shared);
-    drop(test);
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while shared.strong_count() > 0 || !pty::process(pid).0.is_empty() {
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    // A program that just starts ends too.
-    let test = Test::new(80, 24);
-    test.spawn(&["cmd.exe", "/d", "/k"], "");
-    let shared = Arc::downgrade(&unsafe { &*test.0 }.shared);
-    drop(test);
-    while shared.strong_count() > 0 {
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(5));
-    }
+  let test = Test::new(80, 24);
+  test.spawn(&["cmd.exe", "/d", "/c", "ping -n 120 127.0.0.1"], "");
+  // The newest process of the shell is in the foreground.
+  let mut info = String::new();
+  test.wait(&mut || {
+    info = test.info();
+    info.to_lowercase().contains(r#""name":"ping""#)
+  });
+  let pid = info.split("\"process\":{\"pid\":").nth(1).unwrap();
+  let pid: u32 = pid.split(',').next().unwrap().parse().unwrap();
+  let shared = Arc::downgrade(&unsafe { &*test.0 }.shared);
+  drop(test);
+  let deadline = Instant::now() + Duration::from_secs(60);
+  while shared.strong_count() > 0 || !pty::process(pid).0.is_empty() {
+    assert!(Instant::now() < deadline);
+    std::thread::sleep(Duration::from_millis(5));
+  }
+  // A program that just starts ends too.
+  let test = Test::new(80, 24);
+  test.spawn(&["cmd.exe", "/d", "/k"], "");
+  let shared = Arc::downgrade(&unsafe { &*test.0 }.shared);
+  drop(test);
+  while shared.strong_count() > 0 {
+    assert!(Instant::now() < deadline);
+    std::thread::sleep(Duration::from_millis(5));
+  }
 }
 
 #[test]
 fn signals_end_a_program() {
-    let argv: &[&str] = if cfg!(windows) {
-        &["cmd.exe", "/d", "/k", "echo started"]
-    } else {
-        &["/bin/sh", "-c", "echo started; sleep 30"]
-    };
-    let test = Test::new(80, 24);
-    // Hangup, kill and terminate.
-    for signal in [1., 9., 15.] {
-        test.spawn(argv, "");
-        test.wait(&mut || {
-            test.text(false)
-                .is_some_and(|text| text.contains("started"))
-        });
-        unsafe { apps_terminal_control(test.0, KILL, signal) };
-        test.wait(&mut || test.poll().contains("exit"));
-        unsafe { apps_terminal_control(test.0, RESET, 0.) };
-    }
-    // An interrupt goes to the process in the foreground.
-    let argv: &[&str] = if cfg!(windows) {
-        &["cmd.exe", "/d", "/c", "ping -n 120 127.0.0.1"]
-    } else {
-        &["/bin/sh", "-c", "echo 127.0.0.1; sleep 120"]
-    };
+  let argv: &[&str] = if cfg!(windows) {
+    &["cmd.exe", "/d", "/k", "echo started"]
+  } else {
+    &["/bin/sh", "-c", "echo started; sleep 30"]
+  };
+  let test = Test::new(80, 24);
+  // Hangup, kill and terminate.
+  for signal in [1., 9., 15.] {
     test.spawn(argv, "");
     test.wait(&mut || {
-        test.text(false)
-            .is_some_and(|text| text.contains("127.0.0.1"))
+      test
+        .text(false)
+        .is_some_and(|text| text.contains("started"))
     });
-    unsafe { apps_terminal_control(test.0, KILL, 2.) };
+    unsafe { apps_terminal_control(test.0, KILL, signal) };
     test.wait(&mut || test.poll().contains("exit"));
+    unsafe { apps_terminal_control(test.0, RESET, 0.) };
+  }
+  // An interrupt goes to the process in the foreground.
+  let argv: &[&str] = if cfg!(windows) {
+    &["cmd.exe", "/d", "/c", "ping -n 120 127.0.0.1"]
+  } else {
+    &["/bin/sh", "-c", "echo 127.0.0.1; sleep 120"]
+  };
+  test.spawn(argv, "");
+  test.wait(&mut || {
+    test
+      .text(false)
+      .is_some_and(|text| text.contains("127.0.0.1"))
+  });
+  unsafe { apps_terminal_control(test.0, KILL, 2.) };
+  test.wait(&mut || test.poll().contains("exit"));
 }
 
 #[test]
 fn a_program_sees_a_resize() {
-    let test = Test::new(80, 24);
-    let argv: &[&str] = if cfg!(windows) {
-        &["cmd.exe", "/d", "/v:on", "/c", "set /p a=go & mode con"]
-    } else {
-        &["/bin/sh", "-c", "echo go; read a; stty size"]
-    };
-    test.spawn(argv, "");
-    test.wait(&mut || test.text(false).is_some_and(|text| text.contains("go")));
-    unsafe { apps_terminal_resize(test.0, 101, 33, 8, 16) };
-    unsafe { apps_terminal_write(test.0, INPUT, "\r".as_ptr(), 1) };
-    test.wait(&mut || test.text(false).is_some_and(|text| text.contains("101")));
+  let test = Test::new(80, 24);
+  let argv: &[&str] = if cfg!(windows) {
+    &["cmd.exe", "/d", "/v:on", "/c", "set /p a=go & mode con"]
+  } else {
+    &["/bin/sh", "-c", "echo go; read a; stty size"]
+  };
+  test.spawn(argv, "");
+  test.wait(&mut || test.text(false).is_some_and(|text| text.contains("go")));
+  unsafe { apps_terminal_resize(test.0, 101, 33, 8, 16) };
+  unsafe { apps_terminal_write(test.0, INPUT, "\r".as_ptr(), 1) };
+  test.wait(&mut || test.text(false).is_some_and(|text| text.contains("101")));
 }
 
 #[test]
 fn a_resize_to_more_rows_with_the_same_cells_draws_them_all() {
-    let test = Test::new(80, 24);
-    assert_eq!(test.frame().1.len(), 24);
-    unsafe { apps_terminal_resize(test.0, 40, 48, 8, 16) };
-    test.feed("\x1b[48;1Hx");
-    let (frame, rows) = test.frame();
-    assert_eq!((frame.cols, frame.rows, frame.full), (40, 48, 1));
-    assert_eq!(
-        rows.iter().map(|row| row.0).collect::<Vec<_>>(),
-        (0..48).collect::<Vec<_>>()
-    );
-    assert_eq!(rows[47].1[0].ch, 'x' as u32);
+  let test = Test::new(80, 24);
+  assert_eq!(test.frame().1.len(), 24);
+  unsafe { apps_terminal_resize(test.0, 40, 48, 8, 16) };
+  test.feed("\x1b[48;1Hx");
+  let (frame, rows) = test.frame();
+  assert_eq!((frame.cols, frame.rows, frame.full), (40, 48, 1));
+  assert_eq!(
+    rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+    (0..48).collect::<Vec<_>>()
+  );
+  assert_eq!(rows[47].1[0].ch, 'x' as u32);
 }
 
 #[test]
 fn a_held_screen_gives_the_time_until_the_hold_ends() {
-    let test = Test::new(10, 2);
-    test.frame();
-    test.feed("\x1b[?2026hx");
-    let mut frame: Frame = unsafe { std::mem::zeroed() };
-    assert!(!unsafe { apps_terminal_frame(test.0, &mut frame) });
-    assert!((1..=1001).contains(&frame.wait), "{}", frame.wait);
-    test.feed("\x1b[?2026l");
-    assert_eq!(test.frame().1.len(), 1);
+  let test = Test::new(10, 2);
+  test.frame();
+  test.feed("\x1b[?2026hx");
+  let mut frame: Frame = unsafe { std::mem::zeroed() };
+  assert!(!unsafe { apps_terminal_frame(test.0, &mut frame) });
+  assert!((1..=1001).contains(&frame.wait), "{}", frame.wait);
+  test.feed("\x1b[?2026l");
+  assert_eq!(test.frame().1.len(), 1);
 }
 
 #[test]
 fn exit_comes_after_the_last_output_and_ends_the_hold() {
-    let test = Test::new(40, 4);
-    let argv: &[&str] = if cfg!(windows) {
-        let line = "$e = [char]27; [Console]::Write(\"$e[?2026hlast\")";
-        &["powershell.exe", "-NoProfile", "-Command", line]
-    } else {
-        &["/bin/sh", "-c", "printf '\\033[?2026hlast'"]
-    };
-    test.spawn(argv, "");
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !test.poll().contains("exit") {
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(test.text(false).is_some_and(|text| text.contains("last")));
-    assert!(test.frame().1.iter().any(|row| row.1[0].ch == 'l' as u32));
+  let test = Test::new(40, 4);
+  let argv: &[&str] = if cfg!(windows) {
+    let line = "$e = [char]27; [Console]::Write(\"$e[?2026hlast\")";
+    &["powershell.exe", "-NoProfile", "-Command", line]
+  } else {
+    &["/bin/sh", "-c", "printf '\\033[?2026hlast'"]
+  };
+  test.spawn(argv, "");
+  let deadline = Instant::now() + Duration::from_secs(60);
+  while !test.poll().contains("exit") {
+    assert!(Instant::now() < deadline);
+    std::thread::sleep(Duration::from_millis(5));
+  }
+  assert!(test.text(false).is_some_and(|text| text.contains("last")));
+  assert!(test.frame().1.iter().any(|row| row.1[0].ch == 'l' as u32));
 }

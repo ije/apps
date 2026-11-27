@@ -1,7 +1,7 @@
 use crate::css::selector::SelectorList;
 use crate::css::{
-    properties::Prop, properties::Style, sheet::Declaration, sheet::Declarations, sheet::Rule,
-    sheet::Stylesheet, value::color::color, value::tokens::components, value::units::Lengths,
+  properties::Prop, properties::Style, sheet::Declaration, sheet::Declarations, sheet::Rule,
+  sheet::Stylesheet, value::color::color, value::tokens::components, value::units::Lengths,
 };
 use crate::dom::Document;
 use bbtree::unsync::BBTreeMap;
@@ -29,31 +29,32 @@ pub(crate) use ua::{SVG, presentation};
 
 pub(crate) use animation::{Frame, Motion};
 pub(crate) use text::{
-    LineHeight, case, case_ignorable, cursor, font, hyphenation, line_height, plaintext,
-    pseudo_content, push_full, restyle, row_aligns, selection_colors, spacing, starts_word,
-    stretch, styled_run, text_run, text_transform, word_break,
+  LineHeight, case, case_ignorable, cursor, font, hyphenation, line_height, plaintext,
+  pseudo_content, push_full, restyle, row_aligns, selection_colors, spacing, starts_word, stretch,
+  styled_run, text_run, text_transform, word_break,
 };
 pub(crate) use used::{dark, drawable_canvas};
 
 pub fn styles(doc: &Document, width: f32, height: f32) -> Vec<BBTreeMap<String, String>> {
-    let out = compute_styles(
-        doc,
-        width,
-        height,
-        None,
-        &mut HashMap::new(),
-        &mut StyleCache::default(),
-        None,
-    );
-    out.values
-        .iter()
-        .zip(out.vars.iter())
-        .map(|(style, vars)| {
-            style
-                .own()
-                .chain(vars.iter().map(|(prop, value)| (*prop, value)))
-                .map(|(prop, value)| (prop.name().to_owned(), value.to_string()))
-                .collect()
-        })
+  let out = compute_styles(
+    doc,
+    width,
+    height,
+    None,
+    &mut HashMap::new(),
+    &mut StyleCache::default(),
+    None,
+  );
+  out
+    .values
+    .iter()
+    .zip(out.vars.iter())
+    .map(|(style, vars)| {
+      style
+        .own()
+        .chain(vars.iter().map(|(prop, value)| (*prop, value)))
+        .map(|(prop, value)| (prop.name().to_owned(), value.to_string()))
         .collect()
+    })
+    .collect()
 }

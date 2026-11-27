@@ -2,13 +2,13 @@ use crate::css;
 use crate::css::properties::Prop;
 use crate::css::properties::Style;
 use renderer::{
-    Button, Color, Corners, Edges, Event, Hit, Pixels, Point, Rect, Region, ScrollRef, Timer,
-    Window, point, px, size,
+  Button, Color, Corners, Edges, Event, Hit, Pixels, Point, Rect, Region, ScrollRef, Timer, Window,
+  point, px, size,
 };
 use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
-    time::{Duration, Instant},
+  cell::{Cell, RefCell},
+  rc::Rc,
+  time::{Duration, Instant},
 };
 
 const HOLD: Duration = Duration::from_millis(1000);
@@ -19,294 +19,295 @@ const SHORTEST: f32 = 26.;
 
 #[derive(Clone, Copy)]
 struct Part {
-    fill: Color,
-    radius: f32,
-    border: f32,
-    edge: Color,
-    clip: f32,
+  fill: Color,
+  radius: f32,
+  border: f32,
+  edge: Color,
+  clip: f32,
 }
 
 impl Part {
-    fn new(style: &Style, units: &css::value::units::Lengths, thickness: f32) -> Self {
-        let length = |prop| {
-            style
-                .get(prop)
-                .and_then(|value| {
-                    units.resolve(
-                        css::value::tokens::components(value, ' ').first()?,
-                        thickness,
-                    )
-                })
-                .unwrap_or(0.)
-                .max(0.)
-        };
-        let color = |prop| {
-            style
-                .get(prop)
-                .and_then(css::value::color::color)
-                .map_or(Color::TRANSPARENT, |(ink, alpha)| {
-                    crate::css::value::color::rgba((ink, alpha))
-                })
-        };
-        let border = if style
-            .get(Prop::BORDER_TOP_STYLE)
-            .is_some_and(|kind| !matches!(kind, "none" | "hidden"))
-        {
-            length(Prop::BORDER_TOP_WIDTH)
-        } else {
-            0.
-        };
-        Part {
-            fill: color(Prop::BACKGROUND_COLOR),
-            radius: length(Prop::BORDER_TOP_LEFT_RADIUS),
-            border,
-            edge: color(Prop::BORDER_TOP_COLOR),
-            clip: match style.get(Prop::BACKGROUND_CLIP) {
-                Some("padding-box") => border,
-                Some("content-box") => border + length(Prop::PADDING_TOP),
-                _ => 0.,
-            },
-        }
+  fn new(style: &Style, units: &css::value::units::Lengths, thickness: f32) -> Self {
+    let length = |prop| {
+      style
+        .get(prop)
+        .and_then(|value| {
+          units.resolve(
+            css::value::tokens::components(value, ' ').first()?,
+            thickness,
+          )
+        })
+        .unwrap_or(0.)
+        .max(0.)
+    };
+    let color = |prop| {
+      style
+        .get(prop)
+        .and_then(css::value::color::color)
+        .map_or(Color::TRANSPARENT, |(ink, alpha)| {
+          crate::css::value::color::rgba((ink, alpha))
+        })
+    };
+    let border = if style
+      .get(Prop::BORDER_TOP_STYLE)
+      .is_some_and(|kind| !matches!(kind, "none" | "hidden"))
+    {
+      length(Prop::BORDER_TOP_WIDTH)
+    } else {
+      0.
+    };
+    Part {
+      fill: color(Prop::BACKGROUND_COLOR),
+      radius: length(Prop::BORDER_TOP_LEFT_RADIUS),
+      border,
+      edge: color(Prop::BORDER_TOP_COLOR),
+      clip: match style.get(Prop::BACKGROUND_CLIP) {
+        Some("padding-box") => border,
+        Some("content-box") => border + length(Prop::PADDING_TOP),
+        _ => 0.,
+      },
     }
+  }
 
-    fn paint(&self, bounds: Rect<Pixels>, window: &mut Window) {
-        let radius = self
-            .radius
-            .min(f32::from(bounds.size.width.min(bounds.size.height)) / 2.);
-        window.draw_box(
-            bounds.inset(px(self.clip)),
-            Corners::all(px((radius - self.clip).max(0.))),
-            self.fill,
-            Default::default(),
-        );
-        if self.border > 0. && !self.edge.is_transparent() {
-            window.draw_box(
-                bounds,
-                Corners::all(px(radius)),
-                Color::TRANSPARENT,
-                renderer::Border {
-                    widths: Edges::all(px(self.border)),
-                    color: self.edge,
-                    style: Default::default(),
-                    sides: 0,
-                },
-            );
-        }
+  fn paint(&self, bounds: Rect<Pixels>, window: &mut Window) {
+    let radius = self
+      .radius
+      .min(f32::from(bounds.size.width.min(bounds.size.height)) / 2.);
+    window.draw_box(
+      bounds.inset(px(self.clip)),
+      Corners::all(px((radius - self.clip).max(0.))),
+      self.fill,
+      Default::default(),
+    );
+    if self.border > 0. && !self.edge.is_transparent() {
+      window.draw_box(
+        bounds,
+        Corners::all(px(radius)),
+        Color::TRANSPARENT,
+        renderer::Border {
+          widths: Edges::all(px(self.border)),
+          color: self.edge,
+          style: Default::default(),
+          sides: 0,
+        },
+      );
     }
+  }
 }
 
 pub(crate) struct Look {
-    dark: bool,
-    thin: bool,
-    colors: Option<[Color; 2]>,
-    custom: Option<([f32; 2], [Option<Part>; 5])>,
-    pub(crate) forced: [bool; 2],
-    // The box keeps room for a bar at its right, also without one.
-    pub(crate) gutter: bool,
+  dark: bool,
+  thin: bool,
+  colors: Option<[Color; 2]>,
+  custom: Option<([f32; 2], [Option<Part>; 5])>,
+  pub(crate) forced: [bool; 2],
+  // The box keeps room for a bar at its right, also without one.
+  pub(crate) gutter: bool,
 }
 
 impl Look {
-    pub(crate) fn new(
-        style: &Style,
-        parts: Option<&[Option<Style>; 5]>,
-        units: &css::value::units::Lengths,
-        backdrop: Option<u32>,
-    ) -> Option<Self> {
-        let width = style.get(Prop::SCROLLBAR_WIDTH).unwrap_or("auto");
-        if width == "none" {
-            return None;
-        }
-        let scheme = style.get(Prop::COLOR_SCHEME).unwrap_or("");
-        let system = || crate::native::theme_state() & 1 != 0;
-        let mut look = Look {
-            dark: match (scheme.contains("dark"), scheme.contains("light")) {
-                (true, false) => true,
-                (false, true) => false,
-                (true, true) => system(),
-                _ => backdrop.map_or_else(system, |ink| {
-                    let [r, g, b] = [16, 8, 0].map(|shift| (ink >> shift) & 255);
-                    r.max(g).max(b) + r.min(g).min(b) <= 255
-                }),
-            },
-            thin: width == "thin",
-            colors: style.get(Prop::SCROLLBAR_COLOR).and_then(|value| {
-                let parts = css::value::tokens::components(value, ' ');
-                let [thumb, track] =
-                    [parts.first()?, parts.get(1)?].map(|value| css::value::color::color(value));
-                Some([thumb?, track?].map(crate::css::value::color::rgba))
-            }),
-            custom: None,
-            forced: [
-                style
-                    .get(Prop::OVERFLOW_X)
-                    .is_some_and(|value| value == "scroll"),
-                style
-                    .get(Prop::OVERFLOW_Y)
-                    .is_some_and(|value| value == "scroll"),
-            ],
-            gutter: (style.get(Prop::SCROLLBAR_GUTTER))
-                .is_some_and(|value| value.starts_with("stable"))
-                && (style.get(Prop::OVERFLOW_Y))
-                    .is_some_and(|value| matches!(value, "auto" | "scroll" | "hidden")),
-        };
-        if let Some(parts) = parts
-            && let Some(bar) = &parts[0]
-            && width == "auto"
-            && look.colors.is_none()
-        {
-            if bar.get(Prop::DISPLAY).is_some_and(|value| value == "none") {
-                return None;
-            }
-            let size = [Prop::HEIGHT, Prop::WIDTH].map(|name| {
-                bar.get(name)
-                    .and_then(|value| units.resolve(value, 0.))
-                    .map_or(15., |value| value.max(0.))
-            });
-            let thickness = size[0].max(size[1]);
-            look.custom = Some((
-                size,
-                parts
-                    .each_ref()
-                    .map(|part| part.as_ref().map(|part| Part::new(part, units, thickness))),
-            ));
-        }
-        Some(look)
+  pub(crate) fn new(
+    style: &Style,
+    parts: Option<&[Option<Style>; 5]>,
+    units: &css::value::units::Lengths,
+    backdrop: Option<u32>,
+  ) -> Option<Self> {
+    let width = style.get(Prop::SCROLLBAR_WIDTH).unwrap_or("auto");
+    if width == "none" {
+      return None;
     }
+    let scheme = style.get(Prop::COLOR_SCHEME).unwrap_or("");
+    let system = || crate::native::theme_state() & 1 != 0;
+    let mut look = Look {
+      dark: match (scheme.contains("dark"), scheme.contains("light")) {
+        (true, false) => true,
+        (false, true) => false,
+        (true, true) => system(),
+        _ => backdrop.map_or_else(system, |ink| {
+          let [r, g, b] = [16, 8, 0].map(|shift| (ink >> shift) & 255);
+          r.max(g).max(b) + r.min(g).min(b) <= 255
+        }),
+      },
+      thin: width == "thin",
+      colors: style.get(Prop::SCROLLBAR_COLOR).and_then(|value| {
+        let parts = css::value::tokens::components(value, ' ');
+        let [thumb, track] =
+          [parts.first()?, parts.get(1)?].map(|value| css::value::color::color(value));
+        Some([thumb?, track?].map(crate::css::value::color::rgba))
+      }),
+      custom: None,
+      forced: [
+        style
+          .get(Prop::OVERFLOW_X)
+          .is_some_and(|value| value == "scroll"),
+        style
+          .get(Prop::OVERFLOW_Y)
+          .is_some_and(|value| value == "scroll"),
+      ],
+      gutter: (style.get(Prop::SCROLLBAR_GUTTER)).is_some_and(|value| value.starts_with("stable"))
+        && (style.get(Prop::OVERFLOW_Y))
+          .is_some_and(|value| matches!(value, "auto" | "scroll" | "hidden")),
+    };
+    if let Some(parts) = parts
+      && let Some(bar) = &parts[0]
+      && width == "auto"
+      && look.colors.is_none()
+    {
+      if bar.get(Prop::DISPLAY).is_some_and(|value| value == "none") {
+        return None;
+      }
+      let size = [Prop::HEIGHT, Prop::WIDTH].map(|name| {
+        bar
+          .get(name)
+          .and_then(|value| units.resolve(value, 0.))
+          .map_or(15., |value| value.max(0.))
+      });
+      let thickness = size[0].max(size[1]);
+      look.custom = Some((
+        size,
+        parts
+          .each_ref()
+          .map(|part| part.as_ref().map(|part| Part::new(part, units, thickness))),
+      ));
+    }
+    Some(look)
+  }
 
-    pub(crate) fn shown(&self, axes: [bool; 2], handle: &ScrollRef) -> [bool; 2] {
-        let (max, needed) = (handle.extent(), handle.bars());
-        let max = [max.x, max.y];
-        [0, 1].map(|axis| {
-            axes[axis]
-                && match &self.custom {
-                    Some((size, _)) => size[axis] > 0. && (self.forced[axis] || needed[axis]),
-                    None => max[axis] > px(0.5),
-                }
-        })
-    }
-
-    // Finds the bars that the content needs after a layout with bars of this room.
-    fn need(&self, axes: [bool; 2], handle: &ScrollRef, room: [f32; 2], first: bool) {
-        if self.custom.is_none() {
-            return;
+  pub(crate) fn shown(&self, axes: [bool; 2], handle: &ScrollRef) -> [bool; 2] {
+    let (max, needed) = (handle.extent(), handle.bars());
+    let max = [max.x, max.y];
+    [0, 1].map(|axis| {
+      axes[axis]
+        && match &self.custom {
+          Some((size, _)) => size[axis] > 0. && (self.forced[axis] || needed[axis]),
+          None => max[axis] > px(0.5),
         }
-        let max = handle.extent();
-        let max = [max.x, max.y].map(f32::from);
-        let mut needed = max.map(|max| max > 0.5);
-        // Like in Chrome, two bars that are there only because of each other go.
-        let [bottom, right] = room;
-        if needed == [true; 2]
-            && axes == [true; 2]
-            && self.forced == [false; 2]
-            && !self.gutter
-            && max[0] <= right + 0.5
-            && max[1] <= bottom + 0.5
-        {
-            needed = [false; 2];
-        }
-        handle.set_bars(needed, first);
-    }
+    })
+  }
 
-    pub(crate) fn space(&self, shown: [bool; 2]) -> [f32; 2] {
-        self.custom.as_ref().map_or([0.; 2], |(size, _)| {
-            let room = [shown[0], shown[1] || self.gutter];
-            [0, 1].map(|axis| if room[axis] { size[axis] } else { 0. })
-        })
+  // Finds the bars that the content needs after a layout with bars of this room.
+  fn need(&self, axes: [bool; 2], handle: &ScrollRef, room: [f32; 2], first: bool) {
+    if self.custom.is_none() {
+      return;
     }
+    let max = handle.extent();
+    let max = [max.x, max.y].map(f32::from);
+    let mut needed = max.map(|max| max > 0.5);
+    // Like in Chrome, two bars that are there only because of each other go.
+    let [bottom, right] = room;
+    if needed == [true; 2]
+      && axes == [true; 2]
+      && self.forced == [false; 2]
+      && !self.gutter
+      && max[0] <= right + 0.5
+      && max[1] <= bottom + 0.5
+    {
+      needed = [false; 2];
+    }
+    handle.set_bars(needed, first);
+  }
+
+  pub(crate) fn space(&self, shown: [bool; 2]) -> [f32; 2] {
+    self.custom.as_ref().map_or([0.; 2], |(size, _)| {
+      let room = [shown[0], shown[1] || self.gutter];
+      [0, 1].map(|axis| if room[axis] { size[axis] } else { 0. })
+    })
+  }
 }
 
 // The room that the bars of a box, and its gutters, take at its top, right, bottom and left sides.
 pub(crate) fn room(
-    style: &Style,
-    extras: &crate::style::Extras,
-    units: &css::value::units::Lengths,
-    handle: &ScrollRef,
-    gutters: bool,
+  style: &Style,
+  extras: &crate::style::Extras,
+  units: &css::value::units::Lengths,
+  handle: &ScrollRef,
+  gutters: bool,
 ) -> [f32; 4] {
-    let Some(mut look) = Look::new(style, extras.scrollbars.as_deref(), units, None) else {
-        return [0.; 4];
-    };
-    let scrolls = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
-        .map(|prop| (style.get(prop)).is_some_and(|value| matches!(value, "auto" | "scroll")));
-    look.gutter &= gutters;
-    let [bottom, right] = look.space(look.shown(scrolls, handle));
-    let both = gutters
-        && style
-            .get(Prop::SCROLLBAR_GUTTER)
-            .is_some_and(|value| value.contains("both-edges"));
-    [0., right, bottom, if both { right } else { 0. }]
+  let Some(mut look) = Look::new(style, extras.scrollbars.as_deref(), units, None) else {
+    return [0.; 4];
+  };
+  let scrolls = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+    .map(|prop| (style.get(prop)).is_some_and(|value| matches!(value, "auto" | "scroll")));
+  look.gutter &= gutters;
+  let [bottom, right] = look.space(look.shown(scrolls, handle));
+  let both = gutters
+    && style
+      .get(Prop::SCROLLBAR_GUTTER)
+      .is_some_and(|value| value.contains("both-edges"));
+  [0., right, bottom, if both { right } else { 0. }]
 }
 
 // What the pointer does to the bars. A drag keeps its bar until the button goes up, wherever the pointer is.
 #[derive(Clone, Copy, Default, PartialEq)]
 enum Pointer {
-    #[default]
-    Away,
-    // Over the bar of an axis, and whether over its thumb.
-    Over(usize, bool),
-    // Holds the thumb of an axis, this far from the start of the thumb.
-    Drag(usize, f32),
+  #[default]
+  Away,
+  // Over the bar of an axis, and whether over its thumb.
+  Over(usize, bool),
+  // Holds the thumb of an axis, this far from the start of the thumb.
+  Drag(usize, f32),
 }
 
 impl Pointer {
-    fn over(bars: &[Option<Bar>; 2], position: Point<Pixels>, window: &Window) -> Self {
-        bars.iter()
-            .enumerate()
-            .find_map(|(axis, bar)| {
-                let bar = bar.as_ref().filter(|bar| bar.hitbox.hovered(window))?;
-                let position = along(position, axis);
-                Some(Self::Over(
-                    axis,
-                    position >= bar.thumb[0] && position < bar.thumb[0] + bar.thumb[1],
-                ))
-            })
-            .unwrap_or_default()
-    }
+  fn over(bars: &[Option<Bar>; 2], position: Point<Pixels>, window: &Window) -> Self {
+    bars
+      .iter()
+      .enumerate()
+      .find_map(|(axis, bar)| {
+        let bar = bar.as_ref().filter(|bar| bar.hitbox.hovered(window))?;
+        let position = along(position, axis);
+        Some(Self::Over(
+          axis,
+          position >= bar.thumb[0] && position < bar.thumb[0] + bar.thumb[1],
+        ))
+      })
+      .unwrap_or_default()
+  }
 }
 
 #[derive(Default)]
 pub(crate) struct State {
-    offset: Option<Point<Pixels>>,
-    active: Option<Instant>,
-    pointer: Pointer,
-    wake: Option<(Instant, Timer)>,
+  offset: Option<Point<Pixels>>,
+  active: Option<Instant>,
+  pointer: Pointer,
+  wake: Option<(Instant, Timer)>,
 }
 
 impl State {
-    /// Shows the bars of a quiet `Scrollbar`.
-    pub(crate) fn show(&mut self) {
-        self.active = Some(Instant::now());
-    }
+  /// Shows the bars of a quiet `Scrollbar`.
+  pub(crate) fn show(&mut self) {
+    self.active = Some(Instant::now());
+  }
 
-    pub(crate) fn visible(&self) -> bool {
-        self.pointer != Pointer::Away || self.active.is_some_and(|at| at.elapsed() < HOLD + FADE)
-    }
+  pub(crate) fn visible(&self) -> bool {
+    self.pointer != Pointer::Away || self.active.is_some_and(|at| at.elapsed() < HOLD + FADE)
+  }
 }
 
 pub(crate) struct Bar {
-    hitbox: Region,
-    zone: Rect<Pixels>,
-    track: [f32; 2],
-    thumb: [f32; 2],
-    view: f32,
-    // The scroll range of the axis: the lowest and the highest offset.
-    range: [f32; 2],
+  hitbox: Region,
+  zone: Rect<Pixels>,
+  track: [f32; 2],
+  thumb: [f32; 2],
+  view: f32,
+  // The scroll range of the axis: the lowest and the highest offset.
+  range: [f32; 2],
 }
 
 fn along(position: Point<Pixels>, axis: usize) -> f32 {
-    f32::from(if axis == 0 { position.x } else { position.y })
+  f32::from(if axis == 0 { position.x } else { position.y })
 }
 
 pub(crate) struct Scrollbar {
-    pub(crate) id: usize,
-    pub(crate) handle: ScrollRef,
-    pub(crate) look: Option<Look>,
-    pub(crate) axes: [bool; 2],
-    pub(crate) reserved: [f32; 2],
-    pub(crate) borders: [f32; 4],
-    pub(crate) origin: [f32; 2],
-    /// A new offset does not show the bars. A terminal scrolls with its output, and shows them itself.
-    pub(crate) quiet: bool,
+  pub(crate) id: usize,
+  pub(crate) handle: ScrollRef,
+  pub(crate) look: Option<Look>,
+  pub(crate) axes: [bool; 2],
+  pub(crate) reserved: [f32; 2],
+  pub(crate) borders: [f32; 4],
+  pub(crate) origin: [f32; 2],
+  /// A new offset does not show the bars. A terminal scrolls with its output, and shows them itself.
+  pub(crate) quiet: bool,
 }
 
 type Prepainted = Option<(Rc<RefCell<State>>, Rc<[Option<Bar>; 2]>)>;
@@ -314,457 +315,458 @@ type Prepainted = Option<(Rc<RefCell<State>>, Rc<[Option<Bar>; 2]>)>;
 // The bars, what they read of their scroll container (its bounds, range, offset and stretch), and whether the
 // last paint drew them: the paint after they fade draws the box without them.
 struct Bars(
-    Scrollbar,
-    RefCell<Prepainted>,
-    Cell<Option<Read>>,
-    Cell<bool>,
+  Scrollbar,
+  RefCell<Prepainted>,
+  Cell<Option<Read>>,
+  Cell<bool>,
 );
 
 type Read = (Rect<Pixels>, [Point<Pixels>; 4]);
 
 impl Bars {
-    fn read(&self) -> Read {
-        let handle = &self.0.handle;
-        let [low, high] = handle.range();
-        (
-            handle.bounds(),
-            [low, high, handle.offset(), handle.stretch()],
-        )
-    }
+  fn read(&self) -> Read {
+    let handle = &self.0.handle;
+    let [low, high] = handle.range();
+    (
+      handle.bounds(),
+      [low, high, handle.offset(), handle.stretch()],
+    )
+  }
 }
 
 impl renderer::Hooks for Bars {
-    fn volatile(&self) -> bool {
-        false
+  fn volatile(&self) -> bool {
+    false
+  }
+  // Bars that show draw again in each frame.
+  fn cached(&self) -> bool {
+    true
+  }
+  fn prepaint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+    inner(cx.window);
+    let bars = self.0.bars(cx.window);
+    // Custom bars always draw, and a terminal shows its bars in its paint, after this.
+    let custom = self.0.quiet
+      || self
+        .0
+        .look
+        .as_ref()
+        .is_some_and(|look| look.custom.is_some());
+    if self.3.get()
+      || bars
+        .as_ref()
+        .is_some_and(|(state, _)| custom || state.borrow().visible())
+    {
+      cx.window.unsettle();
     }
-    // Bars that show draw again in each frame.
-    fn cached(&self) -> bool {
-        true
+    *self.1.borrow_mut() = bars;
+    self.2.set(Some(self.read()));
+  }
+  fn kept(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+    self.prepaint(cx, inner);
+  }
+  // Hidden bars of a box at rest stay as they are, and a scroll around the box moves them with it.
+  fn skippable(&self) -> bool {
+    true
+  }
+  fn shifts(&self) -> bool {
+    true
+  }
+  fn skips_inside(&self) -> bool {
+    true
+  }
+  fn rests(&self) -> bool {
+    self
+      .0
+      .look
+      .as_ref()
+      .is_none_or(|look| look.custom.is_none())
+      && !self.0.quiet
+      && !self.3.get()
+      && (self.1.borrow().as_ref()).is_none_or(|(state, _)| !state.borrow().visible())
+      && self.2.get() == Some(self.read())
+  }
+  // The regions of the bars are among those that the box around them copies. The window drops a state that
+  // a pass doesn't read.
+  fn skip(&self, _: Rect<Pixels>, window: &mut Window) -> bool {
+    window.keyed::<Rc<RefCell<State>>>(("scrollbar", self.0.id).into());
+    self.rests()
+  }
+  // The scroll of an outer box moved the scroll container, and so its bars. Its own scroll moves only the box
+  // of the bars.
+  fn shift(&self, by: Point<Pixels>, _: Rect<Pixels>, window: &mut Window) -> bool {
+    window.keyed::<Rc<RefCell<State>>>(("scrollbar", self.0.id).into());
+    let now = self.read();
+    match self.2.get() {
+      Some((bounds, rest)) if (bounds + by, rest) == now => self.2.set(Some(now)),
+      _ => return false,
     }
-    fn prepaint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
-        inner(cx.window);
-        let bars = self.0.bars(cx.window);
-        // Custom bars always draw, and a terminal shows its bars in its paint, after this.
-        let custom = self.0.quiet
-            || self
-                .0
-                .look
-                .as_ref()
-                .is_some_and(|look| look.custom.is_some());
-        if self.3.get()
-            || bars
-                .as_ref()
-                .is_some_and(|(state, _)| custom || state.borrow().visible())
-        {
-            cx.window.unsettle();
-        }
-        *self.1.borrow_mut() = bars;
-        self.2.set(Some(self.read()));
+    if let Some((_, bars)) = &mut *self.1.borrow_mut() {
+      let along = [f32::from(by.x), f32::from(by.y)];
+      *bars = Rc::new([0, 1].map(|axis| {
+        let bar = bars[axis].as_ref()?;
+        let mut hitbox = bar.hitbox;
+        hitbox.bounds.origin += by;
+        Some(Bar {
+          hitbox,
+          zone: bar.zone + by,
+          track: [bar.track[0] + along[axis], bar.track[1]],
+          thumb: [bar.thumb[0] + along[axis], bar.thumb[1]],
+          view: bar.view,
+          range: bar.range,
+        })
+      }));
     }
-    fn kept(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
-        self.prepaint(cx, inner);
-    }
-    // Hidden bars of a box at rest stay as they are, and a scroll around the box moves them with it.
-    fn skippable(&self) -> bool {
-        true
-    }
-    fn shifts(&self) -> bool {
-        true
-    }
-    fn skips_inside(&self) -> bool {
-        true
-    }
-    fn rests(&self) -> bool {
-        self.0
-            .look
-            .as_ref()
-            .is_none_or(|look| look.custom.is_none())
-            && !self.0.quiet
-            && !self.3.get()
-            && (self.1.borrow().as_ref()).is_none_or(|(state, _)| !state.borrow().visible())
-            && self.2.get() == Some(self.read())
-    }
-    // The regions of the bars are among those that the box around them copies. The window drops a state that
-    // a pass doesn't read.
-    fn skip(&self, _: Rect<Pixels>, window: &mut Window) -> bool {
-        window.keyed::<Rc<RefCell<State>>>(("scrollbar", self.0.id).into());
-        self.rests()
-    }
-    // The scroll of an outer box moved the scroll container, and so its bars. Its own scroll moves only the box
-    // of the bars.
-    fn shift(&self, by: Point<Pixels>, _: Rect<Pixels>, window: &mut Window) -> bool {
-        window.keyed::<Rc<RefCell<State>>>(("scrollbar", self.0.id).into());
-        let now = self.read();
-        match self.2.get() {
-            Some((bounds, rest)) if (bounds + by, rest) == now => self.2.set(Some(now)),
-            _ => return false,
-        }
-        if let Some((_, bars)) = &mut *self.1.borrow_mut() {
-            let along = [f32::from(by.x), f32::from(by.y)];
-            *bars = Rc::new([0, 1].map(|axis| {
-                let bar = bars[axis].as_ref()?;
-                let mut hitbox = bar.hitbox;
-                hitbox.bounds.origin += by;
-                Some(Bar {
-                    hitbox,
-                    zone: bar.zone + by,
-                    track: [bar.track[0] + along[axis], bar.track[1]],
-                    thumb: [bar.thumb[0] + along[axis], bar.thumb[1]],
-                    view: bar.view,
-                    range: bar.range,
-                })
-            }));
-        }
-        true
-    }
-    fn skip_inside(&self, exact: Rect<Pixels>, window: &mut Window) {
-        self.skip(exact, window);
-    }
-    fn shift_inside(&self, by: Point<Pixels>, exact: Rect<Pixels>, window: &mut Window) {
-        self.shift(by, exact, window);
-    }
-    fn paint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
-        inner(cx.window);
-        let bars = self.1.borrow().clone();
-        self.3.set(
-            bars.as_ref()
-                .is_some_and(|(state, _)| state.borrow().visible()),
-        );
-        self.0.draw(bars, cx.window);
-    }
+    true
+  }
+  fn skip_inside(&self, exact: Rect<Pixels>, window: &mut Window) {
+    self.skip(exact, window);
+  }
+  fn shift_inside(&self, by: Point<Pixels>, exact: Rect<Pixels>, window: &mut Window) {
+    self.shift(by, exact, window);
+  }
+  fn paint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+    inner(cx.window);
+    let bars = self.1.borrow().clone();
+    self.3.set(
+      bars
+        .as_ref()
+        .is_some_and(|(state, _)| state.borrow().visible()),
+    );
+    self.0.draw(bars, cx.window);
+  }
 }
 
 impl From<Scrollbar> for renderer::Child {
-    fn from(bar: Scrollbar) -> Self {
-        let mut style = renderer::Style {
-            position: renderer::Position::Absolute,
-            ..Default::default()
-        };
-        style.inset.left = px(bar.origin[0]).into();
-        style.inset.top = px(bar.origin[1]).into();
-        style.size.width = px(0.).into();
-        style.size.height = px(0.).into();
-        let mut node = renderer::node().hooks(Bars(
-            bar,
-            RefCell::default(),
-            Cell::default(),
-            Cell::default(),
-        ));
-        *node.style() = style;
-        node.into()
-    }
+  fn from(bar: Scrollbar) -> Self {
+    let mut style = renderer::Style {
+      position: renderer::Position::Absolute,
+      ..Default::default()
+    };
+    style.inset.left = px(bar.origin[0]).into();
+    style.inset.top = px(bar.origin[1]).into();
+    style.size.width = px(0.).into();
+    style.size.height = px(0.).into();
+    let mut node = renderer::node().hooks(Bars(
+      bar,
+      RefCell::default(),
+      Cell::default(),
+      Cell::default(),
+    ));
+    *node.style() = style;
+    node.into()
+  }
 }
 
 impl Scrollbar {
-    fn bars(&self, window: &mut Window) -> Prepainted {
-        let look = self.look.as_ref()?;
-        let state = window
-            .keyed::<Rc<RefCell<State>>>(("scrollbar", self.id).into())
-            .clone();
-        let (bounds, [low, high], offset, stretch) = (
-            self.handle.bounds(),
-            self.handle.range(),
-            self.handle.offset(),
-            self.handle.stretch(),
-        );
-        {
-            let mut state = state.borrow_mut();
-            let drawn = offset + stretch;
-            if !self.quiet && state.offset.is_some_and(|old| old != drawn) {
-                state.active = Some(Instant::now());
-            }
-            state.offset = Some(drawn);
-        }
-        let max = high - low;
-        look.need(self.axes, &self.handle, self.reserved, !window.redrawing());
-        let shown = look.shown(self.axes, &self.handle);
-        let space = look.space(shown);
-        if space != self.reserved {
-            window.rebar();
-        }
-        if !shown.contains(&true) {
-            return None;
-        }
-        let [top, right, bottom, left] = self.borders;
-        let inner = [
-            f32::from(bounds.left()) + left,
-            f32::from(bounds.top()) + top,
-            f32::from(bounds.right()) - right,
-            f32::from(bounds.bottom()) - bottom,
-        ];
-        let thickness = [0, 1].map(|axis| match &look.custom {
-            Some((size, _)) => size[axis],
-            None => OVERLAY[usize::from(look.thin)][0],
-        });
-        let (max, high, offset, stretch) = (
-            [max.x, max.y].map(f32::from),
-            [high.x, high.y].map(f32::from),
-            [offset.x, offset.y].map(f32::from),
-            [stretch.x, stretch.y].map(f32::from),
-        );
-        let inset = if look.custom.is_some() { 0. } else { INSET };
-        let bars = [0, 1].map(|axis| {
-            if !shown[axis] {
-                return None;
-            }
-            let cross = 1 - axis;
-            let mut origin = [0.; 2];
-            let mut extent = [0.; 2];
-            origin[axis] = inner[axis];
-            extent[axis] =
-                inner[axis + 2] - inner[axis] - if shown[cross] { thickness[cross] } else { 0. };
-            origin[cross] = inner[cross + 2] - thickness[axis];
-            extent[cross] = thickness[axis];
-            let zone = Rect::new(
-                point(px(origin[0]), px(origin[1])),
-                size(px(extent[0]), px(extent[1])),
-            );
-            let track = [origin[axis] + inset, (extent[axis] - 2. * inset).max(0.)];
-            let view = inner[axis + 2] - inner[axis] - space[cross];
-            let mut thumb = [track[0], 0.];
-            if max[axis] > 0. {
-                let shortest = if look.custom.is_some() {
-                    thickness[axis]
-                } else {
-                    SHORTEST
-                };
-                thumb[1] = (track[1] * view / (view + max[axis]))
-                    .max(shortest)
-                    .min(track[1]);
-                thumb[0] +=
-                    (track[1] - thumb[1]) * ((high[axis] - offset[axis]) / max[axis]).clamp(0., 1.);
-                if look.custom.is_none() && stretch[axis] != 0. {
-                    let end = thumb[0] + thumb[1];
-                    thumb[1] = (thumb[1] - stretch[axis].abs()).max(shortest.min(thumb[1]));
-                    if stretch[axis] < 0. {
-                        thumb[0] = end - thumb[1];
-                    }
-                }
-            }
-            Some(Bar {
-                hitbox: window.add_region(zone, Hit::Shield),
-                zone,
-                track,
-                thumb,
-                view,
-                range: [high[axis] - max[axis], high[axis]],
-            })
-        });
-        Some((state, Rc::new(bars)))
+  fn bars(&self, window: &mut Window) -> Prepainted {
+    let look = self.look.as_ref()?;
+    let state = window
+      .keyed::<Rc<RefCell<State>>>(("scrollbar", self.id).into())
+      .clone();
+    let (bounds, [low, high], offset, stretch) = (
+      self.handle.bounds(),
+      self.handle.range(),
+      self.handle.offset(),
+      self.handle.stretch(),
+    );
+    {
+      let mut state = state.borrow_mut();
+      let drawn = offset + stretch;
+      if !self.quiet && state.offset.is_some_and(|old| old != drawn) {
+        state.active = Some(Instant::now());
+      }
+      state.offset = Some(drawn);
     }
-    fn draw(&self, prepainted: Prepainted, window: &mut Window) {
-        let (Some(look), Some((state, bars))) = (&self.look, prepainted) else {
-            return;
-        };
-        let now = Instant::now();
-        let mut current = state.borrow_mut();
-        let alpha = if look.custom.is_some() || current.pointer != Pointer::Away {
-            1.
-        } else if let Some(at) = current.active {
-            let elapsed = now - at;
-            if elapsed < HOLD {
-                let due = at + HOLD;
-                if current.wake.as_ref().is_none_or(|(at, _)| *at <= now) {
-                    let task = window.timer(due - now, |window, _| window.refresh());
-                    current.wake = Some((due, task));
-                }
-                1.
-            } else if elapsed < HOLD + FADE {
-                window.request_animation_frame();
-                1. - (elapsed - HOLD).as_secs_f32() / FADE.as_secs_f32()
-            } else {
-                0.
-            }
+    let max = high - low;
+    look.need(self.axes, &self.handle, self.reserved, !window.redrawing());
+    let shown = look.shown(self.axes, &self.handle);
+    let space = look.space(shown);
+    if space != self.reserved {
+      window.rebar();
+    }
+    if !shown.contains(&true) {
+      return None;
+    }
+    let [top, right, bottom, left] = self.borders;
+    let inner = [
+      f32::from(bounds.left()) + left,
+      f32::from(bounds.top()) + top,
+      f32::from(bounds.right()) - right,
+      f32::from(bounds.bottom()) - bottom,
+    ];
+    let thickness = [0, 1].map(|axis| match &look.custom {
+      Some((size, _)) => size[axis],
+      None => OVERLAY[usize::from(look.thin)][0],
+    });
+    let (max, high, offset, stretch) = (
+      [max.x, max.y].map(f32::from),
+      [high.x, high.y].map(f32::from),
+      [offset.x, offset.y].map(f32::from),
+      [stretch.x, stretch.y].map(f32::from),
+    );
+    let inset = if look.custom.is_some() { 0. } else { INSET };
+    let bars = [0, 1].map(|axis| {
+      if !shown[axis] {
+        return None;
+      }
+      let cross = 1 - axis;
+      let mut origin = [0.; 2];
+      let mut extent = [0.; 2];
+      origin[axis] = inner[axis];
+      extent[axis] =
+        inner[axis + 2] - inner[axis] - if shown[cross] { thickness[cross] } else { 0. };
+      origin[cross] = inner[cross + 2] - thickness[axis];
+      extent[cross] = thickness[axis];
+      let zone = Rect::new(
+        point(px(origin[0]), px(origin[1])),
+        size(px(extent[0]), px(extent[1])),
+      );
+      let track = [origin[axis] + inset, (extent[axis] - 2. * inset).max(0.)];
+      let view = inner[axis + 2] - inner[axis] - space[cross];
+      let mut thumb = [track[0], 0.];
+      if max[axis] > 0. {
+        let shortest = if look.custom.is_some() {
+          thickness[axis]
         } else {
-            0.
+          SHORTEST
         };
-        if look.custom.is_some() || alpha > 0. {
-            window.paint_volatile();
+        thumb[1] = (track[1] * view / (view + max[axis]))
+          .max(shortest)
+          .min(track[1]);
+        thumb[0] += (track[1] - thumb[1]) * ((high[axis] - offset[axis]) / max[axis]).clamp(0., 1.);
+        if look.custom.is_none() && stretch[axis] != 0. {
+          let end = thumb[0] + thumb[1];
+          thumb[1] = (thumb[1] - stretch[axis].abs()).max(shortest.min(thumb[1]));
+          if stretch[axis] < 0. {
+            thumb[0] = end - thumb[1];
+          }
         }
-        let [bar_width, idle, wide] = OVERLAY[usize::from(look.thin)];
-        let hairline = px(1. / window.scale_factor());
-        let (knob, knob_edge, track, track_edge) = if look.dark {
-            (0xffffff80, 0x00000033, 0xc9c9c926, 0xe6e6e633)
+      }
+      Some(Bar {
+        hitbox: window.add_region(zone, Hit::Shield),
+        zone,
+        track,
+        thumb,
+        view,
+        range: [high[axis] - max[axis], high[axis]],
+      })
+    });
+    Some((state, Rc::new(bars)))
+  }
+  fn draw(&self, prepainted: Prepainted, window: &mut Window) {
+    let (Some(look), Some((state, bars))) = (&self.look, prepainted) else {
+      return;
+    };
+    let now = Instant::now();
+    let mut current = state.borrow_mut();
+    let alpha = if look.custom.is_some() || current.pointer != Pointer::Away {
+      1.
+    } else if let Some(at) = current.active {
+      let elapsed = now - at;
+      if elapsed < HOLD {
+        let due = at + HOLD;
+        if current.wake.as_ref().is_none_or(|(at, _)| *at <= now) {
+          let task = window.timer(due - now, |window, _| window.refresh());
+          current.wake = Some((due, task));
+        }
+        1.
+      } else if elapsed < HOLD + FADE {
+        window.request_animation_frame();
+        1. - (elapsed - HOLD).as_secs_f32() / FADE.as_secs_f32()
+      } else {
+        0.
+      }
+    } else {
+      0.
+    };
+    if look.custom.is_some() || alpha > 0. {
+      window.paint_volatile();
+    }
+    let [bar_width, idle, wide] = OVERLAY[usize::from(look.thin)];
+    let hairline = px(1. / window.scale_factor());
+    let (knob, knob_edge, track, track_edge) = if look.dark {
+      (0xffffff80, 0x00000033, 0xc9c9c926, 0xe6e6e633)
+    } else {
+      (0x00000080, 0xffffff26, 0xfafafabf, 0xdcdcdcc7)
+    };
+    for (axis, bar) in bars.iter().enumerate() {
+      let Some(bar) = bar else { continue };
+      let active =
+        matches!(current.pointer, Pointer::Over(on, _) | Pointer::Drag(on, _) if on == axis);
+      let span = |start: f32, length: f32, cross: [f32; 2]| {
+        let mut bounds = bar.zone;
+        if axis == 0 {
+          bounds.origin = point(px(start), bounds.origin.y + px(cross[0]));
+          bounds.size = size(px(length), px(cross[1]));
         } else {
-            (0x00000080, 0xffffff26, 0xfafafabf, 0xdcdcdcc7)
+          bounds.origin = point(bounds.origin.x + px(cross[0]), px(start));
+          bounds.size = size(px(cross[1]), px(length));
+        }
+        bounds
+      };
+      if let Some((size, parts)) = &look.custom {
+        for part in parts[..2].iter().flatten() {
+          part.paint(bar.zone, window);
+        }
+        let thumb = if active && current.pointer != Pointer::Over(axis, false) {
+          parts[4].or(parts[2])
+        } else {
+          parts[2]
         };
-        for (axis, bar) in bars.iter().enumerate() {
-            let Some(bar) = bar else { continue };
-            let active = matches!(current.pointer, Pointer::Over(on, _) | Pointer::Drag(on, _) if on == axis);
-            let span = |start: f32, length: f32, cross: [f32; 2]| {
-                let mut bounds = bar.zone;
+        if let Some(thumb) = thumb
+          && bar.thumb[1] > 0.
+        {
+          thumb.paint(span(bar.thumb[0], bar.thumb[1], [0., size[axis]]), window);
+        }
+        continue;
+      }
+      if alpha <= 0. {
+        continue;
+      }
+      let width = if active { wide } else { idle };
+      let cross = [bar_width - INSET - width, width];
+      let (thumb_color, track_color) = look
+        .colors
+        .map_or((Color::hex(knob), Color::hex(track)), |[thumb, track]| {
+          (thumb, track)
+        });
+      let edge = |color: u32| {
+        if look.colors.is_some() {
+          Color::TRANSPARENT
+        } else {
+          Color::hex(color).fade(alpha)
+        }
+      };
+      if active {
+        window.draw_box(
+          span(bar.track[0], bar.track[1], cross),
+          Corners::all(px(width / 2.)),
+          track_color.fade(alpha),
+          renderer::Border {
+            widths: Edges::all(hairline),
+            color: edge(track_edge),
+            style: Default::default(),
+            sides: 0,
+          },
+        );
+      }
+      window.draw_box(
+        span(bar.thumb[0], bar.thumb[1], cross),
+        Corners::all(px(width / 2.)),
+        thumb_color.fade(alpha),
+        renderer::Border {
+          widths: Edges::all(hairline),
+          color: edge(knob_edge),
+          style: Default::default(),
+          sides: 0,
+        },
+      );
+    }
+    if let Some((_, parts)) = &look.custom
+      && let (Some(corner), [Some(x), Some(y)]) = (parts[3], &*bars)
+    {
+      corner.paint(
+        Rect::between(
+          point(y.zone.origin.x, x.zone.origin.y),
+          point(y.zone.right(), x.zone.bottom()),
+        ),
+        window,
+      );
+    }
+    drop(current);
+    let handle = self.handle.clone();
+    window.on_capture({
+      let (state, bars, handle) = (state.clone(), bars.clone(), handle.clone());
+      move |event, window, _| {
+        let mut state = state.borrow_mut();
+        match *event {
+          Event::PointerMove { at: position, .. } => {
+            if let Pointer::Drag(axis, grab) = state.pointer {
+              if let Some(bar) = &bars[axis] {
+                let travel = bar.track[1] - bar.thumb[1];
+                let ratio = if travel > 0. {
+                  ((along(position, axis) - grab - bar.track[0]) / travel).clamp(0., 1.)
+                } else {
+                  0.
+                };
+                let mut offset = handle.offset();
+                let to = px(bar.range[1] - ratio * (bar.range[1] - bar.range[0]));
                 if axis == 0 {
-                    bounds.origin = point(px(start), bounds.origin.y + px(cross[0]));
-                    bounds.size = size(px(length), px(cross[1]));
+                  offset.x = to;
                 } else {
-                    bounds.origin = point(bounds.origin.x + px(cross[0]), px(start));
-                    bounds.size = size(px(cross[1]), px(length));
+                  offset.y = to;
                 }
-                bounds
-            };
-            if let Some((size, parts)) = &look.custom {
-                for part in parts[..2].iter().flatten() {
-                    part.paint(bar.zone, window);
-                }
-                let thumb = if active && current.pointer != Pointer::Over(axis, false) {
-                    parts[4].or(parts[2])
-                } else {
-                    parts[2]
-                };
-                if let Some(thumb) = thumb
-                    && bar.thumb[1] > 0.
-                {
-                    thumb.paint(span(bar.thumb[0], bar.thumb[1], [0., size[axis]]), window);
-                }
-                continue;
+                handle.set_offset(offset);
+                handle.grab();
+                window.refresh();
+              }
+              return;
             }
-            if alpha <= 0. {
-                continue;
+            let pointer = Pointer::over(&bars, position, window);
+            if pointer != state.pointer {
+              if pointer == Pointer::Away {
+                state.active = Some(Instant::now());
+              }
+              state.pointer = pointer;
+              window.refresh();
             }
-            let width = if active { wide } else { idle };
-            let cross = [bar_width - INSET - width, width];
-            let (thumb_color, track_color) = look
-                .colors
-                .map_or((Color::hex(knob), Color::hex(track)), |[thumb, track]| {
-                    (thumb, track)
-                });
-            let edge = |color: u32| {
-                if look.colors.is_some() {
-                    Color::TRANSPARENT
-                } else {
-                    Color::hex(color).fade(alpha)
-                }
-            };
-            if active {
-                window.draw_box(
-                    span(bar.track[0], bar.track[1], cross),
-                    Corners::all(px(width / 2.)),
-                    track_color.fade(alpha),
-                    renderer::Border {
-                        widths: Edges::all(hairline),
-                        color: edge(track_edge),
-                        style: Default::default(),
-                        sides: 0,
-                    },
-                );
-            }
-            window.draw_box(
-                span(bar.thumb[0], bar.thumb[1], cross),
-                Corners::all(px(width / 2.)),
-                thumb_color.fade(alpha),
-                renderer::Border {
-                    widths: Edges::all(hairline),
-                    color: edge(knob_edge),
-                    style: Default::default(),
-                    sides: 0,
-                },
-            );
-        }
-        if let Some((_, parts)) = &look.custom
-            && let (Some(corner), [Some(x), Some(y)]) = (parts[3], &*bars)
-        {
-            corner.paint(
-                Rect::between(
-                    point(y.zone.origin.x, x.zone.origin.y),
-                    point(y.zone.right(), x.zone.bottom()),
-                ),
-                window,
-            );
-        }
-        drop(current);
-        let handle = self.handle.clone();
-        window.on_capture({
-            let (state, bars, handle) = (state.clone(), bars.clone(), handle.clone());
-            move |event, window, _| {
-                let mut state = state.borrow_mut();
-                match *event {
-                    Event::PointerMove { at: position, .. } => {
-                        if let Pointer::Drag(axis, grab) = state.pointer {
-                            if let Some(bar) = &bars[axis] {
-                                let travel = bar.track[1] - bar.thumb[1];
-                                let ratio = if travel > 0. {
-                                    ((along(position, axis) - grab - bar.track[0]) / travel)
-                                        .clamp(0., 1.)
-                                } else {
-                                    0.
-                                };
-                                let mut offset = handle.offset();
-                                let to = px(bar.range[1] - ratio * (bar.range[1] - bar.range[0]));
-                                if axis == 0 {
-                                    offset.x = to;
-                                } else {
-                                    offset.y = to;
-                                }
-                                handle.set_offset(offset);
-                                handle.grab();
-                                window.refresh();
-                            }
-                            return;
-                        }
-                        let pointer = Pointer::over(&bars, position, window);
-                        if pointer != state.pointer {
-                            if pointer == Pointer::Away {
-                                state.active = Some(Instant::now());
-                            }
-                            state.pointer = pointer;
-                            window.refresh();
-                        }
-                    }
-                    Event::PointerLeave { .. } if matches!(state.pointer, Pointer::Over(..)) => {
-                        state.pointer = Pointer::Away;
-                        state.active = Some(Instant::now());
-                        window.refresh();
-                    }
-                    Event::PointerUp {
-                        at: position,
-                        button: Button::Left,
-                        ..
-                    } if matches!(state.pointer, Pointer::Drag(..)) => {
-                        // The pointer left no hover behind: it can be anywhere now, also outside the window.
-                        state.pointer = Pointer::over(&bars, position, window);
-                        state.active = Some(Instant::now());
-                        handle.settle(window);
-                        window.refresh();
-                    }
-                    _ => {}
-                }
-            }
-        });
-        window.on_bubble(move |event, window, cx| {
-            let Event::PointerDown {
-                at: position,
-                button: Button::Left,
-                ..
-            } = *event
-            else {
-                return;
-            };
-            let Pointer::Over(axis, on_thumb) = Pointer::over(&bars, position, window) else {
-                return;
-            };
-            let Some(bar) = &bars[axis] else {
-                return;
-            };
-            cx.stop_event();
-            let position = along(position, axis);
-            let mut state = state.borrow_mut();
+          }
+          Event::PointerLeave { .. } if matches!(state.pointer, Pointer::Over(..)) => {
+            state.pointer = Pointer::Away;
             state.active = Some(Instant::now());
-            if on_thumb {
-                state.pointer = Pointer::Drag(axis, position - bar.thumb[0]);
-            } else if bar.range[1] > bar.range[0] {
-                let step = (bar.view * 0.875).max(bar.view - 40.).max(1.);
-                let step = if position < bar.thumb[0] { step } else { -step };
-                let mut offset = handle.target();
-                let value = if axis == 0 {
-                    &mut offset.x
-                } else {
-                    &mut offset.y
-                };
-                *value = (*value + px(step)).clamp(px(bar.range[0]), px(bar.range[1]));
-                handle.animate_to(offset, false);
-                handle.settle(window);
-            }
             window.refresh();
-        });
-    }
+          }
+          Event::PointerUp {
+            at: position,
+            button: Button::Left,
+            ..
+          } if matches!(state.pointer, Pointer::Drag(..)) => {
+            // The pointer left no hover behind: it can be anywhere now, also outside the window.
+            state.pointer = Pointer::over(&bars, position, window);
+            state.active = Some(Instant::now());
+            handle.settle(window);
+            window.refresh();
+          }
+          _ => {}
+        }
+      }
+    });
+    window.on_bubble(move |event, window, cx| {
+      let Event::PointerDown {
+        at: position,
+        button: Button::Left,
+        ..
+      } = *event
+      else {
+        return;
+      };
+      let Pointer::Over(axis, on_thumb) = Pointer::over(&bars, position, window) else {
+        return;
+      };
+      let Some(bar) = &bars[axis] else {
+        return;
+      };
+      cx.stop_event();
+      let position = along(position, axis);
+      let mut state = state.borrow_mut();
+      state.active = Some(Instant::now());
+      if on_thumb {
+        state.pointer = Pointer::Drag(axis, position - bar.thumb[0]);
+      } else if bar.range[1] > bar.range[0] {
+        let step = (bar.view * 0.875).max(bar.view - 40.).max(1.);
+        let step = if position < bar.thumb[0] { step } else { -step };
+        let mut offset = handle.target();
+        let value = if axis == 0 {
+          &mut offset.x
+        } else {
+          &mut offset.y
+        };
+        *value = (*value + px(step)).clamp(px(bar.range[0]), px(bar.range[1]));
+        handle.animate_to(offset, false);
+        handle.settle(window);
+      }
+      window.refresh();
+    });
+  }
 }

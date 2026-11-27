@@ -3,8 +3,8 @@ use super::*;
 #[test]
 #[ignore = "requires the macOS window server"]
 fn pages_reach_no_local_files_through_webviews_and_no_devtools() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         // A guest attaches when its box is laid out, so frames must go on while the page waits.
         const attach = src => run(`new Promise(resolve => {
@@ -32,22 +32,22 @@ fn pages_reach_no_local_files_through_webviews_and_no_devtools() {
         const statuses = [await post({}), await post({ Origin: 'http://localhost:3000' }), await post({ Origin: 'null' })].join();
         if (statuses !== '200,403,403') fail('devtools answered ' + statuses);
         "#,
-        &[(
-            "page.html",
-            concat!(
-                "<body style='margin:0' data-file='",
-                env!("CARGO_MANIFEST_DIR"),
-                "/Cargo.toml'><p>page</p></body>"
-            ),
-        )],
-    );
+    &[(
+      "page.html",
+      concat!(
+        "<body style='margin:0' data-file='",
+        env!("CARGO_MANIFEST_DIR"),
+        "/Cargo.toml'><p>page</p></body>"
+      ),
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn webviews_report_one_event_for_a_navigation_inside_a_page() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const pending = run(`new Promise(resolve => {
             const view = document.createElement('webview');
@@ -65,32 +65,32 @@ fn webviews_report_one_event_for_a_navigation_inside_a_page() {
         while (count === undefined) await win.webContents.capturePage();
         if (count !== 1) fail('did-navigate-in-page fired ' + count + ' times');
         "#,
-        &[("page.html", "<body style='margin:0'><p>page</p></body>")],
-    );
+    &[("page.html", "<body style='margin:0'><p>page</p></body>")],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn closed_selects_draw_only_their_selected_option() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const boxes = await run("[...document.querySelectorAll('select')].map(s => { const r = s.getBoundingClientRect(); return [r.top, r.height].join(); }).join(' ')");
         if (new Set(boxes.split(' ')).size !== 1 || !boxes.endsWith(',19')) fail('select boxes: ' + boxes);
         "#,
-        &[(
-            "page.html",
-            "<body style='margin:0'><select><option>A<option selected>B</select>\n<select>\n  <option>A</option>\n  <option selected>B</option>\n</select>\n\
+    &[(
+      "page.html",
+      "<body style='margin:0'><select><option>A<option selected>B</select>\n<select>\n  <option>A</option>\n  <option selected>B</option>\n</select>\n\
              <select>\n text <optgroup label=G>\n<option>A</option>\n</optgroup>\n<hr>\n<option selected>B</option>\n</select></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn native_overlays_stack_in_one_order() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         const { WebContentsView, ffi } = __apps;
         const path = '/usr/lib/libobjc.A.dylib', lib = new ffi.DynamicLibrary(path);
         const send = (args, result) => new ffi.DynamicLibrary(path).getFunction('objc_msgSend', { arguments: ['ptr', 'ptr', ...args], return: result });
@@ -122,34 +122,34 @@ fn native_overlays_stack_in_one_order() {
         if (!overlay || !yes(get(overlay, 'layer'), sel('isGeometryFlipped'))) fail('the overlay layer must be flipped');
         if (glass) console.log('GLASS');
         "#,
-        &[(
-            "glass.html",
-            "<body style='margin:0;background:white'>\
+    &[(
+      "glass.html",
+      "<body style='margin:0;background:white'>\
              <div class=bg-glass style='position:absolute;left:20px;top:20px;width:120px;height:60px;border-radius:30px'></div></body>",
-        )],
-    );
-    let order: Vec<_> = text
-        .lines()
-        .find_map(|line| line.strip_prefix("ORDER "))
-        .unwrap_or_else(|| panic!("{text}"))
-        .split(' ')
-        .collect();
-    let expected: &[&str] = if text.contains("GLASS") {
-        &["NSGlassEffectView", "AppsOverlayView", "WKWebView"]
-    } else {
-        &["AppsOverlayView", "WKWebView"]
-    };
-    assert_eq!(
-        order, expected,
-        "glass, then promoted layers and the caret, then web views"
-    );
+    )],
+  );
+  let order: Vec<_> = text
+    .lines()
+    .find_map(|line| line.strip_prefix("ORDER "))
+    .unwrap_or_else(|| panic!("{text}"))
+    .split(' ')
+    .collect();
+  let expected: &[&str] = if text.contains("GLASS") {
+    &["NSGlassEffectView", "AppsOverlayView", "WKWebView"]
+  } else {
+    &["AppsOverlayView", "WKWebView"]
+  };
+  assert_eq!(
+    order, expected,
+    "glass, then promoted layers and the caret, then web views"
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn main_filters_synthetic_keys_before_the_page() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('keys.html');
         const seen = [];
         win.webContents.on('before-input-event', (event, input) => {
@@ -164,21 +164,21 @@ fn main_filters_synthetic_keys_before_the_page() {
         if (seen.join() !== 'keyDown x false,keyUp x false,keyDown y true,keyUp y true') fail('main saw ' + seen.join());
         if (page !== 'keydown Y,keyup Y') fail('page saw ' + page);
         "#,
-        &[(
-            "keys.html",
-            "<body><script>globalThis.keys = [];\
+    &[(
+      "keys.html",
+      "<body><script>globalThis.keys = [];\
              for (const type of ['keydown', 'keyup']) addEventListener(type, event => keys.push(type + ' ' + event.key));\
              </script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn native_content_keeps_the_boxes_around_it() {
-    let text = run_hidden(
-        &format!(
-            r#"{STEPS}
+  let text = run_hidden(
+    &format!(
+      r#"{STEPS}
             await load('native.html');
             await run("f.focus(); c.getContext('2d').fillRect(0, 0, 40, 20)");
             await win.webContents.capturePage();
@@ -207,10 +207,10 @@ fn native_content_keeps_the_boxes_around_it() {
             await step('content', () => run("document.getElementById('a').value = 'a\\nb\\nc\\nd'"));
             console.log('GROWN ' + short + ' ' + await run("document.getElementById('a').getBoundingClientRect().height"));
             "#
-        ),
-        &[(
-            "native.html",
-            "<body id=body style='margin:0'><div id=outer><div id=inner>\
+    ),
+    &[(
+      "native.html",
+      "<body id=body style='margin:0'><div id=outer><div id=inner>\
              <canvas id=c width=40 height=20 style='display:block'></canvas>\
              <input id=f value='     ' style='display:block;margin:10px 0 0;padding:0;border:0;width:200px;height:40px;font:20px/40px sans-serif;outline:none'>\
              <button id=b style='display:block;margin-top:10px;width:60px;height:30px'>Go</button>\
@@ -218,62 +218,63 @@ fn native_content_keeps_the_boxes_around_it() {
              <textarea id=a rows=1 style='field-sizing:content;font:10px/10px sans-serif'>a</textarea>\
              </div></div><p id=other>x</p>\
              <script>globalThis.c = document.getElementById('c'); globalThis.f = document.getElementById('f')</script></body>",
-        )],
-    );
-    let line = |name: &str| {
-        text.lines()
-            .find_map(|line| line.strip_prefix(name))
-            .unwrap_or_else(|| panic!("{text}"))
-            .trim()
-            .to_owned()
-    };
-    for step in ["canvas", "selection"] {
-        assert_eq!(built(&text, step), [""; 0], "{step} builds no box: {text}");
-    }
-    assert_eq!(line("CANVAS"), "0,255,0", "the new drawing shows: {text}");
-    let selection: Vec<_> = line("SELECTION").split(' ').map(str::to_owned).collect();
-    assert_ne!(selection[0], selection[1], "the selection shows");
-    let hover: Vec<_> = line("HOVER").split(' ').map(str::to_owned).collect();
-    assert_ne!(hover[0], hover[1], "the hovered button looks hovered");
-    let hovered = built(&text, "hover");
+    )],
+  );
+  let line = |name: &str| {
+    text
+      .lines()
+      .find_map(|line| line.strip_prefix(name))
+      .unwrap_or_else(|| panic!("{text}"))
+      .trim()
+      .to_owned()
+  };
+  for step in ["canvas", "selection"] {
+    assert_eq!(built(&text, step), [""; 0], "{step} builds no box: {text}");
+  }
+  assert_eq!(line("CANVAS"), "0,255,0", "the new drawing shows: {text}");
+  let selection: Vec<_> = line("SELECTION").split(' ').map(str::to_owned).collect();
+  assert_ne!(selection[0], selection[1], "the selection shows");
+  let hover: Vec<_> = line("HOVER").split(' ').map(str::to_owned).collect();
+  assert_ne!(hover[0], hover[1], "the hovered button looks hovered");
+  let hovered = built(&text, "hover");
+  assert!(
+    hovered.contains(&"b") && !hovered.contains(&"other"),
+    "{hovered:?}"
+  );
+  for step in ["value", "typing"] {
+    let built = built(&text, step);
     assert!(
-        hovered.contains(&"b") && !hovered.contains(&"other"),
-        "{hovered:?}"
+      !built.is_empty() && built.iter().all(|id| *id == "f"),
+      "a new value builds only the field: {step} {built:?}"
     );
-    for step in ["value", "typing"] {
-        let built = built(&text, step);
-        assert!(
-            !built.is_empty() && built.iter().all(|id| *id == "f"),
-            "a new value builds only the field: {step} {built:?}"
-        );
-    }
-    assert!(line("SCROLL").parse::<f32>().unwrap() > 300., "{text}");
-    assert_eq!(line("TYPED"), "Wxy");
-    assert!(built(&text, "size").contains(&"c"), "{text}");
-    assert_eq!(
-        built(&text, "cell"),
-        ["g"],
-        "a field in a grid patches in place"
-    );
-    let content = built(&text, "content");
-    assert!(
-        content.contains(&"a") && content.contains(&"inner"),
-        "a field sized by its content lays out again: {content:?}"
-    );
-    let grown: Vec<f32> = line("GROWN")
-        .split(' ')
-        .map(|height| height.parse().unwrap())
-        .collect();
-    assert!(grown[1] > grown[0] + 20., "{grown:?}");
-    assert_eq!(line("WIDTH"), "60");
+  }
+  assert!(line("SCROLL").parse::<f32>().unwrap() > 300., "{text}");
+  assert_eq!(line("TYPED"), "Wxy");
+  assert!(built(&text, "size").contains(&"c"), "{text}");
+  assert_eq!(
+    built(&text, "cell"),
+    ["g"],
+    "a field in a grid patches in place"
+  );
+  let content = built(&text, "content");
+  assert!(
+    content.contains(&"a") && content.contains(&"inner"),
+    "a field sized by its content lays out again: {content:?}"
+  );
+  let grown: Vec<f32> = line("GROWN")
+    .split(' ')
+    .map(|height| height.parse().unwrap())
+    .collect();
+  assert!(grown[1] > grown[0] + 20., "{grown:?}");
+  assert_eq!(line("WIDTH"), "60");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn keys_focus_and_fragments_scroll_like_chrome() {
-    run_hidden(
-        &format!(
-            r#"{INPUT}
+  run_hidden(
+    &format!(
+      r#"{INPUT}
         await load('scroll.html');
         await expect('autofocus', "document.activeElement.id", 'auto');
         await input({{ action: 'click', x: 200, y: 120 }});
@@ -293,22 +294,22 @@ fn keys_focus_and_fragments_scroll_like_chrome() {
         await frames(100);
         await expect('fragment link', "[location.hash, scrollY].join()", '#far,2000');
         "#
-        ),
-        &[(
-            "scroll.html",
-            "<body style='margin:0;height:4000px'><input id=auto autofocus style='position:absolute;top:20px'><a id=link href='#far' style='position:absolute;top:150px;font:20px Helvetica'>far</a>\
+    ),
+    &[(
+      "scroll.html",
+      "<body style='margin:0;height:4000px'><input id=auto autofocus style='position:absolute;top:20px'><a id=link href='#far' style='position:absolute;top:150px;font:20px Helvetica'>far</a>\
              <button id=near style='position:absolute;top:100px'>near</button><button id=far style='position:absolute;top:2000px;height:20px'>far</button>\
              <script>globalThis.$ = id => document.getElementById(id); globalThis.log = []; addEventListener('scrollend', () => log.push('scrollend'));</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn selection_modify_moves_by_words_sentences_and_layout_lines_like_chrome() {
-    run_hidden(
-        &format!(
-            r#"{INPUT}
+  run_hidden(
+    &format!(
+      r#"{INPUT}
         await load('modify.html');
         for (const [name, value] of [
             ['word', 'pa#0:5,pa#0:11,pa#0:12,pa#0:17,pa#0:20,pa#0:22'],
@@ -328,10 +329,10 @@ fn selection_modify_moves_by_words_sentences_and_layout_lines_like_chrome() {
             ['auto directions', 'ltr,rtl,rtl,ltr,rtl,ltr'],
         ]) await expect(name, `results[${{JSON.stringify(name)}}]`, value);
         "#
-        ),
-        &[(
-            "modify.html",
-            "<style>body { margin: 8px; font: 14px/1.3 Helvetica; } p, div { margin: 0 0 4px; } .w { width: 116px; font: 16px/20px Menlo; }</style>\
+    ),
+    &[(
+      "modify.html",
+      "<style>body { margin: 8px; font: 14px/1.3 Helvetica; } p, div { margin: 0 0 4px; } .w { width: 116px; font: 16px/20px Menlo; }</style>\
              <p id=pa>Hello world. This is a test! Another sentence here.</p><p id=pb>one <b>two <i>three</i></b> four<span>five</span> six</p>\
              <div id=pc class=w>aaaa bbbb cccc dddd eeee ffff gggg</div>\
              <div id=pd contenteditable><div>first line</div><div>second <b>bold</b> line</div><div><br></div><div>fourth</div></div>\
@@ -362,16 +363,16 @@ fn selection_modify_moves_by_words_sentences_and_layout_lines_like_chrome() {
              results['auto directions'] = auto.join();\
              const r = document.createRange(), row = (r.selectNodeContents($('ph')), r.getClientRects());\
              results['right to left rects'] = [+(row.length > 1), row[0].width > 60].join(); });</script>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn hover_and_capture_follow_the_pointer_like_chrome() {
-    run_hidden(
-        &format!(
-            r#"{INPUT}
+  run_hidden(
+    &format!(
+      r#"{INPUT}
         await load('hover.html');
         await input({{ action: 'move', x: 50, y: 15 }});
         await expect('hover', "document.querySelector('#list :hover').id", 'i0');
@@ -384,25 +385,25 @@ fn hover_and_capture_follow_the_pointer_like_chrome() {
         await expect('capture', "log.join()", 'pointerdown,gotpointercapture,pointermove,pointerup,lostpointercapture,click');
         await expect('caret at the nearest edge', "String((r => document.caretRangeFromPoint(r.left + r.width * 0.6, r.top + r.height / 2).startOffset)($('w').getBoundingClientRect()))", '2');
         "#
-        ),
-        &[(
-            "hover.html",
-            "<body style='margin:0;font:40px Helvetica'><div id=list style='height:100px;overflow:auto'></div><div id=cap style='width:100px;height:40px'></div><span id=w>WMW</span>\
+    ),
+    &[(
+      "hover.html",
+      "<body style='margin:0;font:40px Helvetica'><div id=list style='height:100px;overflow:auto'></div><div id=cap style='width:100px;height:40px'></div><span id=w>WMW</span>\
              <style>#list div{height:30px}</style><script>globalThis.$ = id => document.getElementById(id); globalThis.log = [];\
              for (let i = 0; i < 20; i++) $('list').append(Object.assign(document.createElement('div'), { id: 'i' + i }));\
              $('cap').style.position = 'absolute'; $('cap').style.top = '230px';\
              $('cap').addEventListener('pointerdown', e => $('cap').setPointerCapture(e.pointerId));\
              for (const type of ['pointerdown', 'gotpointercapture', 'pointermove', 'pointerup', 'lostpointercapture', 'click']) $('cap').addEventListener(type, e => { if (log.at(-1) !== type) log.push(type); });</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn pointer_capture_moves_the_hover_like_chrome() {
-    run_hidden(
-        &format!(
-            r#"{INPUT}
+  run_hidden(
+    &format!(
+      r#"{INPUT}
         await load('a.html');
         await input({{ action: 'press', x: 50, y: 20 }});
         await input({{ action: 'pressed_move', x: 50, y: 80 }});
@@ -411,24 +412,24 @@ fn pointer_capture_moves_the_hover_like_chrome() {
         await input({{ action: 'pressed_move', x: 50, y: 85 }});
         await expect('capture target hovered', "[hovered(), log.join()].join()", 'a,pointerover:a,gotpointercapture:a,mouseover:a,pointermove:a');
         "#
-        ),
-        &[(
-            "a.html",
-            "<body style='margin:0'><div id=a style='height:60px'>a</div><div id=b style='height:60px'>b</div>\
+    ),
+    &[(
+      "a.html",
+      "<body style='margin:0'><div id=a style='height:60px'>a</div><div id=b style='height:60px'>b</div>\
              <script>globalThis.$ = id => document.getElementById(id); globalThis.log = [];\
              globalThis.hovered = () => [...document.querySelectorAll('body > :hover')].map(e => e.id).join();\
              $('a').addEventListener('pointerdown', () => addEventListener('pointermove', e => $('a').setPointerCapture(e.pointerId), { once: true }));\
              for (const type of ['pointerover', 'gotpointercapture', 'mouseover', 'pointermove']) for (const id of ['a', 'b']) $(id).addEventListener(type, e => log.push(type + ':' + id));</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn hover_follows_a_transition_under_the_pointer_like_chrome() {
-    run_hidden(
-        &format!(
-            r#"{INPUT}
+  run_hidden(
+    &format!(
+      r#"{INPUT}
         await load('a.html');
         await input({{ action: 'move', x: 300, y: 20 }});
         await expect('hover', "hovered()", 'm');
@@ -436,22 +437,22 @@ fn hover_follows_a_transition_under_the_pointer_like_chrome() {
         await frames(700);
         await expect('hover after a transition', "hovered()", 'a');
         "#
-        ),
-        &[(
-            "a.html",
-            "<body style='margin:0'><div id=a style='height:60px'>a</div><div id=m></div>\
+    ),
+    &[(
+      "a.html",
+      "<body style='margin:0'><div id=a style='height:60px'>a</div><div id=m></div>\
              <style>#m{position:absolute;top:0;left:250px;width:100px;height:40px;transition:left 300ms}#m.away{left:500px}</style>\
              <script>globalThis.$ = id => document.getElementById(id);\
              globalThis.hovered = () => [...document.querySelectorAll('body > :hover')].map(e => e.id).join();</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn caret_past_a_line_end_takes_editable_text_of_that_line_like_chrome() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('a.html');
         const got = await run("(r => { const p = document.caretPositionFromPoint(r.left + 190, r.top + 36); return p.offsetNode.textContent + ':' + p.offset; })(document.getElementById('ed').getBoundingClientRect())");
         if (got !== ' x:2') fail('caret after a line end: ' + got);
@@ -461,40 +462,40 @@ fn caret_past_a_line_end_takes_editable_text_of_that_line_like_chrome() {
         const hang = await at('w', 59, 10);
         if (hang !== 'w:4') fail('caret after a wrapped line: ' + hang);
         "#,
-        &[(
-            "a.html",
-            "<body style='margin:0;font:14px/24px Helvetica'><div id=ed contenteditable style='width:200px;height:80px'>Compare <span contenteditable=false>The Long Fog</span> with <span contenteditable=false>Thaw</span> x</div>\
+    &[(
+      "a.html",
+      "<body style='margin:0;font:14px/24px Helvetica'><div id=ed contenteditable style='width:200px;height:80px'>Compare <span contenteditable=false>The Long Fog</span> with <span contenteditable=false>Thaw</span> x</div>\
              <div id=g><p id=g1 style='margin:0 0 30px'>one</p><p id=g2 style='margin:0'>two</p></div><div id=w style='width:60px'>aaaa bbbb</div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn scrollers_take_script_and_tab_focus_like_chrome() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('a.html');
         const focus = await run("[$('s').focus(), $('n').focus(), document.activeElement.id].join()");
         if (focus !== ',,s') fail('scroller focus: ' + focus);
         const tabs = await run("$('z').focus(), [1, 2, 3, 4].map(() => (__appsDispatch('keydown', [], { key: 'Tab', code: 'Tab' }), document.activeElement.id)).join()");
         if (tabs !== 's,i,y,z') fail('scroller Tab stops: ' + tabs);
         "#,
-        &[(
-            "a.html",
-            "<body style='margin:0'><button id=z>z</button><div id=s style='overflow:auto;height:40px;width:100px'><div style='height:100px'>s</div></div>\
+    &[(
+      "a.html",
+      "<body style='margin:0'><button id=z>z</button><div id=s style='overflow:auto;height:40px;width:100px'><div style='height:100px'>s</div></div>\
              <div id=n style='overflow:hidden;height:40px'><div style='height:100px'>n</div></div>\
              <div id=w style='overflow:auto;height:40px'><button id=i>i</button><div style='height:100px'></div></div><button id=y>y</button>\
              <script>globalThis.$ = id => document.getElementById(id);</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn terminals_draw_their_grid_and_take_input() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('term.html');
         const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
         const input = body => fetch(MCP + '/input', { method: 'POST', body: JSON.stringify({ window: win.id, ...body }) }).then(response => response.text());
@@ -614,10 +615,10 @@ fn terminals_draw_their_grid_and_take_input() {
         const reloaded = await colors(0);
         if (Math.abs(reloaded[0] - fill[0]) > cell / 4 || reloaded[1]) fail('reloaded page: ' + reloaded);
         "#,
-        &[
-            (
-                "term.html",
-                "<style>:root{-terminal-red:#ff0000;-terminal-green:#00ff00}body{margin:0;background:white}\
+    &[
+      (
+        "term.html",
+        "<style>:root{-terminal-red:#ff0000;-terminal-green:#00ff00}body{margin:0;background:white}\
                  terminal{display:block;font:16px/20px Menlo;width:20ch;height:5lh;padding:10px;color:#000}\
                  terminal::selection{background:#00ff00}</style>\
                  <terminal id=t></terminal><terminal id=p style='height:2lh'></terminal>\
@@ -626,17 +627,17 @@ fn terminals_draw_their_grid_and_take_input() {
                  globalThis.events = []; t.addEventListener('resize', () => events.push('resize'));\
                  globalThis.p = create({ command: ['/bin/sh', '-c', 'printf \"in $PWD\"; sleep 9'], cwd: '/' });\
                  document.getElementById('p').session = p;</script>",
-            ),
-            ("package.json", r#"{"features":["terminal"]}"#),
-        ],
-    );
+      ),
+      ("package.json", r#"{"features":["terminal"]}"#),
+    ],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn bounds_keep_their_width_after_a_zoom_change() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('zoom.html');
         const width = () => run("document.getElementById('t').getBoundingClientRect().width");
         for (const zoom of [1, 1.25, 1]) {
@@ -647,18 +648,18 @@ fn bounds_keep_their_width_after_a_zoom_change() {
             if (Math.abs(got - 250) > 0.5) fail('width at zoom ' + zoom + ': ' + got);
         }
         "#,
-        &[(
-            "zoom.html",
-            "<body style='margin:0'><div style='width:600px;display:flex'><i style='width:100px;flex:none'></i>\
+    &[(
+      "zoom.html",
+      "<body style='margin:0'><div style='width:600px;display:flex'><i style='width:100px;flex:none'></i>\
              <div style='flex:1'><div id=t style='height:4px;width:min(50%,10px)'></div></div></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn pretty_rows_rects_and_carets_of_case_mappings_like_chrome() {
-    run_hidden(
+  run_hidden(
         &r#"
         await load('page.html');
         // Chrome's values. Pretty moves `buff` down, but not with `break-spaces`, `::first-line` or a tab. Text far
@@ -684,8 +685,8 @@ fn pretty_rows_rects_and_carets_of_case_mappings_like_chrome() {
 #[test]
 #[ignore = "requires the macOS window server"]
 fn webviews_in_shadow_roots_attach() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const pending = run(`new Promise(resolve => {
             const host = document.createElement('div');
@@ -699,15 +700,15 @@ fn webviews_in_shadow_roots_attach() {
         while (result === undefined) await win.webContents.capturePage();
         if (result !== 'attached') fail('webview in a shadow root: ' + result);
         "#,
-        &[("page.html", "<body style='margin:0'><p>page</p></body>")],
-    );
+    &[("page.html", "<body style='margin:0'><p>page</p></body>")],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn webviews_outside_the_page_tree_do_not_attach() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const pending = run(`new Promise(resolve => {
             const view = id => "<webview id=" + id + " src='data:text/html,<p>guest</p>' style='display:block;width:100px;height:100px'></webview>";
@@ -728,11 +729,11 @@ fn webviews_outside_the_page_tree_do_not_attach() {
         while (result === undefined) await win.webContents.capturePage();
         if (result !== ' clone') fail('webviews outside the page: ' + result);
         "#,
-        &[(
-            "page.html",
-            "<script>globalThis.attached = []; const send = HTMLWebViewElement.prototype.dispatchEvent; \
+    &[(
+      "page.html",
+      "<script>globalThis.attached = []; const send = HTMLWebViewElement.prototype.dispatchEvent; \
              HTMLWebViewElement.prototype.dispatchEvent = function (event) { if (event.type === 'did-attach') attached.push(this.id); return send.call(this, event); };</script>\
              <body style='margin:0'><p>page</p><template id=page><webview id=page src='data:text/html,<p>guest</p>' style='display:block;width:100px;height:100px'></webview></template></body>",
-        )],
-    );
+    )],
+  );
 }

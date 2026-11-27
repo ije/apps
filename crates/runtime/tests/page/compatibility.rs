@@ -1,36 +1,34 @@
 use apps_runtime::{
-    dom::Document, host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role,
-    render::Page,
+  dom::Document, host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role, render::Page,
 };
 use std::{
-    cell::RefCell,
-    rc::Rc,
-    time::{Duration, Instant},
+  cell::RefCell,
+  rc::Rc,
+  time::{Duration, Instant},
 };
 
 fn run(source: &str) {
-    let engine =
-        JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main).unwrap();
-    engine.eval(&format!("globalThis.result='pending';(async()=>{{{source}}})().then(()=>result='ok',e=>result=String(e)+'\\n'+e.stack);"),"compatibility").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        engine.tick().unwrap();
-        let result = engine.eval("result", "test").unwrap();
-        if result != "pending" {
-            assert_eq!(result, "ok");
-            break;
-        }
-        assert!(Instant::now() < deadline, "Test timed out");
-        std::thread::sleep(Duration::from_millis(1));
+  let engine = JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main).unwrap();
+  engine.eval(&format!("globalThis.result='pending';(async()=>{{{source}}})().then(()=>result='ok',e=>result=String(e)+'\\n'+e.stack);"),"compatibility").unwrap();
+  let deadline = Instant::now() + Duration::from_secs(60);
+  loop {
+    engine.tick().unwrap();
+    let result = engine.eval("result", "test").unwrap();
+    if result != "pending" {
+      assert_eq!(result, "ok");
+      break;
     }
+    assert!(Instant::now() < deadline, "Test timed out");
+    std::thread::sleep(Duration::from_millis(1));
+  }
 }
 
 #[test]
 fn buffer_streams_and_files() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = serde_json::to_string(&dir.path().join("file.txt")).unwrap();
-    run(&format!(
-        r#"
+  let dir = tempfile::tempdir().unwrap();
+  let path = serde_json::to_string(&dir.path().join("file.txt")).unwrap();
+  run(&format!(
+    r#"
         const assert=(c,m)=>{{if(!c)throw Error(m)}};
         const b=Buffer.from('Hello 世界');assert(Buffer.from(b.toString('base64'),'base64').equals(b),'base64');
         const n=Buffer.alloc(8);n.writeBigUInt64LE(12345678901234n);assert(n.readBigUInt64LE()===12345678901234n,'bigint');
@@ -42,12 +40,13 @@ fn buffer_streams_and_files() {
         await __apps.stream.promises.pipeline(__apps.stream.Readable.from(['a','b']),upper,sink);assert(out.join('')==='AB','pipeline');
         await fs.promises.rename({path},{path}+'.moved');assert(!fs.existsSync({path}),'rename');await fs.promises.rm({path}+'.moved');
     "#
-    ));
+  ));
 }
 
 #[test]
 fn node_buffer_matches_node() {
-    run(r##"
+  run(
+    r##"
         const {assert,buffer:{Buffer,transcode}}=__apps;
         const code=(fn)=>{try{fn();return 'none';}catch(error){return error.code+' '+error.message;}};
         assert.strictEqual(Buffer.from('aGk=aGk=','base64').toString('hex'),'6869');
@@ -85,12 +84,14 @@ fn node_buffer_matches_node() {
         assert.deepStrictEqual(Buffer.copyBytesFrom(new Uint16Array([1,2,3]),1,1),Buffer.from([2,0]));
         const statics=[];for(const key in Buffer)statics.push(key);assert.ok(['from','alloc','isBuffer','byteLength','concat','of','copyBytesFrom'].every(key=>statics.includes(key)),statics.join());
         assert.deepStrictEqual([Buffer.alloc(0),Buffer.alloc(51)].map(b=>__apps.util.inspect(b).slice(-20)),['<Buffer >',' 00 ... 1 more byte>']);
-    "##);
+    "##,
+  );
 }
 
 #[test]
 fn node_fast_paths_match_node() {
-    run(r##"
+  run(
+    r##"
         const {assert,buffer:{Buffer},crypto,fs,util,os}=__apps;
         for (const [name, size, min, max] of [['UInt8', 1, 0, 255], ['Int8', 1, -128, 127], ['UInt16', 2, 0, 65535], ['Int16', 2, -32768, 32767], ['UInt32', 4, 0, 4294967295], ['Int32', 4, -2147483648, 2147483647]])
         for (const end of size === 1 ? [''] : ['LE', 'BE']) for (const value of [min, max, 0, min + 1, max - 1, ((min + max) / 3) | 0]) {
@@ -137,12 +138,14 @@ fn node_fast_paths_match_node() {
         await new Promise(resolve => stream.end(resolve));
         assert.strictEqual(fs.readFileSync(path, 'utf8'), expected); assert.strictEqual(stream.bytesWritten, 300);
         assert.deepStrictEqual([fs.existsSync(path), fs.existsSync(path + '.missing'), fs.statSync(path).size, fs.statSync(path).isFile()], [true, false, 300, true]);
-    "##);
+    "##,
+  );
 }
 
 #[test]
 fn node_path_matches_node_vectors() {
-    run(r##"
+  run(
+    r##"
         const {posix:P,win32:W}=__apps.path;
         const t=f=>{try{return f();}catch(error){return 'THROW '+error.code+' '+error.message;}};
         const cases=[
@@ -167,12 +170,14 @@ fn node_path_matches_node_vectors() {
         
         ];
         cases.forEach(([actual,expected],index)=>{if(JSON.stringify(actual)!==expected)throw Error(`case ${index}: ${JSON.stringify(actual)} !== ${expected}`);});
-    "##);
+    "##,
+  );
 }
 
 #[test]
 fn node_string_decoder_url_querystring_and_util_match_node() {
-    run(r##"
+  run(
+    r##"
         const {string_decoder:{StringDecoder},util,url,querystring:qs,buffer:{Buffer}}=__apps;
         const show=(d,parts)=>[...parts.map(p=>p===null?d.end():d.write(Buffer.from(p))),d.lastNeed,d.lastTotal,d.lastChar.toString('hex')];
         const t=f=>{try{return f();}catch(error){return 'THROW '+error.code+' '+error.message;}};
@@ -211,12 +216,14 @@ fn node_string_decoder_url_querystring_and_util_match_node() {
         
         ];
         cases.forEach(([actual,expected],index)=>{if(JSON.stringify(actual)!==expected)throw Error(`case ${index}: ${JSON.stringify(actual)} !== ${expected}`);});
-    "##);
+    "##,
+  );
 }
 
 #[test]
 fn node_util_inspect_matches_node() {
-    run(r##"
+  run(
+    r##"
         const {util}=__apps,i=util.inspect;
         const t=f=>{try{return f();}catch(error){return 'THROW '+error.code+' '+error.message;}};
         const cases=[
@@ -263,12 +270,14 @@ fn node_util_inspect_matches_node() {
         
         ];
         cases.forEach(([actual,expected],index)=>{if(JSON.stringify(actual)!==expected)throw Error(`case ${index}: ${JSON.stringify(actual)} !== ${expected}`);});
-    "##);
+    "##,
+  );
 }
 
 #[test]
 fn node_events_match_node() {
-    run(r##"
+  run(
+    r##"
         const {assert,events,util}=__apps,EventEmitter=events,sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
         const seen=[];const capturing=new EventEmitter({captureRejections:true});capturing.on('x',async()=>{throw new Error('boom');});capturing.on('error',error=>seen.push(error.message));capturing.emit('x');
         const custom=new EventEmitter({captureRejections:true});custom[events.captureRejectionSymbol]=(error,name)=>seen.push(`${error.message}:${name}`);custom.on('y',async()=>{throw new Error('s');});custom.emit('y');
@@ -290,12 +299,14 @@ fn node_events_match_node() {
         const storage=new __apps.async_hooks.AsyncLocalStorage(),scoped=storage.run(7,()=>new events.EventEmitterAsyncResource({name:'scoped'}));let store;scoped.on('a',()=>store=storage.getStore());scoped.emit('a');
         assert.deepStrictEqual([store,scoped.asyncResource.type,scoped.asyncResource.eventEmitter===scoped,typeof scoped.asyncId,util.types.isProxy(new Proxy({},{})),util.types.isProxy({}),util.types.isProxy(globalThis)],[7,'scoped',true,'number',true,false,false]);
         const readable=new __apps.stream.PassThrough();readable.end('x');assert.strictEqual(String(await new Promise(resolve=>readable.once('data',resolve))),'x');
-    "##);
+    "##,
+  );
 }
 
 #[test]
 fn node_stream_helpers_match_node() {
-    run(r##"
+  run(
+    r##"
         const {assert,stream,buffer:{Buffer}}=__apps,{Readable,Writable,Duplex,PassThrough,Transform}=stream,sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
         const order=[],w=new Writable({write(chunk,encoding,callback){callback();}});
         w.on('finish',()=>order.push('finish'));w.end('x',()=>order.push('callback'));await sleep(5);
@@ -322,239 +333,255 @@ fn node_stream_helpers_match_node() {
         const codes=[],corked=new Writable({write(){}});corked.cork();corked.write('a',error=>codes.push(error?.code));corked.write('b',error=>codes.push(error?.code));corked.destroy();await sleep(5);assert.deepStrictEqual([codes,corked.writableLength],[['ERR_STREAM_DESTROYED','ERR_STREAM_DESTROYED'],0]);
         const sink=new Writable({write(){}});sink.cork();const pending=Writable.toWeb(sink).getWriter().write(Buffer.from('a'));await sleep(1);sink.destroy();assert.strictEqual(await pending.then(()=>'resolved',error=>error.code),'ERR_STREAM_DESTROYED');
         const utf16=new Readable({read(){}});utf16.setEncoding('utf16le');for(const part of [[0x61,0],[0x3d],[0xd8,0x00,0xde]])utf16.push(Buffer.from(part));utf16.push(null);assert.strictEqual((await collect(utf16)).join(''),'a\u{1F600}');
-    "##);
+    "##,
+  );
 }
 
 #[test]
 fn bridge_preload_calls_main_and_publishes_events() {
-    let api = JavaScriptCore::load().unwrap();
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse("<body></body>"),
-            dirty: false,
-            ..Default::default()
-        },
+  let api = JavaScriptCore::load().unwrap();
+  let host = Rc::new(RefCell::new(Host::default()));
+  host.borrow().store.borrow_mut().pages.insert(
+    1,
+    Page {
+      doc: Document::parse("<body></body>"),
+      dirty: false,
+      ..Default::default()
+    },
+  );
+  let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
+  let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
+  main.eval("__apps.ipcMain.on('ready',e=>globalThis.preload=e);__apps.ipcMain.handle('sum',(_e,a,b)=>a+b);__apps.ipcMain.handle('double',(_e,v)=>v.map(x=>x*2));__apps.ipcMain.on('version',e=>e.returnValue='v1')","test").unwrap();
+  preload.eval("__apps.contextBridge.exposeInMainWorld('desktop',{sum:(a,b)=>__apps.ipcRenderer.invoke('sum',a,b),double:v=>__apps.ipcRenderer.invoke('double',v),version:__apps.ipcRenderer.sendSync('version'),subscribe:callback=>{const listener=(_event,data)=>callback(data);__apps.ipcRenderer.on('change',listener);return()=>__apps.ipcRenderer.off('change',listener);}});__apps.ipcRenderer.send('ready');","test").unwrap();
+  for context in [&main, &preload] {
+    assert_eq!(
+      context
+        .eval(
+          "['bindApp','poll','rpc','send'].filter(name=>name in __apps).join()",
+          "test"
+        )
+        .unwrap(),
+      ""
     );
-    let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
-    let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
-    main.eval("__apps.ipcMain.on('ready',e=>globalThis.preload=e);__apps.ipcMain.handle('sum',(_e,a,b)=>a+b);__apps.ipcMain.handle('double',(_e,v)=>v.map(x=>x*2));__apps.ipcMain.on('version',e=>e.returnValue='v1')","test").unwrap();
-    preload.eval("__apps.contextBridge.exposeInMainWorld('desktop',{sum:(a,b)=>__apps.ipcRenderer.invoke('sum',a,b),double:v=>__apps.ipcRenderer.invoke('double',v),version:__apps.ipcRenderer.sendSync('version'),subscribe:callback=>{const listener=(_event,data)=>callback(data);__apps.ipcRenderer.on('change',listener);return()=>__apps.ipcRenderer.off('change',listener);}});__apps.ipcRenderer.send('ready');","test").unwrap();
-    for context in [&main, &preload] {
-        assert_eq!(
-            context
-                .eval(
-                    "['bindApp','poll','rpc','send'].filter(name=>name in __apps).join()",
-                    "test"
-                )
-                .unwrap(),
-            ""
-        );
-    }
-    let page = JsContext::new(api, host, Role::Renderer(1)).unwrap();
-    assert_eq!(page.eval("desktop.version", "test").unwrap(), "v1");
-    page.eval(
+  }
+  let page = JsContext::new(api, host, Role::Renderer(1)).unwrap();
+  assert_eq!(page.eval("desktop.version", "test").unwrap(), "v1");
+  page.eval(
         "globalThis.result='pending';desktop.sum(3,4).then(v=>result=v,e=>result=String(e));globalThis.bytes='pending';desktop.double(new Float32Array([1.5,-2,0.25])).then(v=>bytes=v.constructor.name+':'+[...v],e=>bytes=String(e));",
         "test",
     )
     .unwrap();
-    for _ in 0..10 {
-        main.tick().unwrap();
-        preload.tick().unwrap();
-        page.tick().unwrap();
-    }
-    assert_eq!(page.eval("result", "test").unwrap(), "7");
-    assert_eq!(page.eval("bytes", "test").unwrap(), "Float32Array:3,-4,0.5");
-    page.eval("globalThis.observed=[];globalThis.unsubscribe=desktop.subscribe(value=>observed.push(value));if(typeof unsubscribe!=='function')throw Error('unsubscribe must be synchronous');", "test").unwrap();
-    main.eval("preload.reply('change',{value:42});", "test")
-        .unwrap();
-    assert_eq!(page.eval("observed.length", "test").unwrap(), "0");
+  for _ in 0..10 {
+    main.tick().unwrap();
     preload.tick().unwrap();
-    assert_eq!(page.eval("observed[0].value", "test").unwrap(), "42");
-    page.eval("unsubscribe();", "test").unwrap();
-    main.eval("preload.reply('change',{value:43});", "test")
-        .unwrap();
-    preload.tick().unwrap();
-    assert_eq!(page.eval("observed.length", "test").unwrap(), "1");
-    assert_eq!(
-        page.eval("typeof process+':'+typeof __apps", "test")
-            .unwrap(),
-        "undefined:undefined"
-    );
+    page.tick().unwrap();
+  }
+  assert_eq!(page.eval("result", "test").unwrap(), "7");
+  assert_eq!(page.eval("bytes", "test").unwrap(), "Float32Array:3,-4,0.5");
+  page.eval("globalThis.observed=[];globalThis.unsubscribe=desktop.subscribe(value=>observed.push(value));if(typeof unsubscribe!=='function')throw Error('unsubscribe must be synchronous');", "test").unwrap();
+  main
+    .eval("preload.reply('change',{value:42});", "test")
+    .unwrap();
+  assert_eq!(page.eval("observed.length", "test").unwrap(), "0");
+  preload.tick().unwrap();
+  assert_eq!(page.eval("observed[0].value", "test").unwrap(), "42");
+  page.eval("unsubscribe();", "test").unwrap();
+  main
+    .eval("preload.reply('change',{value:43});", "test")
+    .unwrap();
+  preload.tick().unwrap();
+  assert_eq!(page.eval("observed.length", "test").unwrap(), "1");
+  assert_eq!(
+    page
+      .eval("typeof process+':'+typeof __apps", "test")
+      .unwrap(),
+    "undefined:undefined"
+  );
 }
 
 #[test]
 fn bridge_clones_files_and_preload_reads_dropped_paths() {
-    let api = JavaScriptCore::load().unwrap();
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse("<body></body>"),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    host.borrow_mut()
-        .dropped
-        .insert(1, vec!["/tmp/first.txt".into(), "/tmp/notes.txt".into()]);
-    let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
-    let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
-    preload.eval("const {contextBridge,webUtils}=__apps;contextBridge.exposeInMainWorld('desktop',{path:file=>webUtils.getPathForFile(file),describe:file=>[file.constructor.name,file.name,file.type,file.size,file.lastModified],echo:value=>value});", "test").unwrap();
-    let page = JsContext::new(api, host, Role::Renderer(1)).unwrap();
-    page.eval("document.addEventListener('dragover',event=>event.preventDefault());document.addEventListener('drop',event=>globalThis.dropped=event.dataTransfer.files[0]);__appsDrag('enter',0,0,['notes.txt']);__appsDrop([{name:'notes.txt',file:1,bytes:[104,105],lastModified:7}],0,0);", "test").unwrap();
-    assert_eq!(
-        page.eval("typeof __appsFiles+':'+('path' in dropped)", "test")
-            .unwrap(),
-        "undefined:false"
-    );
-    assert_eq!(
-        page.eval("desktop.path(dropped)", "test").unwrap(),
-        "/tmp/notes.txt"
-    );
-    assert_eq!(
-        page.eval("desktop.path(new File(['x'],'x.txt'))", "test")
-            .unwrap(),
-        ""
-    );
-    assert_eq!(
-        page.eval("desktop.describe(dropped).join()", "test")
-            .unwrap(),
-        "File,notes.txt,text/plain,2,7"
-    );
-    assert_eq!(
-        page.eval(
-            "desktop.describe(new Blob(['hello'],{type:'text/plain'})).join()",
-            "test"
-        )
-        .unwrap(),
-        "Blob,,text/plain,5,"
-    );
-    assert_eq!(
-        page.eval("desktop.path(desktop.echo(dropped))", "test")
-            .unwrap(),
-        "/tmp/notes.txt"
-    );
-    assert!(
-        page.eval(
-            "(()=>{try{desktop.path({})}catch(e){return e.message}})()",
-            "test"
-        )
-        .unwrap()
-        .contains("Expected a File")
-    );
-    assert_eq!(
-        main.eval("__apps.webUtils.getPathForFile(new File([],'a'))", "test")
-            .unwrap(),
-        ""
-    );
+  let api = JavaScriptCore::load().unwrap();
+  let host = Rc::new(RefCell::new(Host::default()));
+  host.borrow().store.borrow_mut().pages.insert(
+    1,
+    Page {
+      doc: Document::parse("<body></body>"),
+      dirty: false,
+      ..Default::default()
+    },
+  );
+  host
+    .borrow_mut()
+    .dropped
+    .insert(1, vec!["/tmp/first.txt".into(), "/tmp/notes.txt".into()]);
+  let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
+  let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
+  preload.eval("const {contextBridge,webUtils}=__apps;contextBridge.exposeInMainWorld('desktop',{path:file=>webUtils.getPathForFile(file),describe:file=>[file.constructor.name,file.name,file.type,file.size,file.lastModified],echo:value=>value});", "test").unwrap();
+  let page = JsContext::new(api, host, Role::Renderer(1)).unwrap();
+  page.eval("document.addEventListener('dragover',event=>event.preventDefault());document.addEventListener('drop',event=>globalThis.dropped=event.dataTransfer.files[0]);__appsDrag('enter',0,0,['notes.txt']);__appsDrop([{name:'notes.txt',file:1,bytes:[104,105],lastModified:7}],0,0);", "test").unwrap();
+  assert_eq!(
+    page
+      .eval("typeof __appsFiles+':'+('path' in dropped)", "test")
+      .unwrap(),
+    "undefined:false"
+  );
+  assert_eq!(
+    page.eval("desktop.path(dropped)", "test").unwrap(),
+    "/tmp/notes.txt"
+  );
+  assert_eq!(
+    page
+      .eval("desktop.path(new File(['x'],'x.txt'))", "test")
+      .unwrap(),
+    ""
+  );
+  assert_eq!(
+    page
+      .eval("desktop.describe(dropped).join()", "test")
+      .unwrap(),
+    "File,notes.txt,text/plain,2,7"
+  );
+  assert_eq!(
+    page
+      .eval(
+        "desktop.describe(new Blob(['hello'],{type:'text/plain'})).join()",
+        "test"
+      )
+      .unwrap(),
+    "Blob,,text/plain,5,"
+  );
+  assert_eq!(
+    page
+      .eval("desktop.path(desktop.echo(dropped))", "test")
+      .unwrap(),
+    "/tmp/notes.txt"
+  );
+  assert!(
+    page
+      .eval(
+        "(()=>{try{desktop.path({})}catch(e){return e.message}})()",
+        "test"
+      )
+      .unwrap()
+      .contains("Expected a File")
+  );
+  assert_eq!(
+    main
+      .eval("__apps.webUtils.getPathForFile(new File([],'a'))", "test")
+      .unwrap(),
+    ""
+  );
 }
 
 #[test]
 fn bridge_capabilities_failures_and_closed_contexts() {
-    let api = JavaScriptCore::load().unwrap();
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse("<body></body>"),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
-    let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
-    main.eval("__apps.ipcMain.handle('wait',()=>new Promise(()=>{}));const receive=__appsBridgeReceive;__appsBridgeReceive=message=>{globalThis.lastMessage=message;return receive(message)};", "test").unwrap();
-    preload.eval("__apps.contextBridge.exposeInMainWorld('desktop',{value:()=>7,callback:fn=>fn(),fail:()=>Promise.reject(0),wait:()=>__apps.ipcRenderer.invoke('wait')});", "test").unwrap();
-    let token = host.borrow().bridge[&1]["desktop"].value["items"]["value"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert!(
-        token.len() > 30,
-        "Callback capabilities must not use guessable counters"
-    );
-    let denied=preload.eval(&format!("__appsBridgeReceive({{kind:'call',function:{},sender:{{renderer:2}},args:{{type:'array',id:0,items:[]}}}})",serde_json::to_string(&token).unwrap()),"test").unwrap_err();
-    assert!(denied.to_string().contains("unavailable to this context"));
-    let page = JsContext::new(api.clone(), host.clone(), Role::Renderer(1)).unwrap();
-    assert_eq!(page.eval("desktop.value()", "test").unwrap(), "7");
-    assert!(page.eval("(()=>{try{desktop.callback(()=>{throw Error('callback failed')})}catch(e){return e.message}})()","test").unwrap().ends_with("callback failed"));
-    page.eval(
-        "globalThis.rejected='pending';desktop.fail().then(()=>rejected='wrong',e=>rejected=e)",
-        "test",
+  let api = JavaScriptCore::load().unwrap();
+  let host = Rc::new(RefCell::new(Host::default()));
+  host.borrow().store.borrow_mut().pages.insert(
+    1,
+    Page {
+      doc: Document::parse("<body></body>"),
+      dirty: false,
+      ..Default::default()
+    },
+  );
+  let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
+  let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
+  main.eval("__apps.ipcMain.handle('wait',()=>new Promise(()=>{}));const receive=__appsBridgeReceive;__appsBridgeReceive=message=>{globalThis.lastMessage=message;return receive(message)};", "test").unwrap();
+  preload.eval("__apps.contextBridge.exposeInMainWorld('desktop',{value:()=>7,callback:fn=>fn(),fail:()=>Promise.reject(0),wait:()=>__apps.ipcRenderer.invoke('wait')});", "test").unwrap();
+  let token = host.borrow().bridge[&1]["desktop"].value["items"]["value"]["id"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+  assert!(
+    token.len() > 30,
+    "Callback capabilities must not use guessable counters"
+  );
+  let denied=preload.eval(&format!("__appsBridgeReceive({{kind:'call',function:{},sender:{{renderer:2}},args:{{type:'array',id:0,items:[]}}}})",serde_json::to_string(&token).unwrap()),"test").unwrap_err();
+  assert!(denied.to_string().contains("unavailable to this context"));
+  let page = JsContext::new(api.clone(), host.clone(), Role::Renderer(1)).unwrap();
+  assert_eq!(page.eval("desktop.value()", "test").unwrap(), "7");
+  assert!(page.eval("(()=>{try{desktop.callback(()=>{throw Error('callback failed')})}catch(e){return e.message}})()","test").unwrap().ends_with("callback failed"));
+  page
+    .eval(
+      "globalThis.rejected='pending';desktop.fail().then(()=>rejected='wrong',e=>rejected=e)",
+      "test",
     )
     .unwrap();
-    for _ in 0..3 {
-        preload.tick().unwrap();
-        page.tick().unwrap();
-    }
-    assert_eq!(page.eval("rejected", "test").unwrap(), "0");
-    page.eval(
-        "globalThis.result='pending';desktop.wait().then(v=>result=v,e=>result=e.message)",
-        "test",
-    )
-    .unwrap();
-    let request = main.eval("lastMessage.id", "test").unwrap();
-    preload.eval(&format!("__appsBridgeReceive({{kind:'reply',id:{},sender:{{renderer:1}},value:{{type:'value',value:'forged'}}}})",serde_json::to_string(&request).unwrap()),"test").unwrap();
+  for _ in 0..3 {
     preload.tick().unwrap();
     page.tick().unwrap();
-    assert_eq!(
-        page.eval("result", "test").unwrap(),
-        "pending",
-        "Replies must come from the called context"
-    );
-    drop(main);
-    for _ in 0..3 {
-        preload.tick().unwrap();
-        page.tick().unwrap();
-    }
-    assert_eq!(page.eval("result", "test").unwrap(), "Bridge target closed");
-    drop(page);
-    let page = JsContext::new(api, host.clone(), Role::Renderer(1)).unwrap();
-    assert_eq!(
-        page.eval("desktop.value()", "test").unwrap(),
-        "7",
-        "Published APIs survive page reload"
-    );
-    drop(preload);
-    assert!(
-        !host.borrow().bridge.contains_key(&1),
-        "Closed preload exposures are removed"
-    );
-    assert!(
-        page.eval("desktop.value()", "test")
-            .unwrap_err()
-            .to_string()
-            .contains("unavailable")
-    );
+  }
+  assert_eq!(page.eval("rejected", "test").unwrap(), "0");
+  page
+    .eval(
+      "globalThis.result='pending';desktop.wait().then(v=>result=v,e=>result=e.message)",
+      "test",
+    )
+    .unwrap();
+  let request = main.eval("lastMessage.id", "test").unwrap();
+  preload.eval(&format!("__appsBridgeReceive({{kind:'reply',id:{},sender:{{renderer:1}},value:{{type:'value',value:'forged'}}}})",serde_json::to_string(&request).unwrap()),"test").unwrap();
+  preload.tick().unwrap();
+  page.tick().unwrap();
+  assert_eq!(
+    page.eval("result", "test").unwrap(),
+    "pending",
+    "Replies must come from the called context"
+  );
+  drop(main);
+  for _ in 0..3 {
+    preload.tick().unwrap();
+    page.tick().unwrap();
+  }
+  assert_eq!(page.eval("result", "test").unwrap(), "Bridge target closed");
+  drop(page);
+  let page = JsContext::new(api, host.clone(), Role::Renderer(1)).unwrap();
+  assert_eq!(
+    page.eval("desktop.value()", "test").unwrap(),
+    "7",
+    "Published APIs survive page reload"
+  );
+  drop(preload);
+  assert!(
+    !host.borrow().bridge.contains_key(&1),
+    "Closed preload exposures are removed"
+  );
+  assert!(
+    page
+      .eval("desktop.value()", "test")
+      .unwrap_err()
+      .to_string()
+      .contains("unavailable")
+  );
 }
 
 fn contexts() -> (Rc<RefCell<Host>>, JsContext, JsContext) {
-    let api = JavaScriptCore::load().unwrap();
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse("<body><p id='x'>before</p><span>a</span><span>b</span></body>"),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
-    main.eval(
-        "__appsEvent('ready');globalThis.win=new __apps.BrowserWindow();globalThis.log=[];",
-        "test",
+  let api = JavaScriptCore::load().unwrap();
+  let host = Rc::new(RefCell::new(Host::default()));
+  host.borrow().store.borrow_mut().pages.insert(
+    1,
+    Page {
+      doc: Document::parse("<body><p id='x'>before</p><span>a</span><span>b</span></body>"),
+      dirty: false,
+      ..Default::default()
+    },
+  );
+  let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
+  main
+    .eval(
+      "__appsEvent('ready');globalThis.win=new __apps.BrowserWindow();globalThis.log=[];",
+      "test",
     )
     .unwrap();
-    let preload = JsContext::new(api, host.clone(), Role::Preload(1)).unwrap();
-    (host, main, preload)
+  let preload = JsContext::new(api, host.clone(), Role::Preload(1)).unwrap();
+  (host, main, preload)
 }
 
 #[test]
 fn ipc_is_asynchronous_and_reports_errors_like_electron() {
-    let (_host, main, preload) = contexts();
-    main.eval(r#"
+  let (_host, main, preload) = contexts();
+  main.eval(r#"
         const {ipcMain} = __apps;
         process.on('uncaughtException', error => log.push('uncaught:' + error.message));
         ipcMain.on('bad', () => { throw new Error('listener bug'); });
@@ -565,9 +592,9 @@ fn ipc_is_asynchronous_and_reports_errors_like_electron() {
         ipcMain.handle('rejects', async () => { throw new Error('async boom'); });
         ipcMain.handle('fn', () => () => 1);
     "#, "test").unwrap();
-    preload
-        .eval(
-            r#"
+  preload
+    .eval(
+      r#"
         const {ipcRenderer} = __apps, order = [];
         globalThis.results = order;
         ipcRenderer.on('pong', (e, i) => ipcRenderer.send('ping', i));
@@ -576,70 +603,72 @@ fn ipc_is_asynchronous_and_reports_errors_like_electron() {
         ipcRenderer.send('sender');
         ipcRenderer.send('ping', 0);
     "#,
-            "test",
-        )
-        .unwrap();
-    assert_eq!(
-        main.eval("log.length", "test").unwrap(),
-        "0",
-        "listeners must not run inside the sender's call"
-    );
-    preload.eval(r#"
+      "test",
+    )
+    .unwrap();
+  assert_eq!(
+    main.eval("log.length", "test").unwrap(),
+    "0",
+    "listeners must not run inside the sender's call"
+  );
+  preload.eval(r#"
         results.push('after send', ipcRenderer.sendSync('sync', 21));
         for (const channel of ['throws', 'rejects', 'missing', 'fn']) ipcRenderer.invoke(channel).then(() => results.push(channel + ': resolved'), error => results.push(error.message));
         for (const value of [() => 1, Symbol('x'), Promise.resolve(1)]) try { ipcRenderer.send('x', { value }); results.push('sent'); } catch (error) { results.push(error.message); }
     "#, "test").unwrap();
-    assert_eq!(
-        main.eval("log.length", "test").unwrap(),
-        "3",
-        "sendSync runs after the messages sent before it"
-    );
-    for _ in 0..4000 {
-        main.tick().unwrap();
-        preload.tick().unwrap();
-    }
-    assert_eq!(
-        main.eval("log.slice(0, 3).join('|')", "test").unwrap(),
-        "uncaught:listener bug|true,true,1,function,true,1,string|ping0"
-    );
-    assert_eq!(main.eval("log.at(-1)", "test").unwrap(), "ping3000");
-    assert_eq!(
-        preload.eval("results.join('|')", "test").unwrap(),
-        "after send|42|An object could not be cloned.|An object could not be cloned.|An object could not be cloned.|Error invoking remote method 'throws': TypeError: boom|Error invoking remote method 'missing': Error: No handler registered for 'missing'|Error invoking remote method 'fn': Error: An object could not be cloned.|Error invoking remote method 'rejects': Error: async boom"
-    );
+  assert_eq!(
+    main.eval("log.length", "test").unwrap(),
+    "3",
+    "sendSync runs after the messages sent before it"
+  );
+  for _ in 0..4000 {
+    main.tick().unwrap();
+    preload.tick().unwrap();
+  }
+  assert_eq!(
+    main.eval("log.slice(0, 3).join('|')", "test").unwrap(),
+    "uncaught:listener bug|true,true,1,function,true,1,string|ping0"
+  );
+  assert_eq!(main.eval("log.at(-1)", "test").unwrap(), "ping3000");
+  assert_eq!(
+    preload.eval("results.join('|')", "test").unwrap(),
+    "after send|42|An object could not be cloned.|An object could not be cloned.|An object could not be cloned.|Error invoking remote method 'throws': TypeError: boom|Error invoking remote method 'missing': Error: No handler registered for 'missing'|Error invoking remote method 'fn': Error: An object could not be cloned.|Error invoking remote method 'rejects': Error: async boom"
+  );
 }
 
 #[test]
 fn ipc_values_follow_structured_clone() {
-    let (_host, main, preload) = contexts();
-    main.eval("__apps.ipcMain.handle('echo',(e,v)=>v)", "test")
-        .unwrap();
-    preload.eval(r#"
+  let (_host, main, preload) = contexts();
+  main
+    .eval("__apps.ipcMain.handle('echo',(e,v)=>v)", "test")
+    .unwrap();
+  preload.eval(r#"
         globalThis.out = 'pending';
         const sent = [[1,,3], new Array(2), new TypeError('t'), new RangeError('r'), -0, new Date(5), new Map([[1, {a: 2}]]), new Set([3]), new Uint16Array([1, 2]), undefined, 10n, NaN, {nested: {list: [1, 2]}}];
         __apps.ipcRenderer.invoke('echo', sent).then(v => {
             out = [v[0].length, 1 in v[0], v[1].length, 0 in v[1], v[2] instanceof TypeError, v[2].name, v[2].message, v[3] instanceof RangeError, Object.is(v[4], -0), v[5] instanceof Date && v[5].getTime(), v[6].get(1).a, v[7].has(3), v[8] instanceof Uint16Array && v[8][1], v[9] === undefined && 9 in v, typeof v[10], Number.isNaN(v[11]), v[12].nested.list[1]].join();
         }, error => { out = error.message; });
     "#, "test").unwrap();
-    for _ in 0..3 {
-        main.tick().unwrap();
-        preload.tick().unwrap();
-    }
-    assert_eq!(
-        preload.eval("out", "test").unwrap(),
-        "3,false,2,false,true,TypeError,t,true,true,5,2,true,2,true,bigint,true,2"
-    );
+  for _ in 0..3 {
+    main.tick().unwrap();
+    preload.tick().unwrap();
+  }
+  assert_eq!(
+    preload.eval("out", "test").unwrap(),
+    "3,false,2,false,true,TypeError,t,true,true,5,2,true,2,true,bigint,true,2"
+  );
 }
 
 #[test]
 fn context_bridge_exposes_late_values_promises_and_the_page_dom() {
-    let (host, main, preload) = contexts();
-    main.eval(
-        "__apps.ipcMain.on('dom', (e, text) => log.push(text))",
-        "test",
+  let (host, main, preload) = contexts();
+  main
+    .eval(
+      "__apps.ipcMain.on('dom', (e, text) => log.push(text))",
+      "test",
     )
     .unwrap();
-    preload.eval(r#"
+  preload.eval(r#"
         const {contextBridge, ipcRenderer} = __apps;
         contextBridge.exposeInMainWorld('early', { ready: Promise.resolve(5), fail: () => { throw new TypeError('preload boom'); }, later: () => Promise.reject(new RangeError('no')) });
         setTimeout(() => contextBridge.exposeInMainWorld('timer', { value: 1 }), 0);
@@ -650,44 +679,45 @@ fn context_bridge_exposes_late_values_promises_and_the_page_dom() {
             ipcRenderer.send('dom', [node.textContent, document.querySelectorAll('span').length, node.getAttribute('class'), document.getElementById('missing'), process.type, process.versions.electron].join());
         });
     "#, "test").unwrap();
-    let page = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
-    page.eval("__appsSyncBridge();globalThis.out=[];early.ready.then(v=>out.push('ready:'+v));try{early.fail()}catch(e){out.push(e.name+':'+e.message)}early.later().catch(e=>out.push(e.name+':'+e.message))", "test").unwrap();
-    preload
-        .eval("dispatchEvent(new Event('DOMContentLoaded'))", "test")
-        .unwrap();
-    for _ in 0..3 {
-        main.tick().unwrap();
-        preload.tick().unwrap();
-        page.tick().unwrap();
-    }
-    assert_eq!(
-        page.eval(
-            "out.join('|')+'|'+typeof timer+'|'+document.getElementById('x').textContent",
-            "test"
-        )
-        .unwrap(),
-        "TypeError:preload boom|ready:5|RangeError:no|object|24.0.0"
-    );
-    assert_eq!(
-        main.eval("log.join()", "test").unwrap(),
-        "24.0.0,2,done,,renderer,40.0.0"
-    );
-    assert_eq!(main.eval("process.type", "test").unwrap(), "browser");
+  let page = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+  page.eval("__appsSyncBridge();globalThis.out=[];early.ready.then(v=>out.push('ready:'+v));try{early.fail()}catch(e){out.push(e.name+':'+e.message)}early.later().catch(e=>out.push(e.name+':'+e.message))", "test").unwrap();
+  preload
+    .eval("dispatchEvent(new Event('DOMContentLoaded'))", "test")
+    .unwrap();
+  for _ in 0..3 {
+    main.tick().unwrap();
+    preload.tick().unwrap();
+    page.tick().unwrap();
+  }
+  assert_eq!(
+    page
+      .eval(
+        "out.join('|')+'|'+typeof timer+'|'+document.getElementById('x').textContent",
+        "test"
+      )
+      .unwrap(),
+    "TypeError:preload boom|ready:5|RangeError:no|object|24.0.0"
+  );
+  assert_eq!(
+    main.eval("log.join()", "test").unwrap(),
+    "24.0.0,2,done,,renderer,40.0.0"
+  );
+  assert_eq!(main.eval("process.type", "test").unwrap(), "browser");
 }
 
 #[test]
 fn renderer_cannot_forge_native_worker_requests() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse("<body></body>"),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    let page = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
-    page.eval(r#"
+  let host = Rc::new(RefCell::new(Host::default()));
+  host.borrow().store.borrow_mut().pages.insert(
+    1,
+    Page {
+      doc: Document::parse("<body></body>"),
+      dirty: false,
+      ..Default::default()
+    },
+  );
+  let page = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+  page.eval(r#"
         (()=>{
             const original=JSON.stringify;
             JSON.stringify=()=>original({op:'web.worker.start',args:['postMessage("native")',true,null]});
@@ -702,59 +732,58 @@ fn renderer_cannot_forge_native_worker_requests() {
             worker.onmessage=event=>{delete Array.prototype.toJSON;result=event.data};
         })()
     "#,"test").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        page.tick().unwrap();
-        let result = page.eval("result", "test").unwrap();
-        if result != "pending" {
-            // The request is refused, or the hook can't reach it and the worker has no native APIs.
-            assert!(
-                result == "Page workers cannot request native APIs"
-                    || result == "undefinedundefined",
-                "{result}"
-            );
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "Worker privilege guard did not settle"
-        );
-        std::thread::sleep(Duration::from_millis(1));
+  let deadline = Instant::now() + Duration::from_secs(2);
+  loop {
+    page.tick().unwrap();
+    let result = page.eval("result", "test").unwrap();
+    if result != "pending" {
+      // The request is refused, or the hook can't reach it and the worker has no native APIs.
+      assert!(
+        result == "Page workers cannot request native APIs" || result == "undefinedundefined",
+        "{result}"
+      );
+      break;
     }
+    assert!(
+      Instant::now() < deadline,
+      "Worker privilege guard did not settle"
+    );
+    std::thread::sleep(Duration::from_millis(1));
+  }
 }
 
 #[test]
 fn pages_share_one_shared_worker() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().update_app(|app| {
-        app.scripts = std::sync::Arc::new(
-            [(
-                "echo.js".to_owned(),
-                "onconnect=e=>e.ports[0].postMessage(name)"
-                    .to_owned()
-                    .into(),
-            )]
-            .into(),
-        )
-    });
-    for id in [1, 2, 3] {
-        host.borrow().store.borrow_mut().pages.insert(
-            id,
-            Page {
-                doc: Document::parse("<body></body>"),
-                dirty: false,
-                ..Default::default()
-            },
-        );
-    }
-    let open = |id| {
-        let page = JsContext::new(
-            JavaScriptCore::load().unwrap(),
-            host.clone(),
-            Role::Renderer(id),
-        )
-        .unwrap();
-        page.eval(&format!(r#"
+  let host = Rc::new(RefCell::new(Host::default()));
+  host.borrow_mut().update_app(|app| {
+    app.scripts = std::sync::Arc::new(
+      [(
+        "echo.js".to_owned(),
+        "onconnect=e=>e.ports[0].postMessage(name)"
+          .to_owned()
+          .into(),
+      )]
+      .into(),
+    )
+  });
+  for id in [1, 2, 3] {
+    host.borrow().store.borrow_mut().pages.insert(
+      id,
+      Page {
+        doc: Document::parse("<body></body>"),
+        dirty: false,
+        ..Default::default()
+      },
+    );
+  }
+  let open = |id| {
+    let page = JsContext::new(
+      JavaScriptCore::load().unwrap(),
+      host.clone(),
+      Role::Renderer(id),
+    )
+    .unwrap();
+    page.eval(&format!(r#"
             globalThis.replies=[];
             globalThis.source='let count=0;const all=[];onconnect=e=>{{const port=e.ports[0];all.push(port);port.onmessage=m=>port.postMessage(m.data===\'open\'?[all.filter(p=>!p._closed).length]:[new TextDecoder().decode(m.data),++count,name,typeof process,e.source===port,new Uint8Array([count])])}}';
             const worker=new SharedWorker('data:text/javascript,'+encodeURIComponent(source),'counter');
@@ -763,79 +792,79 @@ fn pages_share_one_shared_worker() {
             worker.onerror=e=>replies.push('error '+e.message);
             new SharedWorker('data:text/javascript,'+encodeURIComponent(source),{{name:'other'}}).port.addEventListener('message',e=>replies.push('other '+e.data.join(' ')));
         "#), "test").unwrap();
-        page
-    };
-    let wait = |page: &JsContext, count: usize| {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            page.tick().unwrap();
-            let replies = page.eval("replies.join()", "test").unwrap();
-            if replies.split(',').count() >= count && !replies.is_empty() {
-                return replies;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "Shared worker did not reply: {replies}"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    };
-    let (one, two) = (open(1), open(2));
-    assert_eq!(wait(&one, 1), "page1 1 counter undefined true 1");
-    assert_eq!(wait(&two, 1), "page2 2 counter undefined true 2");
-    one.eval("const w=new SharedWorker('data:text/javascript,'+encodeURIComponent(source),'counter');w.port.start();w.port.addEventListener('message',e=>replies.push(e.data.join(' ')));w.port.postMessage(new TextEncoder().encode('again'))", "test").unwrap();
-    assert_eq!(
-        wait(&one, 2),
-        "page1 1 counter undefined true 1,again 3 counter undefined true 3"
-    );
-    // A page that goes away closes its ports in the worker.
-    two.eval("worker.port.postMessage('open')", "test").unwrap();
-    assert_eq!(wait(&two, 2), "page2 2 counter undefined true 2,3");
-    drop(one);
-    two.eval("worker.port.postMessage('open')", "test").unwrap();
-    assert_eq!(wait(&two, 3), "page2 2 counter undefined true 2,3,1");
-    // The worker ends with its last page, so a new page gets a new one.
-    drop(two);
-    let three = open(3);
-    assert_eq!(wait(&three, 1), "page3 1 counter undefined true 1");
-    three
+    page
+  };
+  let wait = |page: &JsContext, count: usize| {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+      page.tick().unwrap();
+      let replies = page.eval("replies.join()", "test").unwrap();
+      if replies.split(',').count() >= count && !replies.is_empty() {
+        return replies;
+      }
+      assert!(
+        Instant::now() < deadline,
+        "Shared worker did not reply: {replies}"
+      );
+      std::thread::sleep(Duration::from_millis(1));
+    }
+  };
+  let (one, two) = (open(1), open(2));
+  assert_eq!(wait(&one, 1), "page1 1 counter undefined true 1");
+  assert_eq!(wait(&two, 1), "page2 2 counter undefined true 2");
+  one.eval("const w=new SharedWorker('data:text/javascript,'+encodeURIComponent(source),'counter');w.port.start();w.port.addEventListener('message',e=>replies.push(e.data.join(' ')));w.port.postMessage(new TextEncoder().encode('again'))", "test").unwrap();
+  assert_eq!(
+    wait(&one, 2),
+    "page1 1 counter undefined true 1,again 3 counter undefined true 3"
+  );
+  // A page that goes away closes its ports in the worker.
+  two.eval("worker.port.postMessage('open')", "test").unwrap();
+  assert_eq!(wait(&two, 2), "page2 2 counter undefined true 2,3");
+  drop(one);
+  two.eval("worker.port.postMessage('open')", "test").unwrap();
+  assert_eq!(wait(&two, 3), "page2 2 counter undefined true 2,3,1");
+  // The worker ends with its last page, so a new page gets a new one.
+  drop(two);
+  let three = open(3);
+  assert_eq!(wait(&three, 1), "page3 1 counter undefined true 1");
+  three
         .eval(
             "new SharedWorker('apps:///missing.js').onerror=e=>replies.push(e.message);new SharedWorker('apps:///echo.js',{name:'echo'}).port.onmessage=e=>replies.push(e.data)",
             "test",
         )
         .unwrap();
-    assert_eq!(
-        wait(&three, 3),
-        "page3 1 counter undefined true 1,Missing bundled worker: missing.js,echo"
-    );
+  assert_eq!(
+    wait(&three, 3),
+    "page3 1 counter undefined true 1,Missing bundled worker: missing.js,echo"
+  );
 }
 
 #[test]
 fn page_workers_from_strings_need_js_execute() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().update_app(|app| {
-        app.features = apps_runtime::bundle::Features::default()
-            .without(apps_runtime::bundle::Feature::JsExecute)
-    });
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse("<body></body>"),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    let page = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
-    assert_eq!(page.eval("[`data:text/javascript,postMessage(1)`,URL.createObjectURL(new Blob(['postMessage(1)']))].map(url=>{try{new Worker(url);return 'started'}catch(e){return e.name}}).join()", "test").unwrap(), "SecurityError,SecurityError");
+  let host = Rc::new(RefCell::new(Host::default()));
+  host.borrow_mut().update_app(|app| {
+    app.features =
+      apps_runtime::bundle::Features::default().without(apps_runtime::bundle::Feature::JsExecute)
+  });
+  host.borrow().store.borrow_mut().pages.insert(
+    1,
+    Page {
+      doc: Document::parse("<body></body>"),
+      dirty: false,
+      ..Default::default()
+    },
+  );
+  let page = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+  assert_eq!(page.eval("[`data:text/javascript,postMessage(1)`,URL.createObjectURL(new Blob(['postMessage(1)']))].map(url=>{try{new Worker(url);return 'started'}catch(e){return e.name}}).join()", "test").unwrap(), "SecurityError,SecurityError");
 }
 
 #[test]
 fn context_bridge_releases_collected_functions_and_rejects_taken_names() {
-    let (host, _main, preload) = contexts();
-    preload.eval("globalThis.errors=[];__apps.contextBridge.exposeInMainWorld('early',1);try{__apps.contextBridge.exposeInMainWorld('early',2)}catch(e){errors.push(e.message)}", "test").unwrap();
-    let page = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
-    page.eval("globalThis.released=[];const receive=__appsBridgeReceive;__appsBridgeReceive=message=>{if(message.kind==='release')released.push(...message.ids);return receive(message)};", "test").unwrap();
-    preload.eval(r#"
+  let (host, _main, preload) = contexts();
+  preload.eval("globalThis.errors=[];__apps.contextBridge.exposeInMainWorld('early',1);try{__apps.contextBridge.exposeInMainWorld('early',2)}catch(e){errors.push(e.message)}", "test").unwrap();
+  let page = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+  page.eval("globalThis.released=[];const receive=__appsBridgeReceive;__appsBridgeReceive=message=>{if(message.kind==='release')released.push(...message.ids);return receive(message)};", "test").unwrap();
+  preload.eval(r#"
         const {contextBridge} = __apps;
         globalThis.ids = [];
         const receive = __appsBridgeReceive;
@@ -843,42 +872,44 @@ fn context_bridge_releases_collected_functions_and_rejects_taken_names() {
         contextBridge.exposeInMainWorld('api', { call: fn => fn(), keep: fn => { globalThis.kept = fn; } });
         for (const name of ['api', 'fetch', 'document']) try { contextBridge.exposeInMainWorld(name, 1); } catch (error) { errors.push(error.message); }
     "#, "test").unwrap();
-    assert_eq!(
+  assert_eq!(
         preload.eval("errors.length+':'+errors.every(m=>m==='Cannot bind an API on top of an existing property on the window object')", "test").unwrap(),
         "4:true"
     );
-    page.eval(
-        "const same=()=>2;api.keep(same);api.call(same);for(let i=0;i<200;i++)api.call(()=>i)",
-        "test",
+  page
+    .eval(
+      "const same=()=>2;api.keep(same);api.call(same);for(let i=0;i<200;i++)api.call(()=>i)",
+      "test",
     )
     .unwrap();
-    for _ in 0..3 {
-        preload.collect_garbage();
-        preload.tick().unwrap();
-        page.tick().unwrap();
-    }
-    assert_eq!(
-        preload.eval("ids[1]===ids[0]", "test").unwrap(),
-        "true",
-        "A function sent twice keeps its id"
-    );
-    let released: usize = page
-        .eval("released.length", "test")
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert!(released > 100, "{released}");
-    let kept = serde_json::to_string(&preload.eval("ids[0]", "test").unwrap()).unwrap();
-    let call = |id: &str| {
-        page.eval(&format!("(()=>{{try{{__appsBridgeReceive({{kind:'call',function:{id},sender:{{preload:1}},args:{{type:'array',id:0,items:[]}}}});return 'live'}}catch(e){{return e.message}}}})()"), "test").unwrap()
-    };
-    assert_eq!(call(&kept), "live", "A function with a live proxy stays");
-    assert!(call(&format!("released.find(id=>id!=={kept})")).contains("unavailable"));
+  for _ in 0..3 {
+    preload.collect_garbage();
+    preload.tick().unwrap();
+    page.tick().unwrap();
+  }
+  assert_eq!(
+    preload.eval("ids[1]===ids[0]", "test").unwrap(),
+    "true",
+    "A function sent twice keeps its id"
+  );
+  let released: usize = page
+    .eval("released.length", "test")
+    .unwrap()
+    .parse()
+    .unwrap();
+  assert!(released > 100, "{released}");
+  let kept = serde_json::to_string(&preload.eval("ids[0]", "test").unwrap()).unwrap();
+  let call = |id: &str| {
+    page.eval(&format!("(()=>{{try{{__appsBridgeReceive({{kind:'call',function:{id},sender:{{preload:1}},args:{{type:'array',id:0,items:[]}}}});return 'live'}}catch(e){{return e.message}}}})()"), "test").unwrap()
+  };
+  assert_eq!(call(&kept), "live", "A function with a live proxy stays");
+  assert!(call(&format!("released.find(id=>id!=={kept})")).contains("unavailable"));
 }
 
 #[test]
 fn node_timeout_refresh_restarts_a_fired_timer() {
-    run(r#"
+  run(
+    r#"
         const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
         let fired = 0;
         const until = async ready => { for (let i = 0; i < 2000 && !ready(); i++) await wait(5); };
@@ -899,12 +930,14 @@ fn node_timeout_refresh_restarts_a_fired_timer() {
         await until(() => runs === 3);
         await wait(20);
         if (runs !== 3) throw Error('Refresh inside the callback failed: ' + runs);
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn workers_terminate_with_queued_messages() {
-    run(r#"
+  run(
+    r#"
         for(let n=0;n<4;n++){
             const worker=new __apps.worker_threads.Worker(`const{parentPort}=require('node:worker_threads');parentPort.on('message',value=>parentPort.postMessage(value));`,{eval:true});
             let errors=0;worker.on('error',()=>errors++);
@@ -912,12 +945,14 @@ fn workers_terminate_with_queued_messages() {
             const code=await worker.terminate();if(code!==1||errors)throw Error('Worker termination failed');
             if(await worker.terminate()!==code)throw Error('Repeat termination did not settle');
         }
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn node_http_and_websocket_adapters() {
-    run(r#"
+  run(
+    r#"
         const assert=(c,m)=>{if(!c)throw Error(m)};
         const server=__apps.http.createServer((request,response)=>{response.setHeader('content-type','text/plain');response.write('one');setTimeout(()=>response.end('two'),5);});
         server.listen(0,'127.0.0.1');const address=server.address();
@@ -927,12 +962,14 @@ fn node_http_and_websocket_adapters() {
         const ws=new __apps.ws.WebSocket(`ws://127.0.0.1:${address.port}/`);
         const result=await new Promise((resolve,reject)=>{ws.on('open',()=>ws.send('echo'));ws.on('message',data=>resolve(data.toString()));ws.on('error',reject);});
         assert(result==='echo','WebSocket adapter');ws.close();wss.close();server.close();
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn node_http_classes_ports_and_errors() {
-    run(r#"
+  run(
+    r#"
         const {assert,http,https,stream}=__apps,net=__apps.module.createRequire()('net');
         assert.ok(Object.create(http.IncomingMessage.prototype) instanceof stream.Readable&&Object.create(http.ServerResponse.prototype) instanceof http.OutgoingMessage);
         assert.ok(http.createServer() instanceof net.Server&&http.maxHeaderSize===16384&&http.STATUS_CODES[418]==="I'm a Teapot"&&Object.keys(http.STATUS_CODES).length===63&&http.METHODS.length===35);
@@ -980,12 +1017,14 @@ fn node_http_classes_ports_and_errors() {
         const failed=await new Promise(resolve=>{const socket=net.connect({port,host:'127.0.0.1'}),events=[];socket.on('error',error=>events.push(error));socket.on('close',hadError=>resolve([...events,hadError]));});
         assert.ok(failed[0].code==='ECONNREFUSED'&&failed[0].errno<0&&failed[0].address==='127.0.0.1'&&failed[0].port===port&&failed[1]===true);
         assert.deepStrictEqual([net.isIP('fe80::1%lo0'),net.isIP('1.2.3.4%x')],[6,0]);
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn node_http_close_finishes_requests_and_streams_large_bodies() {
-    run(r#"
+  run(
+    r#"
         const {assert,http}=__apps,listen=server=>new Promise(resolve=>server.listen(0,'127.0.0.1',()=>resolve(`http://127.0.0.1:${server.address().port}`)));
         const loopback=http.createServer((req,res)=>{res.end('<html>done</html>');loopback.close();}),events=[];
         loopback.on('close',()=>events.push('close'));
@@ -999,12 +1038,14 @@ fn node_http_close_finishes_requests_and_streams_large_bodies() {
         const upload=http.createServer((req,res)=>{let size=0;req.on('data',chunk=>size+=chunk.length);req.on('end',()=>res.end(String(size)));});
         assert.strictEqual(await fetch(await listen(upload),{method:'POST',body:new Uint8Array(20<<20)}).then(r=>r.text()),String(20<<20));
         upload.close();
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn electron_net_requests_fetch_and_online_state() {
-    run(r#"
+  run(
+    r#"
         const {assert,http,net}=__apps;
         const server=http.createServer((req,res)=>{
             if(req.url==='/moved'){res.writeHead(302,{Location:'/echo'});return res.end();}
@@ -1023,12 +1064,14 @@ fn electron_net_requests_fetch_and_online_state() {
         assert.deepStrictEqual(await net.resolveHost('127.0.0.1'),{endpoints:[{address:'127.0.0.1',family:'ipv4'}]});
         assert.ok((await net.resolveHost('localhost',{queryType:'A'})).endpoints.every(({address,family})=>family==='ipv4'&&address==='127.0.0.1'));
         await new Promise(resolve=>server.close(resolve));
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn node_net_reads_while_writing_and_reuses_socket_paths() {
-    run(r#"
+  run(
+    r#"
         const {assert,os,path,fs}=__apps,net=__apps.module.createRequire()('net'),size=16<<20;
         const echo=net.createServer(socket=>socket.pipe(socket));await new Promise(resolve=>echo.listen(0,'127.0.0.1',resolve));
         const client=net.connect(echo.address().port,'127.0.0.1');let received=0;
@@ -1045,7 +1088,8 @@ fn node_net_reads_while_writing_and_reuses_socket_paths() {
         await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(file,resolve);});
         const text=await new Promise((resolve,reject)=>{let data='';const socket=net.connect(file);socket.setEncoding('utf8');socket.on('data',chunk=>data+=chunk);socket.on('end',()=>resolve(data));socket.on('error',reject);});
         assert.strictEqual(text,'hi');server.close();assert.ok(!fs.existsSync(file));
-    "#);
+    "#,
+  );
 }
 
 const CERT: &str = "-----BEGIN CERTIFICATE-----
@@ -1067,47 +1111,45 @@ LHs+pMZ09Md+jxkRs1P9lOrFSJyhRANCAARHjFq9L2MZn4xtgTaB+160UtIH4gKp
 
 #[test]
 fn node_tls_connects_upgrades_and_verifies() {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-    use std::io::{Read, Write};
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![CertificateDer::from_pem_slice(CERT.as_bytes()).unwrap()],
-            PrivateKeyDer::from_pem_slice(KEY.as_bytes()).unwrap(),
-        )
-        .unwrap();
-    config.alpn_protocols = vec![b"h2".to_vec()];
-    let config = std::sync::Arc::new(config);
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    // Plain connections send a STARTTLS line first. All of them echo over TLS until the client ends.
-    std::thread::spawn(move || {
-        for mut stream in listener.incoming().flatten() {
-            let config = config.clone();
-            std::thread::spawn(move || {
-                let mut byte = [0];
-                if stream.peek(&mut byte).is_ok() && byte[0] != 0x16 {
-                    while stream.read(&mut byte).is_ok_and(|size| size == 1) && byte[0] != b'\n' {}
-                    stream.write_all(b"OK\r\n").unwrap();
-                }
-                let mut tls = rustls::StreamOwned::new(
-                    rustls::ServerConnection::new(config).unwrap(),
-                    stream,
-                );
-                let mut buffer = [0; 65536];
-                while let Ok(size @ 1..) = tls.read(&mut buffer) {
-                    if tls.write_all(&buffer[..size]).is_err() {
-                        return;
-                    }
-                }
-                tls.conn.send_close_notify();
-                let _ = tls.flush();
-                let _ = tls.sock.shutdown(std::net::Shutdown::Write);
-            });
+  use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+  use std::io::{Read, Write};
+  let mut config = rustls::ServerConfig::builder()
+    .with_no_client_auth()
+    .with_single_cert(
+      vec![CertificateDer::from_pem_slice(CERT.as_bytes()).unwrap()],
+      PrivateKeyDer::from_pem_slice(KEY.as_bytes()).unwrap(),
+    )
+    .unwrap();
+  config.alpn_protocols = vec![b"h2".to_vec()];
+  let config = std::sync::Arc::new(config);
+  let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+  let port = listener.local_addr().unwrap().port();
+  // Plain connections send a STARTTLS line first. All of them echo over TLS until the client ends.
+  std::thread::spawn(move || {
+    for mut stream in listener.incoming().flatten() {
+      let config = config.clone();
+      std::thread::spawn(move || {
+        let mut byte = [0];
+        if stream.peek(&mut byte).is_ok() && byte[0] != 0x16 {
+          while stream.read(&mut byte).is_ok_and(|size| size == 1) && byte[0] != b'\n' {}
+          stream.write_all(b"OK\r\n").unwrap();
         }
-    });
-    run(&format!(
-        r#"
+        let mut tls =
+          rustls::StreamOwned::new(rustls::ServerConnection::new(config).unwrap(), stream);
+        let mut buffer = [0; 65536];
+        while let Ok(size @ 1..) = tls.read(&mut buffer) {
+          if tls.write_all(&buffer[..size]).is_err() {
+            return;
+          }
+        }
+        tls.conn.send_close_notify();
+        let _ = tls.flush();
+        let _ = tls.sock.shutdown(std::net::Shutdown::Write);
+      });
+    }
+  });
+  run(&format!(
+    r#"
         const require=__apps.module.createRequire(),tls=require('tls'),net=require('net'),{{assert}}=__apps,ca=`{CERT}`,port={port};
         const open=options=>new Promise((resolve,reject)=>{{const socket=tls.connect({{port,host:'127.0.0.1',...options}},()=>resolve(socket));socket.once('error',reject);}});
         let socket=await open({{ca}}),received=0;
@@ -1131,24 +1173,27 @@ fn node_tls_connects_upgrades_and_verifies() {
         const seen=[];socket=tls.connect({{port,host:'127.0.0.1',ca}});for(const name of ['secureConnect','error'])socket.on(name,()=>seen.push(name));socket.on('connect',()=>socket.destroy());
         await new Promise(resolve=>socket.on('close',resolve));assert.deepStrictEqual(seen,[]);
     "#
-    ));
+  ));
 }
 
 #[cfg(unix)]
 #[test]
 fn terminal_has_real_tty_and_can_resize() {
-    run(r#"
+  run(
+    r#"
         const terminal=__apps.pty.spawn('/bin/sh',['-c','stty size; test -t 0 && printf tty'],{cols:91,rows:32});
         let output='';terminal.onData(data=>output+=data);
         await new Promise(resolve=>terminal.onExit(resolve));
         if(!output.includes('32 91')||!output.includes('tty'))throw Error('Not a PTY: '+output);
-    "#);
+    "#,
+  );
 }
 
 #[cfg(unix)]
 #[test]
 fn synchronous_child_processes_and_errors() {
-    run(r#"
+  run(
+    r#"
         const child=__apps.child_process;
         const result=child.spawnSync('/bin/sh',['-c','cat; printf failure >&2; exit 7'],{input:'hello',encoding:'utf8'});
         if(result.status!==7||result.stdout!=='hello'||result.stderr!=='failure')throw Error(JSON.stringify(result));
@@ -1159,12 +1204,14 @@ fn synchronous_child_processes_and_errors() {
         if(timeout.error?.code!=='ETIMEDOUT')throw Error('missing timeout error');
         let missing=false;try{__apps.fs.readFileSync('/does/not/exist/apps-test')}catch(e){missing=e.code==='ENOENT'}
         if(!missing)throw Error('synchronous file error code');
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn node_core_modules() {
-    run(r#"
+  run(
+    r#"
         const {assert,util,path,os,url,querystring,events,crypto,zlib,string_decoder:{StringDecoder}}=__apps;
         assert.deepStrictEqual(Buffer.concat([Buffer.alloc(0),Buffer.from('ab')]),Buffer.from('ab'));
         assert.strictEqual(Buffer.alloc(5).fill('ab').toString(),'ababa');
@@ -1197,16 +1244,17 @@ fn node_core_modules() {
         assert.strictEqual(await util.promisify(setTimeout)(1,'done'),'done');
         assert.ok(process.memoryUsage().rss>0&&process.cpuUsage().user>=0&&process.versions.node);
         assert.ok(__apps.module.isBuiltin('node:readline/promises'));
-    "#);
+    "#,
+  );
 }
 
 #[cfg(unix)]
 #[test]
 fn node_files_streams_and_processes() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = serde_json::to_string(dir.path()).unwrap();
-    run(&format!(
-        r#"
+  let dir = tempfile::tempdir().unwrap();
+  let root = serde_json::to_string(dir.path()).unwrap();
+  run(&format!(
+    r#"
         const {{assert,fs,path,stream,readline,zlib,crypto,util,child_process}}=__apps,root={root};
         const file=path.join(root,'a','lines.txt');
         fs.mkdirSync(path.dirname(file),{{recursive:true}});fs.writeFileSync(file,'one\r\ntwo\nthree');
@@ -1232,15 +1280,15 @@ fn node_files_streams_and_processes() {
         await assert.rejects(exec('echo bad >&2; exit 3'),error=>error.code===3&&error.stderr==='bad\n');
         process.env.APPS_ENV_TEST='inherited';assert.strictEqual((await exec('printf "$APPS_ENV_TEST"')).stdout,'inherited');assert.strictEqual(child_process.execSync('printf "$APPS_ENV_TEST"',{{encoding:'utf8'}}),'inherited');
     "#
-    ));
+  ));
 }
 
 #[test]
 fn node_fs_remove_keeps_files_and_directories_like_node() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = serde_json::to_string(dir.path()).unwrap();
-    run(&format!(
-        r#"
+  let dir = tempfile::tempdir().unwrap();
+  let root = serde_json::to_string(dir.path()).unwrap();
+  run(&format!(
+    r#"
         const {{assert,fs,path}}=__apps,root={root},file=path.join(root,'f.txt'),empty=path.join(root,'empty');
         fs.writeFileSync(file,'keep');fs.mkdirSync(empty);
         assert.throws(()=>fs.rmdirSync(file),{{code:'ENOTDIR',syscall:'rmdir'}});
@@ -1255,16 +1303,16 @@ fn node_fs_remove_keeps_files_and_directories_like_node() {
         fs.symlinkSync(empty,path.join(root,'link'));fs.rmSync(path.join(root,'link'));assert.ok(fs.existsSync(empty));
         fs.rmSync(empty,{{recursive:true}});fs.rmSync(file);assert.deepStrictEqual(fs.readdirSync(root),[]);
     "#
-    ));
+  ));
 }
 
 #[cfg(unix)]
 #[test]
 fn node_fs_descriptors_handles_and_streams() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = serde_json::to_string(dir.path()).unwrap();
-    run(&format!(
-        r#"
+  let dir = tempfile::tempdir().unwrap();
+  let root = serde_json::to_string(dir.path()).unwrap();
+  run(&format!(
+    r#"
         const {{assert,fs,path}}=__apps,fsp=fs.promises,root={root},file=path.join(root,'x.txt');
         fs.writeFileSync(file,'hello world');
         const fd=fs.openSync(file,'r+');
@@ -1319,12 +1367,13 @@ fn node_fs_descriptors_handles_and_streams() {
         await new Promise(resolve=>fs.createWriteStream(out,{{flags:'r+',start:2}}).end('XY',resolve));assert.strictEqual(fs.readFileSync(out,'utf8'),'abXYef');
         const failure=await new Promise(resolve=>fs.createWriteStream(path.join(root,'missing','x')).on('error',resolve));assert.strictEqual(failure.code,'ENOENT');
     "#
-    ));
+  ));
 }
 
 #[test]
 fn node_zlib_streams_crypto_digests_and_os_priority() {
-    run(r#"
+  run(
+    r#"
         const {assert,zlib,crypto,os,readline,stream}=__apps;
         const gzip=zlib.createGzip(),sizes=[];gzip.on('data',chunk=>sizes.push(chunk.length));gzip.write('hello');
         await new Promise(resolve=>gzip.flush(resolve));assert.ok(sizes.length>0&&gzip.bytesWritten===5,'flush emits output');
@@ -1379,12 +1428,14 @@ fn node_zlib_streams_crypto_digests_and_os_priority() {
         const line=new readline.promises.Readline(output);await line.clearLine(0).cursorTo(2,3).moveCursor(-1,1).clearScreenDown().commit();
         line.cursorTo(1).rollback();await line.commit();
         assert.deepStrictEqual(written,['\x1b[2K\x1b[4;3H\x1b[1D\x1b[1B\x1b[0J','']);
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn node_event_targets_timerify_loop_use_and_net_addresses_match_node() {
-    run(r#"
+  run(
+    r#"
         const {assert,events,util,tty,worker_threads,perf_hooks:{performance,PerformanceObserver,createHistogram}}=__apps,{BlockList,SocketAddress}=__apps.module.createRequire()('net');
         const target=new EventTarget(),listener=()=>{},handler={handleEvent(){}},emitter=new events.EventEmitter(),controller=new AbortController();
         target.addEventListener('foo',listener);target.addEventListener('foo',handler);emitter.on('x',listener);controller.signal.addEventListener('abort',listener);
@@ -1413,126 +1464,125 @@ fn node_event_targets_timerify_loop_use_and_net_addresses_match_node() {
         assert.throws(()=>new SocketAddress({address:'x'}),{code:'ERR_INVALID_ADDRESS'});assert.throws(()=>new SocketAddress({port:70000}),{code:'ERR_SOCKET_BAD_PORT'});
         assert.strictEqual(process.stdout.isTTY,tty.isatty(1)||undefined);
         if(!process.stdout.isTTY)assert.deepStrictEqual([process.stdout.columns,typeof process.stdout.getWindowSize],[undefined,'undefined']);
-    "#);
+    "#,
+  );
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn node_dns_resolver_reads_answers_like_node() {
-    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let port = socket.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        let label = |text: &str| {
-            let mut out: Vec<u8> = text
-                .split('.')
-                .flat_map(|part| [&[part.len() as u8][..], part.as_bytes()].concat())
-                .collect();
-            out.push(0);
-            out
-        };
-        let text = |value: &str| [&[value.len() as u8][..], value.as_bytes()].concat();
-        let numbers: Vec<u8> = [2024010101u32, 7200, 3600, 1209600, 300]
-            .iter()
-            .flat_map(|n| n.to_be_bytes())
-            .collect();
-        let records: Vec<(u16, u32, Vec<u8>)> = vec![
-            (1, 300, vec![192, 0, 2, 1]),
-            (1, 60, vec![192, 0, 2, 2]),
-            (
-                28,
-                300,
-                [0x20, 1, 0x0d, 0xb8]
-                    .into_iter()
-                    .chain([0; 11])
-                    .chain([1])
-                    .collect(),
-            ),
-            (15, 300, [vec![0, 10], label("mail.example.test")].concat()),
-            (16, 300, text("v=spf1 -all")),
-            (16, 300, [text("a"), text("b")].concat()),
-            (
-                33,
-                300,
-                [vec![0, 1, 0, 2, 1, 187], label("svc.example.test")].concat(),
-            ),
-            (5, 300, label("alias.example.test")),
-            (2, 300, label("ns1.example.test")),
-            (12, 300, label("host.example.test")),
-            (
-                6,
-                300,
-                [
-                    label("ns1.example.test"),
-                    label("admin.example.test"),
-                    numbers,
-                ]
-                .concat(),
-            ),
-            (
-                257,
-                300,
-                [&[0, 5][..], b"issue", b"letsencrypt.org"].concat(),
-            ),
-            (
-                257,
-                300,
-                [&[128, 5][..], b"iodef", b"mailto:x@example.test"].concat(),
-            ),
-            (
-                35,
-                300,
-                [
-                    vec![0, 100, 0, 10],
-                    text("S"),
-                    text("SIP+D2U"),
-                    text(""),
-                    label("_sip._udp.example.test"),
-                ]
-                .concat(),
-            ),
-            (52, 300, vec![3, 1, 1, 0xde, 0xad, 0xbe, 0xef]),
-        ];
-        let mut query = [0u8; 512];
-        while let Ok((size, peer)) = socket.recv_from(&mut query) {
-            let end = 12 + query[12..size].iter().position(|&byte| byte == 0).unwrap() + 5;
-            let name = String::from_utf8_lossy(&query[12..end - 5]).into_owned();
-            let kind = u16::from_be_bytes([query[end - 4], query[end - 3]]);
-            let rcode = if name.contains("missing") {
-                3
-            } else if name.contains("fail") {
-                2
-            } else {
-                0
-            };
-            let answers: Vec<_> = records
-                .iter()
-                .filter(|(ty, ..)| {
-                    rcode == 0 && !name.contains("empty") && (kind == 255 || *ty == kind)
-                })
-                .collect();
-            let mut reply = [
-                &query[..2],
-                &[0x81, 0x80 | rcode, 0, 1],
-                &(answers.len() as u16).to_be_bytes()[..],
-                &[0, 0, 0, 0],
-                &query[12..end],
-            ]
-            .concat();
-            for (ty, ttl, data) in answers {
-                reply.extend(
-                    [0xc0, 12]
-                        .into_iter()
-                        .chain(ty.to_be_bytes())
-                        .chain([0, 1])
-                        .chain(ttl.to_be_bytes())
-                        .chain((data.len() as u16).to_be_bytes())
-                        .chain(data.iter().copied()),
-                );
-            }
-            socket.send_to(&reply, peer).unwrap();
-        }
-    });
-    run(&r#"
+  let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+  let port = socket.local_addr().unwrap().port();
+  std::thread::spawn(move || {
+    let label = |text: &str| {
+      let mut out: Vec<u8> = text
+        .split('.')
+        .flat_map(|part| [&[part.len() as u8][..], part.as_bytes()].concat())
+        .collect();
+      out.push(0);
+      out
+    };
+    let text = |value: &str| [&[value.len() as u8][..], value.as_bytes()].concat();
+    let numbers: Vec<u8> = [2024010101u32, 7200, 3600, 1209600, 300]
+      .iter()
+      .flat_map(|n| n.to_be_bytes())
+      .collect();
+    let records: Vec<(u16, u32, Vec<u8>)> = vec![
+      (1, 300, vec![192, 0, 2, 1]),
+      (1, 60, vec![192, 0, 2, 2]),
+      (
+        28,
+        300,
+        [0x20, 1, 0x0d, 0xb8]
+          .into_iter()
+          .chain([0; 11])
+          .chain([1])
+          .collect(),
+      ),
+      (15, 300, [vec![0, 10], label("mail.example.test")].concat()),
+      (16, 300, text("v=spf1 -all")),
+      (16, 300, [text("a"), text("b")].concat()),
+      (
+        33,
+        300,
+        [vec![0, 1, 0, 2, 1, 187], label("svc.example.test")].concat(),
+      ),
+      (5, 300, label("alias.example.test")),
+      (2, 300, label("ns1.example.test")),
+      (12, 300, label("host.example.test")),
+      (
+        6,
+        300,
+        [
+          label("ns1.example.test"),
+          label("admin.example.test"),
+          numbers,
+        ]
+        .concat(),
+      ),
+      (
+        257,
+        300,
+        [&[0, 5][..], b"issue", b"letsencrypt.org"].concat(),
+      ),
+      (
+        257,
+        300,
+        [&[128, 5][..], b"iodef", b"mailto:x@example.test"].concat(),
+      ),
+      (
+        35,
+        300,
+        [
+          vec![0, 100, 0, 10],
+          text("S"),
+          text("SIP+D2U"),
+          text(""),
+          label("_sip._udp.example.test"),
+        ]
+        .concat(),
+      ),
+      (52, 300, vec![3, 1, 1, 0xde, 0xad, 0xbe, 0xef]),
+    ];
+    let mut query = [0u8; 512];
+    while let Ok((size, peer)) = socket.recv_from(&mut query) {
+      let end = 12 + query[12..size].iter().position(|&byte| byte == 0).unwrap() + 5;
+      let name = String::from_utf8_lossy(&query[12..end - 5]).into_owned();
+      let kind = u16::from_be_bytes([query[end - 4], query[end - 3]]);
+      let rcode = if name.contains("missing") {
+        3
+      } else if name.contains("fail") {
+        2
+      } else {
+        0
+      };
+      let answers: Vec<_> = records
+        .iter()
+        .filter(|(ty, ..)| rcode == 0 && !name.contains("empty") && (kind == 255 || *ty == kind))
+        .collect();
+      let mut reply = [
+        &query[..2],
+        &[0x81, 0x80 | rcode, 0, 1],
+        &(answers.len() as u16).to_be_bytes()[..],
+        &[0, 0, 0, 0],
+        &query[12..end],
+      ]
+      .concat();
+      for (ty, ttl, data) in answers {
+        reply.extend(
+          [0xc0, 12]
+            .into_iter()
+            .chain(ty.to_be_bytes())
+            .chain([0, 1])
+            .chain(ttl.to_be_bytes())
+            .chain((data.len() as u16).to_be_bytes())
+            .chain(data.iter().copied()),
+        );
+      }
+      socket.send_to(&reply, peer).unwrap();
+    }
+  });
+  run(&r#"
         const {assert,dns}=__apps,resolver=new dns.promises.Resolver({timeout:2000,tries:1}),server='127.0.0.1:PORT',name='example.test';
         resolver.setServers([server]);assert.deepStrictEqual(resolver.getServers(),[server]);
         assert.deepStrictEqual(await resolver.resolve4(name),['192.0.2.1','192.0.2.2']);
@@ -1570,10 +1620,10 @@ fn node_dns_resolver_reads_answers_like_node() {
 
 #[test]
 fn node_fs_vectors_statfs_and_glob_match_node() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = serde_json::to_string(&dir.path()).unwrap();
-    run(&format!(
-        r#"
+  let dir = tempfile::tempdir().unwrap();
+  let root = serde_json::to_string(&dir.path()).unwrap();
+  run(&format!(
+    r#"
         const {{assert,fs,path}}=__apps,root={root},fold=process.platform!=='linux',posix=list=>list.map(file=>file.replaceAll('\\','/')),sort=list=>posix(list).sort();
         for(const file of ['a.js','b.ts','.hidden.js','src/c.js','src/d.JS','src/.e.js','src/deep/f.js','src/deep/g.txt','.dot/h.js','lib/i.js']){{fs.mkdirSync(path.join(root,path.dirname(file)),{{recursive:true}});fs.writeFileSync(path.join(root,file),'');}}
         const glob=(pattern,o)=>sort(fs.globSync(pattern,{{cwd:root,...o}})),d=fold?['src/d.JS']:[];
@@ -1608,12 +1658,13 @@ fn node_fs_vectors_statfs_and_glob_match_node() {
         await handle.close();
         assert.throws(()=>fs.readvSync(fd,'x'),{{code:'ERR_INVALID_ARG_TYPE'}});
     "#
-    ));
+  ));
 }
 
 #[test]
 fn node_crypto_keys_signatures_and_kdfs_match_node() {
-    run(r#"
+  run(
+    r#"
         const {assert,crypto,util}=__apps,msg=Buffer.from('hello h2o'),hash=value=>crypto.createHash('sha256').update(value).digest('hex');
         const rsaDer='MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQC1g8caNlHfV5pKM5XtVKZYhyipR8ftOOdvAKj8Nd1/AoU9cF42yGHO5PZxkCbIRYISOfLcGqyRqOp6kIPisVHvA/ixKUdGX0xEoCVhbHWMTTWiXlXXe+vnVcFbRMyMWA9sf6fDzlV1a1N75AnPzHfpbWsrLoS3gvZnsWE0TYHQeRRH5iz/VsMc62IJIhnPEhy1AiFCtKd4guycGbi5oT+HTfIy4Sw4xUrfjIB7H7Xn54mVeDR4dDEXtv/PQYtP1Wuq9NgPy0gFZ8fu7ENwyDBZY0QQ6/kzVgMua6C9DVxnFA2hTgnLO+AQLLaRN5iKWzfjQ4iz4harp0Nmze/Va7v7AgMBAAECggEAGWakr6yHU4pg+zOcg6xTZP3GY74O98mn9Wwxua2uCTk957r4VuaUGA20K8Xg734ZStn/fEFirIrnWUSCTZsZMf9WcjBVGuojdFJhjhsimKzbWGqmzPNjWqmxAnKDxLteroUaDI2CKbQzEsTMLLSv2SN976U1tFqS3IWW6pNSxcIBg4fSub9PgVwoo4SoOcr6njftKrH/U3D65TsoYshy8wEkbpIL7zOiaW3TuLceQMx9U6rEtEGza92mVKOsRTqNluOvXJr/nmQcrNxpShf9A3sXfz7TgHkAbUFwWKT8UYY0oIiFvMhirOulx14mbSOKqcUOx8QqTMxlHVuzXnVBpQKBgQD7RM2ALY7niUqjpb+/jUsfh+iexOXmdg9Cks0beiI3ZlRD4BCYkLTS55PtRqLi7vKY/nFlyPwvOVS3G1UFNiHQJJSqeu1hLR8X7vYwX3ZD/TuipAn8XaWSLu/xzZnLpEqne887QQuiVjqP3XhpUcQVIQChPFj94WaAciGfAQi5pwKBgQC47rzs4j+qPnWCoS+Vvf3bBxgVrlJM+q7ss7XLQYK26mNFPKboBeJzLzD6v83VtwlqYbynZqndgmgfKy4NrxrGyIJde34cLUPXt4qtbyhdxN6fjOP+wwBA9fpIUW7IswwlOz/yerPI9JHAMZs/MFjzKrP+nenfD6eVZy4CglANjQKBgQDmblSfxigWAnxm06yjuKo6QmN8p0nHLmIURZjAKCOU9s00ahoOMDcEa8fnhC4BO+1TjZTlKYrMrCEaw4AXBWvA/KsyJQXpZn3rbwRrnEBTXbsBDrrxq9gZ1d3KvSjb7tFgA1UrHB3VRIr0QMEapRfT4K45L6TVP47HIOPgdAxSZQKBgQCsSQXK7hB/ywZwtzd8mm6oIZjHggp8WsKiE94WSKa9P+lRtGqOGAVaZ6mKwSvCoW3tJLa7gcJYccgM2Y5jAzG/5UbGTmkzWNwuWHiikL8bdHAuVfSGACb5Xe9YdjzuTxfOi79MaBGb8nTih5RpLuJ/T9Y2K+mYfJ4UavaLMdngdQKBgQCn537D4+XAgxJKf0Z6fjSz1vUi39Tcmsn+oV7+nf7U8RfehFl69HarNpem5rfjmaUnghOSgd6gJVYPzlCI6AcyQfGdYUjeRxfl5/mWMtzSGX7rEM4wkhJVlmPAP3qth3i5zSfQ8/Mp8jX/+gn/FglHTOMOJDlncL8zJTi+FTEfuQ==';
         const rsa=crypto.createPrivateKey({key:Buffer.from(rsaDer,'base64'),format:'der',type:'pkcs8'}),rsaPublic=crypto.createPublicKey(rsa);
@@ -1717,12 +1768,14 @@ fn node_crypto_keys_signatures_and_kdfs_match_node() {
         const forged=crypto.createDecipheriv('chacha20-poly1305',chachaKey,nonce).setAuthTag(chacha.getAuthTag());forged.update(chachaSealed);assert.throws(()=>forged.final(),/unable to authenticate/);
         assert.throws(()=>crypto.createCipheriv('chacha20-poly1305',chachaKey.subarray(16),nonce),{code:'ERR_CRYPTO_INVALID_KEYLEN'});
         assert.ok(crypto.getCiphers().includes('chacha20-poly1305')&&crypto.getFips()===0);
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn data_urls_load_binary_wasm_without_a_server() {
-    run(r#"
+  run(
+    r#"
         const raw=await fetch('data:application/octet-stream,%00%FF%23#ignored');
         if(new Uint8Array(await raw.arrayBuffer()).join(',')!=='0,255,35')throw Error('data bytes');
         for(const [url,text] of [['data:,abc#','abc'],['data:,abc#x','abc'],['data:;base64,YWJj#','abc'],['data:,a%23b#c','a#b'],['data:,#','']])if(await(await fetch(url)).text()!==text)throw Error(url);
@@ -1730,12 +1783,14 @@ fn data_urls_load_binary_wasm_without_a_server() {
         if(urls.join()!==['data:,abc','data:,abc',blob].join())throw Error('response urls '+urls);
         const result=await WebAssembly.instantiateStreaming(fetch('data:application/wasm;base64,AGFzbQEAAAA='));
         if(!(result.instance instanceof WebAssembly.Instance))throw Error('Wasm data URL');
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn node_ticks_timers_and_immediates_run_in_node_order() {
-    run(r#"
+  run(
+    r#"
         const {assert,timers}=__apps;
         const order=[];
         await new Promise(resolve=>setTimeout(()=>{
@@ -1760,12 +1815,14 @@ fn node_ticks_timers_and_immediates_run_in_node_order() {
         const controller=new AbortController(),waiting=timers.promises.setTimeout(1000,'x',{signal:controller.signal});controller.abort();
         await assert.rejects(waiting,{name:'AbortError',code:'ABORT_ERR'});
         assert.strictEqual(await timers.promises.setImmediate('v'),'v');
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn node_process_env_constants_and_worker_exit() {
-    run(r#"
+  run(
+    r#"
         const {assert,module,util,worker_threads}=__apps;
         process.env.APPS_COERCE=42;assert.strictEqual(process.env.APPS_COERCE,'42');
         process.env.APPS_COERCE=undefined;assert.strictEqual(process.env.APPS_COERCE,'undefined');
@@ -1781,12 +1838,14 @@ fn node_process_env_constants_and_worker_exit() {
         assert.deepStrictEqual(messages,['exit 7']);
         const closing=new worker_threads.Worker(`require('node:worker_threads').parentPort.close();`,{eval:true});
         assert.strictEqual(await new Promise(resolve=>closing.on('exit',resolve)),0);
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn node_perf_hooks_and_worker_thread_helpers() {
-    run(r#"
+  run(
+    r#"
         const {assert,perf_hooks:{performance,PerformanceObserver,createHistogram,monitorEventLoopDelay},worker_threads}=__apps;
         const observed=new Promise(resolve=>new PerformanceObserver((list,observer)=>{observer.disconnect();resolve(list.getEntries().map(entry=>entry.entryType+':'+entry.name));}).observe({entryTypes:['mark','measure']}));
         performance.mark('a');performance.mark('b',{detail:1});const measure=performance.measure('ab','a','b');
@@ -1819,12 +1878,14 @@ fn node_perf_hooks_and_worker_thread_helpers() {
         const counted=new Promise(resolve=>busy.once('message',resolve));flood.postMessage('last');
         const received=await counted;assert.ok(received>=4097&&received<=5001,'a reader that fell behind still gets later messages: '+received);flood.close();
         assert.strictEqual(typeof worker_threads.SHARE_ENV,'symbol');
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn worker_messages_ports_and_listener_errors() {
-    run(r#"
+  run(
+    r#"
         const {assert,worker_threads:{Worker,MessageChannel}}=__apps;
         const echo=new Worker(`const{parentPort}=require('node:worker_threads');parentPort.on('message',m=>parentPort.postMessage(m));`,{eval:true});
         assert.strictEqual(typeof echo.threadId,'number');
@@ -1859,12 +1920,14 @@ fn worker_messages_ports_and_listener_errors() {
         assert.ok(port1.hasRef()&&!port1.unref().hasRef()&&port1.ref().hasRef());
         assert.ok(echo.listenerCount('message')===0&&echo.emit('message',1)===false&&echo.addListener('x',()=>{}).listenerCount('x')===1);
         assert.strictEqual(await echo.terminate(),1);
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn workers_share_and_move_memory() {
-    run(r#"
+  run(
+    r#"
         const {assert,worker_threads:{Worker,MessageChannel,BroadcastChannel}}=__apps;
         const shared=new SharedArrayBuffer(16),cells=new Int32Array(shared);cells[0]=1;
         const worker=new Worker(`const{parentPort,workerData}=require('node:worker_threads');const cells=new Int32Array(workerData.shared);
@@ -1913,29 +1976,30 @@ fn workers_share_and_move_memory() {
         const blocked=new Worker(`const{parentPort,workerData}=require('node:worker_threads');parentPort.postMessage(1);Atomics.wait(new Int32Array(workerData),0,0);`,{eval:true,workerData:new SharedArrayBuffer(8)});
         await new Promise(resolve=>blocked.once('message',resolve));await new Promise(resolve=>setTimeout(resolve,50));
         assert.strictEqual(await blocked.terminate(),1);assert.strictEqual(await worker.terminate(),1);
-    "#);
+    "#,
+  );
 }
 
 #[cfg(unix)]
 #[test]
 fn fork_and_utility_process_speak_node_ipc() {
-    let dir = tempfile::tempdir().unwrap();
-    let child = r#"const port=process.parentPort,send=port?m=>port.postMessage(m):m=>process.send(m);
+  let dir = tempfile::tempdir().unwrap();
+  let child = r#"const port=process.parentPort,send=port?m=>port.postMessage(m):m=>process.send(m);
 send({ready:process.argv.slice(2),type:process.type??null,fd:process.env.NODE_CHANNEL_FD??null,connected:process.connected});
 (port??process).on('message',m=>{m=port?m.data:m;if(m==='big')send({big:'é\n'.repeat(1<<20)});else if(m==='bye'){send(1);send(2);process.exit(3);}else send({echo:m});});"#;
-    std::fs::write(dir.path().join("child.js"), child).unwrap();
-    let bundle = dir.path().join("bundle.json");
-    std::fs::write(
-        &bundle,
-        serde_json::json!({"files":[["child.js",child]],"pages":[]}).to_string(),
-    )
-    .unwrap();
-    let node = std::process::Command::new("node")
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success());
-    run(&format!(
-        r#"const {{assert,child_process:{{fork,spawn}},utilityProcess,events:{{once}}}}=__apps;
+  std::fs::write(dir.path().join("child.js"), child).unwrap();
+  let bundle = dir.path().join("bundle.json");
+  std::fs::write(
+    &bundle,
+    serde_json::json!({"files":[["child.js",child]],"pages":[]}).to_string(),
+  )
+  .unwrap();
+  let node = std::process::Command::new("node")
+    .arg("--version")
+    .output()
+    .is_ok_and(|output| output.status.success());
+  run(&format!(
+    r#"const {{assert,child_process:{{fork,spawn}},utilityProcess,events:{{once}}}}=__apps;
         const runtime={runtime},file={file},node={node},env={{...process.env,ELECTRON_RUN_AS_NODE:'1',APPS_DEV_BUNDLE:{bundle}}};
         const code=fn=>{{try{{fn();}}catch(error){{return error.code;}}}};
         const script=(child,log=[])=>{{for(const name of ['message','disconnect','exit','close'])child.on(name,(...args)=>log.push(name==='message'?args[0]:name==='exit'?'exit '+args[0]:name));return log;}};
@@ -1987,15 +2051,16 @@ send({ready:process.argv.slice(2),type:process.type??null,fd:process.env.NODE_CH
             assert.deepStrictEqual(log.slice(4).sort(),['close 3','disconnect undefined','exit 3']);
         }}
     "#,
-        runtime = serde_json::to_string(env!("CARGO_BIN_EXE_apps-runtime")).unwrap(),
-        file = serde_json::to_string(&dir.path().join("child.js")).unwrap(),
-        bundle = serde_json::to_string(&bundle).unwrap(),
-    ));
+    runtime = serde_json::to_string(env!("CARGO_BIN_EXE_apps-runtime")).unwrap(),
+    file = serde_json::to_string(&dir.path().join("child.js")).unwrap(),
+    bundle = serde_json::to_string(&bundle).unwrap(),
+  ));
 }
 
 #[test]
 fn node_unzip_waits_for_the_whole_header() {
-    run(r#"
+  run(
+    r#"
         const {assert,zlib,stream}=__apps;
         for(const packed of [zlib.gzipSync('split header'),zlib.deflateSync('split header')]){
             const unzip=zlib.createUnzip();unzip.write(packed.subarray(0,1));unzip.end(packed.subarray(1));
@@ -2003,12 +2068,14 @@ fn node_unzip_waits_for_the_whole_header() {
         }
         const reset=zlib.createUnzip(),packed=zlib.gzipSync('after reset');reset.write(packed.subarray(0,1));reset.reset();reset.end(packed);
         assert.strictEqual(await stream.consumers.text(reset),'after reset');
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn node_deep_equal_matches_each_object_of_sets_and_maps_once() {
-    run(r#"
+  run(
+    r#"
         const {assert,util:{isDeepStrictEqual:same}}=__apps;
         const c={x:1},d={x:2},shared={c:d,n:9};
         // The values are the results of Node 24.
@@ -2021,5 +2088,6 @@ fn node_deep_equal_matches_each_object_of_sets_and_maps_once() {
         assert.throws(()=>assert.deepStrictEqual(new Set([{x:1},{x:1}]),new Set([{x:1},{x:2}])));
         assert.throws(()=>assert.deepEqual(new Set([[{a:1}],[{a:1}]]),new Set([[{a:1}],[{a:2}]])));
         const p={},q={};p.p=p;q.p=q;assert.ok(same(p,q));
-    "#);
+    "#,
+  );
 }

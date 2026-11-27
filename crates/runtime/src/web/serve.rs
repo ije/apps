@@ -7,117 +7,117 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
-    collections::HashMap,
-    convert::Infallible,
-    net::TcpListener,
-    sync::{Arc, Mutex},
-    task::Poll,
-    time::Duration,
+  collections::HashMap,
+  convert::Infallible,
+  net::TcpListener,
+  sync::{Arc, Mutex},
+  task::Poll,
+  time::Duration,
 };
 use tokio::{
-    sync::{mpsc, oneshot, watch},
-    task::{JoinHandle, JoinSet},
+  sync::{mpsc, oneshot, watch},
+  task::{JoinHandle, JoinSet},
 };
 
 type Body = UnsyncBoxBody<Bytes, std::io::Error>;
 type Reply = (
-    oneshot::Sender<Response<Body>>,
-    Option<hyper::upgrade::OnUpgrade>,
+  oneshot::Sender<Response<Body>>,
+  Option<hyper::upgrade::OnUpgrade>,
 );
 type RequestEvent = (
-    crate::jsc::payload::Payload,
-    Option<(Reply, mpsc::Sender<()>)>,
+  crate::jsc::payload::Payload,
+  Option<(Reply, mpsc::Sender<()>)>,
 );
 
 // The status line and the headers of a response from JavaScript.
 fn head(value: &Value) -> Result<hyper::http::response::Builder> {
-    let status = value["status"].as_u64().context("Expected status")?;
-    ensure!((200..=599).contains(&status), "Invalid response status");
-    let headers: Vec<(String, String)> = serde_json::from_value(value["headers"].clone())?;
-    let mut response = Response::builder().status(status as u16);
-    for (name, value) in headers {
-        if name.eq_ignore_ascii_case("transfer-encoding") {
-            continue;
-        }
-        let value = value
-            .chars()
-            .map(|c| u8::try_from(c as u32))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        response = response.header(name, value);
+  let status = value["status"].as_u64().context("Expected status")?;
+  ensure!((200..=599).contains(&status), "Invalid response status");
+  let headers: Vec<(String, String)> = serde_json::from_value(value["headers"].clone())?;
+  let mut response = Response::builder().status(status as u16);
+  for (name, value) in headers {
+    if name.eq_ignore_ascii_case("transfer-encoding") {
+      continue;
     }
-    if let Some(reason) = value["statusText"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-    {
-        let bytes = reason
-            .chars()
-            .map(|c| u8::try_from(c as u32))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        response = response.extension(hyper::ext::ReasonPhrase::try_from(bytes)?);
-    }
-    Ok(response)
+    let value = value
+      .chars()
+      .map(|c| u8::try_from(c as u32))
+      .collect::<std::result::Result<Vec<_>, _>>()?;
+    response = response.header(name, value);
+  }
+  if let Some(reason) = value["statusText"]
+    .as_str()
+    .filter(|value| !value.is_empty())
+  {
+    let bytes = reason
+      .chars()
+      .map(|c| u8::try_from(c as u32))
+      .collect::<std::result::Result<Vec<_>, _>>()?;
+    response = response.extension(hyper::ext::ReasonPhrase::try_from(bytes)?);
+  }
+  Ok(response)
 }
 
 fn full(bytes: Bytes) -> Body {
-    Full::new(bytes)
-        .map_err(|never| match never {})
-        .boxed_unsync()
+  Full::new(bytes)
+    .map_err(|never| match never {})
+    .boxed_unsync()
 }
 
 struct Server {
-    events: mpsc::Receiver<RequestEvent>,
-    replies: HashMap<u64, Reply>,
-    task: JoinHandle<()>,
-    listener: Arc<Mutex<Option<(tokio::net::TcpListener, crate::web::Listening)>>>,
-    stop: watch::Sender<bool>,
-    streams: HashMap<u64, (mpsc::Sender<Option<Bytes>>, Arc<AtomicBool>)>,
-    sockets: Vec<u64>,
-    uploads: HashMap<u64, mpsc::Sender<()>>,
+  events: mpsc::Receiver<RequestEvent>,
+  replies: HashMap<u64, Reply>,
+  task: JoinHandle<()>,
+  listener: Arc<Mutex<Option<(tokio::net::TcpListener, crate::web::Listening)>>>,
+  stop: watch::Sender<bool>,
+  streams: HashMap<u64, (mpsc::Sender<Option<Bytes>>, Arc<AtomicBool>)>,
+  sockets: Vec<u64>,
+  uploads: HashMap<u64, mpsc::Sender<()>>,
 }
 
 impl Drop for Server {
-    fn drop(&mut self) {
-        if let Ok(mut listener) = self.listener.lock() {
-            listener.take();
-        }
-        self.task.abort();
+  fn drop(&mut self) {
+    if let Ok(mut listener) = self.listener.lock() {
+      listener.take();
     }
+    self.task.abort();
+  }
 }
 
 #[derive(Default)]
 pub(crate) struct State {
-    servers: HashMap<u64, Server>,
-    next_id: u64,
+  servers: HashMap<u64, Server>,
+  next_id: u64,
 }
 
 impl State {
-    pub(crate) fn call(
-        &mut self,
-        op: &str,
-        args: &Value,
-        sockets: &mut crate::web::websocket::State,
-        tcp: &mut crate::web::tcp::State,
-    ) -> Result<Value> {
-        match op {
-            "start" => {
-                let hostname = args[0]["hostname"].as_str().context("Expected hostname")?;
-                let port = u16::try_from(args[0]["port"].as_u64().context("Expected port")?)?;
-                let listener = TcpListener::bind((hostname, port))?;
-                let address = listener.local_addr()?;
-                listener.set_nonblocking(true)?;
-                let network = crate::web::network()?;
-                let _guard = network.enter();
-                let listener = tokio::net::TcpListener::from_std(listener)?;
-                let (sender, events) = mpsc::channel(64);
-                let wake = crate::jsc::Waker::current();
-                // `stop` drops the listener on the JavaScript thread, so the port is free before it returns.
-                let listener = Arc::new(Mutex::new(Some((
-                    listener,
-                    crate::web::Listening::new(address),
-                ))));
-                let (stop, stopping) = watch::channel(false);
-                let accepting = listener.clone();
-                let task = network.spawn(crate::web::boxed(async move {
+  pub(crate) fn call(
+    &mut self,
+    op: &str,
+    args: &Value,
+    sockets: &mut crate::web::websocket::State,
+    tcp: &mut crate::web::tcp::State,
+  ) -> Result<Value> {
+    match op {
+      "start" => {
+        let hostname = args[0]["hostname"].as_str().context("Expected hostname")?;
+        let port = u16::try_from(args[0]["port"].as_u64().context("Expected port")?)?;
+        let listener = TcpListener::bind((hostname, port))?;
+        let address = listener.local_addr()?;
+        listener.set_nonblocking(true)?;
+        let network = crate::web::network()?;
+        let _guard = network.enter();
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        let (sender, events) = mpsc::channel(64);
+        let wake = crate::jsc::Waker::current();
+        // `stop` drops the listener on the JavaScript thread, so the port is free before it returns.
+        let listener = Arc::new(Mutex::new(Some((
+          listener,
+          crate::web::Listening::new(address),
+        ))));
+        let (stop, stopping) = watch::channel(false);
+        let accepting = listener.clone();
+        let task = network.spawn(crate::web::boxed(async move {
                     let _closed = crate::jsc::WakeOnDrop(wake.clone());
                     let next_id = Arc::new(AtomicU64::new(0));
                     let mut connections = JoinSet::new();
@@ -221,236 +221,232 @@ impl State {
                     }
                     while connections.join_next().await.is_some() {}
                 }));
-                self.next_id += 1;
-                self.servers.insert(
-                    self.next_id,
-                    Server {
-                        events,
-                        replies: HashMap::new(),
-                        streams: HashMap::new(),
-                        sockets: Vec::new(),
-                        uploads: HashMap::new(),
-                        task,
-                        listener,
-                        stop,
-                    },
-                );
-                Ok(json!({"id": self.next_id, "port": address.port()}))
+        self.next_id += 1;
+        self.servers.insert(
+          self.next_id,
+          Server {
+            events,
+            replies: HashMap::new(),
+            streams: HashMap::new(),
+            sockets: Vec::new(),
+            uploads: HashMap::new(),
+            task,
+            listener,
+            stop,
+          },
+        );
+        Ok(json!({"id": self.next_id, "port": address.port()}))
+      }
+      "poll" => {
+        let (mut events, mut closed) = (Vec::new(), Vec::new());
+        for (&id, server) in &mut self.servers {
+          server.replies.retain(|request, reply| {
+            if reply.0.is_closed() {
+              events.push(json!({"server":id,"id":request,"kind":"cancel"}));
+              false
+            } else {
+              true
             }
-            "poll" => {
-                let (mut events, mut closed) = (Vec::new(), Vec::new());
-                for (&id, server) in &mut self.servers {
-                    server.replies.retain(|request, reply| {
-                        if reply.0.is_closed() {
-                            events.push(json!({"server":id,"id":request,"kind":"cancel"}));
-                            false
-                        } else {
-                            true
-                        }
-                    });
-                    server.uploads.retain(|_, upload| !upload.is_closed());
-                    server.streams.retain(|request, (stream, _)| {
-                        let closed = stream.is_closed();
-                        if closed {
-                            events.push(json!({"server":id,"id":request,"kind":"cancel"}));
-                        }
-                        !closed
-                    });
-                    for _ in 0..64 {
-                        let Ok((event, reply)) = server.events.try_recv() else {
-                            break;
-                        };
-                        let mut event = event.into_value();
-                        if let Some((reply, demand)) = reply {
-                            if reply.0.is_closed() {
-                                continue;
-                            }
-                            let request = event["id"].as_u64().unwrap();
-                            if event["body"] == true {
-                                server.uploads.insert(request, demand);
-                            }
-                            server.replies.insert(request, reply);
-                        }
-                        if event["kind"] == "body"
-                            && (event["done"] == true || event.get("error").is_some())
-                        {
-                            server.uploads.remove(&event["id"].as_u64().unwrap());
-                        }
-                        event["server"] = json!(id);
-                        events.push(event);
-                    }
-                    if server.task.is_finished() && server.events.is_empty() {
-                        events.push(json!({"server":id,"kind":"closed"}));
-                        closed.push(id);
-                    }
-                }
-                for id in closed {
-                    self.servers.remove(&id);
-                }
-                Ok(json!(events))
+          });
+          server.uploads.retain(|_, upload| !upload.is_closed());
+          server.streams.retain(|request, (stream, _)| {
+            let closed = stream.is_closed();
+            if closed {
+              events.push(json!({"server":id,"id":request,"kind":"cancel"}));
             }
-            "pull" | "cancel" => {
-                let server = self
-                    .servers
-                    .get_mut(&args[0].as_u64().context("Expected server ID")?)
-                    .context("Server is closed")?;
-                let id = args[1].as_u64().context("Expected request ID")?;
-                if op == "cancel" {
-                    server.uploads.remove(&id);
-                } else if let Some(upload) = server.uploads.get(&id) {
-                    match upload.try_send(()) {
-                        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
-                        Err(_) => bail!("Request body is closed"),
-                    }
-                } else {
-                    bail!("Request body is closed");
-                }
-                Ok(Value::Null)
+            !closed
+          });
+          for _ in 0..64 {
+            let Ok((event, reply)) = server.events.try_recv() else {
+              break;
+            };
+            let mut event = event.into_value();
+            if let Some((reply, demand)) = reply {
+              if reply.0.is_closed() {
+                continue;
+              }
+              let request = event["id"].as_u64().unwrap();
+              if event["body"] == true {
+                server.uploads.insert(request, demand);
+              }
+              server.replies.insert(request, reply);
             }
-            "respond" => {
-                let server = args[0].as_u64().context("Expected server ID")?;
-                let id = args[1].as_u64().context("Expected request ID")?;
-                let Some(server) = self.servers.get_mut(&server) else {
-                    return Ok(Value::Null);
-                };
-                if !server.replies.contains_key(&id) {
-                    return Ok(Value::Null);
-                }
-                let value = &args[2];
-                let body = crate::web::bytes(&value["body"])?;
-                let response = head(value)?;
-                let body = if value["stream"] == true {
-                    let (sender, receiver) = mpsc::channel::<Option<Bytes>>(16);
-                    let full = Arc::new(AtomicBool::new(false));
-                    server.streams.insert(id, (sender, full.clone()));
-                    let closed = crate::jsc::WakeOnDrop(crate::jsc::Waker::current());
-                    StreamBody::new(futures_util::stream::unfold(
-                        (receiver, closed, full),
-                        |(mut receiver, closed, full)| async move {
-                            let bytes = receiver.recv().await.flatten()?;
-                            // A writer that found the queue full waits for this wake.
-                            if full.swap(false, Ordering::AcqRel) {
-                                closed.0.wake();
-                            }
-                            Some((
-                                Ok::<_, std::io::Error>(hyper::body::Frame::data(bytes)),
-                                (receiver, closed, full),
-                            ))
-                        },
-                    ))
-                    .boxed_unsync()
-                } else {
-                    full(Bytes::from(body))
-                };
-                let response = response.body(body)?;
-                let _ = server.replies.remove(&id).unwrap().0.send(response);
-                Ok(Value::Null)
+            if event["kind"] == "body" && (event["done"] == true || event.get("error").is_some()) {
+              server.uploads.remove(&event["id"].as_u64().unwrap());
             }
-            "write" => {
-                let server = self
-                    .servers
-                    .get_mut(&args[0].as_u64().context("Expected server ID")?)
-                    .context("Server is closed")?;
-                let id = args[1].as_u64().context("Expected request ID")?;
-                let (stream, full) = server
-                    .streams
-                    .get(&id)
-                    .context("Response stream is closed")?;
-                let chunk = if args[2].is_null() {
-                    None
-                } else {
-                    Some(Bytes::from(crate::web::bytes(&args[2])?))
-                };
-                full.store(true, Ordering::Release);
-                match stream.try_send(chunk) {
-                    Ok(()) => {
-                        full.store(false, Ordering::Release);
-                        if args[2].is_null() {
-                            server.streams.remove(&id);
-                        }
-                        Ok(json!(true))
-                    }
-                    Err(mpsc::error::TrySendError::Full(_)) => Ok(json!(false)),
-                    Err(_) => bail!("Response stream is closed"),
-                }
-            }
-            "upgrade" => {
-                let server = self
-                    .servers
-                    .get_mut(&args[0].as_u64().context("Expected server ID")?)
-                    .context("Server is closed")?;
-                let id = args[1].as_u64().context("Expected request ID")?;
-                let key = args[2].as_str().context("Expected WebSocket key")?;
-                ensure!(
-                    base64::engine::general_purpose::STANDARD.decode(key)?.len() == 16,
-                    "Invalid WebSocket key"
-                );
-                let protocol = args[3].as_str().unwrap_or("");
-                let mut response = Response::builder()
-                    .status(101)
-                    .header("upgrade", "websocket")
-                    .header("connection", "Upgrade")
-                    .header(
-                        "sec-websocket-accept",
-                        tokio_tungstenite::tungstenite::handshake::derive_accept_key(
-                            key.as_bytes(),
-                        ),
-                    );
-                if !protocol.is_empty() {
-                    response = response.header("sec-websocket-protocol", protocol);
-                }
-                let response = response.body(full(Bytes::new()))?;
-                let (reply, upgrade) = server
-                    .replies
-                    .remove(&id)
-                    .context("Request is no longer pending")?;
-                server.uploads.remove(&id);
-                let socket = sockets.accept(
-                    upgrade.context("Request is not a WebSocket upgrade")?,
-                    protocol.to_owned(),
-                )?;
-                server.sockets.retain(|id| sockets.is_open(*id));
-                server.sockets.push(socket);
-                let _ = reply.send(response);
-                Ok(json!(socket))
-            }
-            // Answers a CONNECT request. With a 2xx status the connection becomes a TCP socket of `tcp`.
-            "tunnel" => {
-                let server = self
-                    .servers
-                    .get_mut(&args[0].as_u64().context("Expected server ID")?)
-                    .context("Server is closed")?;
-                let id = args[1].as_u64().context("Expected request ID")?;
-                let response = head(&args[2])?;
-                let body = crate::web::bytes(&args[2]["body"])?;
-                let (reply, upgrade) = server
-                    .replies
-                    .remove(&id)
-                    .context("Request is no longer pending")?;
-                let upgrade = upgrade.context("Request is not a CONNECT request")?;
-                let response = response.body(full(Bytes::from(body)))?;
-                let open = response.status().is_success();
-                let _ = reply.send(response);
-                if !open {
-                    return Ok(Value::Null);
-                }
-                Ok(json!(tcp.adopt(upgrade, args[3].clone())?))
-            }
-            "stop" => {
-                let id = args[0].as_u64().context("Expected server ID")?;
-                if args[1] != true {
-                    if let Some(server) = self.servers.get(&id) {
-                        if let Ok(mut listener) = server.listener.lock() {
-                            listener.take();
-                        }
-                        server.stop.send_replace(true);
-                    }
-                } else if let Some(server) = self.servers.remove(&id) {
-                    sockets.close(&server.sockets);
-                }
-                Ok(Value::Null)
-            }
-            _ => bail!("Unknown server operation: {op}"),
+            event["server"] = json!(id);
+            events.push(event);
+          }
+          if server.task.is_finished() && server.events.is_empty() {
+            events.push(json!({"server":id,"kind":"closed"}));
+            closed.push(id);
+          }
         }
+        for id in closed {
+          self.servers.remove(&id);
+        }
+        Ok(json!(events))
+      }
+      "pull" | "cancel" => {
+        let server = self
+          .servers
+          .get_mut(&args[0].as_u64().context("Expected server ID")?)
+          .context("Server is closed")?;
+        let id = args[1].as_u64().context("Expected request ID")?;
+        if op == "cancel" {
+          server.uploads.remove(&id);
+        } else if let Some(upload) = server.uploads.get(&id) {
+          match upload.try_send(()) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+            Err(_) => bail!("Request body is closed"),
+          }
+        } else {
+          bail!("Request body is closed");
+        }
+        Ok(Value::Null)
+      }
+      "respond" => {
+        let server = args[0].as_u64().context("Expected server ID")?;
+        let id = args[1].as_u64().context("Expected request ID")?;
+        let Some(server) = self.servers.get_mut(&server) else {
+          return Ok(Value::Null);
+        };
+        if !server.replies.contains_key(&id) {
+          return Ok(Value::Null);
+        }
+        let value = &args[2];
+        let body = crate::web::bytes(&value["body"])?;
+        let response = head(value)?;
+        let body = if value["stream"] == true {
+          let (sender, receiver) = mpsc::channel::<Option<Bytes>>(16);
+          let full = Arc::new(AtomicBool::new(false));
+          server.streams.insert(id, (sender, full.clone()));
+          let closed = crate::jsc::WakeOnDrop(crate::jsc::Waker::current());
+          StreamBody::new(futures_util::stream::unfold(
+            (receiver, closed, full),
+            |(mut receiver, closed, full)| async move {
+              let bytes = receiver.recv().await.flatten()?;
+              // A writer that found the queue full waits for this wake.
+              if full.swap(false, Ordering::AcqRel) {
+                closed.0.wake();
+              }
+              Some((
+                Ok::<_, std::io::Error>(hyper::body::Frame::data(bytes)),
+                (receiver, closed, full),
+              ))
+            },
+          ))
+          .boxed_unsync()
+        } else {
+          full(Bytes::from(body))
+        };
+        let response = response.body(body)?;
+        let _ = server.replies.remove(&id).unwrap().0.send(response);
+        Ok(Value::Null)
+      }
+      "write" => {
+        let server = self
+          .servers
+          .get_mut(&args[0].as_u64().context("Expected server ID")?)
+          .context("Server is closed")?;
+        let id = args[1].as_u64().context("Expected request ID")?;
+        let (stream, full) = server
+          .streams
+          .get(&id)
+          .context("Response stream is closed")?;
+        let chunk = if args[2].is_null() {
+          None
+        } else {
+          Some(Bytes::from(crate::web::bytes(&args[2])?))
+        };
+        full.store(true, Ordering::Release);
+        match stream.try_send(chunk) {
+          Ok(()) => {
+            full.store(false, Ordering::Release);
+            if args[2].is_null() {
+              server.streams.remove(&id);
+            }
+            Ok(json!(true))
+          }
+          Err(mpsc::error::TrySendError::Full(_)) => Ok(json!(false)),
+          Err(_) => bail!("Response stream is closed"),
+        }
+      }
+      "upgrade" => {
+        let server = self
+          .servers
+          .get_mut(&args[0].as_u64().context("Expected server ID")?)
+          .context("Server is closed")?;
+        let id = args[1].as_u64().context("Expected request ID")?;
+        let key = args[2].as_str().context("Expected WebSocket key")?;
+        ensure!(
+          base64::engine::general_purpose::STANDARD.decode(key)?.len() == 16,
+          "Invalid WebSocket key"
+        );
+        let protocol = args[3].as_str().unwrap_or("");
+        let mut response = Response::builder()
+          .status(101)
+          .header("upgrade", "websocket")
+          .header("connection", "Upgrade")
+          .header(
+            "sec-websocket-accept",
+            tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes()),
+          );
+        if !protocol.is_empty() {
+          response = response.header("sec-websocket-protocol", protocol);
+        }
+        let response = response.body(full(Bytes::new()))?;
+        let (reply, upgrade) = server
+          .replies
+          .remove(&id)
+          .context("Request is no longer pending")?;
+        server.uploads.remove(&id);
+        let socket = sockets.accept(
+          upgrade.context("Request is not a WebSocket upgrade")?,
+          protocol.to_owned(),
+        )?;
+        server.sockets.retain(|id| sockets.is_open(*id));
+        server.sockets.push(socket);
+        let _ = reply.send(response);
+        Ok(json!(socket))
+      }
+      // Answers a CONNECT request. With a 2xx status the connection becomes a TCP socket of `tcp`.
+      "tunnel" => {
+        let server = self
+          .servers
+          .get_mut(&args[0].as_u64().context("Expected server ID")?)
+          .context("Server is closed")?;
+        let id = args[1].as_u64().context("Expected request ID")?;
+        let response = head(&args[2])?;
+        let body = crate::web::bytes(&args[2]["body"])?;
+        let (reply, upgrade) = server
+          .replies
+          .remove(&id)
+          .context("Request is no longer pending")?;
+        let upgrade = upgrade.context("Request is not a CONNECT request")?;
+        let response = response.body(full(Bytes::from(body)))?;
+        let open = response.status().is_success();
+        let _ = reply.send(response);
+        if !open {
+          return Ok(Value::Null);
+        }
+        Ok(json!(tcp.adopt(upgrade, args[3].clone())?))
+      }
+      "stop" => {
+        let id = args[0].as_u64().context("Expected server ID")?;
+        if args[1] != true {
+          if let Some(server) = self.servers.get(&id) {
+            if let Ok(mut listener) = server.listener.lock() {
+              listener.take();
+            }
+            server.stop.send_replace(true);
+          }
+        } else if let Some(server) = self.servers.remove(&id) {
+          sockets.close(&server.sockets);
+        }
+        Ok(Value::Null)
+      }
+      _ => bail!("Unknown server operation: {op}"),
     }
+  }
 }

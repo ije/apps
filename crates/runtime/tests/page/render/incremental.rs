@@ -3,8 +3,8 @@ use super::*;
 #[test]
 #[ignore = "requires the macOS window server"]
 fn observers_rects_hits_and_reloads_like_chrome() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         const input = body => fetch(MCP + '/input', { method: 'POST', body: JSON.stringify({ window: win.id, ...body }) }).then(response => response.text());
         const errors = [], check = (ok, what) => ok || errors.push(what);
         const frames = async () => { for (let n = 0; n < 3; n++) await win.webContents.capturePage(); };
@@ -57,9 +57,9 @@ fn observers_rects_hits_and_reloads_like_chrome() {
         check(await run("[typeof mark, location.href.endsWith('.html#'), hashes.sort().join()].join()") === 'number,true,hash,hash,pop,pop', 'an empty hash: ' + await run("[location.href, hashes.join()].join()"));
         if (errors.length) fail(errors.join('; '));
         "#,
-        &[(
-            "page.html",
-            "<body style='margin:0'><div id=o style='width:56px;perspective:300px'>\
+    &[(
+      "page.html",
+      "<body style='margin:0'><div id=o style='width:56px;perspective:300px'>\
              <div id=t style='height:30px;transform:rotateX(calc(var(--o, 0) * 40deg))'>t</div></div>\
              <div id=s style='position:absolute;left:0;top:100px;width:100px;height:100px;overflow:auto'>\
              <div style='height:20px'></div><div style='height:20px'></div><div style='height:20px'></div>\
@@ -84,15 +84,15 @@ fn observers_rects_hits_and_reloads_like_chrome() {
              globalThis.scaled = []; const z = document.getElementById('z'); z.scrollTop = 10;\
              z.addEventListener('scroll', () => scaled.push(Math.round((z.children[4].getBoundingClientRect().top - z.getBoundingClientRect().top) / 2 + z.scrollTop)));\
              addEventListener('pointerdown', e => downs.push(e.target.id || e.target.localName));</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn reloads_never_show_boxes_of_the_old_page() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         const width = () => run("document.getElementById('t').getBoundingClientRect().width");
         await load('a.html');
         const narrow = await width();
@@ -100,24 +100,24 @@ fn reloads_never_show_boxes_of_the_old_page() {
         const wide = await width();
         if (!(wide > narrow * 4)) fail('old boxes after a navigation: ' + narrow + ' ' + wide);
         "#,
-        &[
-            (
-                "a.html",
-                "<body style='margin:0'><span id=t>i</span></body>",
-            ),
-            (
-                "b.html",
-                "<body style='margin:0'><span id=t>WWWWWWWW</span></body>",
-            ),
-        ],
-    );
+    &[
+      (
+        "a.html",
+        "<body style='margin:0'><span id=t>i</span></body>",
+      ),
+      (
+        "b.html",
+        "<body style='margin:0'><span id=t>WWWWWWWW</span></body>",
+      ),
+    ],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn stretched_images_keep_their_size_when_they_restyle_in_place() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const input = body => fetch(MCP + '/input', { method: 'POST', body: JSON.stringify({ window: win.id, ...body }) }).then(response => response.text());
         const look = async () => {
@@ -129,21 +129,21 @@ fn stretched_images_keep_their_size_when_they_restyle_in_place() {
         const hover = await look();
         if (!before.startsWith('0,0,48,48 | 48,0,') || hover !== before.replace(/ 1$/, ' 0.8')) fail('hover: ' + before + ' then ' + hover);
         "#,
-        &[(
-            "page.html",
-            "<body style='margin:0'><style>img:hover{opacity:.8}</style><div style='display:flex;height:48px'>\
+    &[(
+      "page.html",
+      "<body style='margin:0'><style>img:hover{opacity:.8}</style><div style='display:flex;height:48px'>\
              <img id=i src='data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%2296%22 height=%2296%22%3E%3Crect width=%2296%22 height=%2296%22 fill=%22red%22/%3E%3C/svg%3E'>\
              <span id=j>after</span></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 // Debug builds compare each patched frame with a full one: tree walks, visibility, boxes and layout.
 #[test]
 #[ignore = "requires the macOS window server"]
 fn random_tree_changes_draw_like_full_frames() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         for (let frame = 0; frame < 80; frame++) {
             await run('change()');
@@ -155,9 +155,9 @@ fn random_tree_changes_draw_like_full_frames() {
         }))`));
         if (!state.length || state.includes(false)) fail('rows and boxes disagree: ' + state.join());
         "#,
-        &[(
-            "page.html",
-            "<body style='margin:0'><style>.hide{display:none} .flat{display:contents} li{height:12px} #pane{height:80px;overflow:auto}</style>\
+    &[(
+      "page.html",
+      "<body style='margin:0'><style>.hide{display:none} .flat{display:contents} li{height:12px} #pane{height:80px;overflow:auto}</style>\
              <div id=pane><ul id=list></ul></div><table><tbody id=rows></tbody></table><div id=box></div>\
              <script>\
              let seed = 4321;\
@@ -184,15 +184,15 @@ fn random_tree_changes_draw_like_full_frames() {
              ];\
              globalThis.change = () => { for (let count = 1 + random(3); count--;) steps[random(steps.length)](); };\
              </script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn kept_boxes_follow_what_their_build_read_outside_them() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         const at = id => `(r => [r.x, r.y].join())(document.getElementById('${id}').getBoundingClientRect())`;
         await load('changed.html');
         const top = await run(at('t'));
@@ -205,59 +205,59 @@ fn kept_boxes_follow_what_their_build_read_outside_them() {
         if (ltr !== fresh[0]) fail('parent direction: ' + ltr + ' instead of ' + fresh[0]);
         if (font !== fresh[1]) fail('parent font: ' + font + ' instead of ' + fresh[1]);
         "#,
-        &[
-            (
-                "changed.html",
-                "<body style='margin:0'><div style='padding:10px'><div id=h style='overflow:hidden;height:50px'>\
+    &[
+      (
+        "changed.html",
+        "<body style='margin:0'><div style='padding:10px'><div id=h style='overflow:hidden;height:50px'>\
                  <div style='height:200px'><i id=t style='display:block;height:10px;margin-top:60px'></i></div></div></div>\
                  <div id=d style='direction:rtl;width:300px'><div id=c style='direction:ltr;width:100px;height:10px'></div></div>\
                  <p id=p style='font-size:20px;line-height:30px;margin:0'>x<span id=s \
                  style='display:inline-block;vertical-align:super;font-size:10px;line-height:10px'>y</span></p></body>",
-            ),
-            (
-                "fresh.html",
-                "<body style='margin:0'><div style='padding:10px'><div id=h style='overflow:hidden;height:50px'>\
+      ),
+      (
+        "fresh.html",
+        "<body style='margin:0'><div style='padding:10px'><div id=h style='overflow:hidden;height:50px'>\
                  <div style='height:200px'><i id=t style='display:block;height:10px;margin-top:60px'></i></div></div></div>\
                  <div id=d style='direction:ltr;width:300px'><div id=c style='direction:ltr;width:100px;height:10px'></div></div>\
                  <p id=p style='font-size:40px;line-height:30px;margin:0'>x<span id=s \
                  style='display:inline-block;vertical-align:super;font-size:10px;line-height:10px'>y</span></p></body>",
-            ),
-        ],
-    );
+      ),
+    ],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn new_nodes_read_styles_like_a_full_pass_before_the_first_frame() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('new.html');
         const got = await run('window.got');
         if (got !== ',rgb(255, 0, 0)') fail('styles of new nodes: ' + got);
         "#,
-        &[(
-            "new.html",
-            "<body><script>getComputedStyle(document.body).color;\
+    &[(
+      "new.html",
+      "<body><script>getComputedStyle(document.body).color;\
              const got = [getComputedStyle(document.createElement('i')).color];\
              const x = document.createElement('div'); x.style.color = 'red'; document.body.append(x);\
              got.push(getComputedStyle(x).color); window.got = got.join();</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn grid_items_build_in_place_when_only_their_paint_changes() {
-    let page = r#"<style>
+  let page = r#"<style>
         body { margin: 0; }
         #list { display: grid; grid-template-columns: 200px; width: 200px; }
         .row { position: relative; height: 20px; background: rgb(255, 255, 255); --p: 0; }
         .row::after { content: ""; position: absolute; left: 0; top: 0; height: 20px; width: calc(200px * var(--p)); background: rgb(0, 0, 255); }
         </style>
         <div id="list"><div class="row" id="r0"></div><div class="row" id="r1"></div><div class="row" id="r2"></div></div>"#;
-    let text = run_hidden(
-        &format!(
-            r#"{STEPS}
+  let text = run_hidden(
+    &format!(
+      r#"{STEPS}
             await load('rows.html');
             for (let index = 1; index <= 4; index++) {{
                 await step('p' + index, () => run(`document.getElementById('r1').style.setProperty('--p', '${{index / 4}}')`));
@@ -267,40 +267,40 @@ fn grid_items_build_in_place_when_only_their_paint_changes() {
             await step('paint', () => run("document.getElementById('r2').style.background = 'rgb(0, 255, 0)'"));
             console.log('PAINT ' + await pixel(100, 50));
             "#
-        ),
-        &[("rows.html", page)],
+    ),
+    &[("rows.html", page)],
+  );
+  let rows: Vec<&str> = text
+    .lines()
+    .filter(|line| line.starts_with("ROW "))
+    .collect();
+  assert_eq!(rows.len(), 4, "{text}");
+  for (index, line) in rows.iter().enumerate() {
+    // Bitmaps are BGRA. Past the end of the row the next pixel is outside the window at 200px.
+    let tail = if index == 3 { "" } else { " 255,255,255" };
+    assert!(
+      line.contains(" 255,0,0") && line.ends_with(tail),
+      "the progress draws to its width: {line}"
     );
-    let rows: Vec<&str> = text
-        .lines()
-        .filter(|line| line.starts_with("ROW "))
-        .collect();
-    assert_eq!(rows.len(), 4, "{text}");
-    for (index, line) in rows.iter().enumerate() {
-        // Bitmaps are BGRA. Past the end of the row the next pixel is outside the window at 200px.
-        let tail = if index == 3 { "" } else { " 255,255,255" };
-        assert!(
-            line.contains(" 255,0,0") && line.ends_with(tail),
-            "the progress draws to its width: {line}"
-        );
-    }
-    assert!(text.contains("PAINT 0,255,0"), "{text}");
-    // Only debug builds name the boxes they build. The rows build in place, and the grid stays.
-    for step in ["p2", "p3", "p4", "paint"]
-        .into_iter()
-        .filter(|_| cfg!(debug_assertions))
-    {
-        let built = built(&text, step);
-        assert!(
-            !built.contains(&"list") && !built.is_empty(),
-            "{step} builds {built:?}"
-        );
-    }
+  }
+  assert!(text.contains("PAINT 0,255,0"), "{text}");
+  // Only debug builds name the boxes they build. The rows build in place, and the grid stays.
+  for step in ["p2", "p3", "p4", "paint"]
+    .into_iter()
+    .filter(|_| cfg!(debug_assertions))
+  {
+    let built = built(&text, step);
+    assert!(
+      !built.contains(&"list") && !built.is_empty(),
+      "{step} builds {built:?}"
+    );
+  }
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn animated_boxes_in_positioned_boxes_draw_each_frame() {
-    let page = r#"<style>
+  let page = r#"<style>
         body { margin: 0; }
         #card { position: relative; width: 200px; height: 100px; background: rgb(255, 255, 255); overflow: hidden; border-radius: 8px; box-shadow: inset 0 0 4px rgb(0 0 0 / 0.2); }
         #card::before { content: ""; position: absolute; inset: 0; z-index: 1; background: rgb(0 0 0 / 0.01); mix-blend-mode: multiply; }
@@ -310,9 +310,9 @@ fn animated_boxes_in_positioned_boxes_draw_each_frame() {
         @keyframes grow { from { height: 10px; } to { height: 50px; } }
         </style>
         <div id="card"><div id="art"><div id="bars"><i id="a"></i></div></div></div>"#;
-    let text = run_hidden(
-        &format!(
-            r#"{STEPS}
+  let text = run_hidden(
+    &format!(
+      r#"{STEPS}
             await load('anim.html');
             for (let index = 0; index < 8; index++) {{
                 await wait(130);
@@ -324,34 +324,34 @@ fn animated_boxes_in_positioned_boxes_draw_each_frame() {
                 console.log('BAR ' + blue);
             }}
             "#
-        ),
-        &[("anim.html", page)],
-    );
-    let bars: Vec<&str> = text
-        .lines()
-        .filter(|line| line.starts_with("BAR "))
-        .collect();
-    assert_eq!(bars.len(), 8, "{text}");
-    // Bitmaps are BGRA.
-    let mut heights = bars.clone();
-    heights.sort_unstable();
-    heights.dedup();
-    assert!(heights.len() >= 4, "the bar draws at new heights: {bars:?}");
+    ),
+    &[("anim.html", page)],
+  );
+  let bars: Vec<&str> = text
+    .lines()
+    .filter(|line| line.starts_with("BAR "))
+    .collect();
+  assert_eq!(bars.len(), 8, "{text}");
+  // Bitmaps are BGRA.
+  let mut heights = bars.clone();
+  heights.sort_unstable();
+  heights.dedup();
+  assert!(heights.len() >= 4, "the bar draws at new heights: {bars:?}");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn positioned_boxes_build_in_place_on_each_frame() {
-    let page = r#"<style>
+  let page = r#"<style>
         body { margin: 0; }
         #card { position: relative; width: 200px; height: 100px; background: rgb(255, 255, 255); }
         #bars { position: absolute; left: 10px; bottom: 10px; height: 60px; display: flex; align-items: flex-end; gap: 2px; }
         #bars i { width: 20px; height: 10px; background: rgb(0, 0, 255); }
         </style>
         <div id="card"><div id="bars"><i id="a"></i><i id="b"></i></div></div>"#;
-    let text = run_hidden(
-        &format!(
-            r#"{STEPS}
+  let text = run_hidden(
+    &format!(
+      r#"{STEPS}
             await load('bars.html');
             for (let index = 0; index < 12; index++) {{
                 const height = 10 + (index * 7) % 50;
@@ -361,73 +361,73 @@ fn positioned_boxes_build_in_place_on_each_frame() {
                 console.log('BAR ' + index + ' ' + await pixel(20, top + 5) + ' ' + await pixel(20, top - 5));
             }}
             "#
-        ),
-        &[("bars.html", page)],
+    ),
+    &[("bars.html", page)],
+  );
+  let bars: Vec<&str> = text
+    .lines()
+    .filter(|line| line.starts_with("BAR "))
+    .collect();
+  assert_eq!(bars.len(), 12, "{text}");
+  // After the first build, the bars build again in place and the card around them stays. Only debug builds
+  // name the boxes they build.
+  for index in (1..12).filter(|_| cfg!(debug_assertions)) {
+    let built = built(&text, &format!("bar{index}"));
+    assert!(
+      built.contains(&"bars") && !built.contains(&"card"),
+      "step {index} builds {built:?}"
     );
-    let bars: Vec<&str> = text
-        .lines()
-        .filter(|line| line.starts_with("BAR "))
-        .collect();
-    assert_eq!(bars.len(), 12, "{text}");
-    // After the first build, the bars build again in place and the card around them stays. Only debug builds
-    // name the boxes they build.
-    for index in (1..12).filter(|_| cfg!(debug_assertions)) {
-        let built = built(&text, &format!("bar{index}"));
-        assert!(
-            built.contains(&"bars") && !built.contains(&"card"),
-            "step {index} builds {built:?}"
-        );
-    }
-    for line in bars {
-        // Bitmaps are BGRA.
-        assert!(
-            line.ends_with(" 255,0,0 255,255,255"),
-            "the bar draws at its height: {line}"
-        );
-    }
+  }
+  for line in bars {
+    // Bitmaps are BGRA.
+    assert!(
+      line.ends_with(" 255,0,0 255,255,255"),
+      "the bar draws at its height: {line}"
+    );
+  }
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn boxes_that_never_cull_keep_the_boxes_around_them() {
-    let mut page = String::from(
-        "<body id=body style='margin:0'><p id=o style='margin:0'>x</p>\
+  let mut page = String::from(
+    "<body id=body style='margin:0'><p id=o style='margin:0'>x</p>\
          <div id=s style='height:200px;overflow:auto'><div id=t style='transform:translateZ(0)'>",
-    );
-    for index in 0..400 {
-        page.push_str(&format!(
-            "<div id=r{index} style='height:20px'>row {index}</div>"
-        ));
-    }
-    page.push_str("</div></div></body>");
-    let text = run_hidden(
-        &format!(
-            r#"{STEPS}
+  );
+  for index in 0..400 {
+    page.push_str(&format!(
+      "<div id=r{index} style='height:20px'>row {index}</div>"
+    ));
+  }
+  page.push_str("</div></div></body>");
+  let text = run_hidden(
+    &format!(
+      r#"{STEPS}
             await load('moved.html');
             await win.webContents.capturePage();
             await step('idle', () => run("document.getElementById('o').textContent = 'y'"));
             await step('scroll', () => run("document.getElementById('s').scrollTop = 4000"));
             "#
-        ),
-        &[("moved.html", &page)],
+    ),
+    &[("moved.html", &page)],
+  );
+  for step in ["idle", "scroll"] {
+    let built = built(&text, step);
+    assert!(
+      built.iter().all(|id| ["o", "body"].contains(id)),
+      "a transformed box culls nothing, so it is kept: {step} {built:?}"
     );
-    for step in ["idle", "scroll"] {
-        let built = built(&text, step);
-        assert!(
-            built.iter().all(|id| ["o", "body"].contains(id)),
-            "a transformed box culls nothing, so it is kept: {step} {built:?}"
-        );
-    }
+  }
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn fields_that_a_scroll_moves_take_clicks_and_draw_their_selection() {
-    // The page scrolls the field without a prepaint of it. Debug builds prepaint all boxes in every third pass, so
-    // each check runs three times with one frame before it.
-    let text = run_hidden(
-        &format!(
-            r#"{INPUT}
+  // The page scrolls the field without a prepaint of it. Debug builds prepaint all boxes in every third pass, so
+  // each check runs three times with one frame before it.
+  let text = run_hidden(
+    &format!(
+      r#"{INPUT}
         const capture = () => win.webContents.capturePage({{ x: 0, y: 0, width: 400, height: 300 }});
         const pixel = async (x, y) => [...(await win.webContents.capturePage({{ x, y, width: 1, height: 1 }})).toBitmap()].slice(0, 3).join();
         const place = async () => JSON.parse(await run("(r => JSON.stringify([Math.round(r.x), Math.round(r.y + r.height / 2)]))(document.getElementById('f').getBoundingClientRect())"));
@@ -447,40 +447,40 @@ fn fields_that_a_scroll_moves_take_clicks_and_draw_their_selection() {
         }}
         console.log('SEEN ' + seen.join(' '));
         "#
-        ),
-        &[(
-            "field.html",
-            "<body style='margin:0;background:#fff'><div style='height:150px'></div><div style='padding:10px'>\
+    ),
+    &[(
+      "field.html",
+      "<body style='margin:0;background:#fff'><div style='height:150px'></div><div style='padding:10px'>\
              <input id=f value='hello world' style='font:16px monospace;width:200px;border:0;padding:0;outline:0;background:#fff;color:#fff;caret-color:#fff'>\
              </div><div style='height:3000px'></div><style>#f::selection{background:#00f}</style></body>",
-        )],
-    );
-    let seen = (text.lines()).find_map(|line| line.strip_prefix("SEEN "));
-    assert_eq!(
-        seen,
-        Some(["f,5 blue:255,0,0 white:255,255,255"; 3].join(" ").as_str()),
-        "{text}"
-    );
+    )],
+  );
+  let seen = (text.lines()).find_map(|line| line.strip_prefix("SEEN "));
+  assert_eq!(
+    seen,
+    Some(["f,5 blue:255,0,0 white:255,255,255"; 3].join(" ").as_str()),
+    "{text}"
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn far_tiles_place_the_items_of_a_flexed_grid_at_its_new_size() {
-    // The grid of a tile takes the rest of its column, so a taller caption moves its item up.
-    let mut page = String::from(
-        "<style>body{margin:0;font:14px sans-serif}#g{display:grid;grid-template-columns:1fr 1fr;\
+  // The grid of a tile takes the rest of its column, so a taller caption moves its item up.
+  let mut page = String::from(
+    "<style>body{margin:0;font:14px sans-serif}#g{display:grid;grid-template-columns:1fr 1fr;\
          grid-auto-rows:200px;gap:10px}.t{display:flex;flex-direction:column}\
          .s{flex:1;display:grid;place-items:center}</style><body><main id=g>",
-    );
-    for index in 0..30 {
-        page.push_str(&format!(
-            "<article class=t id=t{index}><div class=s><span id=r{index}>R</span></div>\
+  );
+  for index in 0..30 {
+    page.push_str(&format!(
+      "<article class=t id=t{index}><div class=s><span id=r{index}>R</span></div>\
              <p id=c{index} style='margin:0'>tile</p></article>"
-        ));
-    }
-    page.push_str("</main></body>");
-    let text = run_hidden(
-        r#"
+    ));
+  }
+  page.push_str("</main></body>");
+  let text = run_hidden(
+    r#"
         const top = () => run("Math.round(document.getElementById('r25').getBoundingClientRect().y - document.getElementById('t25').getBoundingClientRect().y)");
         await load('tiles.html');
         await win.webContents.capturePage();
@@ -491,37 +491,37 @@ fn far_tiles_place_the_items_of_a_flexed_grid_at_its_new_size() {
         for (let n = 0; n < 3; n++) await win.webContents.capturePage();
         console.log('NEAR ' + await top());
         "#,
-        &[("tiles.html", &page)],
-    );
-    let line = |prefix: &str| (text.lines()).find_map(|line| line.strip_prefix(prefix));
-    assert!(
-        line("FAR ").is_some() && line("FAR ") == line("NEAR "),
-        "the item of a far tile takes the new size of its grid: {text}"
-    );
+    &[("tiles.html", &page)],
+  );
+  let line = |prefix: &str| (text.lines()).find_map(|line| line.strip_prefix(prefix));
+  assert!(
+    line("FAR ").is_some() && line("FAR ") == line("NEAR "),
+    "the item of a far tile takes the new size of its grid: {text}"
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn clipping_tiles_far_from_the_view_are_spacers_with_exact_boxes_inside() {
-    // Each tile clips and positions what is in it, like the tiles of ui-sink. Tile 28 has a canvas, which is
-    // uncullable inside any box.
-    let mut page = String::from(
-        "<style>body{margin:0;font:14px sans-serif}#g{display:grid;grid-template-columns:1fr 1fr;\
+  // Each tile clips and positions what is in it, like the tiles of ui-sink. Tile 28 has a canvas, which is
+  // uncullable inside any box.
+  let mut page = String::from(
+    "<style>body{margin:0;font:14px sans-serif}#g{display:grid;grid-template-columns:1fr 1fr;\
          grid-auto-rows:200px;gap:10px}.t{position:relative;display:flex;flex-direction:column;overflow:hidden}\
          .s{position:relative;flex:1;display:grid;place-items:center;overflow:hidden}\
          .r{display:inline-block;transform:rotate(10deg);padding:4px}.a{position:absolute;right:4px;top:4px}</style><body id=body><p id=o style='margin:0'>x</p><main id=g>",
-    );
-    for index in 0..30 {
-        let canvas = ["", "<canvas width=8 height=8></canvas>"][usize::from(index == 28)];
-        page.push_str(&format!(
+  );
+  for index in 0..30 {
+    let canvas = ["", "<canvas width=8 height=8></canvas>"][usize::from(index == 28)];
+    page.push_str(&format!(
             "<article class=t id=t{index}><div class=s id=s{index}><span class=r id=r{index}>R</span>\
              <b class=a id=a{index}>A</b>{canvas}</div><p id=c{index} style='margin:0'>tile</p></article>"
         ));
-    }
-    page.push_str("</main></body>");
-    let text = run_hidden(
-        &format!(
-            r#"{STEPS}
+  }
+  page.push_str("</main></body>");
+  let text = run_hidden(
+    &format!(
+      r#"{STEPS}
             const rects = id => run(`JSON.stringify(['r', 'a', 's'].map(part => {{
                 const box = document.getElementById(part + '${{id}}').getBoundingClientRect(), tile = document.getElementById('t${{id}}').getBoundingClientRect();
                 return [box.x - tile.x, box.y - tile.y, box.width, box.height].map(v => Math.round(v * 10) / 10).join();
@@ -536,39 +536,39 @@ fn clipping_tiles_far_from_the_view_are_spacers_with_exact_boxes_inside() {
             await step('near', () => run("document.getElementById('t25').scrollIntoView()"));
             console.log('NEAR ' + await rects(25));
             "#
-        ),
-        &[("tiles.html", &page)],
-    );
-    let built = built(&text, "pinned");
-    assert!(
-        built.contains(&"s29") && !built.contains(&"s28"),
-        "far tiles are spacers that build again near the view, but not one with a canvas: {built:?}"
-    );
-    let line = |prefix: &str| {
-        (text.lines())
-            .find_map(|line| line.strip_prefix(prefix))
-            .unwrap_or_default()
-            .to_string()
-    };
-    assert_eq!(
-        line("FAR "),
-        line("NEAR "),
-        "boxes in a far tile take its changes: {text}"
-    );
+    ),
+    &[("tiles.html", &page)],
+  );
+  let built = built(&text, "pinned");
+  assert!(
+    built.contains(&"s29") && !built.contains(&"s28"),
+    "far tiles are spacers that build again near the view, but not one with a canvas: {built:?}"
+  );
+  let line = |prefix: &str| {
+    (text.lines())
+      .find_map(|line| line.strip_prefix(prefix))
+      .unwrap_or_default()
+      .to_string()
+  };
+  assert_eq!(
+    line("FAR "),
+    line("NEAR "),
+    "boxes in a far tile take its changes: {text}"
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn far_blocks_around_clipping_tiles_take_the_transforms_in_them() {
-    // The row is a plain block far below the view, so it becomes a spacer when its tiles confine their cards.
-    let tiles = "<div class=t><div class=f id=f><div class=c></div></div></div>".repeat(4);
-    let page = format!(
-        "<style>body{{margin:0}}.t{{position:relative;display:inline-block;width:200px;height:200px;overflow:hidden}}\
+  // The row is a plain block far below the view, so it becomes a spacer when its tiles confine their cards.
+  let tiles = "<div class=t><div class=f id=f><div class=c></div></div></div>".repeat(4);
+  let page = format!(
+    "<style>body{{margin:0}}.t{{position:relative;display:inline-block;width:200px;height:200px;overflow:hidden}}\
          .f{{position:absolute;left:50%;top:50%;translate:-50% -50%;scale:var(--s,1)}}.c{{width:300px;height:300px}}</style>\
          <body><div style='height:3000px'></div><div id=row>{tiles}</div><div style='height:3000px'></div></body>"
-    );
-    let text = run_hidden(
-        r#"
+  );
+  let text = run_hidden(
+    r#"
         const width = () => run("String(Math.round(document.getElementById('f').getBoundingClientRect().width))");
         await load('row.html');
         for (let n = 0; n < 3; n++) await win.webContents.capturePage();
@@ -576,95 +576,94 @@ fn far_blocks_around_clipping_tiles_take_the_transforms_in_them() {
         for (let n = 0; n < 3; n++) await win.webContents.capturePage();
         console.log('FAR ' + await width());
         "#,
-        &[("row.html", &page)],
-    );
-    assert!(
-        text.contains("FAR 150"),
-        "a far card takes its new scale: {text}"
-    );
+    &[("row.html", &page)],
+  );
+  assert!(
+    text.contains("FAR 150"),
+    "a far card takes its new scale: {text}"
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn cleared_blocks_far_below_floats_stay_spacers() {
-    let mut page =
-        String::from("<body id=body style='margin:0'><p id=o style='margin:0'>x</p><div>");
-    for _ in 0..300 {
-        page.push_str("<div style='float:left;width:90px;height:40px'></div>");
-    }
-    page.push_str("</div><div id=g style='clear:both'>");
-    for index in 0..50 {
-        page.push_str(&format!("<div id=c{index}>row {index}</div>"));
-    }
-    page.push_str("</div></body>");
-    let text = run_hidden(
-        &format!(
-            r#"{STEPS}
+  let mut page = String::from("<body id=body style='margin:0'><p id=o style='margin:0'>x</p><div>");
+  for _ in 0..300 {
+    page.push_str("<div style='float:left;width:90px;height:40px'></div>");
+  }
+  page.push_str("</div><div id=g style='clear:both'>");
+  for index in 0..50 {
+    page.push_str(&format!("<div id=c{index}>row {index}</div>"));
+  }
+  page.push_str("</div></body>");
+  let text = run_hidden(
+    &format!(
+      r#"{STEPS}
             await load('cleared.html');
             await win.webContents.capturePage();
             await win.webContents.capturePage();
             await step('edit', () => run("document.getElementById('o').textContent = 'y'"));
             console.log('TOP ' + await run("Math.round(document.getElementById('g').getBoundingClientRect().top)"));
             "#
-        ),
-        &[("cleared.html", &page)],
-    );
-    let built = built(&text, "edit");
-    assert!(
-        !built.iter().any(|id| *id == "g" || id.starts_with('c')),
-        "a cleared block far below floats is a spacer, which stays: {built:?}"
-    );
-    assert!(
-        text.contains("TOP 3019"),
-        "the spacer keeps the clearance: {text}"
-    );
+    ),
+    &[("cleared.html", &page)],
+  );
+  let built = built(&text, "edit");
+  assert!(
+    !built.iter().any(|id| *id == "g" || id.starts_with('c')),
+    "a cleared block far below floats is a spacer, which stays: {built:?}"
+  );
+  assert!(
+    text.contains("TOP 3019"),
+    "the spacer keeps the clearance: {text}"
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn first_builds_log_reads_that_replay_the_same() {
-    // Debug builds build the second wrapper again when it takes the style of the first.
-    let wrapper = "<div class=w><div style='height:50px;overflow:auto'>short</div>\
+  // Debug builds build the second wrapper again when it takes the style of the first.
+  let wrapper = "<div class=w><div style='height:50px;overflow:auto'>short</div>\
                    <div class=b></div><span>inline</span><p>block</p></div>";
-    let text = run_hidden(
-        &format!(
-            r#"{STEPS}
+  let text = run_hidden(
+    &format!(
+      r#"{STEPS}
             await load('reads.html');
             await win.webContents.capturePage();
             await step('text', () => run("document.getElementById('o').textContent = 'y'"));
             await step('scroller', () => run("document.getElementById('a').innerHTML = '<div id=s style=\"height:50px;overflow:auto\">short</div>'"));
             await step('grid', () => run("for (const box of document.querySelectorAll('.b')) box.innerHTML = '<div style=\"display:grid\"><span>cell</span></div>'"));
             "#
-        ),
-        &[(
-            "reads.html",
-            &format!(
-                "<body id=body style='margin:0'><p id=o style='margin:0'>x</p>\
+    ),
+    &[(
+      "reads.html",
+      &format!(
+        "<body id=body style='margin:0'><p id=o style='margin:0'>x</p>\
                  <svg style='display:none'><symbol id=dot viewBox='0 0 10 10'><circle cx=5 cy=5 r=4 /></symbol></svg>\
                  <div id=i><svg width=10 height=10><use href='#dot' /></svg></div><div id=a></div>{wrapper}{wrapper}</body>"
-            ),
-        )],
-    );
-    let texted = built(&text, "text");
-    assert!(
-        !texted.contains(&"i"),
-        "a box with a <use> icon is kept: {texted:?}"
-    );
-    let scroller = built(&text, "scroller");
-    assert_eq!(
-        scroller.iter().filter(|id| **id == "s").count(),
-        1,
-        "a new scroll box builds once: {scroller:?}"
-    );
+      ),
+    )],
+  );
+  let texted = built(&text, "text");
+  assert!(
+    !texted.contains(&"i"),
+    "a box with a <use> icon is kept: {texted:?}"
+  );
+  let scroller = built(&text, "scroller");
+  assert_eq!(
+    scroller.iter().filter(|id| **id == "s").count(),
+    1,
+    "a new scroll box builds once: {scroller:?}"
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn shrunk_grids_with_new_content_replay_their_width_in_the_same_build() {
-    // Debug builds build the second flex item again when it takes the style of the first, and visit the grid
-    // that just took a narrower content width.
-    run_hidden(
-        r#"
+  // Debug builds build the second flex item again when it takes the style of the first, and visit the grid
+  // that just took a narrower content width.
+  run_hidden(
+    r#"
         await load('page.html');
         await run("document.getElementById('g').textContent = 'ab'");
         await win.webContents.capturePage();
@@ -672,19 +671,19 @@ fn shrunk_grids_with_new_content_replay_their_width_in_the_same_build() {
         const want = await run("(r => (r.selectNodeContents(document.getElementById('g')), r.getBoundingClientRect().width))(document.createRange())");
         if (Math.abs(width - want) > 1) fail('the grid fits its new text: ' + width + ' ' + want);
         "#,
-        &[(
-            "page.html",
-            "<body style='margin:0'><div style='display:flex'><div><div style='display:grid'>first</div></div></div>\
+    &[(
+      "page.html",
+      "<body style='margin:0'><div style='display:flex'><div><div style='display:grid'>first</div></div></div>\
              <div style='display:flex'><div><div id=g style='display:grid'>second row</div></div></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn the_only_box_of_a_run_paints_its_new_color() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('run.html');
         await win.webContents.capturePage();
         const pixel = async () => [...(await win.webContents.capturePage({ x: 10, y: 20, width: 1, height: 1 })).toBitmap()].slice(0, 3).reverse().join();
@@ -693,45 +692,45 @@ fn the_only_box_of_a_run_paints_its_new_color() {
         await win.webContents.capturePage();
         if (await pixel() !== '255,0,0') fail('the new color did not draw: ' + await pixel());
         "#,
-        &[(
-            "run.html",
-            "<body style='margin:0;font:40px/40px Menlo'><div><div></div><span id=l style='color:rgb(0,128,0)'>\u{2588}</span></div>\
+    &[(
+      "run.html",
+      "<body style='margin:0;font:40px/40px Menlo'><div><div></div><span id=l style='color:rgb(0,128,0)'>\u{2588}</span></div>\
              <script>getComputedStyle(document.getElementById('l')).color</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn animated_custom_properties_restyle_slotted_children() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         await load('t.html');
         for (let n = 0; n < 4; n++) await win.webContents.capturePage();
         console.log('WIDTH ' + await run("document.getElementById('a').getBoundingClientRect().width"));
         "#,
-        &[(
-            "t.html",
-            "<body style='margin:0'><style>@property --w{syntax:'<length>';inherits:false;initial-value:0px}\
+    &[(
+      "t.html",
+      "<body style='margin:0'><style>@property --w{syntax:'<length>';inherits:false;initial-value:0px}\
              @keyframes grow{from{--w:10px}to{--w:90px}}#a{display:block;height:20px;width:var(--w);animation:grow 1s linear infinite}</style>\
              <div id=h><span id=a></span></div>\
              <script>document.getElementById('h').attachShadow({mode:'open'}).innerHTML='<p><slot></slot></p>'</script></body>",
-        )],
-    );
-    let width: f32 = text
-        .lines()
-        .find_map(|line| line.strip_prefix("WIDTH "))
-        .and_then(|width| width.trim().parse().ok())
-        .unwrap_or_else(|| panic!("{text}"));
-    assert!((10. ..=90.).contains(&width), "{text}");
+    )],
+  );
+  let width: f32 = text
+    .lines()
+    .find_map(|line| line.strip_prefix("WIDTH "))
+    .and_then(|width| width.trim().parse().ok())
+    .unwrap_or_else(|| panic!("{text}"));
+  assert!((10. ..=90.).contains(&width), "{text}");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn columns_break_text_rows_and_move_kept_boxes_like_chrome() {
-    let text = run_hidden(
-        &format!(
-            r#"{RECTS}
+  let text = run_hidden(
+    &format!(
+      r#"{RECTS}
             await load('columns.html');
             console.log('RECTS ' + await rects());
             await run(`document.getElementById('a').style.height = '40px'`);
@@ -742,54 +741,55 @@ fn columns_break_text_rows_and_move_kept_boxes_like_chrome() {
                 return [50, 150, 250].map(x => document.elementFromPoint(x, p.y + 10)?.id).join();
             }})()`));
             "#
-        ),
-        &[(
-            "columns.html",
-            "<body style='margin:0;font:10px/20px sans-serif'><style>.w{columns:3;column-gap:0;width:300px}             .w div{height:20px;break-inside:avoid}p{margin:0}</style>             <div class=w><p id=p>One paragraph with enough words to run over all three columns of this box,              line after line, so each column holds two of its rows.</p></div>             <div class=w><div id=a></div><div id=b></div><div id=c></div><div id=d></div><div id=e></div><div id=f></div></div>             </body>",
-        )],
-    );
-    let before = rects(&text);
-    let line = |prefix: &str| {
-        let line = text.lines().find_map(|line| line.strip_prefix(prefix));
-        line.unwrap_or_else(|| panic!("{text}")).to_owned()
-    };
-    let moved: std::collections::HashMap<String, String> =
-        serde_json::from_str(&line("MOVED ")).unwrap();
-    let at = |rects: &std::collections::HashMap<String, String>, ids: &str| {
-        ids.chars()
-            .map(|id| rects[&id.to_string()].clone())
-            .collect::<Vec<_>>()
-    };
-    assert!(
-        before["p"].starts_with("0,0,300,"),
-        "the text spans three columns: {before:?}"
-    );
-    assert_eq!(
-        at(&before, "abcdef"),
-        [
-            "0,0,100,20",
-            "0,20,100,20",
-            "100,0,100,20",
-            "100,20,100,20",
-            "200,0,100,20",
-            "200,20,100,20"
-        ]
-    );
-    assert_eq!(
-        at(&moved, "abcdef"),
-        [
-            "0,0,100,40",
-            "0,40,100,20",
-            "100,0,100,20",
-            "100,20,100,20",
-            "100,40,100,20",
-            "200,0,100,20"
-        ],
-        "kept boxes move to the next columns like in Chrome"
-    );
-    assert_eq!(
-        line("HITS "),
-        "p,p,p",
-        "each column of the text takes pointer events"
-    );
+    ),
+    &[(
+      "columns.html",
+      "<body style='margin:0;font:10px/20px sans-serif'><style>.w{columns:3;column-gap:0;width:300px}             .w div{height:20px;break-inside:avoid}p{margin:0}</style>             <div class=w><p id=p>One paragraph with enough words to run over all three columns of this box,              line after line, so each column holds two of its rows.</p></div>             <div class=w><div id=a></div><div id=b></div><div id=c></div><div id=d></div><div id=e></div><div id=f></div></div>             </body>",
+    )],
+  );
+  let before = rects(&text);
+  let line = |prefix: &str| {
+    let line = text.lines().find_map(|line| line.strip_prefix(prefix));
+    line.unwrap_or_else(|| panic!("{text}")).to_owned()
+  };
+  let moved: std::collections::HashMap<String, String> =
+    serde_json::from_str(&line("MOVED ")).unwrap();
+  let at = |rects: &std::collections::HashMap<String, String>, ids: &str| {
+    ids
+      .chars()
+      .map(|id| rects[&id.to_string()].clone())
+      .collect::<Vec<_>>()
+  };
+  assert!(
+    before["p"].starts_with("0,0,300,"),
+    "the text spans three columns: {before:?}"
+  );
+  assert_eq!(
+    at(&before, "abcdef"),
+    [
+      "0,0,100,20",
+      "0,20,100,20",
+      "100,0,100,20",
+      "100,20,100,20",
+      "200,0,100,20",
+      "200,20,100,20"
+    ]
+  );
+  assert_eq!(
+    at(&moved, "abcdef"),
+    [
+      "0,0,100,40",
+      "0,40,100,20",
+      "100,0,100,20",
+      "100,20,100,20",
+      "100,40,100,20",
+      "200,0,100,20"
+    ],
+    "kept boxes move to the next columns like in Chrome"
+  );
+  assert_eq!(
+    line("HITS "),
+    "p,p,p",
+    "each column of the text takes pointer events"
+  );
 }

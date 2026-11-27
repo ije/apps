@@ -2,46 +2,46 @@ use super::*;
 
 #[test]
 fn utility_classes_follow_dom_changes() {
-    let (host, engine) = css_page(
-        "<html><head><style>@import 'tailwindcss';</style></head><body><div id='dot' class='h-4 w-4 flex'></div></body></html>",
-    );
-    engine.eval("const dot = document.getElementById('dot'); dot.setAttribute('class', 'h-' + 8 + ' w-' + 8 + ' bg-[#123456]');", "test").unwrap();
-    {
-        let host = host.borrow().store.clone();
-        let host = host.borrow();
-        let doc = &host.pages[&1].doc;
-        let id = doc
-            .nodes
-            .iter()
-            .position(|n| n.attrs.get("id").is_some_and(|v| v == "dot"))
-            .unwrap();
-        let styles = apps_runtime::style::styles(doc, 800., 600.);
-        let px = |value: &str| apps_runtime::css::value::length(value, 0., 16., 800., 600.);
-        assert_eq!(px(&styles[id]["height"]), 32.);
-        assert_eq!(px(&styles[id]["width"]), 32.);
-        assert_eq!(styles[id]["background-color"], "#123456");
-        assert_eq!(styles[id]["display"], "block");
-    }
-    engine
-        .eval("dot.removeAttribute('class');", "test")
-        .unwrap();
+  let (host, engine) = css_page(
+    "<html><head><style>@import 'tailwindcss';</style></head><body><div id='dot' class='h-4 w-4 flex'></div></body></html>",
+  );
+  engine.eval("const dot = document.getElementById('dot'); dot.setAttribute('class', 'h-' + 8 + ' w-' + 8 + ' bg-[#123456]');", "test").unwrap();
+  {
     let host = host.borrow().store.clone();
     let host = host.borrow();
     let doc = &host.pages[&1].doc;
     let id = doc
-        .nodes
-        .iter()
-        .position(|n| n.attrs.get("id").is_some_and(|v| v == "dot"))
-        .unwrap();
-    assert!(!apps_runtime::style::styles(doc, 800., 600.)[id].contains_key("height"));
+      .nodes
+      .iter()
+      .position(|n| n.attrs.get("id").is_some_and(|v| v == "dot"))
+      .unwrap();
+    let styles = apps_runtime::style::styles(doc, 800., 600.);
+    let px = |value: &str| apps_runtime::css::value::length(value, 0., 16., 800., 600.);
+    assert_eq!(px(&styles[id]["height"]), 32.);
+    assert_eq!(px(&styles[id]["width"]), 32.);
+    assert_eq!(styles[id]["background-color"], "#123456");
+    assert_eq!(styles[id]["display"], "block");
+  }
+  engine
+    .eval("dot.removeAttribute('class');", "test")
+    .unwrap();
+  let host = host.borrow().store.clone();
+  let host = host.borrow();
+  let doc = &host.pages[&1].doc;
+  let id = doc
+    .nodes
+    .iter()
+    .position(|n| n.attrs.get("id").is_some_and(|v| v == "dot"))
+    .unwrap();
+  assert!(!apps_runtime::style::styles(doc, 800., 600.)[id].contains_key("height"));
 }
 
 #[test]
 fn utility_classes_of_subtrees_that_join_later_apply() {
-    let (_, engine) = css_page(
-        "<html><head><style>@import 'tailwindcss';</style></head><body><div id='a'></div></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><head><style>@import 'tailwindcss';</style></head><body><div id='a'></div></body></html>",
+  );
+  engine.eval(r#"
         const a = document.getElementById('a');
         for (let i = 0; i < 100; i++) document.body.append(document.createElement('p'));
         getComputedStyle(a).color;
@@ -60,10 +60,10 @@ fn utility_classes_of_subtrees_that_join_later_apply() {
 
 #[test]
 fn media_queries_follow_viewport_changes() {
-    let (host, engine) = css_page(
-        "<html><head><style>@media (min-width:40em) { #target { color:red; } }</style></head><body><div id='target'></div></body></html>",
-    );
-    engine.eval(r#"
+  let (host, engine) = css_page(
+    "<html><head><style>@media (min-width:40em) { #target { color:red; } }</style></head><body><div id='target'></div></body></html>",
+  );
+  engine.eval(r#"
         const query = matchMedia('(min-width:40em)');
         if (!(query instanceof MediaQueryList) || !query.matches || query.media !== '(min-width:40em)') throw Error('Media query result');
         if (!matchMedia('screen and (max-height:600px)').matches || !matchMedia('print, (pointer:fine)').matches) throw Error('Media query list');
@@ -76,12 +76,13 @@ fn media_queries_follow_viewport_changes() {
         __appsLayout();
         if (changes.length) throw Error('Initial media event');
     "#, "test").unwrap();
-    host.borrow()
-        .store
-        .borrow_mut()
-        .viewports
-        .insert(1, [400., 600.]);
-    engine.eval(r#"
+  host
+    .borrow()
+    .store
+    .borrow_mut()
+    .viewports
+    .insert(1, [400., 600.]);
+  engine.eval(r#"
         if (query.matches) throw Error('Media query did not resize');
         __appsLayout(); __appsLayout();
         if (JSON.stringify(changes) !== '[[true,"(min-width:40em)",false],false]') throw Error('Media change event');
@@ -89,20 +90,21 @@ fn media_queries_follow_viewport_changes() {
         query.removeListener(listener);
         query.onchange = null;
     "#, "test").unwrap();
-    host.borrow()
-        .store
-        .borrow_mut()
-        .viewports
-        .insert(1, [1000., 600.]);
-    engine.eval("__appsLayout(); if (!query.matches || changes.length !== 2) throw Error('Media listener removal');", "test").unwrap();
+  host
+    .borrow()
+    .store
+    .borrow_mut()
+    .viewports
+    .insert(1, [1000., 600.]);
+  engine.eval("__appsLayout(); if (!query.matches || changes.length !== 2) throw Error('Media listener removal');", "test").unwrap();
 }
 
 #[test]
 fn custom_elements_shadow_styles_and_lifecycle() {
-    let (_, engine) = css_page(
-        "<html><body><div id='outside'>outside</div><test-existing></test-existing></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><body><div id='outside'>outside</div><test-existing></test-existing></body></html>",
+  );
+  engine.eval(r#"
       const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
       const path=document.createElementNS('http://www.w3.org/2000/svg','path');svg.append(path);
       if(!(svg instanceof SVGSVGElement)||!(path instanceof SVGElement)||path instanceof HTMLElement||path.ownerSVGElement!==svg)throw Error('SVG namespace wrapper failed');
@@ -133,10 +135,10 @@ fn custom_elements_shadow_styles_and_lifecycle() {
 // that take other nodes and names.
 #[test]
 fn computed_styles_follow_random_tree_changes() {
-    let (_, engine) = css_page(
-        "<html><head><style>body{color:rgb(1, 1, 1)} p + p{color:rgb(6, 6, 6)} .a{color:rgb(2, 2, 2)} li:first-child{color:rgb(4, 4, 4)} li:nth-child(3n){color:rgb(5, 5, 5)} div:empty{color:rgb(7, 7, 7)} [inert] span{color:rgb(8, 8, 8)} td:last-child{color:rgb(9, 9, 9)} .a > .b{color:rgb(3, 3, 3)} .flat{display:contents} span ~ p{background-color:rgb(1, 0, 0)} div:has(+ div){background-color:rgb(2, 0, 0)} li:last-child{background-color:rgb(3, 0, 0)} li:only-child{background-color:rgb(4, 0, 0)} li:nth-last-child(2){background-color:rgb(5, 0, 0)} li:has(> .a){background-color:rgb(6, 0, 0)} td:has(~ .a){background-color:rgb(7, 0, 0)} ul:has(.b) p{background-color:rgb(8, 0, 0)} body:has(.flat) td{background-color:rgb(9, 0, 0)} body [style] p{background-color:rgb(10, 0, 0)}</style></head><body><ul id='list'></ul><table><tbody id='rows'></tbody></table><div id='box' class='a'></div></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><head><style>body{color:rgb(1, 1, 1)} p + p{color:rgb(6, 6, 6)} .a{color:rgb(2, 2, 2)} li:first-child{color:rgb(4, 4, 4)} li:nth-child(3n){color:rgb(5, 5, 5)} div:empty{color:rgb(7, 7, 7)} [inert] span{color:rgb(8, 8, 8)} td:last-child{color:rgb(9, 9, 9)} .a > .b{color:rgb(3, 3, 3)} .flat{display:contents} span ~ p{background-color:rgb(1, 0, 0)} div:has(+ div){background-color:rgb(2, 0, 0)} li:last-child{background-color:rgb(3, 0, 0)} li:only-child{background-color:rgb(4, 0, 0)} li:nth-last-child(2){background-color:rgb(5, 0, 0)} li:has(> .a){background-color:rgb(6, 0, 0)} td:has(~ .a){background-color:rgb(7, 0, 0)} ul:has(.b) p{background-color:rgb(8, 0, 0)} body:has(.flat) td{background-color:rgb(9, 0, 0)} body [style] p{background-color:rgb(10, 0, 0)}</style></head><body><ul id='list'></ul><table><tbody id='rows'></tbody></table><div id='box' class='a'></div></body></html>",
+  );
+  engine.eval(r#"
         const rules = [['body', 'rgb(1, 1, 1)'], ['p + p', 'rgb(6, 6, 6)'], ['.a', 'rgb(2, 2, 2)'], ['li:first-child', 'rgb(4, 4, 4)'], ['li:nth-child(3n)', 'rgb(5, 5, 5)'], ['div:empty', 'rgb(7, 7, 7)'], ['[inert] span', 'rgb(8, 8, 8)'], ['td:last-child', 'rgb(9, 9, 9)'], ['.a > .b', 'rgb(3, 3, 3)']];
         const up = el => el.assignedSlot ?? el.parentElement ?? el.parentNode?.host ?? null;
         const expected = el => {
@@ -214,10 +216,10 @@ fn computed_styles_follow_random_tree_changes() {
 // Release builds hash only the changed nodes, so this is a check of them.
 #[test]
 fn rules_added_later_follow_names_that_nodes_already_had() {
-    let (_, engine) = css_page(
-        "<html class='dark'><head><style>p{color:rgb(1, 1, 1)}</style></head><body><div data-on='1'><p class='x'>a</p></div></body></html>",
-    );
-    let styles = engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html class='dark'><head><style>p{color:rgb(1, 1, 1)}</style></head><body><div data-on='1'><p class='x'>a</p></div></body></html>",
+  );
+  let styles = engine.eval(r#"
         const p = document.querySelector('p'), sheet = document.styleSheets[0], seen = [getComputedStyle(p).color];
         sheet.insertRule('.dark .x{color:rgb(2, 2, 2)}', 1);
         sheet.insertRule('[data-on] > .x{background-color:rgb(3, 3, 3)}', 2);
@@ -227,18 +229,18 @@ fn rules_added_later_follow_names_that_nodes_already_had() {
         seen.push(getComputedStyle(p).color, getComputedStyle(p).backgroundColor);
         seen.join('|')
     "#, "test").unwrap();
-    assert_eq!(
-        styles,
-        "rgb(1, 1, 1)|rgb(2, 2, 2)|rgb(3, 3, 3)|rgb(1, 1, 1)|rgba(0, 0, 0, 0)"
-    );
+  assert_eq!(
+    styles,
+    "rgb(1, 1, 1)|rgb(2, 2, 2)|rgb(3, 3, 3)|rgb(1, 1, 1)|rgba(0, 0, 0, 0)"
+  );
 }
 
 #[test]
 fn script_animations_leave_important_declarations() {
-    let (_, engine) = css_page(
-        "<html><style>#d{opacity:0.5 !important}</style><body><div id=d></div><div id=e style='color:red !important'></div></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><style>#d{opacity:0.5 !important}</style><body><div id=d></div><div id=e style='color:red !important'></div></body></html>",
+  );
+  engine.eval(r#"
         const d=document.getElementById('d'),e=document.getElementById('e');
         const a=d.animate([{opacity:0},{opacity:1}],{duration:1000,fill:'both'});a.pause();a.currentTime=250;
         e.animate([{color:'blue'},{color:'blue'}],{duration:1000,fill:'both'}).pause();
@@ -249,16 +251,17 @@ fn script_animations_leave_important_declarations() {
 
 #[test]
 fn computed_styles_follow_mutations_and_resize() {
-    let (host, engine) = css_page(
-        "<html><style>.item {color:red} @media (min-width:900px) {.item {color:blue}}</style><body><div class='item'></div></body></html>",
-    );
-    engine.eval("const item=document.querySelector('.item');for(let i=0;i<3;i++)if(getComputedStyle(item).color!=='rgb(255, 0, 0)')throw Error('Initial style');", "test").unwrap();
-    host.borrow()
-        .store
-        .borrow_mut()
-        .viewports
-        .insert(1, [1000., 600.]);
-    engine.eval(r#"
+  let (host, engine) = css_page(
+    "<html><style>.item {color:red} @media (min-width:900px) {.item {color:blue}}</style><body><div class='item'></div></body></html>",
+  );
+  engine.eval("const item=document.querySelector('.item');for(let i=0;i<3;i++)if(getComputedStyle(item).color!=='rgb(255, 0, 0)')throw Error('Initial style');", "test").unwrap();
+  host
+    .borrow()
+    .store
+    .borrow_mut()
+    .viewports
+    .insert(1, [1000., 600.]);
+  engine.eval(r#"
         if(getComputedStyle(item).color!=='rgb(0, 0, 255)')throw Error('Viewport change');
         document.querySelector('style').textContent='.item {color:green}';
         if(getComputedStyle(item).color!=='rgb(0, 128, 0)')throw Error('Stylesheet mutation');
@@ -278,10 +281,10 @@ fn computed_styles_follow_mutations_and_resize() {
 
 #[test]
 fn form_pseudo_classes_follow_script_state() {
-    let (_, engine) = css_page(
-        "<html><body><form><input id=em type=email value=nope><input id=req required><input id=num type=number min=5 value=2><input id=plain><fieldset id=fs disabled><input id=in1 required></fieldset><select id=sel required><option value=''>-</option><option>a</option></select><input type=radio name=r id=r1 required><input type=radio name=r id=r2><input type=checkbox id=cb><textarea id=ta required></textarea></form><x-el id=x></x-el></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><body><form><input id=em type=email value=nope><input id=req required><input id=num type=number min=5 value=2><input id=plain><fieldset id=fs disabled><input id=in1 required></fieldset><select id=sel required><option value=''>-</option><option>a</option></select><input type=radio name=r id=r1 required><input type=radio name=r id=r2><input type=checkbox id=cb><textarea id=ta required></textarea></form><x-el id=x></x-el></body></html>",
+  );
+  engine.eval(r#"
         const q=s=>[...document.querySelectorAll(s)].map(e=>e.id).join(),$=id=>document.getElementById(id);
         const expect=(s,v,step)=>{if(q(s)!==v)throw Error(step+': '+s+' = '+q(s));};
         expect('form :invalid:not(fieldset)','em,req,num,sel,r1,r2,ta','load');
@@ -310,11 +313,11 @@ fn form_pseudo_classes_follow_script_state() {
 
 #[test]
 fn labels_walkers_names_documents_selectors_and_validity_follow_browsers() {
-    checked_page(
-        "<html><body><label><input type=checkbox id=c><input id=t><textarea id=ta></textarea><span id=s>s</span></label>\
+  checked_page(
+    "<html><body><label><input type=checkbox id=c><input id=t><textarea id=ta></textarea><span id=s>s</span></label>\
          <select id=sel required><option value=''>pick</option></select><input type=radio name=a id=r1 required><input type=radio name=a id=r2>\
          <select id=list><option>One</option><option selected>Two</option><option hidden>Hidden</option></select></body></html>",
-        r#"
+    r#"
         const $ = id => document.getElementById(id), c = $('c');
         $('t').click(); $('ta').click(); check('a click on other controls in a label does not activate its control', () => !c.checked);
         $('s').click(); check('a click on plain label content activates its control', () => c.checked);
@@ -342,42 +345,42 @@ fn labels_walkers_names_documents_selectors_and_validity_follow_browsers() {
         const before = getComputedStyle(box).marginLeft; animation.effect.composite = 'add';
         check('a new composite reaches the engine', () => before === '5px' && getComputedStyle(box).marginLeft === '8px');
         "#,
-    );
+  );
 }
 
 #[test]
 fn freed_shadow_roots_drop_their_adopted_sheets() {
-    let (_, engine) = checked_page(
-        "<html><body></body></html>",
-        r#"
+  let (_, engine) = checked_page(
+    "<html><body></body></html>",
+    r#"
         const sheet = new CSSStyleSheet(); sheet.replaceSync('span { color: rgb(255, 0, 0) }');
         (() => { const host = document.createElement('div'); document.body.append(host); const root = host.attachShadow({ mode: 'open' }); root.adoptedStyleSheets = [sheet]; root.innerHTML = '<span>x</span>'; globalThis.old = root._id; getComputedStyle(root.firstChild).color; host.remove(); })();
     "#,
-    );
-    let mut reused = String::new();
-    for _ in 0..20 {
-        engine.collect_garbage();
-        engine.tick().unwrap();
-        reused = engine.eval(r#"__appsDomSweep(true); (() => {
+  );
+  let mut reused = String::new();
+  for _ in 0..20 {
+    engine.collect_garbage();
+    engine.tick().unwrap();
+    reused = engine.eval(r#"__appsDomSweep(true); (() => {
             const hosts = []; let root;
             for (let i = 0; i < 8 && root?._id !== old; i++) { const host = document.createElement('div'); document.body.append(host); hosts.push(host); root = host.attachShadow({ mode: 'open' }); }
             if (root._id !== old) { hosts.forEach(host => host.remove()); return ''; }
             root.innerHTML = '<span>y</span>';
             return root.adoptedStyleSheets.length + ' ' + getComputedStyle(root.firstChild).color;
         })()"#, "test").unwrap();
-        if !reused.is_empty() {
-            break;
-        }
+    if !reused.is_empty() {
+      break;
     }
-    assert_eq!(reused, "0 rgb(0, 0, 0)");
+  }
+  assert_eq!(reused, "0 rgb(0, 0, 0)");
 }
 
 #[test]
 fn cssom_edits_keep_the_engine_and_detached_rules_apart() {
-    let (_, engine) = css_page(
-        "<html><head><style id=s>#a{color:red} @media all{#b{color:green}} @keyframes k{from{opacity:0}to{opacity:1}} @font-face{font-family:A;src:local(Arial)} @media not all{#c{color:blue}}</style></head><body><p id=a>a</p><p id=b>b</p><p id=c>c</p></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><head><style id=s>#a{color:red} @media all{#b{color:green}} @keyframes k{from{opacity:0}to{opacity:1}} @font-face{font-family:A;src:local(Arial)} @media not all{#c{color:blue}}</style></head><body><p id=a>a</p><p id=b>b</p><p id=c>c</p></body></html>",
+  );
+  engine.eval(r#"
         const style = document.getElementById('s'), sheet = style.sheet, color = id => getComputedStyle(document.getElementById(id)).color;
         // Reads the engine's rules back, which also detaches every rule object.
         const same = step => { const js = [...sheet.cssRules].map(rule => rule.cssText).join(' | '); sheet._text = null; const engine = [...sheet.cssRules].map(rule => rule.cssText).join(' | '); if (js !== engine) throw Error(step + ': ' + js + ' != ' + engine); };
@@ -416,9 +419,9 @@ fn cssom_edits_keep_the_engine_and_detached_rules_apart() {
 
 #[test]
 fn computed_appearance_follows_chrome() {
-    checked_page(
-        "<p>x</p>",
-        r#"
+  checked_page(
+    "<p>x</p>",
+    r#"
         check('appearance follows chrome', () => {
           const kinds = ['text', 'hidden', 'image', 'file', 'checkbox', 'radio', 'range', 'button'].map(type => { const input = document.createElement('input'); input.type = type; return input; });
           const elements = [...kinds, ...['button', 'select', 'textarea', 'meter', 'progress', 'div', 'a', 'option', 'img'].map(tag => document.createElement(tag))];
@@ -428,14 +431,14 @@ fn computed_appearance_follows_chrome() {
           return values === 'auto,none,none,none,auto,auto,auto,auto,auto,auto,auto,auto,auto,none,none,none,none';
         });
         "#,
-    );
+  );
 }
 
 #[test]
 fn system_appearance_inputs_keep_their_types() {
-    checked_page(
-        "<style>input{appearance:system;padding:4px;border:2px solid red}</style><form id='form'><input id='switch' name='wifi' type='checkbox' switch><input id='range' type='range' value='250'><input id='text' value='a'><input id='date' type='date'><input id='button' type='button' value='Go'><input id='radio' type='radio'></form>",
-        r#"
+  checked_page(
+    "<style>input{appearance:system;padding:4px;border:2px solid red}</style><form id='form'><input id='switch' name='wifi' type='checkbox' switch><input id='range' type='range' value='250'><input id='text' value='a'><input id='date' type='date'><input id='button' type='button' value='Go'><input id='radio' type='radio'></form>",
+    r#"
         const $ = id => document.getElementById(id);
         check('types', () => [...document.querySelectorAll('input')].map(input => input.type).join() === 'checkbox,range,text,date,button,radio');
         check('appearance', () => getComputedStyle($('text')).appearance === 'system');
@@ -457,36 +460,36 @@ fn system_appearance_inputs_keep_their_types() {
         check('native edits run as user input', () => $('text').value === 'hello' && $('text').getAttribute('value') === 'a' && $('range').value === '33' && !$('switch').checked);
         check('native events', () => events === 'text:input text:change range:input range:change switch:click switch:input switch:change button:click ');
         "#,
-    );
+  );
 }
 
 #[test]
 fn offset_parent_follows_cssom_view() {
-    let (host, engine) = checked_page(
-        "<html><body><div id='rel' style='position:relative'><span id='in'>x</span><b id='fixed' style='position:fixed'>f</b><i id='gone' style='display:none'>g</i></div><table><tr><td><em id='cell'>c</em></td></tr></table></body></html>",
-        "",
-    );
-    {
-        let host = host.borrow().store.clone();
-        let mut host = host.borrow_mut();
-        let host = &mut *host;
-        let page = host.pages.get_mut(&1).unwrap();
-        let (doc, state) = (&page.doc, &mut page.state);
-        for (name, rect) in [
-            ("rel", [10., 20., 100., 50.]),
-            ("in", [15., 30., 10., 10.]),
-            ("fixed", [0., 0., 5., 5.]),
-            ("cell", [3., 70., 5., 5.]),
-        ] {
-            let id = doc
-                .nodes
-                .iter()
-                .position(|node| node.attrs.get("id").map(String::as_str) == Some(name))
-                .unwrap();
-            state.geometry.mirror.insert(id, rect);
-        }
+  let (host, engine) = checked_page(
+    "<html><body><div id='rel' style='position:relative'><span id='in'>x</span><b id='fixed' style='position:fixed'>f</b><i id='gone' style='display:none'>g</i></div><table><tr><td><em id='cell'>c</em></td></tr></table></body></html>",
+    "",
+  );
+  {
+    let host = host.borrow().store.clone();
+    let mut host = host.borrow_mut();
+    let host = &mut *host;
+    let page = host.pages.get_mut(&1).unwrap();
+    let (doc, state) = (&page.doc, &mut page.state);
+    for (name, rect) in [
+      ("rel", [10., 20., 100., 50.]),
+      ("in", [15., 30., 10., 10.]),
+      ("fixed", [0., 0., 5., 5.]),
+      ("cell", [3., 70., 5., 5.]),
+    ] {
+      let id = doc
+        .nodes
+        .iter()
+        .position(|node| node.attrs.get("id").map(String::as_str) == Some(name))
+        .unwrap();
+      state.geometry.mirror.insert(id, rect);
     }
-    engine.eval(r#"
+  }
+  engine.eval(r#"
         const fails = [];
         const $ = id => document.getElementById(id);
         if (document.body.offsetParent !== null || document.documentElement.offsetParent !== null) fails.push('root');
@@ -504,10 +507,10 @@ fn offset_parent_follows_cssom_view() {
 
 #[test]
 fn cssom_rule_lists_insert_delete_and_nest() {
-    let (_, engine) = css_page(
-        "<html><head><style id=s>.a{color:red} @media (min-width:1px){.b{color:blue}}</style><template><style>.t{}</style></template></head><body><p id=p class='a'>x</p><i id=i class=c>y</i></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><head><style id=s>.a{color:red} @media (min-width:1px){.b{color:blue}}</style><template><style>.t{}</style></template></head><body><p id=p class='a'>x</p><i id=i class=c>y</i></body></html>",
+  );
+  engine.eval(r#"
         const style = document.getElementById('s'), sheet = style.sheet, p = document.getElementById('p'), i = document.getElementById('i');
         if (sheet !== style.sheet || document.styleSheets.length !== 1 || document.styleSheets[0] !== sheet || sheet.ownerNode !== style) throw Error('styleSheets');
         if (sheet.cssRules.length !== 2 || !(sheet.cssRules[0] instanceof CSSStyleRule) || sheet.cssRules[0].selectorText !== '.a' || sheet.cssRules[0].style.color !== 'red') throw Error('rules ' + sheet.cssRules.length);
@@ -547,9 +550,9 @@ fn cssom_rule_lists_insert_delete_and_nest() {
 
 #[test]
 fn css_in_js_libraries_insert_rules_through_style_tags() {
-    let (_, engine) =
-        css_page("<html><head></head><body><div id=a>a</div><div id=b>b</div></body></html>");
-    engine.eval(r#"
+  let (_, engine) =
+    css_page("<html><head></head><body><div id=a>a</div><div id=b>b</div></body></html>");
+  engine.eval(r#"
         const a = document.getElementById('a'), b = document.getElementById('b');
         const emotion = { tags: [], ctr: 0, insert(rule) {
             if (this.ctr % 65000 === 0) { const tag = document.createElement('style'); tag.setAttribute('data-emotion', 'css'); tag.appendChild(document.createTextNode('')); tag.setAttribute('data-s', ''); document.head.insertBefore(tag, this.tags.length ? this.tags.at(-1).nextSibling : null); this.tags.push(tag); }
@@ -580,8 +583,8 @@ fn css_in_js_libraries_insert_rules_through_style_tags() {
 
 #[test]
 fn adopted_style_sheets_keep_order_and_stay_out_of_the_tree() {
-    let (_, engine) = css_page("<html><body><p id=p>p</p><x-card id=card></x-card></body></html>");
-    engine.eval(r#"
+  let (_, engine) = css_page("<html><body><p id=p>p</p><x-card id=card></x-card></body></html>");
+  engine.eval(r#"
         const base = new CSSStyleSheet(), override = new CSSStyleSheet();
         base.replaceSync('span{color:red;padding:1px}'); override.replaceSync('span{color:blue}');
         const root = document.getElementById('card').attachShadow({ mode: 'open' });
@@ -609,10 +612,10 @@ fn adopted_style_sheets_keep_order_and_stay_out_of_the_tree() {
 
 #[test]
 fn css_global_supports_escape_and_register_property() {
-    let (_, engine) = css_page(
-        "<html><head><style>.x{width:var(--w)}</style></head><body><div class=x id=x><p id=c></p></div></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><head><style>.x{width:var(--w)}</style></head><body><div class=x id=x><p id=c></p></div></body></html>",
+  );
+  engine.eval(r#"
         if (!CSS.supports('display', 'grid') || CSS.supports('width', 'bogus') || !CSS.supports('(filter: blur(1px)) and (not (display: nonsense))') || !CSS.supports('display: flex') || !CSS.supports('text-emphasis', 'dot') || !CSS.supports('word-break', 'break-all')) throw Error('supports');
         if (!CSS.supports('selector(:has(a))') || CSS.supports('selector(::nonsense(')) throw Error('selector()');
         if (CSS.escape('1a b') !== '\\31 a\\ b' || CSS.escape('-') !== '\\-' || CSS.escape('a#b') !== 'a\\#b') throw Error('escape ' + CSS.escape('1a b'));
@@ -630,11 +633,11 @@ fn css_global_supports_escape_and_register_property() {
 
 #[test]
 fn registered_properties_take_only_the_syntax_names_of_chrome() {
-    let (_, engine) = css_page(
-        "<html><head><style>@property --place{syntax:'<place>';inherits:false;initial-value:center}\
+  let (_, engine) = css_page(
+    "<html><head><style>@property --place{syntax:'<place>';inherits:false;initial-value:center}\
          @property --len{syntax:'<length>+';inherits:false;initial-value:1px 2px}</style></head><body><p id=p></p></body></html>",
-    );
-    engine.eval(r#"
+  );
+  engine.eval(r#"
         const reg = (syntax, initialValue) => { try { CSS.registerProperty({ name: '--r' + Math.random().toString(36).slice(2), syntax, inherits: false, initialValue }); return 'ok'; } catch (e) { return e.name; } };
         for (const [syntax, value] of [['<place>', 'center'], ['<size>', 'max-content'], ['<non-negative-length>', '1px'], ['<easing-function>', 'ease'], ['[a|b]', 'a'], ['<length>{1,2}', '1px'],
           ['<transform-list>+', 'scale(2)'], ['<length> +', '1px'], ['inherit', 'inherit'], ['default', 'default'], ['<length>|*', '1px'], ['foo bar', 'foo bar'], ['1a', '1a']])
@@ -648,20 +651,20 @@ fn registered_properties_take_only_the_syntax_names_of_chrome() {
 
 #[test]
 fn computed_styles_resolve_lengths_colors_initial_values_and_pseudo_elements() {
-    let (host, engine) = css_page(
-        "<html><head><style>:root{font-size:16px} #a{padding:calc(0.25rem * 2) 1em;margin:5%;color:#ff000080;border:2px solid;animation:fade 2s ease-in 1s infinite;line-height:1.5;opacity:50%;box-sizing:border-box;width:100px;height:40px} #a::before{content:'x';font-weight:700} #h{display:none}</style></head><body><div id=a>a</div><span id=s>s</span><div id=h></div></body></html>",
-    );
-    {
-        let host = host.borrow().store.clone();
-        let mut host = host.borrow_mut();
-        let state = host.state(1);
-        let ids: Vec<usize> = (0..64).collect();
-        state
-            .geometry
-            .mirror
-            .extend(ids.into_iter().map(|id| (id, [0., 0., 200., 100.])));
-    }
-    engine.eval(r#"
+  let (host, engine) = css_page(
+    "<html><head><style>:root{font-size:16px} #a{padding:calc(0.25rem * 2) 1em;margin:5%;color:#ff000080;border:2px solid;animation:fade 2s ease-in 1s infinite;line-height:1.5;opacity:50%;box-sizing:border-box;width:100px;height:40px} #a::before{content:'x';font-weight:700} #h{display:none}</style></head><body><div id=a>a</div><span id=s>s</span><div id=h></div></body></html>",
+  );
+  {
+    let host = host.borrow().store.clone();
+    let mut host = host.borrow_mut();
+    let state = host.state(1);
+    let ids: Vec<usize> = (0..64).collect();
+    state
+      .geometry
+      .mirror
+      .extend(ids.into_iter().map(|id| (id, [0., 0., 200., 100.])));
+  }
+  engine.eval(r#"
         const a = document.getElementById('a'), s = getComputedStyle(a), span = getComputedStyle(document.getElementById('s'));
         const expect = (style, name, value) => { if (style[name] !== value) throw Error(name + ': ' + style[name] + ' != ' + value); };
         expect(s, 'paddingTop', '8px'); expect(s, 'paddingLeft', '16px'); expect(s, 'marginTop', '10px');
@@ -683,9 +686,9 @@ fn computed_styles_resolve_lengths_colors_initial_values_and_pseudo_elements() {
 
 #[test]
 fn hosts_take_pseudo_elements_from_their_shadow_tree() {
-    checked_page(
-        "<html><head><style>x-card::before{color:blue}</style></head><body><x-card id=card class=on></x-card></body></html>",
-        r#"
+  checked_page(
+    "<html><head><style>x-card::before{color:blue}</style></head><body><x-card id=card class=on></x-card></body></html>",
+    r#"
         const card = document.getElementById('card');
         card.attachShadow({ mode: 'open' }).innerHTML = `<style>:host::before{content:"A";color:red;font-weight:700!important} :host(.on)::after{content:"B";color:green}</style>`;
         const before = getComputedStyle(card, '::before');
@@ -696,14 +699,14 @@ fn hosts_take_pseudo_elements_from_their_shadow_tree() {
         card.classList.remove('on');
         check('class change', () => getComputedStyle(card, '::after').content === 'none');
         "#,
-    );
+  );
 }
 
 #[test]
 fn invalid_selectors_throw_and_html_names_ignore_case() {
-    checked_page(
-        "<html><body><ul><li data-v='1'>x</li></ul><svg><linearGradient id='g'></linearGradient><rect id='r'></rect></svg></body></html>",
-        r#"
+  checked_page(
+    "<html><body><ul><li data-v='1'>x</li></ul><svg><linearGradient id='g'></linearGradient><rect id='r'></rect></svg></body></html>",
+    r#"
         for (const bad of ['div[', 'li,', 'li >', ':foo', '::foo', ':has(:has(a))']) check('throws ' + bad, () => { try { document.querySelector(bad); return false; } catch (e) { return e instanceof DOMException && e.name === 'SyntaxError'; } });
         check('matches throws', () => { try { document.body.matches('['); return false; } catch (e) { return e.name === 'SyntaxError'; } });
         check('closest throws', () => { try { document.querySelector('li').closest(':foo'); return false; } catch (e) { return e.name === 'SyntaxError'; } });
@@ -712,13 +715,13 @@ fn invalid_selectors_throw_and_html_names_ignore_case() {
         check('svg case', () => document.querySelector('linearGradient')?.id === 'g' && document.querySelector('lineargradient')?.id === 'g' && document.getElementsByTagName('linearGradient').length === 1);
         check('namespaces', () => document.querySelector('*|rect')?.id === 'r' && document.querySelector('|rect') === null);
         "#,
-    );
+  );
 }
 
 #[test]
 fn inline_style_declarations_validate_expand_and_serialize() {
-    let (_, engine) = css_page("<html><body><div id=a></div></body></html>");
-    engine.eval(r#"
+  let (_, engine) = css_page("<html><body><div id=a></div></body></html>");
+  engine.eval(r#"
         const a = document.getElementById('a'), style = a.style;
         style.width = '10px'; style.width = 'bogus';
         if (style.width !== '10px') throw Error('invalid value replaced ' + style.width);
@@ -763,8 +766,8 @@ fn inline_style_declarations_validate_expand_and_serialize() {
 
 #[test]
 fn web_animations_release_finished_effects_and_commit_their_own_stack() {
-    let (_, engine) = css_page("<html><body><div id=a></div><div id=b></div></body></html>");
-    engine.eval(r#"
+  let (_, engine) = css_page("<html><body><div id=a></div><div id=b></div></body></html>");
+  engine.eval(r#"
         const [a, b] = ['a', 'b'].map(id => document.getElementById(id)), counts = { finish: 0, settled: 0 };
         const check = (got, want) => { if (JSON.stringify(got) !== JSON.stringify(want)) throw Error(JSON.stringify(got) + ' != ' + JSON.stringify(want)); };
         const opacity = () => getComputedStyle(a).opacity;
@@ -803,27 +806,27 @@ fn web_animations_release_finished_effects_and_commit_their_own_stack() {
         check(['steps(0)', 'cubic-bezier(2, 0, 0, 1)', 'linear(0)', 'steps(2)'].map(value => CSS.supports('transition-timing-function', value)), [false, false, false, true]);
         try { a.animate({ opacity: [0, 1] }, { easing: 'cubic-bezier(2,0,0,1)' }); throw Error('accepted'); } catch (error) { if (!(error instanceof TypeError)) throw error; }
     "#, "test").unwrap();
-    let started = std::time::Instant::now();
-    while engine.eval("counts.finish", "test").unwrap() == "0" {
-        let delay = engine.tick().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(delay.clamp(1, 10) as u64));
-        assert!(started.elapsed() < std::time::Duration::from_secs(60));
-    }
-    for _ in 0..3 {
-        engine.tick().unwrap();
-    }
-    assert_eq!(
-        engine.eval("JSON.stringify(counts)", "test").unwrap(),
-        r#"{"finish":2,"settled":1}"#
-    );
+  let started = std::time::Instant::now();
+  while engine.eval("counts.finish", "test").unwrap() == "0" {
+    let delay = engine.tick().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(delay.clamp(1, 10) as u64));
+    assert!(started.elapsed() < std::time::Duration::from_secs(60));
+  }
+  for _ in 0..3 {
+    engine.tick().unwrap();
+  }
+  assert_eq!(
+    engine.eval("JSON.stringify(counts)", "test").unwrap(),
+    r#"{"finish":2,"settled":1}"#
+  );
 }
 
 #[test]
 fn slotted_and_part_rules_cross_the_shadow_boundary() {
-    let (_, engine) = css_page(
-        "<html><head><style>#host::part(label){color:blue}#host::part(other){color:purple}#host::part(deep){color:orange}#b{font-weight:300}</style></head><body><div id=host></div></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><head><style>#host::part(label){color:blue}#host::part(other){color:purple}#host::part(deep){color:orange}#b{font-weight:300}</style></head><body><div id=host></div></body></html>",
+  );
+  engine.eval(r#"
         const host = document.getElementById('host'), root = host.attachShadow({ mode: 'open' });
         root.innerHTML = '<style>::slotted(span){color:red}::slotted(.b){font-weight:700}slot[name=x]::slotted(*){padding-top:3px}.lbl{color:green}</style><slot></slot><slot name=x></slot><p part="label" class=lbl id=p>p</p><i part=other id=i>i</i><div id=inner exportparts="core: deep"></div>';
         const inner = root.getElementById('inner').attachShadow({ mode: 'open' });
@@ -842,10 +845,9 @@ fn slotted_and_part_rules_cross_the_shadow_boundary() {
 
 #[test]
 fn web_animations_sample_commit_finish_and_replace() {
-    let (_, engine) = css_page(
-        "<html><body><div id='a'></div><div id='b' style='opacity:0.5'></div></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) =
+    css_page("<html><body><div id='a'></div><div id='b' style='opacity:0.5'></div></body></html>");
+  engine.eval(r#"
         const a = document.getElementById('a'), b = document.getElementById('b'), events = [];
         const check = (got, want) => { if (JSON.stringify(got) !== JSON.stringify(want)) throw Error(JSON.stringify(got) + ' != ' + JSON.stringify(want)); };
         if (!Object.hasOwn(Element.prototype, 'animate')) throw Error('Element.animate is missing');
@@ -871,19 +873,19 @@ fn web_animations_sample_commit_finish_and_replace() {
         events.push('pending ' + fresh.pending + ' ' + fresh.startTime);
         fresh.ready.then(() => events.push('ready ' + fresh.pending + ' ' + (typeof fresh.startTime)));
     "#, "test").unwrap();
-    let started = std::time::Instant::now();
-    while engine
-        .eval("events.length", "test")
-        .unwrap()
-        .parse::<usize>()
-        .unwrap()
-        < 6
-    {
-        let delay = engine.tick().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(delay.clamp(1, 10) as u64));
-        assert!(started.elapsed() < std::time::Duration::from_secs(60));
-    }
-    assert_eq!(
+  let started = std::time::Instant::now();
+  while engine
+    .eval("events.length", "test")
+    .unwrap()
+    .parse::<usize>()
+    .unwrap()
+    < 6
+  {
+    let delay = engine.tick().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(delay.clamp(1, 10) as u64));
+    assert!(started.elapsed() < std::time::Duration::from_secs(60));
+  }
+  assert_eq!(
         engine.eval("JSON.stringify([events.sort(), one.replaceState, two.playState, b.getAnimations().length, getComputedStyle(b).opacity])", "test").unwrap(),
         r#"[["AbortError","finish 20","finished true","pending true null","ready false number","remove"],"removed","finished",1,"0.4"]"#
     );
@@ -891,8 +893,8 @@ fn web_animations_sample_commit_finish_and_replace() {
 
 #[test]
 fn bundled_link_sheets_are_not_text() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
+  let host = Rc::new(RefCell::new(Host::default()));
+  host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: apps_runtime::bundle::page(
@@ -901,8 +903,8 @@ fn bundled_link_sheets_are_not_text() {
             ..Default::default()
         },
     );
-    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
-    assert_eq!(
+  let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+  assert_eq!(
         engine
             .eval("[document.head.innerHTML, document.head.textContent, document.documentElement.textContent, document.querySelector('link').sheet?.cssRules.length].join('|')", "test")
             .unwrap(),
@@ -912,9 +914,9 @@ fn bundled_link_sheets_are_not_text() {
 
 #[test]
 fn web_animation_times_must_be_finite_and_may_be_huge() {
-    checked_page(
-        "<html><body><div id='a' style='opacity:0.5'></div></body></html>",
-        r#"
+  checked_page(
+    "<html><body><div id='a' style='opacity:0.5'></div></body></html>",
+    r#"
         const a = document.getElementById('a');
         const animation = a.animate({ opacity: [0, 1] }, { duration: 1000, delay: 1e300 });
         const rejects = (set) => { try { set(); return false; } catch (error) { return error instanceof TypeError; } };
@@ -926,14 +928,14 @@ fn web_animation_times_must_be_finite_and_may_be_huge() {
         check('huge time', () => { animation.currentTime = 1e300; animation.pause(); animation.currentTime = -1e300; return getComputedStyle(a).opacity === '0.5'; });
         check('huge start', () => { animation.startTime = 1e300; animation.play(); return getComputedStyle(a).opacity === '0.5'; });
         "#,
-    );
+  );
 }
 
 #[test]
 fn declared_values_serialize_like_chrome() {
-    checked_page(
-        "<html><head><style id=s>@media (min-width: 100px) { .m { color: blue } } .n { color: red; &:hover { color: blue } } @font-face { font-family: \"X\"; src: url(x.woff2) }</style></head><body><div id=d></div></body></html>",
-        r#"
+  checked_page(
+    "<html><head><style id=s>@media (min-width: 100px) { .m { color: blue } } .n { color: red; &:hover { color: blue } } @font-face { font-family: \"X\"; src: url(x.woff2) }</style></head><body><div id=d></div></body></html>",
+    r#"
         const d = document.getElementById('d'), rules = document.getElementById('s').sheet.cssRules;
         for (const [text, expected] of [
             ['color:RED', 'color: red;'], ['color:#FFF', 'color: rgb(255, 255, 255);'], ['color:rgba(1,2,3,.5)', 'color: rgba(1, 2, 3, 0.5);'],
@@ -951,14 +953,14 @@ fn declared_values_serialize_like_chrome() {
         check('nested rule text', () => rules[1].cssText === '.n {\n  color: red;\n  &:hover { color: blue; }\n}');
         check('font face text', () => rules[2].cssText === '@font-face { font-family: X; src: url("x.woff2"); }');
         "#,
-    );
+  );
 }
 
 #[test]
 fn named_style_queries_and_values_like_chrome() {
-    checked_page(
-        "<html><head><style>.box { background-color: rgb(200, 200, 200); } @container card style(--k: 1) { .named { background-color: rgb(0, 0, 255); } } @container card style(--k: 2) { .named { color: rgb(0, 128, 0); } } @container side style(--k: 1) { .named { outline-color: rgb(1, 2, 3); } } @container card (min-width: 10px) { .named { border-top-color: rgb(9, 9, 9); } } @container card style(--k) { .named::before { content: 'p'; color: rgb(0, 0, 255); } } .card { container-name: card; --k: 1; } .side { container: side / inline-size; --k: 1; } .mid { --k: 2; } .p { color: rgb(255, 0, 0); border: 2px solid; text-decoration: underline; } .c { color: rgb(0, 0, 255); border-color: inherit; text-decoration-color: inherit; background-color: inherit; } .p2 { color: rgb(255, 0, 0); border-color: rgb(255, 0, 0); } body { counter-reset: n; } .n::before { counter-increment: n; content: counter(n) '.'; } @media (200px <= width < 3000px) { .m { order: 1; } } @media (1/2 < aspect-ratio) { .m { order: 2; } }</style></head><body><div class=card id=c1><div><div class='box named' id=a></div></div></div><div class=card id=c2><div class=mid><div class='box named' id=b></div></div></div><div class=side id=s><div class=card id=c3 style='--k: 2'><div class='box named' id=c></div></div></div><div id=nc><div class='box named' id=d></div></div><div class=p><div class=c id=e></div></div><div class=p2><div class=c id=f></div></div><p class=n id=n>x</p><div id=x></div></body></html>",
-        r#"
+  checked_page(
+    "<html><head><style>.box { background-color: rgb(200, 200, 200); } @container card style(--k: 1) { .named { background-color: rgb(0, 0, 255); } } @container card style(--k: 2) { .named { color: rgb(0, 128, 0); } } @container side style(--k: 1) { .named { outline-color: rgb(1, 2, 3); } } @container card (min-width: 10px) { .named { border-top-color: rgb(9, 9, 9); } } @container card style(--k) { .named::before { content: 'p'; color: rgb(0, 0, 255); } } .card { container-name: card; --k: 1; } .side { container: side / inline-size; --k: 1; } .mid { --k: 2; } .p { color: rgb(255, 0, 0); border: 2px solid; text-decoration: underline; } .c { color: rgb(0, 0, 255); border-color: inherit; text-decoration-color: inherit; background-color: inherit; } .p2 { color: rgb(255, 0, 0); border-color: rgb(255, 0, 0); } body { counter-reset: n; } .n::before { counter-increment: n; content: counter(n) '.'; } @media (200px <= width < 3000px) { .m { order: 1; } } @media (1/2 < aspect-ratio) { .m { order: 2; } }</style></head><body><div class=card id=c1><div><div class='box named' id=a></div></div></div><div class=card id=c2><div class=mid><div class='box named' id=b></div></div></div><div class=side id=s><div class=card id=c3 style='--k: 2'><div class='box named' id=c></div></div></div><div id=nc><div class='box named' id=d></div></div><div class=p><div class=c id=e></div></div><div class=p2><div class=c id=f></div></div><p class=n id=n>x</p><div id=x></div></body></html>",
+    r#"
         const value = (id, name, pseudo) => getComputedStyle(document.getElementById(id), pseudo).getPropertyValue(name);
         const node = id => document.getElementById(id);
         const snap = () => ['a', 'b', 'c', 'd'].map(id => [value(id, 'background-color'), value(id, 'color'), value(id, 'outline-color'), value(id, 'border-top-color')].join(' ')).join('|');
@@ -990,14 +992,14 @@ fn named_style_queries_and_values_like_chrome() {
         check('background layers', () => (x.style.cssText = 'background-image: url(a.png); background-position: 1px 2px, 3px 4px; background-size: 1px, 2px', [getComputedStyle(x).backgroundPosition, getComputedStyle(x).backgroundSize].join() === '1px 2px,1px auto'));
         check('offsets of static boxes', () => (x.style.cssText = 'left: calc(10% + 2px); top: 10%', [getComputedStyle(x).left, getComputedStyle(x).top].join() === 'calc(10% + 2px),10%'));
         "#,
-    );
+  );
 }
 
 #[test]
 fn css_values_and_cascade_like_chrome() {
-    checked_page(
-        "<html><head><style>@scope (.card) { :scope { color: rgb(1, 0, 0); } } div { color: rgb(2, 0, 0); } @scope (.r5) { :where(:scope) { color: rgb(255, 0, 0); } & { color: rgb(0, 128, 0); } } @scope (.r3) { :not(:scope) { background-color: rgb(1, 1, 1); } :is(:scope) i { color: rgb(3, 3, 3); } } @container card style(--theme: dark) { .q { outline-color: rgb(9, 9, 9); } } .dark { --theme: dark; } @container style(--theme: dark) { .q { color: rgb(3, 0, 0); } } @container not style(--theme) { .q { background-color: rgb(4, 0, 0); } } .b { margin: 1px !important; margin-top: 5px; } .ctr { counter-reset: n m 3; counter-increment: n; } .nest { counter-reset: s; } p::before { content: normal; } p::first-letter { color: rgb(5, 6, 7); } input::placeholder { font-size: 12px; } li::marker { color: rgb(8, 9, 10); }</style></head><body><div class=card id=c></div><p class=r5 id=r5></p><div class=r3 id=r3><i id=r3i></i></div><div class=dark><div class=q id=q1></div></div><div><div class=q id=q2></div></div><div class=b id=b></div><div class=ctr id=ctr></div><p id=p>p</p><input id=in placeholder=x><ol class=nest><li id=l1><ol class=nest><li id=l2></li></ol></li></ol><div id=d></div></body></html>",
-        r#"
+  checked_page(
+    "<html><head><style>@scope (.card) { :scope { color: rgb(1, 0, 0); } } div { color: rgb(2, 0, 0); } @scope (.r5) { :where(:scope) { color: rgb(255, 0, 0); } & { color: rgb(0, 128, 0); } } @scope (.r3) { :not(:scope) { background-color: rgb(1, 1, 1); } :is(:scope) i { color: rgb(3, 3, 3); } } @container card style(--theme: dark) { .q { outline-color: rgb(9, 9, 9); } } .dark { --theme: dark; } @container style(--theme: dark) { .q { color: rgb(3, 0, 0); } } @container not style(--theme) { .q { background-color: rgb(4, 0, 0); } } .b { margin: 1px !important; margin-top: 5px; } .ctr { counter-reset: n m 3; counter-increment: n; } .nest { counter-reset: s; } p::before { content: normal; } p::first-letter { color: rgb(5, 6, 7); } input::placeholder { font-size: 12px; } li::marker { color: rgb(8, 9, 10); }</style></head><body><div class=card id=c></div><p class=r5 id=r5></p><div class=r3 id=r3><i id=r3i></i></div><div class=dark><div class=q id=q1></div></div><div><div class=q id=q2></div></div><div class=b id=b></div><div class=ctr id=ctr></div><p id=p>p</p><input id=in placeholder=x><ol class=nest><li id=l1><ol class=nest><li id=l2></li></ol></li></ol><div id=d></div></body></html>",
+    r#"
         const value = (id, name, pseudo) => getComputedStyle(document.getElementById(id), pseudo).getPropertyValue(name);
         const attempt = fn => { try { return fn(); } catch (error) { return error.name; } };
         const d = document.getElementById('d'), set = text => { d.style.cssText = text; return getComputedStyle(d); };
@@ -1037,47 +1039,47 @@ fn css_values_and_cascade_like_chrome() {
             ['width: calc(min(10px, 20px) + max(1em, 2px))', 'width: calc(10px + max(1em, 2px));'], ['width: calc(1rem + 2px)', 'width: calc(2px + 1rem);'], ['border-radius: calc(1px + 2%) / calc(3px + 1em)', 'border-radius: calc(2% + 1px) / calc(1em + 3px);'], ['--x: calc( 2px+1em )', '--x: calc( 2px+1em );'], ['height: -webkit-calc(1px + 2px)', 'height: calc(3px);'], ['width: calc(min(10px, 20px) + 5px)', 'width: calc(15px);'], ['width: calc(min(10px, 1em) * 1 + 2px)', 'width: calc(2px + min(10px, 1em));'],
         ]) check(text, () => { d.style.cssText = text; return d.style.cssText === expected; });
         "#,
-    );
+  );
 }
 
 #[test]
 fn computed_styles_report_used_values_like_chrome() {
-    let (host, engine) = css_page(
-        "<html><head><style>#w{position:relative;width:200px;height:100px;padding:5px;border:2px solid} #a{position:absolute;width:50%;left:10%;top:4px;padding:2px 3%} #r{position:relative;top:10px;left:5px} #m{width:100px;margin:0 auto} #h{display:none;width:50%;transform-origin:center} #p::before{content:'x' attr(data-v) \"y\"} .o{width:100%;padding:28px;margin:0 auto} #v{direction:rtl;width:200px} #w::before{content:'';display:block;width:max(10%,3px);height:4px;margin-left:5%} #w::after{content:'';display:block;width:calc(10% + 1px);min-width:20%} #m::before{content:'';display:block;padding-left:5%} #r::before{content:'x';display:none;width:50%} #r::after{content:'';position:absolute;width:10px;height:10px}</style></head><body><div id=w><div id=a></div><div id=r></div><div id=m></div><div id=o class=o></div></div><div id=h></div><p id=p data-v=t></p><div id=v><div id=q class=o></div></div></body></html>",
-    );
-    let id = |name: &str| -> usize {
-        engine
-            .eval(&format!("document.getElementById('{name}')._id"), "id")
-            .unwrap()
-            .parse()
-            .unwrap()
-    };
-    let ids = ["w", "a", "r", "m", "p", "o", "v", "q"].map(id);
-    {
-        let host = host.borrow().store.clone();
-        let mut host = host.borrow_mut();
-        let state = host.state(1);
-        state.geometry.mirror.extend(ids.into_iter().zip([
-            [8., 8., 214., 114.],
-            [31., 14., 117.6, 15.5],
-            [20., 25., 200., 0.],
-            [65., 15., 100., 0.],
-            [8., 130., 784., 16.],
-            [15., 15., 256., 56.],
-            [8., 150., 200., 56.],
-            [8., 150., 256., 56.],
-        ]));
-        // The boxes that layout gave the pseudo-elements, by node | pseudo << 30: the place from the border box of
-        // the element, the size, then the padding plus border of each side.
-        state.layout.pseudo_boxes.extend([
-            (ids[0] | 1 << 30, [17., 7., 20., 4., 0., 0., 0., 0.]),
-            (ids[0] | 2 << 30, [7., 11., 40., 0., 0., 0., 0., 0.]),
-            (ids[3] | 1 << 30, [0., 0., 100., 0., 0., 0., 0., 10.]),
-            (ids[2] | 1 << 30, [0., 0., 200., 18., 0., 0., 0., 0.]),
-            (ids[2] | 2 << 30, [0., 0., 10., 10., 0., 0., 0., 0.]),
-        ]);
-    }
-    engine.eval(r#"
+  let (host, engine) = css_page(
+    "<html><head><style>#w{position:relative;width:200px;height:100px;padding:5px;border:2px solid} #a{position:absolute;width:50%;left:10%;top:4px;padding:2px 3%} #r{position:relative;top:10px;left:5px} #m{width:100px;margin:0 auto} #h{display:none;width:50%;transform-origin:center} #p::before{content:'x' attr(data-v) \"y\"} .o{width:100%;padding:28px;margin:0 auto} #v{direction:rtl;width:200px} #w::before{content:'';display:block;width:max(10%,3px);height:4px;margin-left:5%} #w::after{content:'';display:block;width:calc(10% + 1px);min-width:20%} #m::before{content:'';display:block;padding-left:5%} #r::before{content:'x';display:none;width:50%} #r::after{content:'';position:absolute;width:10px;height:10px}</style></head><body><div id=w><div id=a></div><div id=r></div><div id=m></div><div id=o class=o></div></div><div id=h></div><p id=p data-v=t></p><div id=v><div id=q class=o></div></div></body></html>",
+  );
+  let id = |name: &str| -> usize {
+    engine
+      .eval(&format!("document.getElementById('{name}')._id"), "id")
+      .unwrap()
+      .parse()
+      .unwrap()
+  };
+  let ids = ["w", "a", "r", "m", "p", "o", "v", "q"].map(id);
+  {
+    let host = host.borrow().store.clone();
+    let mut host = host.borrow_mut();
+    let state = host.state(1);
+    state.geometry.mirror.extend(ids.into_iter().zip([
+      [8., 8., 214., 114.],
+      [31., 14., 117.6, 15.5],
+      [20., 25., 200., 0.],
+      [65., 15., 100., 0.],
+      [8., 130., 784., 16.],
+      [15., 15., 256., 56.],
+      [8., 150., 200., 56.],
+      [8., 150., 256., 56.],
+    ]));
+    // The boxes that layout gave the pseudo-elements, by node | pseudo << 30: the place from the border box of
+    // the element, the size, then the padding plus border of each side.
+    state.layout.pseudo_boxes.extend([
+      (ids[0] | 1 << 30, [17., 7., 20., 4., 0., 0., 0., 0.]),
+      (ids[0] | 2 << 30, [7., 11., 40., 0., 0., 0., 0., 0.]),
+      (ids[3] | 1 << 30, [0., 0., 100., 0., 0., 0., 0., 10.]),
+      (ids[2] | 1 << 30, [0., 0., 200., 18., 0., 0., 0., 0.]),
+      (ids[2] | 2 << 30, [0., 0., 10., 10., 0., 0., 0., 0.]),
+    ]);
+  }
+  engine.eval(r#"
         const value = (id, name, pseudo) => getComputedStyle(document.getElementById(id), pseudo).getPropertyValue(name);
         for (const [id, name, expected, pseudo] of [
             ['a', 'width', '105px'], ['a', 'inline-size', '105px'], ['a', 'padding-left', '6.29688px'], ['a', 'left', '21px'], ['a', 'inset', '4px 71.4062px 90.5px 21px'],
@@ -1095,9 +1097,9 @@ fn computed_styles_report_used_values_like_chrome() {
 
 #[test]
 fn target_and_range_pseudo_classes_like_chrome() {
-    checked_page(
-        "<html><head><style>:target{color:red}</style></head><body><p id='a'>a</p><p id='b'>b</p><input id='n' type='number' min='1' max='5' value='3'><input id='d' type='date' min='2020-01-01' value='2019-12-31'><input id='r' type='range'><input id='x' type='number' value='9'></body></html>",
-        r#"
+  checked_page(
+    "<html><head><style>:target{color:red}</style></head><body><p id='a'>a</p><p id='b'>b</p><input id='n' type='number' min='1' max='5' value='3'><input id='d' type='date' min='2020-01-01' value='2019-12-31'><input id='r' type='range'><input id='x' type='number' value='9'></body></html>",
+    r#"
         const target = () => document.querySelector(':target')?.id ?? null, color = id => getComputedStyle(document.getElementById(id)).color;
         location.hash = 'a';
         check('hash sets the target', () => target() === 'a' && color('a') === 'rgb(255, 0, 0)');
@@ -1110,14 +1112,14 @@ fn target_and_range_pseudo_classes_like_chrome() {
         const n = document.getElementById('n'); n.value = '7';
         check('typed values', () => ids(':out-of-range') === 'n d' && n.matches(':out-of-range'));
     "#,
-    );
+  );
 }
 
 #[test]
 fn border_images_parse_and_serialize_like_chrome() {
-    checked_page(
-        "<html><head><style>#r{border:10px solid red;border-image:linear-gradient(red, blue) 30% fill / 2 / 4px round space} @supports (border-image: linear-gradient(red, blue) 1) { #r { color: green } }</style></head><body><div id=r></div><div id=d></div></body></html>",
-        r#"
+  checked_page(
+    "<html><head><style>#r{border:10px solid red;border-image:linear-gradient(red, blue) 30% fill / 2 / 4px round space} @supports (border-image: linear-gradient(red, blue) 1) { #r { color: green } }</style></head><body><div id=r></div><div id=d></div></body></html>",
+    r#"
         const d = document.getElementById('d'), r = document.getElementById('r');
         for (const [text, expected] of [
             ['border-image:linear-gradient(red, blue) 1', 'border-image: linear-gradient(red, blue) 1 / 1 / 0 stretch;'],
@@ -1136,15 +1138,15 @@ fn border_images_parse_and_serialize_like_chrome() {
         check('@supports', () => s.color === 'rgb(0, 128, 0)');
         check('CSS.supports', () => ['border-image', 'linear-gradient(red, blue) 1', 'border-image', 'url(a.png) 30 / 10px / 5px stretch repeat', 'border-image', 'red', 'border-image', '1 2 3 4 5', 'border-image-slice', '30 fill', 'border-image-slice', 'fill', 'border-image-slice', '-1', 'border-image-slice', '1px', 'border-image-repeat', 'round space', 'border-image-repeat', 'round space stretch', 'border-image-width', 'auto 1px 10% 2', 'border-image-width', '-1px', 'border-image-outset', '1 2px', 'border-image-outset', '10%', 'border-image-source', 'none', 'border-image-source', 'linear-gradient(red, blue)', 'border-image-source', 'red'].reduce((out, v, i, a) => i % 2 ? out : out + (CSS.supports(v, a[i + 1]) ? '1' : '0'), '') === '11001000101010110');
         "#,
-    );
+  );
 }
 
 #[test]
 fn text_stroke_values_like_chrome() {
-    let (_, engine) = css_page(
-        "<html><head><style>body{font-size:16px}#a{-webkit-text-stroke:2px red}#b{-webkit-text-stroke:thin;color:blue}#c{-webkit-text-stroke:green 3px}#d{-webkit-text-stroke:-1px red}#e{-webkit-text-stroke-width:0.1em;font-size:20px}</style></head><body><div id=a><span id=a2>x</span></div><div id=b></div><div id=c></div><div id=d></div><div id=e></div></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><head><style>body{font-size:16px}#a{-webkit-text-stroke:2px red}#b{-webkit-text-stroke:thin;color:blue}#c{-webkit-text-stroke:green 3px}#d{-webkit-text-stroke:-1px red}#e{-webkit-text-stroke-width:0.1em;font-size:20px}</style></head><body><div id=a><span id=a2>x</span></div><div id=b></div><div id=c></div><div id=d></div><div id=e></div></body></html>",
+  );
+  engine.eval(r#"
         const got = ['a', 'a2', 'b', 'c', 'd', 'e'].map(id => getComputedStyle(document.getElementById(id)).getPropertyValue('-webkit-text-stroke')).join('|');
         if (got !== '2px rgb(255, 0, 0)|2px rgb(255, 0, 0)|0.666667px rgb(0, 0, 255)|3px rgb(0, 128, 0)|0px rgb(0, 0, 0)|2px rgb(0, 0, 0)') throw Error(got);
         if (!CSS.supports('-webkit-text-stroke', '1px red') || CSS.supports('-webkit-text-stroke-width', '-1px')) throw Error('supports');
@@ -1156,10 +1158,10 @@ fn text_stroke_values_like_chrome() {
 
 #[test]
 fn typed_om_reads_and_writes_styles() {
-    let (_, engine) = css_page(
-        "<html><style>#d{width:50%;transition-duration:1s,2s}</style><body><div id=d style='height:calc(10px + 2em);color:red;--x:a var(--y, 1px)'></div></body></html>",
-    );
-    engine.eval(r#"
+  let (_, engine) = css_page(
+    "<html><style>#d{width:50%;transition-duration:1s,2s}</style><body><div id=d style='height:calc(10px + 2em);color:red;--x:a var(--y, 1px)'></div></body></html>",
+  );
+  engine.eval(r#"
         const check = (got, want) => { if (String(got) !== want) throw Error(`${got} !== ${want}`); };
         const d = document.getElementById('d'), m = d.attributeStyleMap;
         check(CSS.px(1).add(CSS.em(2)).sub(CSS.px(3)), 'calc(1px + 2em + -3px)');
@@ -1189,13 +1191,13 @@ fn typed_om_reads_and_writes_styles() {
 
 #[test]
 fn author_layers_before_the_import_are_kept_per_tree() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(1, Page {
+  let host = Rc::new(RefCell::new(Host::default()));
+  host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><style>@import 'tailwindcss';</style><body><p class='text-blue-500'></p><div id=host></div></body></html>"),
         dirty: false, ..Default::default()
     });
-    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
-    engine.eval(r#"
+  let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+  engine.eval(r#"
         if (getComputedStyle(document.querySelector('p')).color !== 'oklch(0.623 0.214 259.815)') throw Error('light tree');
         const root = document.getElementById('host').attachShadow({ mode: 'open' });
         root.innerHTML = "<style>@layer reset; @import 'tailwindcss';</style><style>@layer reset { p { color: red } }</style><p class='text-blue-500'></p>";
@@ -1206,9 +1208,9 @@ fn author_layers_before_the_import_are_kept_per_tree() {
 
 #[test]
 fn a_new_timeline_keeps_a_pending_pause() {
-    checked_page(
-        "<html><body><div id='a'></div></body></html>",
-        r#"
+  checked_page(
+    "<html><body><div id='a'></div></body></html>",
+    r#"
         const animation = document.getElementById('a').animate({ opacity: [0, 1] }, { duration: 100000 });
         __appsAnimationFrame();
         animation.pause();
@@ -1218,17 +1220,17 @@ fn a_new_timeline_keeps_a_pending_pause() {
         check('pending pause: ' + before, () => before === 'paused,true');
         check('settled pause: ' + [animation.playState, animation.pending], () => animation.playState === 'paused' && !animation.pending);
         "#,
-    );
+  );
 }
 
 #[test]
 fn keyframes_append_rule_only_appends() {
-    let (_, engine) = css_page(
-        "<html><head><style id=s>@keyframes k{from{opacity:0}to{opacity:1}}</style></head><body></body></html>",
-    );
-    engine
-        .eval(
-            r#"
+  let (_, engine) = css_page(
+    "<html><head><style id=s>@keyframes k{from{opacity:0}to{opacity:1}}</style></head><body></body></html>",
+  );
+  engine
+    .eval(
+      r#"
         const keys = document.getElementById('s').sheet.cssRules[0];
         for (const text of ['0', 'bad', '']) keys.appendRule(text);
         if (keys.cssRules.length !== 2) throw Error('append ' + keys.cssRules.length);
@@ -1243,7 +1245,7 @@ fn keyframes_append_rule_only_appends() {
         constructed.cssRules[0].appendRule('bad');
         if (constructed.cssRules[0].cssRules.length !== 1) throw Error('constructed');
     "#,
-            "test",
-        )
-        .unwrap();
+      "test",
+    )
+    .unwrap();
 }

@@ -1,27 +1,26 @@
 use apps_runtime::{
-    dom::Document, host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role,
-    render::Page,
+  dom::Document, host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role, render::Page,
 };
 use std::{
-    cell::RefCell,
-    rc::Rc,
-    sync::Arc,
-    time::{Duration, Instant},
+  cell::RefCell,
+  rc::Rc,
+  sync::Arc,
+  time::{Duration, Instant},
 };
 
 #[test]
 fn canvas_identity_and_webgl_errors() {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse("<html><body><canvas id='parsed'></canvas></body></html>"),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
-    engine.eval(r#"
+  let host = Rc::new(RefCell::new(Host::default()));
+  host.borrow().store.borrow_mut().pages.insert(
+    1,
+    Page {
+      doc: Document::parse("<html><body><canvas id='parsed'></canvas></body></html>"),
+      dirty: false,
+      ..Default::default()
+    },
+  );
+  let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+  engine.eval(r#"
         const parsed = document.getElementById('parsed');
         const canvas = document.createElementNS('http://www.w3.org/1999/xhtml', 'canvas');
         document.body.appendChild(canvas);
@@ -52,65 +51,65 @@ fn canvas_identity_and_webgl_errors() {
 }
 
 fn page(html: &str) -> (Rc<RefCell<Host>>, JsContext) {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse(html),
-            dirty: false,
-            ..Default::default()
-        },
-    );
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
-    (host, engine)
+  let host = Rc::new(RefCell::new(Host::default()));
+  host.borrow().store.borrow_mut().pages.insert(
+    1,
+    Page {
+      doc: Document::parse(html),
+      dirty: false,
+      ..Default::default()
+    },
+  );
+  let engine = JsContext::new(
+    JavaScriptCore::load().unwrap(),
+    host.clone(),
+    Role::Renderer(1),
+  )
+  .unwrap();
+  (host, engine)
 }
 
 fn wait(engine: &JsContext, ready: &str) -> String {
-    for _ in 0..5000 {
-        let value = engine.eval(ready, "gpu-test").unwrap();
-        if value != "pending" {
-            return value;
-        }
-        engine.tick().unwrap();
-        std::thread::sleep(Duration::from_millis(1));
+  for _ in 0..5000 {
+    let value = engine.eval(ready, "gpu-test").unwrap();
+    if value != "pending" {
+      return value;
     }
-    panic!("GPU work did not finish: {ready}");
+    engine.tick().unwrap();
+    std::thread::sleep(Duration::from_millis(1));
+  }
+  panic!("GPU work did not finish: {ready}");
 }
 
 fn present(host: &RefCell<Host>, node: usize) -> Arc<renderer::RenderImage> {
-    for _ in 0..5000 {
-        if let Some(image) = host
-            .borrow()
-            .store
-            .borrow_mut()
-            .graphics
-            .get_mut(&1)
-            .unwrap()
-            .image(node)
-            .unwrap()
-        {
-            return image;
-        }
-        std::thread::sleep(Duration::from_millis(1));
+  for _ in 0..5000 {
+    if let Some(image) = host
+      .borrow()
+      .store
+      .borrow_mut()
+      .graphics
+      .get_mut(&1)
+      .unwrap()
+      .image(node)
+      .unwrap()
+    {
+      return image;
     }
-    panic!("Canvas was not presented");
+    std::thread::sleep(Duration::from_millis(1));
+  }
+  panic!("Canvas was not presented");
 }
 
 #[test]
 #[ignore = "Requires a native GPU adapter"]
 fn bitmaps_upload_and_offscreen_canvases_draw() {
-    let (wake, woken) = std::sync::mpsc::channel();
-    apps_runtime::jsc::Waker::install(move || {
-        let _ = wake.send(());
-    });
-    let (host, engine) =
-        page("<html><body><canvas id='shown' width='4' height='4'></canvas></body></html>");
-    engine.eval(r#"
+  let (wake, woken) = std::sync::mpsc::channel();
+  apps_runtime::jsc::Waker::install(move || {
+    let _ = wake.send(());
+  });
+  let (host, engine) =
+    page("<html><body><canvas id='shown' width='4' height='4'></canvas></body></html>");
+  engine.eval(r#"
         globalThis.result = 'pending';
         const same = (actual, expected, name) => { actual = JSON.stringify(actual); expected = JSON.stringify(expected); if (actual !== expected) throw Error(name + ': ' + actual + ' is not ' + expected); };
         const clear = (context, device, color) => {
@@ -180,73 +179,74 @@ fn bitmaps_upload_and_offscreen_canvases_draw() {
           await worker.terminate();
         })().then(() => { if (result === 'pending') result = 'ok'; }, error => { result = error + '\n' + error.stack; });
     "#, "gpu-test").unwrap();
-    let started = Instant::now();
-    loop {
-        let value = engine.eval("result", "gpu-test").unwrap();
-        if value != "pending" {
-            assert_eq!(value, "ok");
-            break;
-        }
-        let _ = woken.recv_timeout(Duration::from_millis(2));
-        engine.tick().unwrap();
-        assert!(
-            started.elapsed() < Duration::from_secs(30),
-            "GPU work did not finish"
-        );
+  let started = Instant::now();
+  loop {
+    let value = engine.eval("result", "gpu-test").unwrap();
+    if value != "pending" {
+      assert_eq!(value, "ok");
+      break;
     }
-    drop(host);
+    let _ = woken.recv_timeout(Duration::from_millis(2));
+    engine.tick().unwrap();
+    assert!(
+      started.elapsed() < Duration::from_secs(30),
+      "GPU work did not finish"
+    );
+  }
+  drop(host);
 }
 
 #[test]
 #[ignore = "Requires a native GPU adapter"]
 fn renders_pixels_and_runs_compute() {
-    let (host, engine) =
-        page("<html><body><canvas id='canvas' width='64' height='64'></canvas></body></html>");
-    engine.eval(include_str!("webgpu.js"), "gpu-test").unwrap();
-    assert_eq!(wait(&engine, "globalThis.gpuTestResult ?? 'pending'"), "ok");
-    let broken: usize = engine
-        .eval("brokenCanvas", "gpu-test")
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert!(
-        host.borrow()
-            .store
-            .borrow_mut()
-            .graphics
-            .get_mut(&1)
-            .unwrap()
-            .image(broken)
-            .unwrap()
-            .is_none()
-    );
-    let node = host.borrow().store.borrow().pages[&1]
-        .doc
-        .nodes
-        .iter()
-        .position(|n| n.tag == "canvas")
-        .unwrap();
-    let image = present(&host, node);
-    let pixels = image.bytes();
-    assert_eq!(
-        &pixels[(32 * 64 + 32) * 4..(32 * 64 + 32) * 4 + 4],
-        &[0, 0, 255, 255]
-    );
-    assert_eq!(&pixels[0..4], &[0, 0, 0, 255]);
-    engine
-        .eval(
-            "canvas.width = 16; canvas.height = 8; context.getCurrentTexture();",
-            "resize",
-        )
-        .unwrap();
-    assert_eq!(present(&host, node).bytes().len(), 16 * 8 * 4);
+  let (host, engine) =
+    page("<html><body><canvas id='canvas' width='64' height='64'></canvas></body></html>");
+  engine.eval(include_str!("webgpu.js"), "gpu-test").unwrap();
+  assert_eq!(wait(&engine, "globalThis.gpuTestResult ?? 'pending'"), "ok");
+  let broken: usize = engine
+    .eval("brokenCanvas", "gpu-test")
+    .unwrap()
+    .parse()
+    .unwrap();
+  assert!(
+    host
+      .borrow()
+      .store
+      .borrow_mut()
+      .graphics
+      .get_mut(&1)
+      .unwrap()
+      .image(broken)
+      .unwrap()
+      .is_none()
+  );
+  let node = host.borrow().store.borrow().pages[&1]
+    .doc
+    .nodes
+    .iter()
+    .position(|n| n.tag == "canvas")
+    .unwrap();
+  let image = present(&host, node);
+  let pixels = image.bytes();
+  assert_eq!(
+    &pixels[(32 * 64 + 32) * 4..(32 * 64 + 32) * 4 + 4],
+    &[0, 0, 255, 255]
+  );
+  assert_eq!(&pixels[0..4], &[0, 0, 0, 255]);
+  engine
+    .eval(
+      "canvas.width = 16; canvas.height = 8; context.getCurrentTexture();",
+      "resize",
+    )
+    .unwrap();
+  assert_eq!(present(&host, node).bytes().len(), 16 * 8 * 4);
 }
 
 #[test]
 #[ignore = "Requires a native GPU adapter"]
 fn map_async_and_work_done_resolve_without_blocking_the_tick() {
-    let (_host, engine) = page("<body></body>");
-    engine.eval(r#"(async () => {
+  let (_host, engine) = page("<body></body>");
+  engine.eval(r#"(async () => {
         const device = await (await navigator.gpu.requestAdapter()).requestDevice();
         const output = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
         const readback = device.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
@@ -279,25 +279,25 @@ fn map_async_and_work_done_resolve_without_blocking_the_tick() {
         aborted.unmap();
         globalThis.gpuTestResult = 'ok';
     })().catch(error => { globalThis.gpuTestResult = String(error); });"#, "gpu-test").unwrap();
-    assert_eq!(engine.eval("state", "gpu-test").unwrap(), "pending");
-    let tick = Instant::now();
-    engine.tick().unwrap();
-    let tick = tick.elapsed().as_secs_f64() * 1000.;
-    assert_eq!(wait(&engine, "globalThis.gpuTestResult ?? 'pending'"), "ok");
-    let issued: f64 = engine.eval("issued", "gpu-test").unwrap().parse().unwrap();
-    let mapped: f64 = engine.eval("mapped", "gpu-test").unwrap().parse().unwrap();
-    assert_eq!(engine.eval("done", "gpu-test").unwrap(), "true");
-    assert!(
-        issued + tick < mapped / 2.,
-        "mapAsync blocked: issued in {issued:.1} ms, tick {tick:.1} ms, mapped after {mapped:.1} ms"
-    );
+  assert_eq!(engine.eval("state", "gpu-test").unwrap(), "pending");
+  let tick = Instant::now();
+  engine.tick().unwrap();
+  let tick = tick.elapsed().as_secs_f64() * 1000.;
+  assert_eq!(wait(&engine, "globalThis.gpuTestResult ?? 'pending'"), "ok");
+  let issued: f64 = engine.eval("issued", "gpu-test").unwrap().parse().unwrap();
+  let mapped: f64 = engine.eval("mapped", "gpu-test").unwrap().parse().unwrap();
+  assert_eq!(engine.eval("done", "gpu-test").unwrap(), "true");
+  assert!(
+    issued + tick < mapped / 2.,
+    "mapAsync blocked: issued in {issued:.1} ms, tick {tick:.1} ms, mapped after {mapped:.1} ms"
+  );
 }
 
 #[test]
 #[ignore = "Requires a native GPU adapter"]
 fn static_canvas_stops_presenting_when_idle() {
-    let (host, engine) = page("<body><canvas id='canvas' width='32' height='32'></canvas></body>");
-    engine.eval(r#"(async () => {
+  let (host, engine) = page("<body><canvas id='canvas' width='32' height='32'></canvas></body>");
+  engine.eval(r#"(async () => {
         const device = await (await navigator.gpu.requestAdapter()).requestDevice();
         const context = document.getElementById('canvas').getContext('webgpu');
         context.configure({ device, format: 'rgba8unorm' });
@@ -306,31 +306,32 @@ fn static_canvas_stops_presenting_when_idle() {
         device.queue.submit([encoder.finish()]);
         globalThis.gpuTestResult = 'ok';
     })().catch(error => { globalThis.gpuTestResult = String(error); });"#, "gpu-test").unwrap();
-    assert_eq!(wait(&engine, "globalThis.gpuTestResult ?? 'pending'"), "ok");
-    let node = host.borrow().store.borrow().pages[&1]
-        .doc
-        .nodes
-        .iter()
-        .position(|n| n.tag == "canvas")
-        .unwrap();
-    let image = present(&host, node);
-    assert_eq!(&image.bytes()[..4], &[0, 255, 0, 255]);
-    host.borrow()
-        .store
-        .borrow_mut()
-        .pages
-        .get_mut(&1)
-        .unwrap()
-        .dirty = false;
-    std::thread::sleep(Duration::from_millis(20));
-    for _ in 0..3 {
-        assert_eq!(engine.tick().unwrap(), -1);
-        let host = host.borrow();
-        let mut state = host.store.borrow_mut();
-        let gpu = state.graphics.get_mut(&1).unwrap();
-        assert!(!gpu.presented());
-        assert_eq!(gpu.image(node).unwrap().unwrap().id, image.id);
-        assert!(!state.pages[&1].dirty);
-        assert!(!state.pages[&1].state.frame_requested);
-    }
+  assert_eq!(wait(&engine, "globalThis.gpuTestResult ?? 'pending'"), "ok");
+  let node = host.borrow().store.borrow().pages[&1]
+    .doc
+    .nodes
+    .iter()
+    .position(|n| n.tag == "canvas")
+    .unwrap();
+  let image = present(&host, node);
+  assert_eq!(&image.bytes()[..4], &[0, 255, 0, 255]);
+  host
+    .borrow()
+    .store
+    .borrow_mut()
+    .pages
+    .get_mut(&1)
+    .unwrap()
+    .dirty = false;
+  std::thread::sleep(Duration::from_millis(20));
+  for _ in 0..3 {
+    assert_eq!(engine.tick().unwrap(), -1);
+    let host = host.borrow();
+    let mut state = host.store.borrow_mut();
+    let gpu = state.graphics.get_mut(&1).unwrap();
+    assert!(!gpu.presented());
+    assert_eq!(gpu.image(node).unwrap().unwrap().id, image.id);
+    assert!(!state.pages[&1].dirty);
+    assert!(!state.pages[&1].state.frame_requested);
+  }
 }

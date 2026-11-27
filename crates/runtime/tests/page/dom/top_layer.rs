@@ -2,9 +2,9 @@ use super::*;
 
 #[test]
 fn inner_text_client_box_urls_dialog_and_details() {
-    let (host, engine) = checked_page(
-        "<html><head><base href='apps://app/sub/'></head><body><div id='t'>a  b<br>c<p>para</p><span style='display:none'>hidden</span>end</div><div id='box' style='border:3px solid;padding:5px'></div><a id='a' href='x.html#h'>x</a><img id='i' src='img.png'><dialog id='d'><form method='dialog'><button id='ok' value='yes'>ok</button></form></dialog><details id='det'><summary id='sum'>s</summary>body</details></body></html>",
-        r#"
+  let (host, engine) = checked_page(
+    "<html><head><base href='apps://app/sub/'></head><body><div id='t'>a  b<br>c<p>para</p><span style='display:none'>hidden</span>end</div><div id='box' style='border:3px solid;padding:5px'></div><a id='a' href='x.html#h'>x</a><img id='i' src='img.png'><dialog id='d'><form method='dialog'><button id='ok' value='yes'>ok</button></form></dialog><details id='det'><summary id='sum'>s</summary>body</details></body></html>",
+    r#"
         check('innerText', () => document.getElementById('t').innerText === 'a b\nc\n\npara\n\nend');
         const t = document.getElementById('t'); t.innerText = 'x\ny';
         check('innerText setter', () => t.innerHTML === 'x<br>y');
@@ -25,28 +25,29 @@ fn inner_text_client_box_urls_dialog_and_details() {
         document.getElementById('sum').click();
         check('summary opens details', () => det.open && det.hasAttribute('open'));
         "#,
-    );
-    let id = {
-        let host = host.borrow().store.clone();
-        let mut host = host.borrow_mut();
-        let host = &mut *host;
-        let doc = &host.pages[&1].doc;
-        let id = doc
-            .nodes
-            .iter()
-            .position(|node| node.attrs.get("id").map(String::as_str) == Some("box"))
-            .unwrap();
-        host.state(1)
-            .geometry
-            .mirror
-            .insert(id, [0., 0., 116., 40.]);
-        id
-    };
-    let _ = id;
-    for _ in 0..10 {
-        engine.tick().unwrap();
-    }
-    engine.eval(r#"
+  );
+  let id = {
+    let host = host.borrow().store.clone();
+    let mut host = host.borrow_mut();
+    let host = &mut *host;
+    let doc = &host.pages[&1].doc;
+    let id = doc
+      .nodes
+      .iter()
+      .position(|node| node.attrs.get("id").map(String::as_str) == Some("box"))
+      .unwrap();
+    host
+      .state(1)
+      .geometry
+      .mirror
+      .insert(id, [0., 0., 116., 40.]);
+    id
+  };
+  let _ = id;
+  for _ in 0..10 {
+    engine.tick().unwrap();
+  }
+  engine.eval(r#"
         const box = document.getElementById('box');
         if (box.clientWidth !== 110 || box.clientHeight !== 34 || box.clientLeft !== 3 || box.offsetWidth !== 116) throw Error('client box ' + [box.clientWidth, box.clientHeight, box.clientLeft]);
         if (dialogEvents.join() !== 'cancel,close:yes,close:yes') throw Error('dialog events ' + dialogEvents.join());
@@ -56,9 +57,9 @@ fn inner_text_client_box_urls_dialog_and_details() {
 
 #[test]
 fn popovers_follow_the_auto_stack_light_dismiss_and_invokers() {
-    let (host, engine) = checked_page(
-        "<html><body><div id='a' popover><button id='open-b' popovertarget='b'>b</button><div id='b' popover='auto'>b</div></div><div id='c' popover=''>c</div><div id='m' popover='manual'>m</div><div id='h' popover='hint'>h</div><div id='plain'>x</div><button id='toggle' popovertarget='a'>a</button><button id='show' popovertarget='m' popovertargetaction='show'>m</button><form><button id='submit' popovertarget='a'>no</button></form><button id='cmd' commandfor='c' command='toggle-popover'>c</button><button id='custom' commandfor='plain' command='--go'>go</button></body></html>",
-        r#"
+  let (host, engine) = checked_page(
+    "<html><body><div id='a' popover><button id='open-b' popovertarget='b'>b</button><div id='b' popover='auto'>b</div></div><div id='c' popover=''>c</div><div id='m' popover='manual'>m</div><div id='h' popover='hint'>h</div><div id='plain'>x</div><button id='toggle' popovertarget='a'>a</button><button id='show' popovertarget='m' popovertargetaction='show'>m</button><form><button id='submit' popovertarget='a'>no</button></form><button id='cmd' commandfor='c' command='toggle-popover'>c</button><button id='custom' commandfor='plain' command='--go'>go</button></body></html>",
+    r#"
         const $ = id => document.getElementById(id), [a, b, c, m, h, plain] = ['a', 'b', 'c', 'm', 'h', 'plain'].map($);
         const log = [];
         for (const node of [a, b, c, m, h]) for (const type of ['beforetoggle', 'toggle']) node.addEventListener(type, e => log.push(node.id + ':' + type + ':' + e.oldState + '>' + e.newState));
@@ -108,27 +109,27 @@ fn popovers_follow_the_auto_stack_light_dismiss_and_invokers() {
         check('removal hides', () => !c.matches(':popover-open'));
         globalThis.toggleLog = log;
         "#,
-    );
-    let id: usize = engine
-        .eval(
-            "document.getElementById('m').showPopover(); document.getElementById('m')._id",
-            "test",
-        )
-        .unwrap()
-        .parse()
-        .unwrap();
-    engine.eval("document.body.offsetWidth", "test").unwrap();
-    assert_eq!(
-        host.borrow().store.borrow().pages[&1]
-            .state
-            .interaction
-            .top_layer,
-        [id]
-    );
-    for _ in 0..10 {
-        engine.tick().unwrap();
-    }
-    engine
+  );
+  let id: usize = engine
+    .eval(
+      "document.getElementById('m').showPopover(); document.getElementById('m')._id",
+      "test",
+    )
+    .unwrap()
+    .parse()
+    .unwrap();
+  engine.eval("document.body.offsetWidth", "test").unwrap();
+  assert_eq!(
+    host.borrow().store.borrow().pages[&1]
+      .state
+      .interaction
+      .top_layer,
+    [id]
+  );
+  for _ in 0..10 {
+    engine.tick().unwrap();
+  }
+  engine
         .eval(
             r#"
         const toggles = toggleLog.filter(entry => entry.includes(':toggle:'));
@@ -141,9 +142,9 @@ fn popovers_follow_the_auto_stack_light_dismiss_and_invokers() {
 
 #[test]
 fn dialogs_close_on_requests_and_light_dismiss_by_closedby() {
-    let (host, engine) = checked_page(
-        "<html><body><div style='overflow:hidden;height:10px'><dialog id='d'><button id='in'>in</button></dialog></div><dialog id='n' closedby='none'>n</dialog><dialog id='any' closedby='any'>any</dialog><button id='open' commandfor='d' command='show-modal'>open</button><button id='close' commandfor='d' command='close' value='done'>close</button><div id='out'>out</div></body></html>",
-        r#"
+  let (host, engine) = checked_page(
+    "<html><body><div style='overflow:hidden;height:10px'><dialog id='d'><button id='in'>in</button></dialog></div><dialog id='n' closedby='none'>n</dialog><dialog id='any' closedby='any'>any</dialog><button id='open' commandfor='d' command='show-modal'>open</button><button id='close' commandfor='d' command='close' value='done'>close</button><div id='out'>out</div></body></html>",
+    r#"
         const $ = id => document.getElementById(id), d = $('d');
         const log = [];
         for (const type of ['beforetoggle', 'cancel', 'close']) d.addEventListener(type, e => log.push(type + (e.newState ? ':' + e.newState : '')));
@@ -170,26 +171,26 @@ fn dialogs_close_on_requests_and_light_dismiss_by_closedby() {
         check('canceled beforetoggle keeps the dialog closed', () => !d.open);
         d.showModal();
         "#,
-    );
-    let ids: Vec<usize> = ["d", "out"]
-        .iter()
-        .map(|id| {
-            engine
-                .eval(&format!("document.getElementById('{id}')._id"), "test")
-                .unwrap()
-                .parse()
-                .unwrap()
-        })
-        .collect();
-    {
-        let host = host.borrow().store.clone();
-        let mut host = host.borrow_mut();
-        let dom = host.state(1);
-        assert_eq!(dom.interaction.top_layer, [ids[0]]);
-        dom.geometry.mirror.insert(ids[0], [40., 40., 20., 20.]);
-        dom.geometry.mirror.insert(ids[1], [0., 0., 100., 100.]);
-    }
-    engine
+  );
+  let ids: Vec<usize> = ["d", "out"]
+    .iter()
+    .map(|id| {
+      engine
+        .eval(&format!("document.getElementById('{id}')._id"), "test")
+        .unwrap()
+        .parse()
+        .unwrap()
+    })
+    .collect();
+  {
+    let host = host.borrow().store.clone();
+    let mut host = host.borrow_mut();
+    let dom = host.state(1);
+    assert_eq!(dom.interaction.top_layer, [ids[0]]);
+    dom.geometry.mirror.insert(ids[0], [40., 40., 20., 20.]);
+    dom.geometry.mirror.insert(ids[1], [0., 0., 100., 100.]);
+  }
+  engine
         .eval(
             r#"
         const d = document.getElementById('d');
@@ -201,20 +202,20 @@ fn dialogs_close_on_requests_and_light_dismiss_by_closedby() {
             "test",
         )
         .unwrap();
-    assert!(
-        host.borrow().store.borrow().pages[&1]
-            .state
-            .interaction
-            .top_layer
-            .is_empty()
-    );
+  assert!(
+    host.borrow().store.borrow().pages[&1]
+      .state
+      .interaction
+      .top_layer
+      .is_empty()
+  );
 }
 
 #[test]
 fn fullscreen_elements_enter_the_top_layer_and_exit_on_escape() {
-    let (host, engine) = checked_page(
-        "<html><body><div id='v'>video</div><dialog id='d'>d</dialog></body></html>",
-        r#"
+  let (host, engine) = checked_page(
+    "<html><body><div id='v'>video</div><dialog id='d'>d</dialog></body></html>",
+    r#"
         const v = document.getElementById('v'), log = [];
         document.addEventListener('fullscreenchange', e => log.push('change:' + e.target.id + ':' + !!document.fullscreenElement));
         document.addEventListener('fullscreenerror', e => log.push('error:' + e.target.id));
@@ -225,30 +226,33 @@ fn fullscreen_elements_enter_the_top_layer_and_exit_on_escape() {
         const d = document.getElementById('d'); d.showModal();
         globalThis.failed = d.requestFullscreen().then(() => 'resolved', e => e instanceof TypeError);
         "#,
+  );
+  let id: usize = engine
+    .eval("document.getElementById('v')._id", "test")
+    .unwrap()
+    .parse()
+    .unwrap();
+  {
+    let host = host.borrow();
+    assert_eq!(
+      host.store.borrow().pages[&1]
+        .state
+        .interaction
+        .top_layer
+        .first(),
+      Some(&id)
     );
-    let id: usize = engine
-        .eval("document.getElementById('v')._id", "test")
-        .unwrap()
-        .parse()
-        .unwrap();
-    {
-        let host = host.borrow();
-        assert_eq!(
-            host.store.borrow().pages[&1]
-                .state
-                .interaction
-                .top_layer
-                .first(),
-            Some(&id)
-        );
-        assert!(host.commands.iter().any(|command| {
-            command["args"][0] == "htmlFullscreen" && command["args"][2] == true
-        }));
-    }
-    for _ in 0..10 {
-        engine.tick().unwrap();
-    }
-    engine
+    assert!(
+      host
+        .commands
+        .iter()
+        .any(|command| { command["args"][0] == "htmlFullscreen" && command["args"][2] == true })
+    );
+  }
+  for _ in 0..10 {
+    engine.tick().unwrap();
+  }
+  engine
         .eval(
             r#"
         globalThis.done = null; failed.then(value => globalThis.done = value);
@@ -259,10 +263,10 @@ fn fullscreen_elements_enter_the_top_layer_and_exit_on_escape() {
             "test",
         )
         .unwrap();
-    for _ in 0..10 {
-        engine.tick().unwrap();
-    }
-    engine
+  for _ in 0..10 {
+    engine.tick().unwrap();
+  }
+  engine
         .eval(
             r#"
         if (done !== true) throw Error('modal dialogs cannot go fullscreen ' + done);
@@ -271,21 +275,23 @@ fn fullscreen_elements_enter_the_top_layer_and_exit_on_escape() {
             "test",
         )
         .unwrap();
-    assert!(
-        host.borrow().commands.iter().any(|command| {
-            command["args"][0] == "htmlFullscreen" && command["args"][2] == false
-        })
-    );
+  assert!(
+    host
+      .borrow()
+      .commands
+      .iter()
+      .any(|command| { command["args"][0] == "htmlFullscreen" && command["args"][2] == false })
+  );
 }
 
 #[test]
 fn inert_nodes_and_modal_dialogs_take_no_hits_focus_or_selection() {
-    let (host, engine) = checked_page(
-        "<html><body><style>body.through dialog::backdrop{pointer-events:none}</style>\
+  let (host, engine) = checked_page(
+    "<html><body><style>body.through dialog::backdrop{pointer-events:none}</style>\
          <div id='wrap' inert><button id='b'>b</button><span id='t'>inert text</span><dialog id='d'><button id='in'>in</button></dialog></div>\
          <div id='under'><button id='u'>u</button></div><div id='over' inert></div><button id='out'>out</button><p id='free'>free text</p>\
          <div id='pop' popover='manual'><button id='pb'>pb</button></div><div id='fs'><button id='fb'>fb</button></div></body></html>",
-        r#"
+    r#"
         const $ = id => document.getElementById(id);
         check('inert takes no focus', () => { $('b').focus(); return document.activeElement === document.body; });
         check('other nodes take focus', () => { $('out').focus(); return document.activeElement === $('out'); });
@@ -294,39 +300,40 @@ fn inert_nodes_and_modal_dialogs_take_no_hits_focus_or_selection() {
         check('other text is selected', () => { getSelection().selectAllChildren($('free')); return String(getSelection()) === 'free text'; });
         check('tailwind variant and attribute', () => $('t').matches('[inert] *') && $('wrap').inert);
         "#,
-    );
-    let id = |name: &str| -> usize {
-        engine
-            .eval(&format!("document.getElementById('{name}')._id"), "test")
-            .unwrap()
-            .parse()
-            .unwrap()
-    };
-    let rects = [
-        ("wrap", [0., 0., 50., 40.]),
-        ("b", [0., 0., 50., 20.]),
-        ("t", [0., 20., 50., 20.]),
-        ("under", [100., 0., 50., 50.]),
-        ("u", [100., 0., 50., 20.]),
-        ("over", [100., 0., 50., 50.]),
-        ("out", [0., 60., 50., 20.]),
-        ("free", [0., 90., 50., 20.]),
-        ("d", [200., 200., 100., 50.]),
-        ("in", [200., 200., 50., 20.]),
-        ("pop", [300., 0., 50., 50.]),
-        ("pb", [300., 0., 50., 20.]),
-        ("fs", [0., 120., 50., 50.]),
-        ("fb", [0., 120., 50., 20.]),
-    ]
-    .map(|(name, rect)| (id(name), rect));
-    host.borrow()
-        .store
-        .borrow_mut()
-        .state(1)
-        .geometry
-        .mirror
-        .extend(rects);
-    let fails = engine
+  );
+  let id = |name: &str| -> usize {
+    engine
+      .eval(&format!("document.getElementById('{name}')._id"), "test")
+      .unwrap()
+      .parse()
+      .unwrap()
+  };
+  let rects = [
+    ("wrap", [0., 0., 50., 40.]),
+    ("b", [0., 0., 50., 20.]),
+    ("t", [0., 20., 50., 20.]),
+    ("under", [100., 0., 50., 50.]),
+    ("u", [100., 0., 50., 20.]),
+    ("over", [100., 0., 50., 50.]),
+    ("out", [0., 60., 50., 20.]),
+    ("free", [0., 90., 50., 20.]),
+    ("d", [200., 200., 100., 50.]),
+    ("in", [200., 200., 50., 20.]),
+    ("pop", [300., 0., 50., 50.]),
+    ("pb", [300., 0., 50., 20.]),
+    ("fs", [0., 120., 50., 50.]),
+    ("fb", [0., 120., 50., 20.]),
+  ]
+  .map(|(name, rect)| (id(name), rect));
+  host
+    .borrow()
+    .store
+    .borrow_mut()
+    .state(1)
+    .geometry
+    .mirror
+    .extend(rects);
+  let fails = engine
         .eval(
             r#"(() => {
         const $ = id => document.getElementById(id), at = (x, y) => { const node = document.elementFromPoint(x, y); return node?.id || node?.localName; };
@@ -356,5 +363,5 @@ fn inert_nodes_and_modal_dialogs_take_no_hits_focus_or_selection() {
             "test",
         )
         .unwrap();
-    assert_eq!(fails, "");
+  assert_eq!(fails, "");
 }

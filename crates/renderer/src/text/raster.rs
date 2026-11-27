@@ -3,146 +3,146 @@ use crate::{Color, Pixels, Point, Rect, Size};
 use anyhow::Result;
 
 impl Fonts {
-    /// Offset from the pen in device pixels, size, and alpha bytes, or RGBA for emoji.
-    #[allow(clippy::too_many_arguments)]
-    pub fn glyph_pixels(
-        &self,
-        font: FontId,
-        glyph: GlyphId,
-        size: Pixels,
-        scale: f32,
-        subpixel: u8,
-        emoji: bool,
-        stroke: f32,
-    ) -> Option<(Point<i32>, Size<i32>, Vec<u8>)> {
-        let raster = GlyphRaster {
-            font,
-            glyph,
-            size,
-            scale,
-            subpixel,
-            emoji,
-            dilation: 0,
-            stroke,
-        };
-        let (shown, size, bytes) = self.raster(&raster, i32::MAX).ok()??;
-        Some((shown.origin, size, bytes))
-    }
+  /// Offset from the pen in device pixels, size, and alpha bytes, or RGBA for emoji.
+  #[allow(clippy::too_many_arguments)]
+  pub fn glyph_pixels(
+    &self,
+    font: FontId,
+    glyph: GlyphId,
+    size: Pixels,
+    scale: f32,
+    subpixel: u8,
+    emoji: bool,
+    stroke: f32,
+  ) -> Option<(Point<i32>, Size<i32>, Vec<u8>)> {
+    let raster = GlyphRaster {
+      font,
+      glyph,
+      size,
+      scale,
+      subpixel,
+      emoji,
+      dilation: 0,
+      stroke,
+    };
+    let (shown, size, bytes) = self.raster(&raster, i32::MAX).ok()??;
+    Some((shown.origin, size, bytes))
+  }
 
-    /// A glyph larger than `max` rasters at a smaller scale, and `shown` is the place it stretches back to.
-    pub(crate) fn raster(&self, raster: &GlyphRaster, max: i32) -> Result<Option<Raster<Vec<u8>>>> {
-        let full = self.backend.raster_bounds(raster)?;
-        let stretch = full.size.width.max(full.size.height) as f32 / max as f32;
-        #[cfg(target_os = "windows")]
-        let stretch = if max < i32::MAX {
-            stretch.max(raster.size.0 * raster.scale / super::windows::MAX_ANALYSIS)
-        } else {
-            stretch
-        };
-        let (raster, bounds) = if stretch > 1. {
-            let small = GlyphRaster {
-                scale: raster.scale / stretch,
-                subpixel: 0,
-                ..*raster
-            };
-            (small, self.backend.raster_bounds(&small)?)
-        } else {
-            (*raster, full)
-        };
-        if bounds.is_empty() {
-            return Ok(None);
-        }
-        let (size, bytes) = self.backend.rasterize(&raster, bounds)?;
-        let shown = if stretch > 1. {
-            let grow = |value: i32| (value as f32 * stretch).round() as i32;
-            Rect::new(bounds.origin.map(grow), size.map(grow))
-        } else {
-            Rect::new(bounds.origin, size)
-        };
-        Ok(Some((shown, size, bytes)))
+  /// A glyph larger than `max` rasters at a smaller scale, and `shown` is the place it stretches back to.
+  pub(crate) fn raster(&self, raster: &GlyphRaster, max: i32) -> Result<Option<Raster<Vec<u8>>>> {
+    let full = self.backend.raster_bounds(raster)?;
+    let stretch = full.size.width.max(full.size.height) as f32 / max as f32;
+    #[cfg(target_os = "windows")]
+    let stretch = if max < i32::MAX {
+      stretch.max(raster.size.0 * raster.scale / super::windows::MAX_ANALYSIS)
+    } else {
+      stretch
+    };
+    let (raster, bounds) = if stretch > 1. {
+      let small = GlyphRaster {
+        scale: raster.scale / stretch,
+        subpixel: 0,
+        ..*raster
+      };
+      (small, self.backend.raster_bounds(&small)?)
+    } else {
+      (*raster, full)
+    };
+    if bounds.is_empty() {
+      return Ok(None);
     }
+    let (size, bytes) = self.backend.rasterize(&raster, bounds)?;
+    let shown = if stretch > 1. {
+      let grow = |value: i32| (value as f32 * stretch).round() as i32;
+      Rect::new(bounds.origin.map(grow), size.map(grow))
+    } else {
+      Rect::new(bounds.origin, size)
+    };
+    Ok(Some((shown, size, bytes)))
+  }
 
-    /// Font smoothing for glyphs in `color`, part of the raster key: 0 for none.
-    pub(crate) fn dilation(&self, color: Color) -> u8 {
-        self.backend.dilation(color)
-    }
+  /// Font smoothing for glyphs in `color`, part of the raster key: 0 for none.
+  pub(crate) fn dilation(&self, color: Color) -> u8 {
+    self.backend.dilation(color)
+  }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{Font, TextSystem, px};
+  use super::*;
+  use crate::{Font, TextSystem, px};
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn smoothed_dark_glyphs_cover_the_rows_of_chrome() {
-        let text = TextSystem::new();
-        let font = text.face(&Font::new("Helvetica"));
-        let glyph = text.backend.glyph(font, 'H').unwrap();
-        // The top edge of an 'H' at 32 px and 2x, in the darkest pixel of each row.
-        let edge = |dilation| {
-            let raster = GlyphRaster {
-                font,
-                glyph,
-                size: px(32.),
-                scale: 2.,
-                subpixel: 0,
-                emoji: false,
-                dilation,
-                stroke: 0.,
-            };
-            let (_, size, bytes) = text.raster(&raster, 512).unwrap().unwrap();
-            bytes
-                .chunks(size.width as usize)
-                .map(|row| *row.iter().max().unwrap())
-                .find(|&alpha| alpha > 0)
-                .unwrap()
-        };
-        // Chromium has a partial row of 120 above the cap height, and a glyph without smoothing starts lower.
-        assert!((i32::from(edge(1)) - 120).abs() < 16, "{}", edge(1));
-        assert!(edge(0) > 200, "{}", edge(0));
-    }
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn smoothed_dark_glyphs_cover_the_rows_of_chrome() {
+    let text = TextSystem::new();
+    let font = text.face(&Font::new("Helvetica"));
+    let glyph = text.backend.glyph(font, 'H').unwrap();
+    // The top edge of an 'H' at 32 px and 2x, in the darkest pixel of each row.
+    let edge = |dilation| {
+      let raster = GlyphRaster {
+        font,
+        glyph,
+        size: px(32.),
+        scale: 2.,
+        subpixel: 0,
+        emoji: false,
+        dilation,
+        stroke: 0.,
+      };
+      let (_, size, bytes) = text.raster(&raster, 512).unwrap().unwrap();
+      bytes
+        .chunks(size.width as usize)
+        .map(|row| *row.iter().max().unwrap())
+        .find(|&alpha| alpha > 0)
+        .unwrap()
+    };
+    // Chromium has a partial row of 120 above the cap height, and a glyph without smoothing starts lower.
+    assert!((i32::from(edge(1)) - 120).abs() < 16, "{}", edge(1));
+    assert!(edge(0) > 200, "{}", edge(0));
+  }
 
-    #[test]
-    fn huge_glyphs_raster_small_and_stretch_to_their_size() {
-        let text = TextSystem::new();
-        let font = text.face(&Font::new("Helvetica"));
-        let glyph = text.backend.glyph(font, 'W').unwrap();
-        let raster = GlyphRaster {
-            font,
-            glyph,
-            size: px(10000.),
-            scale: 2.,
-            subpixel: 2,
-            emoji: false,
-            dilation: 0,
-            stroke: 0.,
-        };
-        let full = text.backend.raster_bounds(&raster).unwrap();
-        assert!(full.size.width > 16384, "{full:?}");
-        let max = crate::text::MAX_GLYPH_SIDE;
-        let (shown, size, bytes) = text.raster(&raster, max).unwrap().unwrap();
-        assert!(size.width.max(size.height) <= max + 4);
-        assert_eq!(bytes.len(), (size.width * size.height) as usize);
-        assert!(bytes.iter().any(|alpha| *alpha > 0));
-        let stretch = full.size.width.max(full.size.height) / max + 1;
-        for (shown, full) in [
-            (shown.origin.x, full.origin.x),
-            (shown.origin.y, full.origin.y),
-            (shown.size.width, full.size.width),
-            (shown.size.height, full.size.height),
-        ] {
-            assert!((shown - full).abs() <= 3 * stretch, "{shown:?} vs {full:?}");
-        }
-        let small = GlyphRaster {
-            size: px(16.),
-            ..raster
-        };
-        let (shown, size, _) = text.raster(&small, max).unwrap().unwrap();
-        assert_eq!(shown.size, size);
-        assert_eq!(
-            shown.origin,
-            text.backend.raster_bounds(&small).unwrap().origin
-        );
+  #[test]
+  fn huge_glyphs_raster_small_and_stretch_to_their_size() {
+    let text = TextSystem::new();
+    let font = text.face(&Font::new("Helvetica"));
+    let glyph = text.backend.glyph(font, 'W').unwrap();
+    let raster = GlyphRaster {
+      font,
+      glyph,
+      size: px(10000.),
+      scale: 2.,
+      subpixel: 2,
+      emoji: false,
+      dilation: 0,
+      stroke: 0.,
+    };
+    let full = text.backend.raster_bounds(&raster).unwrap();
+    assert!(full.size.width > 16384, "{full:?}");
+    let max = crate::text::MAX_GLYPH_SIDE;
+    let (shown, size, bytes) = text.raster(&raster, max).unwrap().unwrap();
+    assert!(size.width.max(size.height) <= max + 4);
+    assert_eq!(bytes.len(), (size.width * size.height) as usize);
+    assert!(bytes.iter().any(|alpha| *alpha > 0));
+    let stretch = full.size.width.max(full.size.height) / max + 1;
+    for (shown, full) in [
+      (shown.origin.x, full.origin.x),
+      (shown.origin.y, full.origin.y),
+      (shown.size.width, full.size.width),
+      (shown.size.height, full.size.height),
+    ] {
+      assert!((shown - full).abs() <= 3 * stretch, "{shown:?} vs {full:?}");
     }
+    let small = GlyphRaster {
+      size: px(16.),
+      ..raster
+    };
+    let (shown, size, _) = text.raster(&small, max).unwrap().unwrap();
+    assert_eq!(shown.size, size);
+    assert_eq!(
+      shown.origin,
+      text.backend.raster_bounds(&small).unwrap().origin
+    );
+  }
 }

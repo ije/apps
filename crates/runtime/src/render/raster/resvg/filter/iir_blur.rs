@@ -7,100 +7,100 @@
 use super::ImageRefMut;
 
 struct BlurData {
-    width: usize,
-    height: usize,
-    sigma_x: f64,
-    sigma_y: f64,
+  width: usize,
+  height: usize,
+  sigma_x: f64,
+  sigma_y: f64,
 }
 
 const STEPS: usize = 4;
 
 pub fn apply(sigma_x: f64, sigma_y: f64, src: ImageRefMut) {
-    let buf_size = (src.width * src.height) as usize;
-    let mut buf = vec![0.0; buf_size];
-    let buf = &mut buf;
+  let buf_size = (src.width * src.height) as usize;
+  let mut buf = vec![0.0; buf_size];
+  let buf = &mut buf;
 
-    let d = BlurData {
-        width: src.width as usize,
-        height: src.height as usize,
-        sigma_x,
-        sigma_y,
-    };
+  let d = BlurData {
+    width: src.width as usize,
+    height: src.height as usize,
+    sigma_x,
+    sigma_y,
+  };
 
-    let data: &mut [u8] = rgb::bytemuck::cast_slice_mut(src.data);
-    for channel in 0..4 {
-        gaussian_channel(data, &d, channel, buf);
-    }
+  let data: &mut [u8] = rgb::bytemuck::cast_slice_mut(src.data);
+  for channel in 0..4 {
+    gaussian_channel(data, &d, channel, buf);
+  }
 }
 
 fn gaussian_channel(data: &mut [u8], d: &BlurData, channel: usize, buf: &mut [f64]) {
-    for i in 0..data.len() / 4 {
-        buf[i] = data[i * 4 + channel] as f64 / 255.0;
-    }
+  for i in 0..data.len() / 4 {
+    buf[i] = data[i * 4 + channel] as f64 / 255.0;
+  }
 
-    gaussianiir2d(d, buf);
+  gaussianiir2d(d, buf);
 
-    for i in 0..data.len() / 4 {
-        data[i * 4 + channel] = (buf[i] * 255.0) as u8;
-    }
+  for i in 0..data.len() / 4 {
+    data[i * 4 + channel] = (buf[i] * 255.0) as u8;
+  }
 }
 
 // Process four independent rows together, with vertical passes in memory order. Preserve resvg's operation
 // order per value.
 fn gaussianiir2d(d: &BlurData, buf: &mut [f64]) {
-    let width = d.width;
-    let (lambda_x, dnu_x) = if d.sigma_x > 0.0 {
-        let (lambda, dnu) = gen_coefficients(d.sigma_x, STEPS);
+  let width = d.width;
+  let (lambda_x, dnu_x) = if d.sigma_x > 0.0 {
+    let (lambda, dnu) = gen_coefficients(d.sigma_x, STEPS);
 
-        for rows in buf.chunks_mut(width * 4) {
-            let n = rows.len() / width;
-            for _ in 0..STEPS {
-                for x in 1..width {
-                    for row in 0..n {
-                        rows[row * width + x] += dnu * rows[row * width + x - 1];
-                    }
-                }
-                for x in (1..width).rev() {
-                    for row in 0..n {
-                        rows[row * width + x - 1] += dnu * rows[row * width + x];
-                    }
-                }
-            }
+    for rows in buf.chunks_mut(width * 4) {
+      let n = rows.len() / width;
+      for _ in 0..STEPS {
+        for x in 1..width {
+          for row in 0..n {
+            rows[row * width + x] += dnu * rows[row * width + x - 1];
+          }
         }
-
-        (lambda, dnu)
-    } else {
-        (1.0, 1.0)
-    };
-
-    let (lambda_y, dnu_y) = if d.sigma_y > 0.0 {
-        let (lambda, dnu) = gen_coefficients(d.sigma_y, STEPS);
-        for _ in 0..STEPS {
-            for y in 1..d.height {
-                let (done, rest) = buf.split_at_mut(y * width);
-                for (out, prev) in rest[..width].iter_mut().zip(&done[(y - 1) * width..]) {
-                    *out += dnu * prev;
-                }
-            }
-            for y in (1..d.height).rev() {
-                let (rest, done) = buf.split_at_mut(y * width);
-                for (out, next) in rest[(y - 1) * width..].iter_mut().zip(&done[..width]) {
-                    *out += dnu * next;
-                }
-            }
+        for x in (1..width).rev() {
+          for row in 0..n {
+            rows[row * width + x - 1] += dnu * rows[row * width + x];
+          }
         }
+      }
+    }
 
-        (lambda, dnu)
-    } else {
-        (1.0, 1.0)
-    };
+    (lambda, dnu)
+  } else {
+    (1.0, 1.0)
+  };
 
-    let post_scale = ((dnu_x * dnu_y).sqrt() / (lambda_x * lambda_y).sqrt()).powi(2 * STEPS as i32);
-    buf.iter_mut().for_each(|v| *v *= post_scale);
+  let (lambda_y, dnu_y) = if d.sigma_y > 0.0 {
+    let (lambda, dnu) = gen_coefficients(d.sigma_y, STEPS);
+    for _ in 0..STEPS {
+      for y in 1..d.height {
+        let (done, rest) = buf.split_at_mut(y * width);
+        for (out, prev) in rest[..width].iter_mut().zip(&done[(y - 1) * width..]) {
+          *out += dnu * prev;
+        }
+      }
+      for y in (1..d.height).rev() {
+        let (rest, done) = buf.split_at_mut(y * width);
+        for (out, next) in rest[(y - 1) * width..].iter_mut().zip(&done[..width]) {
+          *out += dnu * next;
+        }
+      }
+    }
+
+    (lambda, dnu)
+  } else {
+    (1.0, 1.0)
+  };
+
+  let post_scale = ((dnu_x * dnu_y).sqrt() / (lambda_x * lambda_y).sqrt()).powi(2 * STEPS as i32);
+  buf.iter_mut().for_each(|v| *v *= post_scale);
 }
 
 fn gen_coefficients(sigma: f64, steps: usize) -> (f64, f64) {
-    let lambda = (sigma * sigma) / (2.0 * steps as f64);
-    let dnu = (1.0 + 2.0 * lambda - (1.0 + 4.0 * lambda).sqrt()) / (2.0 * lambda);
-    (lambda, dnu)
+  let lambda = (sigma * sigma) / (2.0 * steps as f64);
+  let dnu = (1.0 + 2.0 * lambda - (1.0 + 4.0 * lambda).sqrt()) / (2.0 * lambda);
+  (lambda, dnu)
 }

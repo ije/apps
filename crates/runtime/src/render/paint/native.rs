@@ -1,136 +1,137 @@
 use crate::css;
 use crate::{
-    css::properties::Prop,
-    dom::{Document, Node},
-    style,
+  css::properties::Prop,
+  dom::{Document, Node},
+  style,
 };
 use renderer::{ControlEvent, ControlKind, ControlSink, NativeControl, Pixels, Rect};
 use std::sync::{Arc, Mutex, PoisonError};
 
 impl Node {
-    pub(crate) fn button_label(&self) -> &str {
-        self.attrs.get("value").map_or(
-            match self.input_type().to_ascii_lowercase().as_str() {
-                "submit" => "Submit",
-                "reset" => "Reset",
-                _ => "",
-            },
-            String::as_str,
-        )
-    }
+  pub(crate) fn button_label(&self) -> &str {
+    self.attrs.get("value").map_or(
+      match self.input_type().to_ascii_lowercase().as_str() {
+        "submit" => "Submit",
+        "reset" => "Reset",
+        _ => "",
+      },
+      String::as_str,
+    )
+  }
 }
 
 #[derive(Default)]
 pub(crate) struct Controls {
-    shown: rustc_hash::FxHashMap<usize, (u64, u64)>,
-    next: u64,
-    events: Arc<Mutex<Vec<ControlEvent>>>,
-    sink: Option<ControlSink>,
+  shown: rustc_hash::FxHashMap<usize, (u64, u64)>,
+  next: u64,
+  events: Arc<Mutex<Vec<ControlEvent>>>,
+  sink: Option<ControlSink>,
 }
 
 pub(crate) fn register(controls: &std::cell::RefCell<Controls>, id: usize) {
-    let mut controls = controls.borrow_mut();
-    let controls = &mut *controls;
-    if !controls.shown.contains_key(&id) {
-        controls.next += 1;
-        controls.shown.insert(id, (controls.next, 0));
-    }
-    if controls.sink.is_none() {
-        let (events, waker) = (controls.events.clone(), crate::jsc::Waker::current());
-        controls.sink = Some(Arc::new(move |event| {
-            events
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(event);
-            waker.wake();
-        }));
-    }
+  let mut controls = controls.borrow_mut();
+  let controls = &mut *controls;
+  if !controls.shown.contains_key(&id) {
+    controls.next += 1;
+    controls.shown.insert(id, (controls.next, 0));
+  }
+  if controls.sink.is_none() {
+    let (events, waker) = (controls.events.clone(), crate::jsc::Waker::current());
+    controls.sink = Some(Arc::new(move |event| {
+      events
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(event);
+      waker.wake();
+    }));
+  }
 }
 
 pub(crate) fn sync(
-    controls: &std::cell::RefCell<Controls>,
-    doc: &Document,
-    styles: &style::Chunked<std::rc::Rc<css::properties::Style>>,
+  controls: &std::cell::RefCell<Controls>,
+  doc: &Document,
+  styles: &style::Chunked<std::rc::Rc<css::properties::Style>>,
 ) {
-    let mut controls = controls.borrow_mut();
-    if !controls.shown.is_empty() {
-        controls.shown.retain(|&id, _| {
-            doc.nodes
-                .get(id)
-                .zip(styles.get(id))
-                .is_some_and(|(node, style)| node.native_control(style).is_some())
-        });
-    }
+  let mut controls = controls.borrow_mut();
+  if !controls.shown.is_empty() {
+    controls.shown.retain(|&id, _| {
+      doc
+        .nodes
+        .get(id)
+        .zip(styles.get(id))
+        .is_some_and(|(node, style)| node.native_control(style).is_some())
+    });
+  }
 }
 
 pub(crate) fn paint(
-    view: &super::super::ViewState,
-    id: usize,
-    bounds: Rect<Pixels>,
-    style: &css::properties::Style,
-    window: &mut renderer::Window,
+  view: &super::super::ViewState,
+  id: usize,
+  bounds: Rect<Pixels>,
+  style: &css::properties::Style,
+  window: &mut renderer::Window,
 ) {
-    let controls = view.controls.borrow();
-    let (Some(&(key, seen)), Some(sink)) = (controls.shown.get(&id), &controls.sink) else {
-        return;
-    };
-    // Native controls are placed again in each frame.
-    window.paint_volatile();
-    let store = view.store.borrow();
-    let Some(node) = store
-        .pages
-        .get(&view.id)
-        .and_then(|page| page.doc.nodes.get(id))
-    else {
-        return;
-    };
-    let Some(kind) = node.native_control(style) else {
-        return;
-    };
-    let attr = |name: &str| node.attrs.get(name).cloned().unwrap_or_default();
-    let scheme = style.get(Prop::COLOR_SCHEME).unwrap_or("");
-    let control = NativeControl {
-        key,
-        kind,
-        bounds,
-        clip: bounds,
-        enabled: !node.attrs.contains_key("disabled"),
-        editable: !node.attrs.contains_key("readonly"),
-        checked: node.checked(),
-        dark: match (scheme.contains("light"), scheme.contains("dark")) {
-            (true, true) => None,
-            (_, dark) => Some(dark),
-        },
-        value: match kind {
-            ControlKind::Button => node.button_label().to_owned(),
-            _ => node.current_value().unwrap_or("").to_owned(),
-        },
-        placeholder: attr("placeholder"),
-        min: attr("min"),
-        max: attr("max"),
-        step: attr("step"),
-        seen,
-    };
-    window.native_control(control, sink);
+  let controls = view.controls.borrow();
+  let (Some(&(key, seen)), Some(sink)) = (controls.shown.get(&id), &controls.sink) else {
+    return;
+  };
+  // Native controls are placed again in each frame.
+  window.paint_volatile();
+  let store = view.store.borrow();
+  let Some(node) = store
+    .pages
+    .get(&view.id)
+    .and_then(|page| page.doc.nodes.get(id))
+  else {
+    return;
+  };
+  let Some(kind) = node.native_control(style) else {
+    return;
+  };
+  let attr = |name: &str| node.attrs.get(name).cloned().unwrap_or_default();
+  let scheme = style.get(Prop::COLOR_SCHEME).unwrap_or("");
+  let control = NativeControl {
+    key,
+    kind,
+    bounds,
+    clip: bounds,
+    enabled: !node.attrs.contains_key("disabled"),
+    editable: !node.attrs.contains_key("readonly"),
+    checked: node.checked(),
+    dark: match (scheme.contains("light"), scheme.contains("dark")) {
+      (true, true) => None,
+      (_, dark) => Some(dark),
+    },
+    value: match kind {
+      ControlKind::Button => node.button_label().to_owned(),
+      _ => node.current_value().unwrap_or("").to_owned(),
+    },
+    placeholder: attr("placeholder"),
+    min: attr("min"),
+    max: attr("max"),
+    step: attr("step"),
+    seen,
+  };
+  window.native_control(control, sink);
 }
 
 pub(crate) fn events(view: &super::super::ViewState) -> Vec<(usize, ControlEvent)> {
-    let mut controls = view.controls.borrow_mut();
-    let events = std::mem::take(
-        &mut *controls
-            .events
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner),
-    );
-    events
-        .into_iter()
-        .filter_map(|event| {
-            let (&id, entry) = controls
-                .shown
-                .iter_mut()
-                .find(|(_, (key, _))| *key == event.key)?;
-            entry.1 = entry.1.max(event.seq);
-            Some((id, event))
-        })
-        .collect()
+  let mut controls = view.controls.borrow_mut();
+  let events = std::mem::take(
+    &mut *controls
+      .events
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner),
+  );
+  events
+    .into_iter()
+    .filter_map(|event| {
+      let (&id, entry) = controls
+        .shown
+        .iter_mut()
+        .find(|(_, (key, _))| *key == event.key)?;
+      entry.1 = entry.1.max(event.seq);
+      Some((id, event))
+    })
+    .collect()
 }

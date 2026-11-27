@@ -1,13 +1,13 @@
 use std::{
-    ffi::c_void,
-    fmt::Write as _,
-    io::Write,
-    sync::{
-        Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, AtomicU32, Ordering},
-        mpsc,
-    },
-    time::{Duration, Instant},
+  ffi::c_void,
+  fmt::Write as _,
+  io::Write,
+  sync::{
+    Arc, Mutex, MutexGuard,
+    atomic::{AtomicBool, AtomicU32, Ordering},
+    mpsc,
+  },
+  time::{Duration, Instant},
 };
 
 #[cfg_attr(windows, path = "windows.rs")]
@@ -21,178 +21,177 @@ pub type Alloc = extern "C" fn(output: *mut c_void, length: usize) -> *mut u8;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Host {
-    pub waker: extern "C" fn() -> *mut c_void,
-    pub wake: extern "C" fn(waker: *mut c_void),
-    pub drop_waker: extern "C" fn(waker: *mut c_void),
-    /// Decodes a PNG image for the terminal. It writes the width and the height to `size` and RGBA pixels
-    /// to the memory from `alloc`, which can be null.
-    pub decode_png: extern "C" fn(
-        data: *const u8,
-        length: usize,
-        size: *mut u32,
-        output: *mut c_void,
-        alloc: Alloc,
-    ) -> bool,
+  pub waker: extern "C" fn() -> *mut c_void,
+  pub wake: extern "C" fn(waker: *mut c_void),
+  pub drop_waker: extern "C" fn(waker: *mut c_void),
+  /// Decodes a PNG image for the terminal. It writes the width and the height to `size` and RGBA pixels
+  /// to the memory from `alloc`, which can be null.
+  pub decode_png: extern "C" fn(
+    data: *const u8,
+    length: usize,
+    size: *mut u32,
+    output: *mut c_void,
+    alloc: Alloc,
+  ) -> bool,
 }
 
 /// One cell of a row. Colors are `0x01RRGGBB`, or 0 for the default color.
 #[repr(C)]
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
 pub struct Cell {
-    pub ch: u32,
-    pub fg: u32,
-    pub bg: u32,
-    pub underline: u32,
-    /// Bits 0 to 7: bold, italic, faint, blink, inverse, invisible, strikethrough, overline. Bits 8 to 10:
-    /// the underline style. Bit 11: wide. Bit 12: the spacer of a wide cell. Bit 13: selected.
-    pub flags: u16,
-    /// The count of codepoints after `ch`. They are in `Frame::extras`, in cell order.
-    pub extra: u16,
+  pub ch: u32,
+  pub fg: u32,
+  pub bg: u32,
+  pub underline: u32,
+  /// Bits 0 to 7: bold, italic, faint, blink, inverse, invisible, strikethrough, overline. Bits 8 to 10:
+  /// the underline style. Bit 11: wide. Bit 12: the spacer of a wide cell. Bit 13: selected.
+  pub flags: u16,
+  /// The count of codepoints after `ch`. They are in `Frame::extras`, in cell order.
+  pub extra: u16,
 }
 
 /// A rectangle of an image on the screen.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Placement {
-    /// The generation of the image. It is the key of the pixels for `apps_terminal_image`, and no other
-    /// image ever has it.
-    pub image: u64,
-    pub id: u32,
-    /// 0: below the backgrounds of the cells, 1: below the text, 2: above the text.
-    pub layer: u32,
-    pub z: i32,
-    /// The top left cell, which can be outside the grid.
-    pub col: i32,
-    pub row: i32,
-    /// In pixels: the offset in that cell, the size, and the part of the image to show.
-    pub x: u32,
-    pub y: u32,
-    pub width: u32,
-    pub height: u32,
-    pub source: [u32; 4],
+  /// The generation of the image. It is the key of the pixels for `apps_terminal_image`, and no other
+  /// image ever has it.
+  pub image: u64,
+  pub id: u32,
+  /// 0: below the backgrounds of the cells, 1: below the text, 2: above the text.
+  pub layer: u32,
+  pub z: i32,
+  /// The top left cell, which can be outside the grid.
+  pub col: i32,
+  pub row: i32,
+  /// In pixels: the offset in that cell, the size, and the part of the image to show.
+  pub x: u32,
+  pub y: u32,
+  pub width: u32,
+  pub height: u32,
+  pub source: [u32; 4],
 }
 
 /// The rows that changed since the last frame. The pointers are valid until the next frame.
 #[repr(C)]
 pub struct Frame {
-    pub cols: u16,
-    pub rows: u16,
-    pub cursor_x: u16,
-    pub cursor_y: u16,
-    /// 0: no cursor. Else 1 bar, 2 block, 3 underline, 4 hollow block.
-    pub cursor: u8,
-    pub cursor_blinks: u8,
-    pub cursor_wide: u8,
-    /// All rows are in the frame.
-    pub full: u8,
-    pub foreground: u32,
-    pub background: u32,
-    pub cursor_color: u32,
-    /// The count of rows. Row `i` is `ys[i]` and has the cells from `i * cols`.
-    pub count: u32,
-    pub ys: *const u16,
-    pub cells: *const Cell,
-    pub extras: *const u32,
-    /// All images of the screen, in the order to draw them.
-    pub placements: *const Placement,
-    pub placed: u32,
-    /// The time in ms until an animated image has its next picture, or 0. In a frame without data, the
-    /// time until the program stops holding the screen.
-    pub wait: u32,
-    /// In rows: all rows with the scrollback, the first row of the screen, and the rows of the screen.
-    pub scroll: [u32; 3],
+  pub cols: u16,
+  pub rows: u16,
+  pub cursor_x: u16,
+  pub cursor_y: u16,
+  /// 0: no cursor. Else 1 bar, 2 block, 3 underline, 4 hollow block.
+  pub cursor: u8,
+  pub cursor_blinks: u8,
+  pub cursor_wide: u8,
+  /// All rows are in the frame.
+  pub full: u8,
+  pub foreground: u32,
+  pub background: u32,
+  pub cursor_color: u32,
+  /// The count of rows. Row `i` is `ys[i]` and has the cells from `i * cols`.
+  pub count: u32,
+  pub ys: *const u16,
+  pub cells: *const Cell,
+  pub extras: *const u32,
+  /// All images of the screen, in the order to draw them.
+  pub placements: *const Placement,
+  pub placed: u32,
+  /// The time in ms until an animated image has its next picture, or 0. In a frame without data, the
+  /// time until the program stops holding the screen.
+  pub wait: u32,
+  /// In rows: all rows with the scrollback, the first row of the screen, and the rows of the screen.
+  pub scroll: [u32; 3],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Str {
-    ptr: *const u8,
-    len: usize,
+  ptr: *const u8,
+  len: usize,
 }
 
 impl Str {
-    fn text(&self) -> String {
-        if self.len == 0 {
-            return String::new();
-        }
-        String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(self.ptr, self.len) })
-            .into_owned()
+  fn text(&self) -> String {
+    if self.len == 0 {
+      return String::new();
     }
+    String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(self.ptr, self.len) }).into_owned()
+  }
 }
 
 #[repr(C)]
 struct VtHost {
-    user: *mut c_void,
-    reply: extern "C" fn(*mut c_void, *const u8, usize),
-    event: extern "C" fn(*mut c_void, u32, *const u8, usize),
-    status: extern "C" fn(*mut c_void, u32, u32, i32, *const Str),
+  user: *mut c_void,
+  reply: extern "C" fn(*mut c_void, *const u8, usize),
+  event: extern "C" fn(*mut c_void, u32, *const u8, usize),
+  status: extern "C" fn(*mut c_void, u32, u32, i32, *const Str),
 }
 
 #[repr(C)]
 struct Info {
-    cols: u16,
-    rows: u16,
-    cursor_x: u16,
-    cursor_y: u16,
-    cursor_visible: u8,
-    alternate: u8,
-    mouse: u8,
-    bottom: u8,
-    total: u64,
-    offset: u64,
-    title: Str,
-    pwd: Str,
+  cols: u16,
+  rows: u16,
+  cursor_x: u16,
+  cursor_y: u16,
+  cursor_visible: u8,
+  alternate: u8,
+  mouse: u8,
+  bottom: u8,
+  total: u64,
+  offset: u64,
+  title: Str,
+  pwd: Str,
 }
 
 enum Vt {}
 
 unsafe extern "C" {
-    fn vt_new(cols: u16, rows: u16, host: *const VtHost) -> *mut Vt;
-    fn vt_free(vt: *mut Vt);
-    fn vt_write(vt: *mut Vt, data: *const u8, len: usize);
-    fn vt_resize(vt: *mut Vt, cols: u16, rows: u16, cell_w: u32, cell_h: u32);
-    fn vt_theme(vt: *mut Vt, colors: *const u32, dark: bool);
-    fn vt_key(
-        vt: *mut Vt,
-        action: u32,
-        name: *const u8,
-        name_len: usize,
-        mods: u32,
-        text: *const u8,
-        text_len: usize,
-        out: *mut u8,
-        cap: usize,
-    ) -> usize;
-    fn vt_paste(vt: *mut Vt, data: *mut u8, len: usize);
-    fn vt_focus(vt: *mut Vt, focused: bool);
-    fn vt_scroll(vt: *mut Vt, kind: u32, rows: i32);
-    fn vt_mouse(
-        vt: *mut Vt,
-        kind: u32,
-        button: u32,
-        mods: u32,
-        x: f64,
-        y: f64,
-        held: bool,
-        time: u64,
-    ) -> bool;
-    fn vt_wheel(vt: *mut Vt, rows: i32, mods: u32, x: f64, y: f64);
-    fn vt_select(vt: *mut Vt, all: bool);
-    fn vt_reset(vt: *mut Vt);
-    fn vt_text(vt: *mut Vt, selected: bool, text: *mut *mut u8, len: *mut usize) -> bool;
-    fn vt_text_free(text: *mut u8, len: usize);
-    fn vt_info(vt: *mut Vt, info: *mut Info);
-    fn vt_frame_begin(vt: *mut Vt, now: u64);
-    fn vt_frame_end(vt: *mut Vt, frame: *mut Frame) -> bool;
-    fn vt_image(
-        vt: *mut Vt,
-        id: u32,
-        generation: u64,
-        size: *mut u32,
-        out: *mut c_void,
-        alloc: Alloc,
-    ) -> bool;
-    fn vt_png(decode: extern "C" fn(*const u8, usize, *mut u32, *mut c_void, Alloc) -> bool);
+  fn vt_new(cols: u16, rows: u16, host: *const VtHost) -> *mut Vt;
+  fn vt_free(vt: *mut Vt);
+  fn vt_write(vt: *mut Vt, data: *const u8, len: usize);
+  fn vt_resize(vt: *mut Vt, cols: u16, rows: u16, cell_w: u32, cell_h: u32);
+  fn vt_theme(vt: *mut Vt, colors: *const u32, dark: bool);
+  fn vt_key(
+    vt: *mut Vt,
+    action: u32,
+    name: *const u8,
+    name_len: usize,
+    mods: u32,
+    text: *const u8,
+    text_len: usize,
+    out: *mut u8,
+    cap: usize,
+  ) -> usize;
+  fn vt_paste(vt: *mut Vt, data: *mut u8, len: usize);
+  fn vt_focus(vt: *mut Vt, focused: bool);
+  fn vt_scroll(vt: *mut Vt, kind: u32, rows: i32);
+  fn vt_mouse(
+    vt: *mut Vt,
+    kind: u32,
+    button: u32,
+    mods: u32,
+    x: f64,
+    y: f64,
+    held: bool,
+    time: u64,
+  ) -> bool;
+  fn vt_wheel(vt: *mut Vt, rows: i32, mods: u32, x: f64, y: f64);
+  fn vt_select(vt: *mut Vt, all: bool);
+  fn vt_reset(vt: *mut Vt);
+  fn vt_text(vt: *mut Vt, selected: bool, text: *mut *mut u8, len: *mut usize) -> bool;
+  fn vt_text_free(text: *mut u8, len: usize);
+  fn vt_info(vt: *mut Vt, info: *mut Info);
+  fn vt_frame_begin(vt: *mut Vt, now: u64);
+  fn vt_frame_end(vt: *mut Vt, frame: *mut Frame) -> bool;
+  fn vt_image(
+    vt: *mut Vt,
+    id: u32,
+    generation: u64,
+    size: *mut u32,
+    out: *mut c_void,
+    alloc: Alloc,
+  ) -> bool;
+  fn vt_png(decode: extern "C" fn(*const u8, usize, *mut u32, *mut c_void, Alloc) -> bool);
 }
 
 struct Waker(*mut c_void, Host);
@@ -201,9 +200,9 @@ unsafe impl Send for Waker {}
 unsafe impl Sync for Waker {}
 
 impl Drop for Waker {
-    fn drop(&mut self) {
-        (self.1.drop_waker)(self.0);
-    }
+  fn drop(&mut self) {
+    (self.1.drop_waker)(self.0);
+  }
 }
 
 const WORKING: u32 = 1;
@@ -217,537 +216,536 @@ const KINDS: [&str; 4] = ["", "permission", "question", "auth"];
 const RECORDS: usize = 256;
 
 struct Record {
-    id: String,
-    state: u32,
-    kind: u32,
-    progress: i32,
-    app: String,
-    title: String,
-    message: String,
+  id: String,
+  state: u32,
+  kind: u32,
+  progress: i32,
+  app: String,
+  title: String,
+  message: String,
 }
 
 // What the terminal asks for while it reads output. The callbacks of the C side fill it.
 #[derive(Default)]
 struct Effects {
-    replies: Vec<u8>,
-    events: Vec<(u32, String)>,
-    reports: Vec<Record>,
+  replies: Vec<u8>,
+  events: Vec<(u32, String)>,
+  reports: Vec<Record>,
 }
 
 extern "C" fn on_reply(user: *mut c_void, data: *const u8, len: usize) {
-    let effects = unsafe { &mut *user.cast::<Effects>() };
-    effects
-        .replies
-        .extend_from_slice(unsafe { std::slice::from_raw_parts(data, len) });
+  let effects = unsafe { &mut *user.cast::<Effects>() };
+  effects
+    .replies
+    .extend_from_slice(unsafe { std::slice::from_raw_parts(data, len) });
 }
 
 extern "C" fn on_event(user: *mut c_void, kind: u32, text: *const u8, len: usize) {
-    let effects = unsafe { &mut *user.cast::<Effects>() };
-    effects.events.push((kind, Str { ptr: text, len }.text()));
+  let effects = unsafe { &mut *user.cast::<Effects>() };
+  effects.events.push((kind, Str { ptr: text, len }.text()));
 }
 
 extern "C" fn on_status(
-    user: *mut c_void,
-    state: u32,
-    kind: u32,
-    progress: i32,
-    strings: *const Str,
+  user: *mut c_void,
+  state: u32,
+  kind: u32,
+  progress: i32,
+  strings: *const Str,
 ) {
-    let effects = unsafe { &mut *user.cast::<Effects>() };
-    let strings = unsafe { std::slice::from_raw_parts(strings, 4) };
-    effects.reports.push(Record {
-        id: strings[0].text(),
-        state,
-        kind,
-        progress,
-        app: strings[1].text(),
-        title: strings[2].text(),
-        message: strings[3].text(),
-    });
+  let effects = unsafe { &mut *user.cast::<Effects>() };
+  let strings = unsafe { std::slice::from_raw_parts(strings, 4) };
+  effects.reports.push(Record {
+    id: strings[0].text(),
+    state,
+    kind,
+    progress,
+    app: strings[1].text(),
+    title: strings[2].text(),
+    message: strings[3].text(),
+  });
 }
 
 struct State {
-    vt: *mut Vt,
-    // Boxed, because the C side keeps its address.
-    effects: Box<Effects>,
-    input: Option<mpsc::Sender<Vec<u8>>>,
-    pty: Option<pty::Pty>,
-    // Of the program, until it is reaped.
-    pid: Option<u32>,
-    // Counts the programs, so the threads of an old program stop.
-    program: u64,
-    // The newest record is last.
-    records: Vec<Record>,
-    reported: bool,
-    // JSON events for the page, each with a comma after it.
-    events: String,
-    // The program holds the screen for a synchronized update.
-    held: Option<Instant>,
-    // The screen changed since the last poll.
-    changed: bool,
-    size: [u32; 4],
+  vt: *mut Vt,
+  // Boxed, because the C side keeps its address.
+  effects: Box<Effects>,
+  input: Option<mpsc::Sender<Vec<u8>>>,
+  pty: Option<pty::Pty>,
+  // Of the program, until it is reaped.
+  pid: Option<u32>,
+  // Counts the programs, so the threads of an old program stop.
+  program: u64,
+  // The newest record is last.
+  records: Vec<Record>,
+  reported: bool,
+  // JSON events for the page, each with a comma after it.
+  events: String,
+  // The program holds the screen for a synchronized update.
+  held: Option<Instant>,
+  // The screen changed since the last poll.
+  changed: bool,
+  size: [u32; 4],
 }
 
 unsafe impl Send for State {}
 
 impl Drop for State {
-    fn drop(&mut self) {
-        unsafe { vt_free(self.vt) };
-    }
+  fn drop(&mut self) {
+    unsafe { vt_free(self.vt) };
+  }
 }
 
 fn quote(out: &mut String, text: &str) {
-    out.push('"');
-    for c in text.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
+  out.push('"');
+  for c in text.chars() {
+    match c {
+      '"' => out.push_str("\\\""),
+      '\\' => out.push_str("\\\\"),
+      c if (c as u32) < 0x20 => {
+        let _ = write!(out, "\\u{:04x}", c as u32);
+      }
+      c => out.push(c),
     }
-    out.push('"');
+  }
+  out.push('"');
 }
 
 // Shells report the directory as a `file://host/path` URL (OSC 7) or as a path.
 fn path_of(pwd: &str) -> String {
-    let Some(rest) = pwd.strip_prefix("file://") else {
-        return pwd.to_owned();
-    };
-    let path = &rest.as_bytes()[rest.find('/').unwrap_or(rest.len())..];
-    let mut bytes = Vec::with_capacity(path.len());
-    let mut index = 0;
-    while index < path.len() {
-        let hex = |at: usize| path.get(at).and_then(|digit| (*digit as char).to_digit(16));
-        if path[index] == b'%'
-            && let (Some(high), Some(low)) = (hex(index + 1), hex(index + 2))
-        {
-            bytes.push((high * 16 + low) as u8);
-            index += 3;
-        } else {
-            bytes.push(path[index]);
-            index += 1;
-        }
+  let Some(rest) = pwd.strip_prefix("file://") else {
+    return pwd.to_owned();
+  };
+  let path = &rest.as_bytes()[rest.find('/').unwrap_or(rest.len())..];
+  let mut bytes = Vec::with_capacity(path.len());
+  let mut index = 0;
+  while index < path.len() {
+    let hex = |at: usize| path.get(at).and_then(|digit| (*digit as char).to_digit(16));
+    if path[index] == b'%'
+      && let (Some(high), Some(low)) = (hex(index + 1), hex(index + 2))
+    {
+      bytes.push((high * 16 + low) as u8);
+      index += 3;
+    } else {
+      bytes.push(path[index]);
+      index += 1;
     }
-    let path = String::from_utf8_lossy(&bytes).into_owned();
-    match path.as_bytes() {
-        // A path with a drive, like `/C:/folder`.
-        [b'/', _, b':', ..] if cfg!(windows) => path[1..].replace('/', "\\"),
-        _ => path,
-    }
+  }
+  let path = String::from_utf8_lossy(&bytes).into_owned();
+  match path.as_bytes() {
+    // A path with a drive, like `/C:/folder`.
+    [b'/', _, b':', ..] if cfg!(windows) => path[1..].replace('/', "\\"),
+    _ => path,
+  }
 }
 
 impl State {
-    fn send(&mut self, bytes: Vec<u8>) {
-        if bytes.is_empty() {
-            return;
-        }
-        match &self.input {
-            Some(input) => {
-                let _ = input.send(bytes);
-            }
-            // Without a program, the page gets the input.
-            None => {
-                self.events.push_str("[\"data\",");
-                quote(&mut self.events, &String::from_utf8_lossy(&bytes));
-                self.events.push_str("],");
-            }
-        }
+  fn send(&mut self, bytes: Vec<u8>) {
+    if bytes.is_empty() {
+      return;
     }
+    match &self.input {
+      Some(input) => {
+        let _ = input.send(bytes);
+      }
+      // Without a program, the page gets the input.
+      None => {
+        self.events.push_str("[\"data\",");
+        quote(&mut self.events, &String::from_utf8_lossy(&bytes));
+        self.events.push_str("],");
+      }
+    }
+  }
 
-    // Removes the records in these states.
-    fn forget(&mut self, states: [u32; 2]) {
+  // Removes the records in these states.
+  fn forget(&mut self, states: [u32; 2]) {
+    let count = self.records.len();
+    self
+      .records
+      .retain(|record| !states.contains(&record.state));
+    self.reported |= count != self.records.len();
+  }
+
+  // Applies what the terminal asked for in the last call.
+  fn settle(&mut self) {
+    let effects = std::mem::take(&mut *self.effects);
+    self.send(effects.replies);
+    for (kind, text) in effects.events {
+      match kind {
+        0 => self.events.push_str("[\"bell\"],"),
+        1 | 2 => {
+          self.events.push_str(if kind == 1 {
+            "[\"title\","
+          } else {
+            "[\"cwd\","
+          });
+          let text = if kind == 1 { text } else { path_of(&text) };
+          quote(&mut self.events, &text);
+          self.events.push_str("],");
+        }
+        // A full reset removes the title and the directory without their events.
+        3 => self.events.push_str("[\"title\",\"\"],[\"cwd\",\"\"],"),
+        4 => self.forget([WORKING, BLOCKED]),
+        5 => self.held = Some(Instant::now()),
+        _ => self.held = None,
+      }
+    }
+    for report in effects.reports {
+      let id = &report.id;
+      if report.state == CLEAR {
         let count = self.records.len();
-        self.records
-            .retain(|record| !states.contains(&record.state));
+        self.records.retain(|record| {
+          !id.is_empty()
+            && record.id != *id
+            && !(record.id.starts_with(id.as_str()) && record.id.as_bytes()[id.len()] == b'/')
+        });
         self.reported |= count != self.records.len();
+        continue;
+      }
+      self.reported = true;
+      self.records.retain(|record| record.id != *id);
+      if self.records.len() == RECORDS {
+        self.records.remove(0);
+      }
+      self.records.push(report);
     }
+  }
 
-    // Applies what the terminal asked for in the last call.
-    fn settle(&mut self) {
-        let effects = std::mem::take(&mut *self.effects);
-        self.send(effects.replies);
-        for (kind, text) in effects.events {
-            match kind {
-                0 => self.events.push_str("[\"bell\"],"),
-                1 | 2 => {
-                    self.events.push_str(if kind == 1 {
-                        "[\"title\","
-                    } else {
-                        "[\"cwd\","
-                    });
-                    let text = if kind == 1 { text } else { path_of(&text) };
-                    quote(&mut self.events, &text);
-                    self.events.push_str("],");
-                }
-                // A full reset removes the title and the directory without their events.
-                3 => self.events.push_str("[\"title\",\"\"],[\"cwd\",\"\"],"),
-                4 => self.forget([WORKING, BLOCKED]),
-                5 => self.held = Some(Instant::now()),
-                _ => self.held = None,
-            }
-        }
-        for report in effects.reports {
-            let id = &report.id;
-            if report.state == CLEAR {
-                let count = self.records.len();
-                self.records.retain(|record| {
-                    !id.is_empty()
-                        && record.id != *id
-                        && !(record.id.starts_with(id.as_str())
-                            && record.id.as_bytes()[id.len()] == b'/')
-                });
-                self.reported |= count != self.records.len();
-                continue;
-            }
-            self.reported = true;
-            self.records.retain(|record| record.id != *id);
-            if self.records.len() == RECORDS {
-                self.records.remove(0);
-            }
-            self.records.push(report);
-        }
-    }
+  fn write(&mut self, bytes: &[u8]) {
+    unsafe { vt_write(self.vt, bytes.as_ptr(), bytes.len()) };
+    self.changed = true;
+    self.settle();
+  }
 
-    fn write(&mut self, bytes: &[u8]) {
-        unsafe { vt_write(self.vt, bytes.as_ptr(), bytes.len()) };
-        self.changed = true;
-        self.settle();
+  // A record without an app takes it from its nearest ancestor that has one.
+  fn app<'a>(&'a self, record: &'a Record) -> &'a str {
+    let mut id = record.id.as_str();
+    let mut app = record.app.as_str();
+    while app.is_empty() && !id.is_empty() {
+      id = id.rfind('/').map_or("", |end| &id[..end]);
+      app = self
+        .records
+        .iter()
+        .find(|other| other.id == id)
+        .map_or("", |other| &other.app);
     }
+    app
+  }
 
-    // A record without an app takes it from its nearest ancestor that has one.
-    fn app<'a>(&'a self, record: &'a Record) -> &'a str {
-        let mut id = record.id.as_str();
-        let mut app = record.app.as_str();
-        while app.is_empty() && !id.is_empty() {
-            id = id.rfind('/').map_or("", |end| &id[..end]);
-            app = self
-                .records
-                .iter()
-                .find(|other| other.id == id)
-                .map_or("", |other| &other.app);
+  fn poll(&mut self) -> String {
+    let mut json = String::from("[");
+    json.push_str(&std::mem::take(&mut self.events));
+    if std::mem::take(&mut self.reported) {
+      json.push_str("[\"status\",[");
+      for record in &self.records {
+        json.push_str("{\"id\":");
+        quote(&mut json, &record.id);
+        let _ = write!(
+          json,
+          ",\"state\":\"{}\",\"kind\":",
+          STATES.get(record.state as usize).unwrap_or(&"idle")
+        );
+        match KINDS.get(record.kind as usize) {
+          Some(kind) if record.kind > 0 && record.state == BLOCKED => quote(&mut json, kind),
+          _ => json.push_str("null"),
         }
-        app
+        json.push_str(",\"progress\":");
+        if record.progress >= 0 {
+          let _ = write!(json, "{}", record.progress);
+        } else {
+          json.push_str("null");
+        }
+        for (key, text) in [
+          ("app", self.app(record)),
+          ("title", &record.title),
+          ("message", &record.message),
+        ] {
+          let _ = write!(json, ",\"{key}\":");
+          quote(&mut json, text);
+        }
+        json.push_str("},");
+      }
+      if json.ends_with(',') {
+        json.pop();
+      }
+      json.push_str("]],");
     }
+    if json.ends_with(',') {
+      json.pop();
+    }
+    json.push(']');
+    json
+  }
 
-    fn poll(&mut self) -> String {
-        let mut json = String::from("[");
-        json.push_str(&std::mem::take(&mut self.events));
-        if std::mem::take(&mut self.reported) {
-            json.push_str("[\"status\",[");
-            for record in &self.records {
-                json.push_str("{\"id\":");
-                quote(&mut json, &record.id);
-                let _ = write!(
-                    json,
-                    ",\"state\":\"{}\",\"kind\":",
-                    STATES.get(record.state as usize).unwrap_or(&"idle")
-                );
-                match KINDS.get(record.kind as usize) {
-                    Some(kind) if record.kind > 0 && record.state == BLOCKED => {
-                        quote(&mut json, kind)
-                    }
-                    _ => json.push_str("null"),
-                }
-                json.push_str(",\"progress\":");
-                if record.progress >= 0 {
-                    let _ = write!(json, "{}", record.progress);
-                } else {
-                    json.push_str("null");
-                }
-                for (key, text) in [
-                    ("app", self.app(record)),
-                    ("title", &record.title),
-                    ("message", &record.message),
-                ] {
-                    let _ = write!(json, ",\"{key}\":");
-                    quote(&mut json, text);
-                }
-                json.push_str("},");
-            }
-            if json.ends_with(',') {
-                json.pop();
-            }
-            json.push_str("]],");
-        }
-        if json.ends_with(',') {
-            json.pop();
-        }
-        json.push(']');
-        json
+  // Ends a program that still runs.
+  fn hang_up(&mut self) {
+    self.program += 1;
+    self.held = None;
+    self.input = None;
+    let pid = self.pid.take();
+    if let Some(pty) = self.pty.take() {
+      pty.hang_up(pid);
     }
-
-    // Ends a program that still runs.
-    fn hang_up(&mut self) {
-        self.program += 1;
-        self.held = None;
-        self.input = None;
-        let pid = self.pid.take();
-        if let Some(pty) = self.pty.take() {
-            pty.hang_up(pid);
-        }
-    }
+  }
 }
 
 struct Shared {
-    state: Mutex<State>,
-    waker: Waker,
-    // The count of threads of the app that wait for the lock.
-    waiting: AtomicU32,
-    // The app has a wake that it did not answer with a poll yet.
-    woken: AtomicBool,
+  state: Mutex<State>,
+  waker: Waker,
+  // The count of threads of the app that wait for the lock.
+  waiting: AtomicU32,
+  // The app has a wake that it did not answer with a poll yet.
+  woken: AtomicBool,
 }
 
 impl Shared {
-    fn state(&self) -> MutexGuard<'_, State> {
-        self.waiting.fetch_add(1, Ordering::Relaxed);
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.waiting.fetch_sub(1, Ordering::Relaxed);
-        state
-    }
+  fn state(&self) -> MutexGuard<'_, State> {
+    self.waiting.fetch_add(1, Ordering::Relaxed);
+    let state = self
+      .state
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner);
+    self.waiting.fetch_sub(1, Ordering::Relaxed);
+    state
+  }
 
-    // The lock for the thread that reads the PTY. A program with much output takes the lock again and
-    // again, and the lock is not fair, so this thread lets the app go first.
-    fn reading(&self) -> MutexGuard<'_, State> {
-        while self.waiting.load(Ordering::Relaxed) > 0 {
-            std::thread::yield_now();
-        }
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+  // The lock for the thread that reads the PTY. A program with much output takes the lock again and
+  // again, and the lock is not fair, so this thread lets the app go first.
+  fn reading(&self) -> MutexGuard<'_, State> {
+    while self.waiting.load(Ordering::Relaxed) > 0 {
+      std::thread::yield_now();
     }
+    self
+      .state
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+  }
 
-    // One wake is enough until the app polls.
-    fn wake(&self) {
-        if !self.woken.swap(true, Ordering::AcqRel) {
-            (self.waker.1.wake)(self.waker.0);
-        }
+  // One wake is enough until the app polls.
+  fn wake(&self) {
+    if !self.woken.swap(true, Ordering::AcqRel) {
+      (self.waker.1.wake)(self.waker.0);
     }
+  }
 }
 
 pub struct Terminal {
-    shared: Arc<Shared>,
-    // The C side reads frames without the lock, so it has its own pointer.
-    vt: *mut Vt,
-    start: Instant,
+  shared: Arc<Shared>,
+  // The C side reads frames without the lock, so it has its own pointer.
+  vt: *mut Vt,
+  start: Instant,
 }
 
 impl Drop for Terminal {
-    fn drop(&mut self) {
-        self.shared.state().hang_up();
-    }
+  fn drop(&mut self) {
+    self.shared.state().hang_up();
+  }
 }
 
 impl Terminal {
-    fn new(host: Host, cols: u16, rows: u16) -> Option<Self> {
-        let mut effects = Box::<Effects>::default();
-        let vt_host = VtHost {
-            user: (&raw mut *effects).cast(),
-            reply: on_reply,
-            event: on_event,
-            status: on_status,
-        };
-        static DECODER: std::sync::Once = std::sync::Once::new();
-        DECODER.call_once(|| unsafe { vt_png(host.decode_png) });
-        let vt = unsafe { vt_new(cols.max(1), rows.max(1), &vt_host) };
-        if vt.is_null() {
-            return None;
-        }
-        Some(Self {
-            shared: Arc::new(Shared {
-                state: Mutex::new(State {
-                    vt,
-                    effects,
-                    input: None,
-                    pty: None,
-                    pid: None,
-                    program: 0,
-                    records: Vec::new(),
-                    reported: false,
-                    events: String::new(),
-                    held: None,
-                    changed: false,
-                    size: [cols.max(1) as u32, rows.max(1) as u32, 8, 16],
-                }),
-                waker: Waker((host.waker)(), host),
-                waiting: AtomicU32::new(0),
-                woken: AtomicBool::new(false),
-            }),
-            vt,
-            start: Instant::now(),
-        })
+  fn new(host: Host, cols: u16, rows: u16) -> Option<Self> {
+    let mut effects = Box::<Effects>::default();
+    let vt_host = VtHost {
+      user: (&raw mut *effects).cast(),
+      reply: on_reply,
+      event: on_event,
+      status: on_status,
+    };
+    static DECODER: std::sync::Once = std::sync::Once::new();
+    DECODER.call_once(|| unsafe { vt_png(host.decode_png) });
+    let vt = unsafe { vt_new(cols.max(1), rows.max(1), &vt_host) };
+    if vt.is_null() {
+      return None;
     }
+    Some(Self {
+      shared: Arc::new(Shared {
+        state: Mutex::new(State {
+          vt,
+          effects,
+          input: None,
+          pty: None,
+          pid: None,
+          program: 0,
+          records: Vec::new(),
+          reported: false,
+          events: String::new(),
+          held: None,
+          changed: false,
+          size: [cols.max(1) as u32, rows.max(1) as u32, 8, 16],
+        }),
+        waker: Waker((host.waker)(), host),
+        waiting: AtomicU32::new(0),
+        woken: AtomicBool::new(false),
+      }),
+      vt,
+      start: Instant::now(),
+    })
+  }
 
-    fn spawn(&self, argv: &[&str], shell: bool, env: &[&str], cwd: &str) -> std::io::Result<u32> {
-        let mut state = self.shared.state();
-        state.hang_up();
-        let pty::Program {
-            pty,
-            mut reader,
-            mut writer,
-            child,
-            pid,
-        } = pty::spawn(argv, shell, env, cwd, state.size)?;
-        let (input, bytes) = mpsc::channel::<Vec<u8>>();
-        state.pty = Some(pty);
-        state.input = Some(input);
-        state.pid = Some(pid);
-        let program = state.program;
-        let thread = |name: &str, run: Box<dyn FnOnce() + Send>| {
-            std::thread::Builder::new().name(name.into()).spawn(run)
-        };
-        let shared = self.shared.clone();
-        // Dropped when the reader ends, so `exit` can come after the last output.
-        let (read, drained) = mpsc::channel::<()>();
-        thread(
-            "apps-terminal-read",
-            Box::new(move || {
-                let _read = read;
-                let mut bytes = vec![0; 65536];
-                loop {
-                    let count = reader.read(&mut bytes);
-                    if count == 0 {
-                        return;
-                    }
-                    let mut state = shared.reading();
-                    // A console of Windows ends only when its output is read.
-                    if state.program != program {
-                        continue;
-                    }
-                    state.write(&bytes[..count]);
-                    drop(state);
-                    shared.wake();
-                }
-            }),
-        )?;
-        thread(
-            "apps-terminal-write",
-            Box::new(move || {
-                while let Ok(bytes) = bytes.recv() {
-                    if writer.write_all(&bytes).is_err() {
-                        break;
-                    }
-                }
-            }),
-        )?;
-        let shared = Arc::downgrade(&self.shared);
-        thread(
-            "apps-terminal-wait",
-            Box::new(move || {
-                child.wait();
-                if drained.recv_timeout(pty::DRAIN) == Err(mpsc::RecvTimeoutError::Timeout) {
-                    child.end_rest();
-                }
-                let Some(shared) = shared.upgrade() else {
-                    child.reap();
-                    return;
-                };
-                let mut state = shared.state();
-                let current = state.program == program;
-                // Never signal a reaped child; its PID may belong to another process.
-                if current {
-                    state.pid = None;
-                }
-                let exit = child.reap();
-                if !current {
-                    return;
-                }
-                state.forget([WORKING, BLOCKED]);
-                if state.held.take().is_some() {
-                    state.changed = true;
-                }
-                state.events.push_str("[\"exit\",");
-                let _ = match exit.0 {
-                    Some(code) => write!(state.events, "{code},"),
-                    None => write!(state.events, "null,"),
-                };
-                match exit.1 {
-                    Some(signal) => quote(&mut state.events, &signal),
-                    None => state.events.push_str("null"),
-                }
-                state.events.push_str("],");
-                drop(state);
-                shared.wake();
-            }),
-        )?;
-        Ok(pid)
-    }
-
-    fn info(&self, process: bool) -> String {
-        let state = self.shared.state();
-        let mut info: Info = unsafe { std::mem::zeroed() };
-        unsafe { vt_info(state.vt, &mut info) };
-        let mut json = format!(
-            "{{\"cursor\":[{},{},{}],\"alternate\":{},\"mouse\":{},\"bottom\":{},\"total\":{},\"offset\":{},\"title\":",
-            info.cursor_x,
-            info.cursor_y,
-            info.cursor_visible != 0,
-            info.alternate != 0,
-            info.mouse != 0,
-            info.bottom != 0,
-            info.total,
-            info.offset,
-        );
-        quote(&mut json, &info.title.text());
-        let mut cwd = path_of(&info.pwd.text());
-        json.push_str(",\"process\":");
-        let foreground = match (&state.pty, state.pid) {
-            (Some(pty), Some(pid)) if process => pty.foreground(pid),
-            _ => None,
-        };
-        match foreground {
-            Some(pid) => {
-                let (name, directory) = pty::process(pid);
-                let _ = write!(json, "{{\"pid\":{pid},\"name\":");
-                quote(&mut json, &name);
-                json.push('}');
-                // Shells that don't report their directory still have one.
-                if cwd.is_empty() {
-                    cwd = directory;
-                }
-            }
-            _ => json.push_str("null"),
+  fn spawn(&self, argv: &[&str], shell: bool, env: &[&str], cwd: &str) -> std::io::Result<u32> {
+    let mut state = self.shared.state();
+    state.hang_up();
+    let pty::Program {
+      pty,
+      mut reader,
+      mut writer,
+      child,
+      pid,
+    } = pty::spawn(argv, shell, env, cwd, state.size)?;
+    let (input, bytes) = mpsc::channel::<Vec<u8>>();
+    state.pty = Some(pty);
+    state.input = Some(input);
+    state.pid = Some(pid);
+    let program = state.program;
+    let thread = |name: &str, run: Box<dyn FnOnce() + Send>| {
+      std::thread::Builder::new().name(name.into()).spawn(run)
+    };
+    let shared = self.shared.clone();
+    // Dropped when the reader ends, so `exit` can come after the last output.
+    let (read, drained) = mpsc::channel::<()>();
+    thread(
+      "apps-terminal-read",
+      Box::new(move || {
+        let _read = read;
+        let mut bytes = vec![0; 65536];
+        loop {
+          let count = reader.read(&mut bytes);
+          if count == 0 {
+            return;
+          }
+          let mut state = shared.reading();
+          // A console of Windows ends only when its output is read.
+          if state.program != program {
+            continue;
+          }
+          state.write(&bytes[..count]);
+          drop(state);
+          shared.wake();
         }
-        json.push_str(",\"cwd\":");
-        quote(&mut json, &cwd);
-        let _ = match state.pid {
-            Some(pid) => write!(json, ",\"pid\":{pid}}}"),
-            None => write!(json, ",\"pid\":null}}"),
+      }),
+    )?;
+    thread(
+      "apps-terminal-write",
+      Box::new(move || {
+        while let Ok(bytes) = bytes.recv() {
+          if writer.write_all(&bytes).is_err() {
+            break;
+          }
+        }
+      }),
+    )?;
+    let shared = Arc::downgrade(&self.shared);
+    thread(
+      "apps-terminal-wait",
+      Box::new(move || {
+        child.wait();
+        if drained.recv_timeout(pty::DRAIN) == Err(mpsc::RecvTimeoutError::Timeout) {
+          child.end_rest();
+        }
+        let Some(shared) = shared.upgrade() else {
+          child.reap();
+          return;
         };
-        json
+        let mut state = shared.state();
+        let current = state.program == program;
+        // Never signal a reaped child; its PID may belong to another process.
+        if current {
+          state.pid = None;
+        }
+        let exit = child.reap();
+        if !current {
+          return;
+        }
+        state.forget([WORKING, BLOCKED]);
+        if state.held.take().is_some() {
+          state.changed = true;
+        }
+        state.events.push_str("[\"exit\",");
+        let _ = match exit.0 {
+          Some(code) => write!(state.events, "{code},"),
+          None => write!(state.events, "null,"),
+        };
+        match exit.1 {
+          Some(signal) => quote(&mut state.events, &signal),
+          None => state.events.push_str("null"),
+        }
+        state.events.push_str("],");
+        drop(state);
+        shared.wake();
+      }),
+    )?;
+    Ok(pid)
+  }
+
+  fn info(&self, process: bool) -> String {
+    let state = self.shared.state();
+    let mut info: Info = unsafe { std::mem::zeroed() };
+    unsafe { vt_info(state.vt, &mut info) };
+    let mut json = format!(
+      "{{\"cursor\":[{},{},{}],\"alternate\":{},\"mouse\":{},\"bottom\":{},\"total\":{},\"offset\":{},\"title\":",
+      info.cursor_x,
+      info.cursor_y,
+      info.cursor_visible != 0,
+      info.alternate != 0,
+      info.mouse != 0,
+      info.bottom != 0,
+      info.total,
+      info.offset,
+    );
+    quote(&mut json, &info.title.text());
+    let mut cwd = path_of(&info.pwd.text());
+    json.push_str(",\"process\":");
+    let foreground = match (&state.pty, state.pid) {
+      (Some(pty), Some(pid)) if process => pty.foreground(pid),
+      _ => None,
+    };
+    match foreground {
+      Some(pid) => {
+        let (name, directory) = pty::process(pid);
+        let _ = write!(json, "{{\"pid\":{pid},\"name\":");
+        quote(&mut json, &name);
+        json.push('}');
+        // Shells that don't report their directory still have one.
+        if cwd.is_empty() {
+          cwd = directory;
+        }
+      }
+      _ => json.push_str("null"),
     }
+    json.push_str(",\"cwd\":");
+    quote(&mut json, &cwd);
+    let _ = match state.pid {
+      Some(pid) => write!(json, ",\"pid\":{pid}}}"),
+      None => write!(json, ",\"pid\":null}}"),
+    };
+    json
+  }
 }
 
 fn output(out: *mut c_void, alloc: Alloc, bytes: &[u8]) {
-    let target = alloc(out, bytes.len());
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), target, bytes.len()) };
+  let target = alloc(out, bytes.len());
+  unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), target, bytes.len()) };
 }
 
 unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
-    if len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(ptr, len) }
-    }
+  if len == 0 {
+    &[]
+  } else {
+    unsafe { std::slice::from_raw_parts(ptr, len) }
+  }
 }
 
 // Strings in a list end with a NUL byte.
 unsafe fn list<'a>(ptr: *const u8, len: usize) -> Vec<&'a str> {
-    unsafe { bytes(ptr, len) }
-        .split(|byte| *byte == 0)
-        .filter(|text| !text.is_empty())
-        .filter_map(|text| std::str::from_utf8(text).ok())
-        .collect()
+  unsafe { bytes(ptr, len) }
+    .split(|byte| *byte == 0)
+    .filter(|text| !text.is_empty())
+    .filter_map(|text| std::str::from_utf8(text).ok())
+    .collect()
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn apps_terminal_abi() -> u32 {
-    ABI
+  ABI
 }
 
 /// Makes a terminal with no program. Returns null when it cannot.
@@ -756,20 +754,20 @@ pub extern "C" fn apps_terminal_abi() -> u32 {
 /// `host` points to a `Host`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn apps_terminal_new(
-    host: *const Host,
-    cols: u16,
-    rows: u16,
+  host: *const Host,
+  cols: u16,
+  rows: u16,
 ) -> *mut Terminal {
-    Terminal::new(unsafe { *host }, cols, rows).map_or(std::ptr::null_mut(), |terminal| {
-        Box::into_raw(Box::new(terminal))
-    })
+  Terminal::new(unsafe { *host }, cols, rows).map_or(std::ptr::null_mut(), |terminal| {
+    Box::into_raw(Box::new(terminal))
+  })
 }
 
 /// # Safety
 /// `terminal` comes from `apps_terminal_new` and is not used again.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn apps_terminal_free(terminal: *mut Terminal) {
-    drop(unsafe { Box::from_raw(terminal) });
+  drop(unsafe { Box::from_raw(terminal) });
 }
 
 /// Starts a program in a PTY, and ends the program before it. `argv` and `env` are lists of strings that
@@ -780,31 +778,31 @@ pub unsafe extern "C" fn apps_terminal_free(terminal: *mut Terminal) {
 /// `terminal` comes from `apps_terminal_new`, and the pointers hold their lengths.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn apps_terminal_spawn(
-    terminal: *mut Terminal,
-    argv: *const u8,
-    argv_len: usize,
-    shell: bool,
-    env: *const u8,
-    env_len: usize,
-    cwd: *const u8,
-    cwd_len: usize,
-    out: *mut c_void,
-    alloc: Alloc,
+  terminal: *mut Terminal,
+  argv: *const u8,
+  argv_len: usize,
+  shell: bool,
+  env: *const u8,
+  env_len: usize,
+  cwd: *const u8,
+  cwd_len: usize,
+  out: *mut c_void,
+  alloc: Alloc,
 ) -> i64 {
-    let terminal = unsafe { &*terminal };
-    let cwd = std::str::from_utf8(unsafe { bytes(cwd, cwd_len) }).unwrap_or("");
-    match terminal.spawn(
-        &unsafe { list(argv, argv_len) },
-        shell,
-        &unsafe { list(env, env_len) },
-        cwd,
-    ) {
-        Ok(pid) => pid as i64,
-        Err(error) => {
-            output(out, alloc, error.to_string().as_bytes());
-            -1
-        }
+  let terminal = unsafe { &*terminal };
+  let cwd = std::str::from_utf8(unsafe { bytes(cwd, cwd_len) }).unwrap_or("");
+  match terminal.spawn(
+    &unsafe { list(argv, argv_len) },
+    shell,
+    &unsafe { list(env, env_len) },
+    cwd,
+  ) {
+    Ok(pid) => pid as i64,
+    Err(error) => {
+      output(out, alloc, error.to_string().as_bytes());
+      -1
     }
+  }
 }
 
 /// What `apps_terminal_write` does with the bytes.
@@ -819,25 +817,25 @@ pub const OUTPUT: u32 = 2;
 /// `terminal` comes from `apps_terminal_new`, and `data` points to `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn apps_terminal_write(
-    terminal: *mut Terminal,
-    kind: u32,
-    data: *const u8,
-    len: usize,
+  terminal: *mut Terminal,
+  kind: u32,
+  data: *const u8,
+  len: usize,
 ) {
-    let mut state = unsafe { &*terminal }.shared.state();
-    let data = unsafe { bytes(data, len) };
-    match kind {
-        OUTPUT => state.write(data),
-        PASTE => {
-            let mut data = data.to_vec();
-            unsafe { vt_paste(state.vt, data.as_mut_ptr(), data.len()) };
-            state.settle();
-        }
-        _ => state.send(data.to_vec()),
+  let mut state = unsafe { &*terminal }.shared.state();
+  let data = unsafe { bytes(data, len) };
+  match kind {
+    OUTPUT => state.write(data),
+    PASTE => {
+      let mut data = data.to_vec();
+      unsafe { vt_paste(state.vt, data.as_mut_ptr(), data.len()) };
+      state.settle();
     }
-    if kind != OUTPUT {
-        unsafe { vt_scroll(state.vt, 1, 0) };
-    }
+    _ => state.send(data.to_vec()),
+  }
+  if kind != OUTPUT {
+    unsafe { vt_scroll(state.vt, 1, 0) };
+  }
 }
 
 /// Sends a key to the program. `action` is 0 for a release, 1 for a press and 2 for a repeat. `name` is
@@ -849,39 +847,39 @@ pub unsafe extern "C" fn apps_terminal_write(
 /// `terminal` comes from `apps_terminal_new`, and the pointers hold their lengths.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn apps_terminal_key(
-    terminal: *mut Terminal,
-    action: u32,
-    name: *const u8,
-    name_len: usize,
-    mods: u32,
-    text: *const u8,
-    text_len: usize,
+  terminal: *mut Terminal,
+  action: u32,
+  name: *const u8,
+  name_len: usize,
+  mods: u32,
+  text: *const u8,
+  text_len: usize,
 ) -> bool {
-    let mut state = unsafe { &*terminal }.shared.state();
-    let mut encoded = [0; 128];
-    let len = unsafe {
-        vt_key(
-            state.vt,
-            action,
-            name,
-            name_len,
-            mods,
-            text,
-            text_len,
-            encoded.as_mut_ptr(),
-            encoded.len(),
-        )
-    };
-    if len == 0 {
-        return false;
-    }
-    if action != 0 {
-        // The user is at the terminal, so they have seen what finished.
-        state.forget([DONE, ERROR]);
-        unsafe { vt_scroll(state.vt, 1, 0) };
-    }
-    state.send(encoded[..len].to_vec());
-    true
+  let mut state = unsafe { &*terminal }.shared.state();
+  let mut encoded = [0; 128];
+  let len = unsafe {
+    vt_key(
+      state.vt,
+      action,
+      name,
+      name_len,
+      mods,
+      text,
+      text_len,
+      encoded.as_mut_ptr(),
+      encoded.len(),
+    )
+  };
+  if len == 0 {
+    return false;
+  }
+  if action != 0 {
+    // The user is at the terminal, so they have seen what finished.
+    state.forget([DONE, ERROR]);
+    unsafe { vt_scroll(state.vt, 1, 0) };
+  }
+  state.send(encoded[..len].to_vec());
+  true
 }
 
 /// A pointer event at a position in cell pixels from the top left of the grid. `kind` is 0 for a press,
@@ -892,20 +890,20 @@ pub unsafe extern "C" fn apps_terminal_key(
 /// `terminal` comes from `apps_terminal_new`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn apps_terminal_mouse(
-    terminal: *mut Terminal,
-    kind: u32,
-    button: u32,
-    mods: u32,
-    x: f64,
-    y: f64,
-    held: bool,
+  terminal: *mut Terminal,
+  kind: u32,
+  button: u32,
+  mods: u32,
+  x: f64,
+  y: f64,
+  held: bool,
 ) -> bool {
-    let terminal = unsafe { &*terminal };
-    let mut state = terminal.shared.state();
-    let time = terminal.start.elapsed().as_nanos() as u64;
-    let taken = unsafe { vt_mouse(state.vt, kind.min(2), button, mods, x, y, held, time) };
-    state.settle();
-    taken
+  let terminal = unsafe { &*terminal };
+  let mut state = terminal.shared.state();
+  let time = terminal.start.elapsed().as_nanos() as u64;
+  let taken = unsafe { vt_mouse(state.vt, kind.min(2), button, mods, x, y, held, time) };
+  state.settle();
+  taken
 }
 
 /// Scrolls by rows, down when `rows` is positive. The program gets the wheel when it tracks the mouse.
@@ -914,15 +912,15 @@ pub unsafe extern "C" fn apps_terminal_mouse(
 /// `terminal` comes from `apps_terminal_new`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn apps_terminal_wheel(
-    terminal: *mut Terminal,
-    rows: i32,
-    mods: u32,
-    x: f64,
-    y: f64,
+  terminal: *mut Terminal,
+  rows: i32,
+  mods: u32,
+  x: f64,
+  y: f64,
 ) {
-    let mut state = unsafe { &*terminal }.shared.state();
-    unsafe { vt_wheel(state.vt, rows, mods, x, y) };
-    state.settle();
+  let mut state = unsafe { &*terminal }.shared.state();
+  unsafe { vt_wheel(state.vt, rows, mods, x, y) };
+  state.settle();
 }
 
 pub const FOCUS: u32 = 0;
@@ -942,30 +940,30 @@ pub const SCROLL_ROW: u32 = 8;
 /// `terminal` comes from `apps_terminal_new`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn apps_terminal_control(terminal: *mut Terminal, op: u32, value: f64) {
-    let mut state = unsafe { &*terminal }.shared.state();
-    let vt = state.vt;
-    unsafe {
-        match op {
-            FOCUS => vt_focus(vt, value != 0.),
-            SCROLL_TOP => vt_scroll(vt, 0, 0),
-            SCROLL_BOTTOM => vt_scroll(vt, 1, 0),
-            SCROLL_ROWS => vt_scroll(vt, 2, value as i32),
-            SCROLL_ROW => vt_scroll(vt, 3, value as i32),
-            SELECT_ALL => vt_select(vt, true),
-            SELECT_NONE => vt_select(vt, false),
-            RESET => vt_reset(vt),
-            KILL => {
-                // Windows has no signals. The console turns this key into an interrupt.
-                if cfg!(windows) && value == 2. && state.pid.is_some() {
-                    state.send(vec![3]);
-                } else if let (Some(pty), Some(pid)) = (&state.pty, state.pid) {
-                    pty.signal(pid, value as i32);
-                }
-            }
-            _ => {}
+  let mut state = unsafe { &*terminal }.shared.state();
+  let vt = state.vt;
+  unsafe {
+    match op {
+      FOCUS => vt_focus(vt, value != 0.),
+      SCROLL_TOP => vt_scroll(vt, 0, 0),
+      SCROLL_BOTTOM => vt_scroll(vt, 1, 0),
+      SCROLL_ROWS => vt_scroll(vt, 2, value as i32),
+      SCROLL_ROW => vt_scroll(vt, 3, value as i32),
+      SELECT_ALL => vt_select(vt, true),
+      SELECT_NONE => vt_select(vt, false),
+      RESET => vt_reset(vt),
+      KILL => {
+        // Windows has no signals. The console turns this key into an interrupt.
+        if cfg!(windows) && value == 2. && state.pid.is_some() {
+          state.send(vec![3]);
+        } else if let (Some(pty), Some(pid)) = (&state.pty, state.pid) {
+          pty.signal(pid, value as i32);
         }
+      }
+      _ => {}
     }
-    state.settle();
+  }
+  state.settle();
 }
 
 /// Sets the grid size in cells and the cell size in pixels.
@@ -974,20 +972,20 @@ pub unsafe extern "C" fn apps_terminal_control(terminal: *mut Terminal, op: u32,
 /// `terminal` comes from `apps_terminal_new`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn apps_terminal_resize(
-    terminal: *mut Terminal,
-    cols: u16,
-    rows: u16,
-    cell_w: u32,
-    cell_h: u32,
+  terminal: *mut Terminal,
+  cols: u16,
+  rows: u16,
+  cell_w: u32,
+  cell_h: u32,
 ) {
-    let mut state = unsafe { &*terminal }.shared.state();
-    let (cols, rows) = (cols.max(1), rows.max(1));
-    state.size = [cols as u32, rows as u32, cell_w.max(1), cell_h.max(1)];
-    unsafe { vt_resize(state.vt, cols, rows, cell_w.max(1), cell_h.max(1)) };
-    state.settle();
-    if let Some(pty) = &state.pty {
-        pty.resize(state.size);
-    }
+  let mut state = unsafe { &*terminal }.shared.state();
+  let (cols, rows) = (cols.max(1), rows.max(1));
+  state.size = [cols as u32, rows as u32, cell_w.max(1), cell_h.max(1)];
+  unsafe { vt_resize(state.vt, cols, rows, cell_w.max(1), cell_h.max(1)) };
+  state.settle();
+  if let Some(pty) = &state.pty {
+    pty.resize(state.size);
+  }
 }
 
 /// Sets the default colors: foreground, background, cursor, and the 16 colors of the palette, each as
@@ -997,13 +995,13 @@ pub unsafe extern "C" fn apps_terminal_resize(
 /// `terminal` comes from `apps_terminal_new`, and `colors` points to 19 colors.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn apps_terminal_theme(
-    terminal: *mut Terminal,
-    colors: *const u32,
-    dark: bool,
+  terminal: *mut Terminal,
+  colors: *const u32,
+  dark: bool,
 ) {
-    let mut state = unsafe { &*terminal }.shared.state();
-    unsafe { vt_theme(state.vt, colors, dark) };
-    state.settle();
+  let mut state = unsafe { &*terminal }.shared.state();
+  unsafe { vt_theme(state.vt, colors, dark) };
+  state.settle();
 }
 
 /// Writes the events since the last poll as a JSON array of `[kind, ...values]`. The kinds are `title`,
@@ -1015,15 +1013,15 @@ pub unsafe extern "C" fn apps_terminal_theme(
 /// `terminal` comes from `apps_terminal_new`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn apps_terminal_poll(
-    terminal: *mut Terminal,
-    out: *mut c_void,
-    alloc: Alloc,
+  terminal: *mut Terminal,
+  out: *mut c_void,
+  alloc: Alloc,
 ) -> bool {
-    let shared = &unsafe { &*terminal }.shared;
-    shared.woken.store(false, Ordering::Release);
-    let mut state = shared.state();
-    output(out, alloc, state.poll().as_bytes());
-    std::mem::take(&mut state.changed)
+  let shared = &unsafe { &*terminal }.shared;
+  shared.woken.store(false, Ordering::Release);
+  let mut state = shared.state();
+  output(out, alloc, state.poll().as_bytes());
+  std::mem::take(&mut state.changed)
 }
 
 /// Writes the state of the terminal as a JSON object. With `process` it has the foreground process and its
@@ -1033,12 +1031,12 @@ pub unsafe extern "C" fn apps_terminal_poll(
 /// `terminal` comes from `apps_terminal_new`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn apps_terminal_info(
-    terminal: *mut Terminal,
-    process: bool,
-    out: *mut c_void,
-    alloc: Alloc,
+  terminal: *mut Terminal,
+  process: bool,
+  out: *mut c_void,
+  alloc: Alloc,
 ) {
-    output(out, alloc, unsafe { &*terminal }.info(process).as_bytes());
+  output(out, alloc, unsafe { &*terminal }.info(process).as_bytes());
 }
 
 /// Writes the selected text, or all text with the scrollback. Returns false when there is none.
@@ -1047,19 +1045,19 @@ pub unsafe extern "C" fn apps_terminal_info(
 /// `terminal` comes from `apps_terminal_new`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn apps_terminal_text(
-    terminal: *mut Terminal,
-    selected: bool,
-    out: *mut c_void,
-    alloc: Alloc,
+  terminal: *mut Terminal,
+  selected: bool,
+  out: *mut c_void,
+  alloc: Alloc,
 ) -> bool {
-    let state = unsafe { &*terminal }.shared.state();
-    let (mut text, mut len) = (std::ptr::null_mut(), 0);
-    if !unsafe { vt_text(state.vt, selected, &mut text, &mut len) } {
-        return false;
-    }
-    output(out, alloc, unsafe { bytes(text, len) });
-    unsafe { vt_text_free(text, len) };
-    true
+  let state = unsafe { &*terminal }.shared.state();
+  let (mut text, mut len) = (std::ptr::null_mut(), 0);
+  if !unsafe { vt_text(state.vt, selected, &mut text, &mut len) } {
+    return false;
+  }
+  output(out, alloc, unsafe { bytes(text, len) });
+  unsafe { vt_text_free(text, len) };
+  true
 }
 
 /// Reads the rows that changed since the last frame. Returns false when the frame has no data, which is
@@ -1070,20 +1068,20 @@ pub unsafe extern "C" fn apps_terminal_text(
 /// `terminal` comes from `apps_terminal_new`, `frame` points to a `Frame`, and only one thread calls this.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn apps_terminal_frame(terminal: *mut Terminal, frame: *mut Frame) -> bool {
-    let terminal = unsafe { &*terminal };
-    let state = terminal.shared.state();
-    // A program that never ends its update must not freeze the screen.
-    if let Some(left) = state
-        .held
-        .and_then(|since| Duration::from_secs(1).checked_sub(since.elapsed()))
-        .filter(|left| !left.is_zero())
-    {
-        unsafe { (*frame).wait = left.as_millis() as u32 + 1 };
-        return false;
-    }
-    unsafe { vt_frame_begin(state.vt, terminal.start.elapsed().as_millis() as u64) };
-    drop(state);
-    unsafe { vt_frame_end(terminal.vt, frame) }
+  let terminal = unsafe { &*terminal };
+  let state = terminal.shared.state();
+  // A program that never ends its update must not freeze the screen.
+  if let Some(left) = state
+    .held
+    .and_then(|since| Duration::from_secs(1).checked_sub(since.elapsed()))
+    .filter(|left| !left.is_zero())
+  {
+    unsafe { (*frame).wait = left.as_millis() as u32 + 1 };
+    return false;
+  }
+  unsafe { vt_frame_begin(state.vt, terminal.start.elapsed().as_millis() as u64) };
+  drop(state);
+  unsafe { vt_frame_end(terminal.vt, frame) }
 }
 
 /// Writes the pixels of an image of a frame as BGRA, and its width and height to `size`. Returns false
@@ -1093,15 +1091,15 @@ pub unsafe extern "C" fn apps_terminal_frame(terminal: *mut Terminal, frame: *mu
 /// `terminal` comes from `apps_terminal_new`, and `size` points to two numbers.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn apps_terminal_image(
-    terminal: *mut Terminal,
-    id: u32,
-    generation: u64,
-    size: *mut u32,
-    out: *mut c_void,
-    alloc: Alloc,
+  terminal: *mut Terminal,
+  id: u32,
+  generation: u64,
+  size: *mut u32,
+  out: *mut c_void,
+  alloc: Alloc,
 ) -> bool {
-    let state = unsafe { &*terminal }.shared.state();
-    unsafe { vt_image(state.vt, id, generation, size, out, alloc) }
+  let state = unsafe { &*terminal }.shared.state();
+  unsafe { vt_image(state.vt, id, generation, size, out, alloc) }
 }
 
 #[cfg(test)]

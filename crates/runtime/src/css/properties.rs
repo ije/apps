@@ -25,10 +25,10 @@ macro_rules! props {
 }
 
 fn known(name: &str) -> Option<Prop> {
-    NAMES
-        .binary_search(&name)
-        .ok()
-        .map(|index| Prop(index as u32, PhantomData))
+  NAMES
+    .binary_search(&name)
+    .ok()
+    .map(|index| Prop(index as u32, PhantomData))
 }
 
 // Keep sorted: lookups binary-search the names. Only properties that apply have a grammar, which `@supports` and the
@@ -544,104 +544,104 @@ thread_local! {
 }
 
 impl Prop {
-    pub(crate) fn new(name: &str) -> Self {
-        known(name).unwrap_or_else(|| {
-            INTERNED.with(|interned| {
-                let (names, ids) = &mut *interned.borrow_mut();
-                if let Some(&prop) = ids.get(name) {
-                    return prop;
-                }
-                // Share leaked names across threads even though property IDs are thread-local.
-                static LEAKED: std::sync::Mutex<rustc_hash::FxHashSet<&'static str>> =
-                    std::sync::Mutex::new(rustc_hash::FxHashSet::with_hasher(
-                        rustc_hash::FxBuildHasher,
-                    ));
-                let name: &'static str = {
-                    let mut leaked = LEAKED
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    match leaked.get(name) {
-                        Some(&name) => name,
-                        None => {
-                            let name: &'static str = Box::leak(name.into());
-                            leaked.insert(name);
-                            name
-                        }
-                    }
-                };
-                let index = names.len() as u32;
-                let prop = Prop(
-                    if name.starts_with("--") {
-                        CUSTOM | index
-                    } else {
-                        NAMES.len() as u32 + index
-                    },
-                    PhantomData,
-                );
-                names.push(name);
-                ids.insert(name, prop);
-                prop
-            })
-        })
-    }
-
-    pub(crate) fn find(name: &str) -> Option<Self> {
-        known(name).or_else(|| INTERNED.with(|interned| interned.borrow().1.get(name).copied()))
-    }
-
-    pub(crate) fn name(self) -> &'static str {
-        match NAMES.get(self.0 as usize) {
-            Some(name) => name,
-            None => INTERNED.with(|interned| {
-                interned.borrow().0[(if self.is_custom() {
-                    self.0 & !CUSTOM
-                } else {
-                    self.0 - NAMES.len() as u32
-                }) as usize]
-            }),
+  pub(crate) fn new(name: &str) -> Self {
+    known(name).unwrap_or_else(|| {
+      INTERNED.with(|interned| {
+        let (names, ids) = &mut *interned.borrow_mut();
+        if let Some(&prop) = ids.get(name) {
+          return prop;
         }
-    }
+        // Share leaked names across threads even though property IDs are thread-local.
+        static LEAKED: std::sync::Mutex<rustc_hash::FxHashSet<&'static str>> =
+          std::sync::Mutex::new(rustc_hash::FxHashSet::with_hasher(
+            rustc_hash::FxBuildHasher,
+          ));
+        let name: &'static str = {
+          let mut leaked = LEAKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+          match leaked.get(name) {
+            Some(&name) => name,
+            None => {
+              let name: &'static str = Box::leak(name.into());
+              leaked.insert(name);
+              name
+            }
+          }
+        };
+        let index = names.len() as u32;
+        let prop = Prop(
+          if name.starts_with("--") {
+            CUSTOM | index
+          } else {
+            NAMES.len() as u32 + index
+          },
+          PhantomData,
+        );
+        names.push(name);
+        ids.insert(name, prop);
+        prop
+      })
+    })
+  }
 
-    pub(crate) fn is_custom(self) -> bool {
-        self.0 & CUSTOM != 0
-    }
+  pub(crate) fn find(name: &str) -> Option<Self> {
+    known(name).or_else(|| INTERNED.with(|interned| interned.borrow().1.get(name).copied()))
+  }
 
-    pub(crate) fn is_known(self) -> bool {
-        (self.0 as usize) < NAMES.len()
+  pub(crate) fn name(self) -> &'static str {
+    match NAMES.get(self.0 as usize) {
+      Some(name) => name,
+      None => INTERNED.with(|interned| {
+        interned.borrow().0[(if self.is_custom() {
+          self.0 & !CUSTOM
+        } else {
+          self.0 - NAMES.len() as u32
+        }) as usize]
+      }),
     }
+  }
 
-    pub(crate) fn index(self) -> Option<usize> {
-        self.is_known().then_some(self.0 as usize)
-    }
+  pub(crate) fn is_custom(self) -> bool {
+    self.0 & CUSTOM != 0
+  }
 
-    // The standard property that Chrome also takes under this `-webkit-` name.
-    pub(crate) fn unprefixed(name: &str) -> Option<&str> {
-        const ALIASES: &str = "hyphenate-character align-content align-items align-self background-origin background-size animation animation-delay animation-direction animation-duration animation-fill-mode animation-iteration-count animation-name animation-play-state animation-timing-function appearance backface-visibility border-bottom-left-radius border-bottom-right-radius border-radius border-top-left-radius border-top-right-radius box-shadow box-sizing clip-path column-count column-gap column-rule column-rule-color column-rule-style column-rule-width column-span column-width columns filter flex flex-basis flex-direction flex-flow flex-grow flex-shrink flex-wrap justify-content mask mask-image mask-origin mask-position mask-repeat mask-size order perspective perspective-origin text-emphasis text-emphasis-color text-emphasis-position text-emphasis-style transform transform-origin transform-style transition transition-delay transition-duration transition-property transition-timing-function user-select";
-        let base = name.strip_prefix("-webkit-")?;
-        ALIASES
-            .split(' ')
-            .any(|alias| alias == base)
-            .then_some(base)
-            .filter(|base| Self::find(base).is_some_and(Self::is_known))
-    }
+  pub(crate) fn is_known(self) -> bool {
+    (self.0 as usize) < NAMES.len()
+  }
 
-    pub(crate) fn names() -> &'static [&'static str] {
-        &NAMES
-    }
+  pub(crate) fn index(self) -> Option<usize> {
+    self.is_known().then_some(self.0 as usize)
+  }
 
-    pub(crate) fn inherited(self) -> bool {
-        INHERITED.get(self.0 as usize).copied().unwrap_or(false)
-    }
+  // The standard property that Chrome also takes under this `-webkit-` name.
+  pub(crate) fn unprefixed(name: &str) -> Option<&str> {
+    const ALIASES: &str = "hyphenate-character align-content align-items align-self background-origin background-size animation animation-delay animation-direction animation-duration animation-fill-mode animation-iteration-count animation-name animation-play-state animation-timing-function appearance backface-visibility border-bottom-left-radius border-bottom-right-radius border-radius border-top-left-radius border-top-right-radius box-shadow box-sizing clip-path column-count column-gap column-rule column-rule-color column-rule-style column-rule-width column-span column-width columns filter flex flex-basis flex-direction flex-flow flex-grow flex-shrink flex-wrap justify-content mask mask-image mask-origin mask-position mask-repeat mask-size order perspective perspective-origin text-emphasis text-emphasis-color text-emphasis-position text-emphasis-style transform transform-origin transform-style transition transition-delay transition-duration transition-property transition-timing-function user-select";
+    let base = name.strip_prefix("-webkit-")?;
+    ALIASES
+      .split(' ')
+      .any(|alias| alias == base)
+      .then_some(base)
+      .filter(|base| Self::find(base).is_some_and(Self::is_known))
+  }
 
-    pub(crate) fn grammar(self) -> Option<&'static str> {
-        GRAMMARS.get(self.0 as usize).copied().flatten()
-    }
+  pub(crate) fn names() -> &'static [&'static str] {
+    &NAMES
+  }
+
+  pub(crate) fn inherited(self) -> bool {
+    INHERITED.get(self.0 as usize).copied().unwrap_or(false)
+  }
+
+  pub(crate) fn grammar(self) -> Option<&'static str> {
+    GRAMMARS.get(self.0 as usize).copied().flatten()
+  }
 }
 
 impl std::fmt::Debug for Prop {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.name())
-    }
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str(self.name())
+  }
 }
 
 pub(crate) type Vars = Rc<Vec<(Prop, Rc<str>)>>;
@@ -652,636 +652,637 @@ const WORDS: usize = (Known::Count as usize).div_ceil(64);
 pub(crate) struct PropSet([u64; WORDS]);
 
 impl PropSet {
-    pub(crate) const fn new(props: &[Prop]) -> Self {
-        let mut bits = [0; WORDS];
-        let mut at = 0;
-        while at < props.len() {
-            let id = props[at].0 as usize;
-            bits[id / 64] |= 1 << (id % 64);
-            at += 1;
-        }
-        Self(bits)
+  pub(crate) const fn new(props: &[Prop]) -> Self {
+    let mut bits = [0; WORDS];
+    let mut at = 0;
+    while at < props.len() {
+      let id = props[at].0 as usize;
+      bits[id / 64] |= 1 << (id % 64);
+      at += 1;
     }
+    Self(bits)
+  }
 
-    pub(crate) fn contains(&self, prop: Prop) -> bool {
-        let id = prop.0 as usize;
-        self.0
-            .get(id / 64)
-            .is_some_and(|word| word >> (id % 64) & 1 == 1)
-    }
+  pub(crate) fn contains(&self, prop: Prop) -> bool {
+    let id = prop.0 as usize;
+    self
+      .0
+      .get(id / 64)
+      .is_some_and(|word| word >> (id % 64) & 1 == 1)
+  }
 }
 
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct Style {
-    entries: Vec<(Prop, Rc<str>)>,
-    vars: Vars,
-    known: [u64; WORDS],
-    before: [u16; WORDS],
-    // The properties of `CURRENT` whose value is `currentcolor`, stored as the color.
-    current: u16,
+  entries: Vec<(Prop, Rc<str>)>,
+  vars: Vars,
+  known: [u64; WORDS],
+  before: [u16; WORDS],
+  // The properties of `CURRENT` whose value is `currentcolor`, stored as the color.
+  current: u16,
 }
 
 // Color properties that store `currentcolor` as the color, so `inherit` must know the keyword.
 const CURRENT: [Prop; 11] = [
-    Prop::BORDER_TOP_COLOR,
-    Prop::BORDER_RIGHT_COLOR,
-    Prop::BORDER_BOTTOM_COLOR,
-    Prop::BORDER_LEFT_COLOR,
-    Prop::OUTLINE_COLOR,
-    Prop::TEXT_DECORATION_COLOR,
-    Prop::COLUMN_RULE_COLOR,
-    Prop::BACKGROUND_COLOR,
-    Prop::FLOOD_COLOR,
-    Prop::LIGHTING_COLOR,
-    Prop::STOP_COLOR,
+  Prop::BORDER_TOP_COLOR,
+  Prop::BORDER_RIGHT_COLOR,
+  Prop::BORDER_BOTTOM_COLOR,
+  Prop::BORDER_LEFT_COLOR,
+  Prop::OUTLINE_COLOR,
+  Prop::TEXT_DECORATION_COLOR,
+  Prop::COLUMN_RULE_COLOR,
+  Prop::BACKGROUND_COLOR,
+  Prop::FLOOD_COLOR,
+  Prop::LIGHTING_COLOR,
+  Prop::STOP_COLOR,
 ];
 
 fn current_bit(prop: Prop) -> u16 {
-    CURRENT
-        .iter()
-        .position(|&known| known == prop)
-        .map_or(0, |index| 1 << index)
+  CURRENT
+    .iter()
+    .position(|&known| known == prop)
+    .map_or(0, |index| 1 << index)
 }
 
 impl Style {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
+  pub(crate) fn new() -> Self {
+    Self::default()
+  }
 
-    fn position(&self, prop: Prop) -> Result<usize, usize> {
-        let id = prop.0 as usize;
-        if prop.is_custom() {
-            return self.vars.binary_search_by_key(&prop, |entry| entry.0);
+  fn position(&self, prop: Prop) -> Result<usize, usize> {
+    let id = prop.0 as usize;
+    if prop.is_custom() {
+      return self.vars.binary_search_by_key(&prop, |entry| entry.0);
+    }
+    if id >= NAMES.len() {
+      return self.entries.binary_search_by_key(&prop, |entry| entry.0);
+    }
+    let (word, bit) = (id / 64, id % 64);
+    let index =
+      self.before[word] as usize + (self.known[word] & ((1 << bit) - 1)).count_ones() as usize;
+    if self.known[word] >> bit & 1 == 1 {
+      Ok(index)
+    } else {
+      Err(index)
+    }
+  }
+
+  fn count(&mut self, prop: Prop, delta: i16) {
+    let id = prop.0 as usize;
+    if id < NAMES.len() {
+      self.known[id / 64] ^= 1 << (id % 64);
+      for before in &mut self.before[id / 64 + 1..] {
+        *before = before.wrapping_add_signed(delta);
+      }
+    }
+  }
+
+  fn index(&mut self) {
+    self.known = [0; WORDS];
+    for (prop, _) in &self.entries {
+      if let Some(word) = self.known.get_mut(prop.0 as usize / 64)
+        && (prop.0 as usize) < NAMES.len()
+      {
+        *word |= 1 << (prop.0 % 64);
+      }
+    }
+    let mut count = 0;
+    for (before, word) in self.before.iter_mut().zip(self.known) {
+      *before = count;
+      count += word.count_ones() as u16;
+    }
+  }
+
+  pub(crate) fn get(&self, prop: Prop) -> Option<&str> {
+    self.value(prop).map(|value| &**value)
+  }
+
+  pub(crate) fn value(&self, prop: Prop) -> Option<&Rc<str>> {
+    let index = self.position(prop).ok()?;
+    Some(if prop.is_custom() {
+      &self.vars[index].1
+    } else {
+      &self.entries[index].1
+    })
+  }
+
+  // Whether a property of `set` has another value, or is set in one style only.
+  pub(crate) fn differs_in(&self, other: &Self, set: &PropSet) -> bool {
+    for word in 0..WORDS {
+      let mine = self.known[word] & set.0[word];
+      if mine != other.known[word] & set.0[word] {
+        return true;
+      }
+      let mut bits = mine;
+      while bits != 0 {
+        let below = (1u64 << bits.trailing_zeros()) - 1;
+        bits &= bits - 1;
+        let at = |style: &Self| {
+          style.before[word] as usize + (style.known[word] & below).count_ones() as usize
+        };
+        if self.entries[at(self)].1 != other.entries[at(other)].1 {
+          return true;
         }
-        if id >= NAMES.len() {
-            return self.entries.binary_search_by_key(&prop, |entry| entry.0);
-        }
-        let (word, bit) = (id / 64, id % 64);
-        let index = self.before[word] as usize
-            + (self.known[word] & ((1 << bit) - 1)).count_ones() as usize;
-        if self.known[word] >> bit & 1 == 1 {
-            Ok(index)
-        } else {
-            Err(index)
-        }
+      }
     }
+    false
+  }
 
-    fn count(&mut self, prop: Prop, delta: i16) {
-        let id = prop.0 as usize;
-        if id < NAMES.len() {
-            self.known[id / 64] ^= 1 << (id % 64);
-            for before in &mut self.before[id / 64 + 1..] {
-                *before = before.wrapping_add_signed(delta);
-            }
-        }
-    }
+  pub(crate) fn values_in<'a>(&'a self, set: &'a PropSet) -> impl Iterator<Item = &'a str> + 'a {
+    (0..WORDS).flat_map(move |word| {
+      let mut bits = self.known[word] & set.0[word];
+      std::iter::from_fn(move || {
+        let below = (1u64 << (bits != 0).then(|| bits.trailing_zeros())?) - 1;
+        bits &= bits - 1;
+        let at = self.before[word] as usize + (self.known[word] & below).count_ones() as usize;
+        Some(&*self.entries[at].1)
+      })
+    })
+  }
 
-    fn index(&mut self) {
-        self.known = [0; WORDS];
-        for (prop, _) in &self.entries {
-            if let Some(word) = self.known.get_mut(prop.0 as usize / 64)
-                && (prop.0 as usize) < NAMES.len()
-            {
-                *word |= 1 << (prop.0 % 64);
-            }
-        }
-        let mut count = 0;
-        for (before, word) in self.before.iter_mut().zip(self.known) {
-            *before = count;
-            count += word.count_ones() as u16;
-        }
-    }
+  pub(crate) fn contains(&self, prop: Prop) -> bool {
+    self.position(prop).is_ok()
+  }
 
-    pub(crate) fn get(&self, prop: Prop) -> Option<&str> {
-        self.value(prop).map(|value| &**value)
-    }
+  pub(crate) fn current(&self, prop: Prop) -> bool {
+    self.current & current_bit(prop) != 0
+  }
 
-    pub(crate) fn value(&self, prop: Prop) -> Option<&Rc<str>> {
-        let index = self.position(prop).ok()?;
-        Some(if prop.is_custom() {
-            &self.vars[index].1
-        } else {
-            &self.entries[index].1
-        })
-    }
+  // `currentcolor` that `value` stands for, or else another value.
+  pub(crate) fn insert_current(&mut self, prop: Prop, value: Rc<str>) {
+    self.insert(prop, value);
+    self.current |= current_bit(prop);
+  }
 
-    // Whether a property of `set` has another value, or is set in one style only.
-    pub(crate) fn differs_in(&self, other: &Self, set: &PropSet) -> bool {
-        for word in 0..WORDS {
-            let mine = self.known[word] & set.0[word];
-            if mine != other.known[word] & set.0[word] {
-                return true;
-            }
-            let mut bits = mine;
-            while bits != 0 {
-                let below = (1u64 << bits.trailing_zeros()) - 1;
-                bits &= bits - 1;
-                let at = |style: &Self| {
-                    style.before[word] as usize + (style.known[word] & below).count_ones() as usize
-                };
-                if self.entries[at(self)].1 != other.entries[at(other)].1 {
-                    return true;
-                }
-            }
-        }
-        false
+  pub(crate) fn insert(&mut self, prop: Prop, value: impl Into<Rc<str>>) {
+    if self.current != 0 {
+      self.current &= !current_bit(prop);
     }
+    let value = value.into();
+    match (self.position(prop), prop.is_custom()) {
+      (Ok(index), true) => Rc::make_mut(&mut self.vars)[index].1 = value,
+      (Err(index), true) => Rc::make_mut(&mut self.vars).insert(index, (prop, value)),
+      (Ok(index), false) => self.entries[index].1 = value,
+      (Err(index), false) => {
+        self.entries.insert(index, (prop, value));
+        self.count(prop, 1);
+      }
+    }
+  }
 
-    pub(crate) fn values_in<'a>(&'a self, set: &'a PropSet) -> impl Iterator<Item = &'a str> + 'a {
-        (0..WORDS).flat_map(move |word| {
-            let mut bits = self.known[word] & set.0[word];
-            std::iter::from_fn(move || {
-                let below = (1u64 << (bits != 0).then(|| bits.trailing_zeros())?) - 1;
-                bits &= bits - 1;
-                let at =
-                    self.before[word] as usize + (self.known[word] & below).count_ones() as usize;
-                Some(&*self.entries[at].1)
-            })
-        })
+  pub(crate) fn remove(&mut self, prop: Prop) -> Option<Rc<str>> {
+    if self.current != 0 {
+      self.current &= !current_bit(prop);
     }
+    let index = self.position(prop).ok()?;
+    if prop.is_custom() {
+      return Some(Rc::make_mut(&mut self.vars).remove(index).1);
+    }
+    self.count(prop, -1);
+    Some(self.entries.remove(index).1)
+  }
 
-    pub(crate) fn contains(&self, prop: Prop) -> bool {
-        self.position(prop).is_ok()
-    }
+  // `keep` returns whether the value stands for `currentcolor` among the properties of `CURRENT`.
+  pub(crate) fn retain_current(
+    &mut self,
+    mut keep: impl FnMut(Prop, &mut Rc<str>) -> (bool, bool),
+  ) {
+    let mut current = 0;
+    self.retain(|prop, value| {
+      let (kept, keyword) = keep(prop, value);
+      if keyword {
+        current |= current_bit(prop);
+      }
+      kept
+    });
+    self.current = current;
+  }
 
-    pub(crate) fn current(&self, prop: Prop) -> bool {
-        self.current & current_bit(prop) != 0
+  pub(crate) fn retain(&mut self, mut keep: impl FnMut(Prop, &mut Rc<str>) -> bool) {
+    let len = self.entries.len();
+    self.entries.retain_mut(|(prop, value)| keep(*prop, value));
+    if self.entries.len() != len {
+      self.index();
     }
+  }
 
-    // `currentcolor` that `value` stands for, or else another value.
-    pub(crate) fn insert_current(&mut self, prop: Prop, value: Rc<str>) {
-        self.insert(prop, value);
-        self.current |= current_bit(prop);
-    }
+  pub(crate) fn iter(&self) -> impl Iterator<Item = (Prop, &Rc<str>)> {
+    self
+      .entries
+      .iter()
+      .chain(self.vars.iter())
+      .map(|(prop, value)| (*prop, value))
+  }
 
-    pub(crate) fn insert(&mut self, prop: Prop, value: impl Into<Rc<str>>) {
-        if self.current != 0 {
-            self.current &= !current_bit(prop);
-        }
-        let value = value.into();
-        match (self.position(prop), prop.is_custom()) {
-            (Ok(index), true) => Rc::make_mut(&mut self.vars)[index].1 = value,
-            (Err(index), true) => Rc::make_mut(&mut self.vars).insert(index, (prop, value)),
-            (Ok(index), false) => self.entries[index].1 = value,
-            (Err(index), false) => {
-                self.entries.insert(index, (prop, value));
-                self.count(prop, 1);
-            }
-        }
-    }
+  pub(crate) fn own(&self) -> impl Iterator<Item = (Prop, &Rc<str>)> {
+    self.entries.iter().map(|(prop, value)| (*prop, value))
+  }
 
-    pub(crate) fn remove(&mut self, prop: Prop) -> Option<Rc<str>> {
-        if self.current != 0 {
-            self.current &= !current_bit(prop);
-        }
-        let index = self.position(prop).ok()?;
-        if prop.is_custom() {
-            return Some(Rc::make_mut(&mut self.vars).remove(index).1);
-        }
-        self.count(prop, -1);
-        Some(self.entries.remove(index).1)
-    }
+  pub(crate) fn vars(&self) -> &Vars {
+    &self.vars
+  }
 
-    // `keep` returns whether the value stands for `currentcolor` among the properties of `CURRENT`.
-    pub(crate) fn retain_current(
-        &mut self,
-        mut keep: impl FnMut(Prop, &mut Rc<str>) -> (bool, bool),
-    ) {
-        let mut current = 0;
-        self.retain(|prop, value| {
-            let (kept, keyword) = keep(prop, value);
-            if keyword {
-                current |= current_bit(prop);
-            }
-            kept
-        });
-        self.current = current;
-    }
+  pub(crate) fn set_vars(&mut self, vars: Vars) {
+    self.vars = vars;
+  }
 
-    pub(crate) fn retain(&mut self, mut keep: impl FnMut(Prop, &mut Rc<str>) -> bool) {
-        let len = self.entries.len();
-        self.entries.retain_mut(|(prop, value)| keep(*prop, value));
-        if self.entries.len() != len {
-            self.index();
-        }
-    }
-
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (Prop, &Rc<str>)> {
-        self.entries
-            .iter()
-            .chain(self.vars.iter())
-            .map(|(prop, value)| (*prop, value))
-    }
-
-    pub(crate) fn own(&self) -> impl Iterator<Item = (Prop, &Rc<str>)> {
-        self.entries.iter().map(|(prop, value)| (*prop, value))
-    }
-
-    pub(crate) fn vars(&self) -> &Vars {
-        &self.vars
-    }
-
-    pub(crate) fn set_vars(&mut self, vars: Vars) {
-        self.vars = vars;
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.vars.is_empty()
-    }
+  pub(crate) fn is_empty(&self) -> bool {
+    self.entries.is_empty() && self.vars.is_empty()
+  }
 }
 
 impl FromIterator<(Prop, Rc<str>)> for Style {
-    fn from_iter<I: IntoIterator<Item = (Prop, Rc<str>)>>(entries: I) -> Self {
-        let mut style = Self::default();
-        style.extend(entries);
-        style
-    }
+  fn from_iter<I: IntoIterator<Item = (Prop, Rc<str>)>>(entries: I) -> Self {
+    let mut style = Self::default();
+    style.extend(entries);
+    style
+  }
 }
 
 impl Extend<(Prop, Rc<str>)> for Style {
-    fn extend<I: IntoIterator<Item = (Prop, Rc<str>)>>(&mut self, entries: I) {
-        let start = self.entries.len();
-        let mut custom = Vec::new();
-        for entry in entries {
-            if entry.0.is_custom() {
-                custom.push(entry);
-            } else {
-                self.entries.push(entry);
-            }
-        }
-        if self.entries.len() != start {
-            merge(&mut self.entries, start);
-            self.index();
-        }
-        if !custom.is_empty() {
-            let list = Rc::make_mut(&mut self.vars);
-            let start = list.len();
-            list.extend(custom);
-            merge(list, start);
-        }
+  fn extend<I: IntoIterator<Item = (Prop, Rc<str>)>>(&mut self, entries: I) {
+    let start = self.entries.len();
+    let mut custom = Vec::new();
+    for entry in entries {
+      if entry.0.is_custom() {
+        custom.push(entry);
+      } else {
+        self.entries.push(entry);
+      }
     }
+    if self.entries.len() != start {
+      merge(&mut self.entries, start);
+      self.index();
+    }
+    if !custom.is_empty() {
+      let list = Rc::make_mut(&mut self.vars);
+      let start = list.len();
+      list.extend(custom);
+      merge(list, start);
+    }
+  }
 }
 
 fn merge(list: &mut Vec<(Prop, Rc<str>)>, start: usize) {
-    if list[start..].is_sorted_by(|a, b| a.0 < b.0)
-        && list[..start]
-            .last()
-            .zip(list.get(start))
-            .is_none_or(|(a, b)| a.0 < b.0)
-    {
-        return;
-    }
-    // Preserve stable order and retain the last value for each property.
-    list.sort_by_key(|entry| entry.0);
-    list.reverse();
-    list.dedup_by_key(|entry| entry.0);
-    list.reverse();
+  if list[start..].is_sorted_by(|a, b| a.0 < b.0)
+    && list[..start]
+      .last()
+      .zip(list.get(start))
+      .is_none_or(|(a, b)| a.0 < b.0)
+  {
+    return;
+  }
+  // Preserve stable order and retain the last value for each property.
+  list.sort_by_key(|entry| entry.0);
+  list.reverse();
+  list.dedup_by_key(|entry| entry.0);
+  list.reverse();
 }
 
 impl std::fmt::Debug for Style {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_map().entries(self.iter()).finish()
-    }
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_map().entries(self.iter()).finish()
+  }
 }
 
 impl serde::Serialize for Style {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut entries: Vec<_> = self
-            .iter()
-            .map(|(prop, value)| (prop.name(), &**value))
-            .collect();
-        entries.sort_unstable_by_key(|entry| entry.0);
-        serializer.collect_map(entries)
-    }
+  fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    let mut entries: Vec<_> = self
+      .iter()
+      .map(|(prop, value)| (prop.name(), &**value))
+      .collect();
+    entries.sort_unstable_by_key(|entry| entry.0);
+    serializer.collect_map(entries)
+  }
 }
 
 #[cfg(test)]
 impl std::ops::Index<&str> for Style {
-    type Output = str;
+  type Output = str;
 
-    fn index(&self, name: &str) -> &str {
-        Prop::find(name)
-            .and_then(|prop| self.get(prop))
-            .unwrap_or_else(|| panic!("no {name}"))
-    }
+  fn index(&self, name: &str) -> &str {
+    Prop::find(name)
+      .and_then(|prop| self.get(prop))
+      .unwrap_or_else(|| panic!("no {name}"))
+  }
 }
 
 // A style holds longhands only: the cascade expands every shorthand.
 pub(crate) const PADDING: [Prop; 4] = [
-    Prop::PADDING_TOP,
-    Prop::PADDING_RIGHT,
-    Prop::PADDING_BOTTOM,
-    Prop::PADDING_LEFT,
+  Prop::PADDING_TOP,
+  Prop::PADDING_RIGHT,
+  Prop::PADDING_BOTTOM,
+  Prop::PADDING_LEFT,
 ];
 pub(crate) const INSETS: [Prop; 4] = [Prop::TOP, Prop::RIGHT, Prop::BOTTOM, Prop::LEFT];
 pub(crate) const MARGIN: [Prop; 4] = [
-    Prop::MARGIN_TOP,
-    Prop::MARGIN_RIGHT,
-    Prop::MARGIN_BOTTOM,
-    Prop::MARGIN_LEFT,
+  Prop::MARGIN_TOP,
+  Prop::MARGIN_RIGHT,
+  Prop::MARGIN_BOTTOM,
+  Prop::MARGIN_LEFT,
 ];
 
 pub(crate) const BORDERS: [[Prop; 3]; 4] = [
-    [
-        Prop::BORDER_TOP_WIDTH,
-        Prop::BORDER_TOP_STYLE,
-        Prop::BORDER_TOP_COLOR,
-    ],
-    [
-        Prop::BORDER_RIGHT_WIDTH,
-        Prop::BORDER_RIGHT_STYLE,
-        Prop::BORDER_RIGHT_COLOR,
-    ],
-    [
-        Prop::BORDER_BOTTOM_WIDTH,
-        Prop::BORDER_BOTTOM_STYLE,
-        Prop::BORDER_BOTTOM_COLOR,
-    ],
-    [
-        Prop::BORDER_LEFT_WIDTH,
-        Prop::BORDER_LEFT_STYLE,
-        Prop::BORDER_LEFT_COLOR,
-    ],
+  [
+    Prop::BORDER_TOP_WIDTH,
+    Prop::BORDER_TOP_STYLE,
+    Prop::BORDER_TOP_COLOR,
+  ],
+  [
+    Prop::BORDER_RIGHT_WIDTH,
+    Prop::BORDER_RIGHT_STYLE,
+    Prop::BORDER_RIGHT_COLOR,
+  ],
+  [
+    Prop::BORDER_BOTTOM_WIDTH,
+    Prop::BORDER_BOTTOM_STYLE,
+    Prop::BORDER_BOTTOM_COLOR,
+  ],
+  [
+    Prop::BORDER_LEFT_WIDTH,
+    Prop::BORDER_LEFT_STYLE,
+    Prop::BORDER_LEFT_COLOR,
+  ],
 ];
 
 #[test]
 fn names_are_sorted() {
-    assert!(NAMES.is_sorted());
+  assert!(NAMES.is_sorted());
 }
 
 pub(crate) type Registry = FxHashMap<Prop, (Rc<str>, bool, Option<Rc<str>>)>;
 
 /// The physical property of a logical one in the box of a style, and other properties as they are.
 pub(crate) fn physical(prop: Prop, style: &Style) -> Prop {
-    if !prop.is_logical() {
-        return prop;
-    }
-    let rtl = style.get(Prop::DIRECTION) == Some("rtl");
-    side(prop, rtl, style.get(Prop::INTERNAL_LINES))
+  if !prop.is_logical() {
+    return prop;
+  }
+  let rtl = style.get(Prop::DIRECTION) == Some("rtl");
+  side(prop, rtl, style.get(Prop::INTERNAL_LINES))
 }
 
 pub(crate) fn side(prop: Prop, rtl: bool, lines: Option<&str>) -> Prop {
-    let prop = match LOGICAL.iter().find(|(logical, ..)| *logical == prop) {
-        Some(&(_, _, right)) if rtl => right,
-        Some(&(_, left, _)) => left,
-        None => return prop,
-    };
-    let Some(mode) = lines else { return prop };
-    // The sides where vertical lines put the top, bottom, left and right of horizontal ones.
-    let sides = match mode {
-        "vertical-lr" => ["left", "right", "top", "bottom"],
-        "sideways-lr" => ["left", "right", "bottom", "top"],
-        _ => ["right", "left", "top", "bottom"],
-    };
-    let name = prop.name();
-    let names = ["top", "bottom", "left", "right"];
-    let at = |side: usize| name.contains(names[side]);
-    let found = (0..4).find(|&side| at(side));
-    let corner;
-    let (old, new) = match found {
-        // Corners have two sides.
-        Some(block @ (0 | 1)) if at(2) || at(3) => {
-            let line = if at(2) { 2 } else { 3 };
-            corner = [
-                format!("{}-{}", names[block], names[line]),
-                format!("{}-{}", sides[line], sides[block]),
-            ];
-            (&*corner[0], &*corner[1])
-        }
-        Some(side) => (names[side], sides[side]),
-        None if name.ends_with("height") => ("height", "width"),
-        None if name.ends_with("width") => ("width", "height"),
-        None => return prop,
-    };
-    let name = name.replacen(old, new, 1);
-    Prop::find(&name).unwrap_or(prop)
+  let prop = match LOGICAL.iter().find(|(logical, ..)| *logical == prop) {
+    Some(&(_, _, right)) if rtl => right,
+    Some(&(_, left, _)) => left,
+    None => return prop,
+  };
+  let Some(mode) = lines else { return prop };
+  // The sides where vertical lines put the top, bottom, left and right of horizontal ones.
+  let sides = match mode {
+    "vertical-lr" => ["left", "right", "top", "bottom"],
+    "sideways-lr" => ["left", "right", "bottom", "top"],
+    _ => ["right", "left", "top", "bottom"],
+  };
+  let name = prop.name();
+  let names = ["top", "bottom", "left", "right"];
+  let at = |side: usize| name.contains(names[side]);
+  let found = (0..4).find(|&side| at(side));
+  let corner;
+  let (old, new) = match found {
+    // Corners have two sides.
+    Some(block @ (0 | 1)) if at(2) || at(3) => {
+      let line = if at(2) { 2 } else { 3 };
+      corner = [
+        format!("{}-{}", names[block], names[line]),
+        format!("{}-{}", sides[line], sides[block]),
+      ];
+      (&*corner[0], &*corner[1])
+    }
+    Some(side) => (names[side], sides[side]),
+    None if name.ends_with("height") => ("height", "width"),
+    None if name.ends_with("width") => ("width", "height"),
+    None => return prop,
+  };
+  let name = name.replacen(old, new, 1);
+  Prop::find(&name).unwrap_or(prop)
 }
 
 const LOGICAL_SET: PropSet = {
-    let mut props = [LOGICAL[0].0; LOGICAL.len()];
-    let mut at = 0;
-    while at < LOGICAL.len() {
-        props[at] = LOGICAL[at].0;
-        at += 1;
-    }
-    PropSet::new(&props)
+  let mut props = [LOGICAL[0].0; LOGICAL.len()];
+  let mut at = 0;
+  while at < LOGICAL.len() {
+    props[at] = LOGICAL[at].0;
+    at += 1;
+  }
+  PropSet::new(&props)
 };
 
 impl Prop {
-    pub(crate) fn is_logical(self) -> bool {
-        LOGICAL_SET.contains(self)
-    }
+  pub(crate) fn is_logical(self) -> bool {
+    LOGICAL_SET.contains(self)
+  }
 }
 
 pub(crate) const LOGICAL: [(Prop, Prop, Prop); 46] = [
-    (Prop::MARGIN_BLOCK_START, Prop::MARGIN_TOP, Prop::MARGIN_TOP),
-    (
-        Prop::MARGIN_BLOCK_END,
-        Prop::MARGIN_BOTTOM,
-        Prop::MARGIN_BOTTOM,
-    ),
-    (
-        Prop::PADDING_BLOCK_START,
-        Prop::PADDING_TOP,
-        Prop::PADDING_TOP,
-    ),
-    (
-        Prop::PADDING_BLOCK_END,
-        Prop::PADDING_BOTTOM,
-        Prop::PADDING_BOTTOM,
-    ),
-    (
-        Prop::SCROLL_MARGIN_BLOCK_START,
-        Prop::SCROLL_MARGIN_TOP,
-        Prop::SCROLL_MARGIN_TOP,
-    ),
-    (
-        Prop::SCROLL_MARGIN_BLOCK_END,
-        Prop::SCROLL_MARGIN_BOTTOM,
-        Prop::SCROLL_MARGIN_BOTTOM,
-    ),
-    (
-        Prop::SCROLL_PADDING_BLOCK_START,
-        Prop::SCROLL_PADDING_TOP,
-        Prop::SCROLL_PADDING_TOP,
-    ),
-    (
-        Prop::SCROLL_PADDING_BLOCK_END,
-        Prop::SCROLL_PADDING_BOTTOM,
-        Prop::SCROLL_PADDING_BOTTOM,
-    ),
-    (Prop::INSET_BLOCK_START, Prop::TOP, Prop::TOP),
-    (
-        Prop::BORDER_BLOCK_START_WIDTH,
-        Prop::BORDER_TOP_WIDTH,
-        Prop::BORDER_TOP_WIDTH,
-    ),
-    (
-        Prop::BORDER_BLOCK_START_STYLE,
-        Prop::BORDER_TOP_STYLE,
-        Prop::BORDER_TOP_STYLE,
-    ),
-    (
-        Prop::BORDER_BLOCK_START_COLOR,
-        Prop::BORDER_TOP_COLOR,
-        Prop::BORDER_TOP_COLOR,
-    ),
-    (Prop::INSET_BLOCK_END, Prop::BOTTOM, Prop::BOTTOM),
-    (
-        Prop::BORDER_BLOCK_END_WIDTH,
-        Prop::BORDER_BOTTOM_WIDTH,
-        Prop::BORDER_BOTTOM_WIDTH,
-    ),
-    (
-        Prop::BORDER_BLOCK_END_STYLE,
-        Prop::BORDER_BOTTOM_STYLE,
-        Prop::BORDER_BOTTOM_STYLE,
-    ),
-    (
-        Prop::BORDER_BLOCK_END_COLOR,
-        Prop::BORDER_BOTTOM_COLOR,
-        Prop::BORDER_BOTTOM_COLOR,
-    ),
-    (Prop::INLINE_SIZE, Prop::WIDTH, Prop::WIDTH),
-    (Prop::BLOCK_SIZE, Prop::HEIGHT, Prop::HEIGHT),
-    (Prop::MIN_INLINE_SIZE, Prop::MIN_WIDTH, Prop::MIN_WIDTH),
-    (Prop::MIN_BLOCK_SIZE, Prop::MIN_HEIGHT, Prop::MIN_HEIGHT),
-    (Prop::MAX_INLINE_SIZE, Prop::MAX_WIDTH, Prop::MAX_WIDTH),
-    (Prop::MAX_BLOCK_SIZE, Prop::MAX_HEIGHT, Prop::MAX_HEIGHT),
-    (
-        Prop::MARGIN_INLINE_START,
-        Prop::MARGIN_LEFT,
-        Prop::MARGIN_RIGHT,
-    ),
-    (
-        Prop::MARGIN_INLINE_END,
-        Prop::MARGIN_RIGHT,
-        Prop::MARGIN_LEFT,
-    ),
-    (
-        Prop::PADDING_INLINE_START,
-        Prop::PADDING_LEFT,
-        Prop::PADDING_RIGHT,
-    ),
-    (
-        Prop::PADDING_INLINE_END,
-        Prop::PADDING_RIGHT,
-        Prop::PADDING_LEFT,
-    ),
-    (
-        Prop::SCROLL_MARGIN_INLINE_START,
-        Prop::SCROLL_MARGIN_LEFT,
-        Prop::SCROLL_MARGIN_RIGHT,
-    ),
-    (
-        Prop::SCROLL_MARGIN_INLINE_END,
-        Prop::SCROLL_MARGIN_RIGHT,
-        Prop::SCROLL_MARGIN_LEFT,
-    ),
-    (
-        Prop::SCROLL_PADDING_INLINE_START,
-        Prop::SCROLL_PADDING_LEFT,
-        Prop::SCROLL_PADDING_RIGHT,
-    ),
-    (
-        Prop::SCROLL_PADDING_INLINE_END,
-        Prop::SCROLL_PADDING_RIGHT,
-        Prop::SCROLL_PADDING_LEFT,
-    ),
-    (Prop::INSET_INLINE_START, Prop::LEFT, Prop::RIGHT),
-    (Prop::INSET_INLINE_END, Prop::RIGHT, Prop::LEFT),
-    (
-        Prop::BORDER_INLINE_START_WIDTH,
-        Prop::BORDER_LEFT_WIDTH,
-        Prop::BORDER_RIGHT_WIDTH,
-    ),
-    (
-        Prop::BORDER_INLINE_START_STYLE,
-        Prop::BORDER_LEFT_STYLE,
-        Prop::BORDER_RIGHT_STYLE,
-    ),
-    (
-        Prop::BORDER_INLINE_START_COLOR,
-        Prop::BORDER_LEFT_COLOR,
-        Prop::BORDER_RIGHT_COLOR,
-    ),
-    (
-        Prop::BORDER_INLINE_END_WIDTH,
-        Prop::BORDER_RIGHT_WIDTH,
-        Prop::BORDER_LEFT_WIDTH,
-    ),
-    (
-        Prop::BORDER_INLINE_END_STYLE,
-        Prop::BORDER_RIGHT_STYLE,
-        Prop::BORDER_LEFT_STYLE,
-    ),
-    (
-        Prop::BORDER_INLINE_END_COLOR,
-        Prop::BORDER_RIGHT_COLOR,
-        Prop::BORDER_LEFT_COLOR,
-    ),
-    (
-        Prop::BORDER_START_START_RADIUS,
-        Prop::BORDER_TOP_LEFT_RADIUS,
-        Prop::BORDER_TOP_RIGHT_RADIUS,
-    ),
-    (
-        Prop::CORNER_START_START_SHAPE,
-        Prop::CORNER_TOP_LEFT_SHAPE,
-        Prop::CORNER_TOP_RIGHT_SHAPE,
-    ),
-    (
-        Prop::CORNER_START_END_SHAPE,
-        Prop::CORNER_TOP_RIGHT_SHAPE,
-        Prop::CORNER_TOP_LEFT_SHAPE,
-    ),
-    (
-        Prop::CORNER_END_START_SHAPE,
-        Prop::CORNER_BOTTOM_LEFT_SHAPE,
-        Prop::CORNER_BOTTOM_RIGHT_SHAPE,
-    ),
-    (
-        Prop::CORNER_END_END_SHAPE,
-        Prop::CORNER_BOTTOM_RIGHT_SHAPE,
-        Prop::CORNER_BOTTOM_LEFT_SHAPE,
-    ),
-    (
-        Prop::BORDER_START_END_RADIUS,
-        Prop::BORDER_TOP_RIGHT_RADIUS,
-        Prop::BORDER_TOP_LEFT_RADIUS,
-    ),
-    (
-        Prop::BORDER_END_START_RADIUS,
-        Prop::BORDER_BOTTOM_LEFT_RADIUS,
-        Prop::BORDER_BOTTOM_RIGHT_RADIUS,
-    ),
-    (
-        Prop::BORDER_END_END_RADIUS,
-        Prop::BORDER_BOTTOM_RIGHT_RADIUS,
-        Prop::BORDER_BOTTOM_LEFT_RADIUS,
-    ),
+  (Prop::MARGIN_BLOCK_START, Prop::MARGIN_TOP, Prop::MARGIN_TOP),
+  (
+    Prop::MARGIN_BLOCK_END,
+    Prop::MARGIN_BOTTOM,
+    Prop::MARGIN_BOTTOM,
+  ),
+  (
+    Prop::PADDING_BLOCK_START,
+    Prop::PADDING_TOP,
+    Prop::PADDING_TOP,
+  ),
+  (
+    Prop::PADDING_BLOCK_END,
+    Prop::PADDING_BOTTOM,
+    Prop::PADDING_BOTTOM,
+  ),
+  (
+    Prop::SCROLL_MARGIN_BLOCK_START,
+    Prop::SCROLL_MARGIN_TOP,
+    Prop::SCROLL_MARGIN_TOP,
+  ),
+  (
+    Prop::SCROLL_MARGIN_BLOCK_END,
+    Prop::SCROLL_MARGIN_BOTTOM,
+    Prop::SCROLL_MARGIN_BOTTOM,
+  ),
+  (
+    Prop::SCROLL_PADDING_BLOCK_START,
+    Prop::SCROLL_PADDING_TOP,
+    Prop::SCROLL_PADDING_TOP,
+  ),
+  (
+    Prop::SCROLL_PADDING_BLOCK_END,
+    Prop::SCROLL_PADDING_BOTTOM,
+    Prop::SCROLL_PADDING_BOTTOM,
+  ),
+  (Prop::INSET_BLOCK_START, Prop::TOP, Prop::TOP),
+  (
+    Prop::BORDER_BLOCK_START_WIDTH,
+    Prop::BORDER_TOP_WIDTH,
+    Prop::BORDER_TOP_WIDTH,
+  ),
+  (
+    Prop::BORDER_BLOCK_START_STYLE,
+    Prop::BORDER_TOP_STYLE,
+    Prop::BORDER_TOP_STYLE,
+  ),
+  (
+    Prop::BORDER_BLOCK_START_COLOR,
+    Prop::BORDER_TOP_COLOR,
+    Prop::BORDER_TOP_COLOR,
+  ),
+  (Prop::INSET_BLOCK_END, Prop::BOTTOM, Prop::BOTTOM),
+  (
+    Prop::BORDER_BLOCK_END_WIDTH,
+    Prop::BORDER_BOTTOM_WIDTH,
+    Prop::BORDER_BOTTOM_WIDTH,
+  ),
+  (
+    Prop::BORDER_BLOCK_END_STYLE,
+    Prop::BORDER_BOTTOM_STYLE,
+    Prop::BORDER_BOTTOM_STYLE,
+  ),
+  (
+    Prop::BORDER_BLOCK_END_COLOR,
+    Prop::BORDER_BOTTOM_COLOR,
+    Prop::BORDER_BOTTOM_COLOR,
+  ),
+  (Prop::INLINE_SIZE, Prop::WIDTH, Prop::WIDTH),
+  (Prop::BLOCK_SIZE, Prop::HEIGHT, Prop::HEIGHT),
+  (Prop::MIN_INLINE_SIZE, Prop::MIN_WIDTH, Prop::MIN_WIDTH),
+  (Prop::MIN_BLOCK_SIZE, Prop::MIN_HEIGHT, Prop::MIN_HEIGHT),
+  (Prop::MAX_INLINE_SIZE, Prop::MAX_WIDTH, Prop::MAX_WIDTH),
+  (Prop::MAX_BLOCK_SIZE, Prop::MAX_HEIGHT, Prop::MAX_HEIGHT),
+  (
+    Prop::MARGIN_INLINE_START,
+    Prop::MARGIN_LEFT,
+    Prop::MARGIN_RIGHT,
+  ),
+  (
+    Prop::MARGIN_INLINE_END,
+    Prop::MARGIN_RIGHT,
+    Prop::MARGIN_LEFT,
+  ),
+  (
+    Prop::PADDING_INLINE_START,
+    Prop::PADDING_LEFT,
+    Prop::PADDING_RIGHT,
+  ),
+  (
+    Prop::PADDING_INLINE_END,
+    Prop::PADDING_RIGHT,
+    Prop::PADDING_LEFT,
+  ),
+  (
+    Prop::SCROLL_MARGIN_INLINE_START,
+    Prop::SCROLL_MARGIN_LEFT,
+    Prop::SCROLL_MARGIN_RIGHT,
+  ),
+  (
+    Prop::SCROLL_MARGIN_INLINE_END,
+    Prop::SCROLL_MARGIN_RIGHT,
+    Prop::SCROLL_MARGIN_LEFT,
+  ),
+  (
+    Prop::SCROLL_PADDING_INLINE_START,
+    Prop::SCROLL_PADDING_LEFT,
+    Prop::SCROLL_PADDING_RIGHT,
+  ),
+  (
+    Prop::SCROLL_PADDING_INLINE_END,
+    Prop::SCROLL_PADDING_RIGHT,
+    Prop::SCROLL_PADDING_LEFT,
+  ),
+  (Prop::INSET_INLINE_START, Prop::LEFT, Prop::RIGHT),
+  (Prop::INSET_INLINE_END, Prop::RIGHT, Prop::LEFT),
+  (
+    Prop::BORDER_INLINE_START_WIDTH,
+    Prop::BORDER_LEFT_WIDTH,
+    Prop::BORDER_RIGHT_WIDTH,
+  ),
+  (
+    Prop::BORDER_INLINE_START_STYLE,
+    Prop::BORDER_LEFT_STYLE,
+    Prop::BORDER_RIGHT_STYLE,
+  ),
+  (
+    Prop::BORDER_INLINE_START_COLOR,
+    Prop::BORDER_LEFT_COLOR,
+    Prop::BORDER_RIGHT_COLOR,
+  ),
+  (
+    Prop::BORDER_INLINE_END_WIDTH,
+    Prop::BORDER_RIGHT_WIDTH,
+    Prop::BORDER_LEFT_WIDTH,
+  ),
+  (
+    Prop::BORDER_INLINE_END_STYLE,
+    Prop::BORDER_RIGHT_STYLE,
+    Prop::BORDER_LEFT_STYLE,
+  ),
+  (
+    Prop::BORDER_INLINE_END_COLOR,
+    Prop::BORDER_RIGHT_COLOR,
+    Prop::BORDER_LEFT_COLOR,
+  ),
+  (
+    Prop::BORDER_START_START_RADIUS,
+    Prop::BORDER_TOP_LEFT_RADIUS,
+    Prop::BORDER_TOP_RIGHT_RADIUS,
+  ),
+  (
+    Prop::CORNER_START_START_SHAPE,
+    Prop::CORNER_TOP_LEFT_SHAPE,
+    Prop::CORNER_TOP_RIGHT_SHAPE,
+  ),
+  (
+    Prop::CORNER_START_END_SHAPE,
+    Prop::CORNER_TOP_RIGHT_SHAPE,
+    Prop::CORNER_TOP_LEFT_SHAPE,
+  ),
+  (
+    Prop::CORNER_END_START_SHAPE,
+    Prop::CORNER_BOTTOM_LEFT_SHAPE,
+    Prop::CORNER_BOTTOM_RIGHT_SHAPE,
+  ),
+  (
+    Prop::CORNER_END_END_SHAPE,
+    Prop::CORNER_BOTTOM_RIGHT_SHAPE,
+    Prop::CORNER_BOTTOM_LEFT_SHAPE,
+  ),
+  (
+    Prop::BORDER_START_END_RADIUS,
+    Prop::BORDER_TOP_RIGHT_RADIUS,
+    Prop::BORDER_TOP_LEFT_RADIUS,
+  ),
+  (
+    Prop::BORDER_END_START_RADIUS,
+    Prop::BORDER_BOTTOM_LEFT_RADIUS,
+    Prop::BORDER_BOTTOM_RIGHT_RADIUS,
+  ),
+  (
+    Prop::BORDER_END_END_RADIUS,
+    Prop::BORDER_BOTTOM_RIGHT_RADIUS,
+    Prop::BORDER_BOTTOM_LEFT_RADIUS,
+  ),
 ];
 
 #[cfg(test)]
 mod tests {
-    use super::{Prop, PropSet, Style};
+  use super::{Prop, PropSet, Style};
 
-    #[test]
-    fn styles_differ_only_in_the_properties_of_a_set() {
-        let set = PropSet::new(&[Prop::TOP, Prop::WIDTH, Prop::TRANSFORM]);
-        let mut a = Style::default();
-        a.insert(Prop::COLOR, "red");
-        a.insert(Prop::WIDTH, "10px");
-        let mut b = a.clone();
-        b.insert(Prop::COLOR, "blue");
-        assert!(!a.differs_in(&b, &set));
-        b.insert(Prop::WIDTH, "11px");
-        assert!(a.differs_in(&b, &set));
-        b.insert(Prop::WIDTH, "10px");
-        b.insert(Prop::TOP, "0px");
-        assert!(a.differs_in(&b, &set) && b.differs_in(&a, &set));
-        a.insert(Prop::TOP, "0px");
-        a.insert(Prop::ZOOM, "1");
-        assert!(!a.differs_in(&b, &set));
-    }
+  #[test]
+  fn styles_differ_only_in_the_properties_of_a_set() {
+    let set = PropSet::new(&[Prop::TOP, Prop::WIDTH, Prop::TRANSFORM]);
+    let mut a = Style::default();
+    a.insert(Prop::COLOR, "red");
+    a.insert(Prop::WIDTH, "10px");
+    let mut b = a.clone();
+    b.insert(Prop::COLOR, "blue");
+    assert!(!a.differs_in(&b, &set));
+    b.insert(Prop::WIDTH, "11px");
+    assert!(a.differs_in(&b, &set));
+    b.insert(Prop::WIDTH, "10px");
+    b.insert(Prop::TOP, "0px");
+    assert!(a.differs_in(&b, &set) && b.differs_in(&a, &set));
+    a.insert(Prop::TOP, "0px");
+    a.insert(Prop::ZOOM, "1");
+    assert!(!a.differs_in(&b, &set));
+  }
 }

@@ -36,12 +36,12 @@ pub(crate) const LEAVING: u32 = TOP_LAYER << 5;
 
 // A `contenteditable` value makes the element editable or not, or inherits when `None`.
 pub(crate) fn editable_value(value: &str) -> Option<bool> {
-    if value.eq_ignore_ascii_case("false") {
-        Some(false)
-    } else {
-        (value.is_empty()
-            || value.eq_ignore_ascii_case("true")
-            || value.eq_ignore_ascii_case("plaintext-only"))
-        .then_some(true)
-    }
+  if value.eq_ignore_ascii_case("false") {
+    Some(false)
+  } else {
+    (value.is_empty()
+      || value.eq_ignore_ascii_case("true")
+      || value.eq_ignore_ascii_case("plaintext-only"))
+    .then_some(true)
+  }
 }

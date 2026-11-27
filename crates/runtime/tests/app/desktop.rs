@@ -2,136 +2,136 @@
 #[cfg(target_os = "macos")]
 #[ignore = "requires the macOS window server"]
 fn native_desktop_dispatches_application_events() {
-    use std::{path::Path, process::Command};
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let output = tempfile::tempdir().unwrap();
-    let engine = apps_runtime::host::context::JsContext::new(
-        apps_runtime::jsc::JavaScriptCore::load().unwrap(),
-        std::rc::Rc::default(),
-        apps_runtime::jsc::Role::Main,
-    )
+  use std::{path::Path, process::Command};
+  let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+  let output = tempfile::tempdir().unwrap();
+  let engine = apps_runtime::host::context::JsContext::new(
+    apps_runtime::jsc::JavaScriptCore::load().unwrap(),
+    std::rc::Rc::default(),
+    apps_runtime::jsc::Role::Main,
+  )
+  .unwrap();
+  engine
+    .eval(include_str!("../../js/browser.js"), "browser")
     .unwrap();
-    engine
-        .eval(include_str!("../../js/browser.js"), "browser")
-        .unwrap();
-    engine.eval(include_str!("menu.js"), "menu-tests").unwrap();
-    let template = output.path().join("menu.json");
-    std::fs::write(
-        &template,
-        engine.eval("JSON.stringify(menuTemplate)", "menu").unwrap(),
-    )
+  engine.eval(include_str!("menu.js"), "menu-tests").unwrap();
+  let template = output.path().join("menu.json");
+  std::fs::write(
+    &template,
+    engine.eval("JSON.stringify(menuTemplate)", "menu").unwrap(),
+  )
+  .unwrap();
+  let binary = output.path().join("desktop-smoke");
+  let result = Command::new("xcrun")
+    .args(["clang", "-fobjc-arc", "-Wno-incompatible-pointer-types"])
+    .arg(root.join("native/desktop.m"))
+    .arg(root.join("tests/app/desktop_native.m"))
+    .args([
+      "-framework",
+      "AppKit",
+      "-framework",
+      "Foundation",
+      "-framework",
+      "Security",
+      "-framework",
+      "UserNotifications",
+      "-framework",
+      "Carbon",
+      "-framework",
+      "IOKit",
+      "-framework",
+      "CoreGraphics",
+      "-framework",
+      "ImageIO",
+      "-framework",
+      "ServiceManagement",
+      "-framework",
+      "UniformTypeIdentifiers",
+      "-o",
+    ])
+    .arg(&binary)
+    .output()
     .unwrap();
-    let binary = output.path().join("desktop-smoke");
-    let result = Command::new("xcrun")
-        .args(["clang", "-fobjc-arc", "-Wno-incompatible-pointer-types"])
-        .arg(root.join("native/desktop.m"))
-        .arg(root.join("tests/app/desktop_native.m"))
-        .args([
-            "-framework",
-            "AppKit",
-            "-framework",
-            "Foundation",
-            "-framework",
-            "Security",
-            "-framework",
-            "UserNotifications",
-            "-framework",
-            "Carbon",
-            "-framework",
-            "IOKit",
-            "-framework",
-            "CoreGraphics",
-            "-framework",
-            "ImageIO",
-            "-framework",
-            "ServiceManagement",
-            "-framework",
-            "UniformTypeIdentifiers",
-            "-o",
-        ])
-        .arg(&binary)
-        .output()
-        .unwrap();
+  assert!(
+    result.status.success(),
+    "{}: {}",
+    result.status,
+    String::from_utf8_lossy(&result.stderr)
+  );
+  for argument in [Path::new("--tray"), &template] {
+    let result = Command::new(&binary).arg(argument).output().unwrap();
     assert!(
-        result.status.success(),
-        "{}: {}",
-        result.status,
-        String::from_utf8_lossy(&result.stderr)
+      result.status.success(),
+      "{argument:?} {}: {}",
+      result.status,
+      String::from_utf8_lossy(&result.stderr)
     );
-    for argument in [Path::new("--tray"), &template] {
-        let result = Command::new(&binary).arg(argument).output().unwrap();
-        assert!(
-            result.status.success(),
-            "{argument:?} {}: {}",
-            result.status,
-            String::from_utf8_lossy(&result.stderr)
-        );
-    }
+  }
 }
 
 #[test]
 fn application_menu_defaults_and_overrides() {
-    let engine = apps_runtime::host::context::JsContext::new(
-        apps_runtime::jsc::JavaScriptCore::load().unwrap(),
-        std::rc::Rc::default(),
-        apps_runtime::jsc::Role::Main,
-    )
+  let engine = apps_runtime::host::context::JsContext::new(
+    apps_runtime::jsc::JavaScriptCore::load().unwrap(),
+    std::rc::Rc::default(),
+    apps_runtime::jsc::Role::Main,
+  )
+  .unwrap();
+  engine
+    .eval(include_str!("../../js/browser.js"), "browser")
     .unwrap();
-    engine
-        .eval(include_str!("../../js/browser.js"), "browser")
-        .unwrap();
-    engine.eval(include_str!("menu.js"), "menu-tests").unwrap();
+  engine.eval(include_str!("menu.js"), "menu-tests").unwrap();
 }
 
 #[test]
 fn native_theme_properties_and_events() {
-    let engine = apps_runtime::host::context::JsContext::new(
-        apps_runtime::jsc::JavaScriptCore::load().unwrap(),
-        std::rc::Rc::default(),
-        apps_runtime::jsc::Role::Main,
-    )
+  let engine = apps_runtime::host::context::JsContext::new(
+    apps_runtime::jsc::JavaScriptCore::load().unwrap(),
+    std::rc::Rc::default(),
+    apps_runtime::jsc::Role::Main,
+  )
+  .unwrap();
+  engine
+    .eval(include_str!("../../js/browser.js"), "browser")
     .unwrap();
-    engine
-        .eval(include_str!("../../js/browser.js"), "browser")
-        .unwrap();
-    engine
-        .eval(include_str!("native_theme.js"), "native-theme-tests")
-        .unwrap();
+  engine
+    .eval(include_str!("native_theme.js"), "native-theme-tests")
+    .unwrap();
 }
 
 #[test]
 fn power_save_blocker_and_system_preferences() {
-    let engine = apps_runtime::host::context::JsContext::new(
-        apps_runtime::jsc::JavaScriptCore::load().unwrap(),
-        std::rc::Rc::default(),
-        apps_runtime::jsc::Role::Main,
-    )
+  let engine = apps_runtime::host::context::JsContext::new(
+    apps_runtime::jsc::JavaScriptCore::load().unwrap(),
+    std::rc::Rc::default(),
+    apps_runtime::jsc::Role::Main,
+  )
+  .unwrap();
+  engine
+    .eval(include_str!("../../js/browser.js"), "browser")
     .unwrap();
+  engine
+    .eval(include_str!("native_shell.js"), "native-shell-tests")
+    .unwrap();
+  engine.tick().unwrap();
+  assert_eq!(
     engine
-        .eval(include_str!("../../js/browser.js"), "browser")
-        .unwrap();
-    engine
-        .eval(include_str!("native_shell.js"), "native-shell-tests")
-        .unwrap();
-    engine.tick().unwrap();
-    assert_eq!(
-        engine
-            .eval("nativeShellAsync.sort().join()", "test")
-            .unwrap(),
-        "Canceled,true"
-    );
+      .eval("nativeShellAsync.sort().join()", "test")
+      .unwrap(),
+    "Canceled,true"
+  );
 }
 
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires the macOS window server"]
 fn oversized_windows_open_and_report_their_size() {
-    use std::{
-        io::Write,
-        process::{Command, Stdio},
-        time::{Duration, Instant},
-    };
-    let main = r#"
+  use std::{
+    io::Write,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+  };
+  let main = r#"
         const { app, BrowserWindow, ipcMain } = __apps;
         ipcMain.on('size', (_, width, height) => {
             if (!(width > 0 && height > 0 && width < 6000)) throw Error('Wrong size: ' + width + 'x' + height);
@@ -142,55 +142,55 @@ fn oversized_windows_open_and_report_their_size() {
             setTimeout(() => process.exit(1), 5000);
         });
     "#;
-    let page = r#"
+  let page = r#"
         <body>
         <script type='preload'>__apps.contextBridge.exposeInMainWorld('report', (...args) => __apps.ipcRenderer.send('size', ...args));</script>
         <script>addEventListener('resize', () => report(innerWidth, innerHeight));</script>
     "#;
-    let bundle = serde_json::json!({"files": [
+  let bundle = serde_json::json!({"files": [
         ["app.js", format!("$appsDefine({});", serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":main}))],
         ["index.html", page],
     ], "pages": []});
-    let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
-        .arg("--bundle-stdin")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(bundle.to_string().as_bytes())
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(12);
-    while child.try_wait().unwrap().is_none() {
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+  let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
+    .arg("--bundle-stdin")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  child
+    .stdin
+    .take()
+    .unwrap()
+    .write_all(bundle.to_string().as_bytes())
+    .unwrap();
+  let deadline = Instant::now() + Duration::from_secs(12);
+  while child.try_wait().unwrap().is_none() {
+    if Instant::now() >= deadline {
+      child.kill().unwrap();
+      break;
     }
-    let output = child.wait_with_output().unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success() && stdout.contains("OVERSIZED_OK"),
-        "{stdout}\n{stderr}"
-    );
+    std::thread::sleep(Duration::from_millis(50));
+  }
+  let output = child.wait_with_output().unwrap();
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    output.status.success() && stdout.contains("OVERSIZED_OK"),
+    "{stdout}\n{stderr}"
+  );
 }
 
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires the macOS window server"]
 fn page_zoom_shrinks_the_viewport_and_survives_reloads() {
-    use std::{
-        io::Write,
-        process::{Command, Stdio},
-        time::{Duration, Instant},
-    };
-    let main = r#"
+  use std::{
+    io::Write,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+  };
+  let main = r#"
         const { app, BrowserWindow, ipcMain } = __apps;
         let win, stage = 0, base;
         const expect = (ok, what) => { if (!ok) { console.error('ZOOM_FAIL ' + what); process.exit(2); } };
@@ -211,85 +211,85 @@ fn page_zoom_shrinks_the_viewport_and_survives_reloads() {
             win.loadFile('apps:///index.html');
         });
     "#;
-    let page = r#"
+  let page = r#"
         <body>
         <script type='preload'>__apps.contextBridge.exposeInMainWorld('report', (...args) => __apps.ipcRenderer.send('size', ...args));</script>
         <script>const send = () => report(innerWidth, innerHeight, devicePixelRatio); send(); addEventListener('resize', send);</script>
     "#;
-    let bundle = serde_json::json!({"files": [
+  let bundle = serde_json::json!({"files": [
         ["app.js", format!("$appsDefine({});", serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":main}))],
         ["index.html", page],
     ], "pages": []});
-    let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
-        .arg("--bundle-stdin")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(bundle.to_string().as_bytes())
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(12);
-    while child.try_wait().unwrap().is_none() {
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+  let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
+    .arg("--bundle-stdin")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  child
+    .stdin
+    .take()
+    .unwrap()
+    .write_all(bundle.to_string().as_bytes())
+    .unwrap();
+  let deadline = Instant::now() + Duration::from_secs(12);
+  while child.try_wait().unwrap().is_none() {
+    if Instant::now() >= deadline {
+      child.kill().unwrap();
+      break;
     }
-    let output = child.wait_with_output().unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success() && stdout.contains("ZOOM_OK"),
-        "{stdout}\n{stderr}"
-    );
+    std::thread::sleep(Duration::from_millis(50));
+  }
+  let output = child.wait_with_output().unwrap();
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    output.status.success() && stdout.contains("ZOOM_OK"),
+    "{stdout}\n{stderr}"
+  );
 }
 
 #[cfg(target_os = "macos")]
 fn run_window_test(main: &str, page: &str) -> std::process::Output {
-    use std::{
-        io::Write,
-        process::{Command, Stdio},
-        time::{Duration, Instant},
-    };
-    let bundle = serde_json::json!({"files": [
+  use std::{
+    io::Write,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+  };
+  let bundle = serde_json::json!({"files": [
         ["app.js", format!("$appsDefine({});", serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":main}))],
         ["index.html", page],
     ], "pages": []});
-    let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
-        .arg("--bundle-stdin")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(bundle.to_string().as_bytes())
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(12);
-    while child.try_wait().unwrap().is_none() {
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+  let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
+    .arg("--bundle-stdin")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  child
+    .stdin
+    .take()
+    .unwrap()
+    .write_all(bundle.to_string().as_bytes())
+    .unwrap();
+  let deadline = Instant::now() + Duration::from_secs(12);
+  while child.try_wait().unwrap().is_none() {
+    if Instant::now() >= deadline {
+      child.kill().unwrap();
+      break;
     }
-    child.wait_with_output().unwrap()
+    std::thread::sleep(Duration::from_millis(50));
+  }
+  child.wait_with_output().unwrap()
 }
 
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires the macOS window server"]
 fn native_glass_appearance_preserves_focus() {
-    let main = r#"
+  let main = r#"
         const { app, BrowserWindow } = __apps;
         const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
         app.whenReady().then(async () => {
@@ -318,22 +318,22 @@ fn native_glass_appearance_preserves_focus() {
             console.log('GLASS_FOCUS_OK'); app.quit();
         });
     "#;
-    let output = run_window_test(
-        main,
-        r#"<body style="margin:0;background:transparent"><div style="-macos-glass:clear;width:236px;height:52px;border-radius:26px">Glass</div></body>"#,
-    );
-    let text = String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success() && text.contains("GLASS_FOCUS_OK"),
-        "{text}"
-    );
+  let output = run_window_test(
+    main,
+    r#"<body style="margin:0;background:transparent"><div style="-macos-glass:clear;width:236px;height:52px;border-radius:26px">Glass</div></body>"#,
+  );
+  let text = String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
+  assert!(
+    output.status.success() && text.contains("GLASS_FOCUS_OK"),
+    "{text}"
+  );
 }
 
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires the macOS window server"]
 fn pages_see_the_window_frame_and_levels_apply() {
-    let main = r#"
+  let main = r#"
         const { app, BrowserWindow } = __apps;
         app.whenReady().then(async () => {
             setTimeout(() => process.exit(3), 8000);
@@ -351,19 +351,19 @@ fn pages_see_the_window_frame_and_levels_apply() {
             console.log('WINDOW_FRAME_OK'); app.quit();
         });
     "#;
-    let output = run_window_test(main, "<body></body>");
-    let text = String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success() && text.contains("WINDOW_FRAME_OK"),
-        "{text}"
-    );
+  let output = run_window_test(main, "<body></body>");
+  let text = String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
+  assert!(
+    output.status.success() && text.contains("WINDOW_FRAME_OK"),
+    "{text}"
+  );
 }
 
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires the macOS window server"]
 fn native_captures_repeat_and_fatal_errors_exit_with_failure() {
-    let capture = r#"
+  let capture = r#"
         const { app, BrowserWindow } = __apps;
         app.whenReady().then(async () => {
             setTimeout(() => process.exit(3), 8000);
@@ -373,31 +373,28 @@ fn native_captures_repeat_and_fatal_errors_exit_with_failure() {
             console.log('CAPTURE_OK'); app.quit();
         });
     "#;
-    let fatal = "__apps.app.whenReady().then(() => { new __apps.BrowserWindow(); setTimeout(() => { throw Error('FATAL_IN_TIMER'); }, 50); });";
-    for (main, success, marker) in [
-        (capture, true, "CAPTURE_OK"),
-        (fatal, false, "FATAL_IN_TIMER"),
-    ] {
-        let output = run_window_test(main, "<body style='background:red'>x</body>");
-        let text =
-            String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success() == success
-                && output.status.code().is_some()
-                && text.contains(marker),
-            "{:?} {text}",
-            output.status
-        );
-    }
+  let fatal = "__apps.app.whenReady().then(() => { new __apps.BrowserWindow(); setTimeout(() => { throw Error('FATAL_IN_TIMER'); }, 50); });";
+  for (main, success, marker) in [
+    (capture, true, "CAPTURE_OK"),
+    (fatal, false, "FATAL_IN_TIMER"),
+  ] {
+    let output = run_window_test(main, "<body style='background:red'>x</body>");
+    let text = String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
+    assert!(
+      output.status.success() == success && output.status.code().is_some() && text.contains(marker),
+      "{:?} {text}",
+      output.status
+    );
+  }
 }
 
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires the macOS window server"]
 fn closing_a_loading_window_keeps_the_app() {
-    // The big value makes the bridge sync of the page slow, so a close can stop it.
-    let page = "<script type='preload'>__apps.contextBridge.exposeInMainWorld('big', Array.from({length: 1500000}, (_, i) => ({i, s: 'x' + i})))</script><script>for (const end = Date.now() + 300; Date.now() < end;);</script><body>x</body>";
-    let common = r#"
+  // The big value makes the bridge sync of the page slow, so a close can stop it.
+  let page = "<script type='preload'>__apps.contextBridge.exposeInMainWorld('big', Array.from({length: 1500000}, (_, i) => ({i, s: 'x' + i})))</script><script>for (const end = Date.now() + 300; Date.now() < end;);</script><body>x</body>";
+  let common = r#"
         const { app, BrowserWindow } = __apps;
         const closeLoading = async delay => {
             const win = new BrowserWindow({ width: 200, height: 150, show: false });
@@ -414,7 +411,7 @@ fn closing_a_loading_window_keeps_the_app() {
             new BrowserWindow({ show: false }).loadFile('apps:///index.html');
         };
     "#;
-    let others = r#"
+  let others = r#"
         app.whenReady().then(async () => {
             const other = new BrowserWindow({ width: 200, height: 150, show: false });
             await run();
@@ -422,32 +419,31 @@ fn closing_a_loading_window_keeps_the_app() {
             console.log('CLOSE_LOADING_OK'); app.quit();
         });
     "#;
-    let listener = r#"
+  let listener = r#"
         app.on('window-all-closed', () => {});
         app.whenReady().then(async () => {
             await run();
             console.log('CLOSE_LOADING_OK'); app.quit();
         });
     "#;
-    for main in [others, listener] {
-        let output = run_window_test(&format!("{common}{main}"), page);
-        let text =
-            String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success() && text.contains("CLOSE_LOADING_OK"),
-            "{:?} {text}",
-            output.status
-        );
-    }
+  for main in [others, listener] {
+    let output = run_window_test(&format!("{common}{main}"), page);
+    let text = String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
+    assert!(
+      output.status.success() && text.contains("CLOSE_LOADING_OK"),
+      "{:?} {text}",
+      output.status
+    );
+  }
 }
 
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires the macOS window server"]
 fn animation_end_handlers_run_before_the_final_frame() {
-    use base64::Engine;
+  use base64::Engine;
 
-    let main = r#"
+  let main = r#"
         const { app, BrowserWindow } = __apps;
         app.whenReady().then(async () => {
             const win = new BrowserWindow({ width: 300, height: 200 });
@@ -461,7 +457,7 @@ fn animation_end_handlers_run_before_the_final_frame() {
             console.log('ANIMATION_PAINT_OK'); app.quit();
         });
     "#;
-    let page = r#"
+  let page = r#"
         <style>
             body { margin:0; background:lime; }
             div { width:100px; height:100px; background:red; }
@@ -473,40 +469,41 @@ fn animation_end_handlers_run_before_the_final_frame() {
             box.addEventListener('animationend', () => queueMicrotask(() => box.remove()));
         </script>
     "#;
-    let output = run_window_test(main, page);
-    let text = String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success() && text.contains("ANIMATION_PAINT_OK"),
-        "{text}"
-    );
-    let red: Vec<_> = text
-        .lines()
-        .filter_map(|line| line.strip_prefix("FRAME "))
-        .map(|encoded| {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .unwrap();
-            image::load_from_memory(&bytes)
-                .unwrap()
-                .to_rgba8()
-                .get_pixel(0, 0)[0]
-        })
-        .collect();
-    assert_eq!(red.len(), 40, "{text}");
-    assert!(red.iter().any(|&value| value > 0 && value < 250), "{red:?}");
-    assert_eq!(red.last(), Some(&0), "{red:?}");
-    assert!(
-        red.windows(2)
-            .all(|pair| pair[1] <= pair[0].saturating_add(2)),
-        "The closing popup flashed: {red:?}"
-    );
+  let output = run_window_test(main, page);
+  let text = String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
+  assert!(
+    output.status.success() && text.contains("ANIMATION_PAINT_OK"),
+    "{text}"
+  );
+  let red: Vec<_> = text
+    .lines()
+    .filter_map(|line| line.strip_prefix("FRAME "))
+    .map(|encoded| {
+      let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .unwrap();
+      image::load_from_memory(&bytes)
+        .unwrap()
+        .to_rgba8()
+        .get_pixel(0, 0)[0]
+    })
+    .collect();
+  assert_eq!(red.len(), 40, "{text}");
+  assert!(red.iter().any(|&value| value > 0 && value < 250), "{red:?}");
+  assert_eq!(red.last(), Some(&0), "{red:?}");
+  assert!(
+    red
+      .windows(2)
+      .all(|pair| pair[1] <= pair[0].saturating_add(2)),
+    "The closing popup flashed: {red:?}"
+  );
 }
 
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires the macOS window server"]
 fn textarea_content_sizing_follows_text_and_constraints() {
-    let main = r#"
+  let main = r#"
         const { app, BrowserWindow, ipcMain } = __apps;
         let finished = false;
         ipcMain.on('done', () => { finished = true; console.log('FIELD_SIZING_OK'); app.quit(); });
@@ -516,7 +513,7 @@ fn textarea_content_sizing_follows_text_and_constraints() {
             while (!finished) await win.webContents.capturePage();
         });
     "#;
-    let page = r#"
+  let page = r#"
         <style>
             textarea { display:block; font:16px/20px monospace; padding:6px; border:1px solid; width:200px; box-sizing:border-box; }
             #content { field-sizing:content; }
@@ -561,26 +558,26 @@ three</textarea></main>
             }, 200);
         </script>
     "#;
-    let output = run_window_test(main, page);
-    let text = String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success() && text.contains("FIELD_SIZING_OK"),
-        "{text}"
-    );
+  let output = run_window_test(main, page);
+  let text = String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
+  assert!(
+    output.status.success() && text.contains("FIELD_SIZING_OK"),
+    "{text}"
+  );
 }
 
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires the macOS window server"]
 fn layout_callbacks_can_request_the_next_frame() {
-    let main = r#"
+  let main = r#"
         const { app, BrowserWindow, ipcMain } = __apps;
         ipcMain.on('done', () => { console.log('FRAME_OK'); app.quit(); });
         app.whenReady().then(() => {
             new BrowserWindow({ width: 280, height: 120 }).loadFile('apps:///index.html');
         });
     "#;
-    let page = r#"
+  let page = r#"
         <body><div style='height:10px'></div>
         <script type='preload'>__apps.contextBridge.exposeInMainWorld('done', () => __apps.ipcRenderer.send('done'));</script>
         <script>
@@ -593,25 +590,25 @@ fn layout_callbacks_can_request_the_next_frame() {
             setTimeout(() => { observer.observe(box); box.style.height = '20px'; }, 300);
         </script>
     "#;
-    let output = run_window_test(main, page);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("FRAME_OK"));
+  let output = run_window_test(main, page);
+  assert!(
+    output.status.success(),
+    "{}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert!(String::from_utf8_lossy(&output.stdout).contains("FRAME_OK"));
 }
 
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires the macOS window server"]
 fn native_theme_updates_hidden_renderers_and_cached_styles() {
-    use std::{
-        io::Write,
-        process::{Command, Stdio},
-        time::{Duration, Instant},
-    };
-    let main = r#"
+  use std::{
+    io::Write,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+  };
+  let main = r#"
         const { app, BrowserWindow, ipcMain, nativeTheme } = __apps;
         nativeTheme.themeSource = 'dark';
         let reports = 0;
@@ -635,7 +632,7 @@ fn native_theme_updates_hidden_renderers_and_cached_styles() {
             setTimeout(() => { throw Error('Theme notification did not wake the idle runtime: ' + JSON.stringify({ reports, updates })); }, 5000);
         });
     "#;
-    let page = r#"
+  let page = r#"
         <style>body { color: black } @media (prefers-color-scheme: dark) { body { color: white } }</style>
         <body>
         <script type='preload'>__apps.contextBridge.exposeInMainWorld('report', (...args) => __apps.ipcRenderer.send('theme', ...args));</script>
@@ -649,50 +646,50 @@ fn native_theme_updates_hidden_renderers_and_cached_styles() {
             report(dark.matches, light.matches, getComputedStyle(document.body).color, changes);
         </script>
     "#;
-    let bundle = serde_json::json!({"files": [
+  let bundle = serde_json::json!({"files": [
         ["app.js", format!("$appsDefine({});", serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":main}))],
         ["index.html", page],
     ], "pages": []});
-    let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
-        .arg("--bundle-stdin")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(bundle.to_string().as_bytes())
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(12);
-    while child.try_wait().unwrap().is_none() {
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+  let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
+    .arg("--bundle-stdin")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  child
+    .stdin
+    .take()
+    .unwrap()
+    .write_all(bundle.to_string().as_bytes())
+    .unwrap();
+  let deadline = Instant::now() + Duration::from_secs(12);
+  while child.try_wait().unwrap().is_none() {
+    if Instant::now() >= deadline {
+      child.kill().unwrap();
+      break;
     }
-    let output = child.wait_with_output().unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success() && stdout.contains("NATIVE_THEME_OK"),
-        "{stdout}\n{stderr}"
-    );
+    std::thread::sleep(Duration::from_millis(50));
+  }
+  let output = child.wait_with_output().unwrap();
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    output.status.success() && stdout.contains("NATIVE_THEME_OK"),
+    "{stdout}\n{stderr}"
+  );
 }
 
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires the macOS window server"]
 fn native_browser_window_geometry_state_and_close() {
-    use std::{
-        io::Write,
-        process::{Command, Stdio},
-        time::{Duration, Instant},
-    };
-    let main = r#"
+  use std::{
+    io::Write,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+  };
+  let main = r#"
         const { app, BrowserWindow } = __apps;
         const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
         const once = (win, name) => new Promise((resolve, reject) => { const timer = setTimeout(() => reject(Error('No ' + name + ' event')), 5000); win.once(name, () => { clearTimeout(timer); resolve(); }); });
@@ -747,49 +744,49 @@ fn native_browser_window_geometry_state_and_close() {
             app.quit();
         });
     "#;
-    let bundle = serde_json::json!({"files": [
+  let bundle = serde_json::json!({"files": [
         ["app.js", format!("$appsDefine({});", serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":main}))],
     ], "pages": []});
-    let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
-        .arg("--bundle-stdin")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(bundle.to_string().as_bytes())
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(25);
-    while child.try_wait().unwrap().is_none() {
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+  let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
+    .arg("--bundle-stdin")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  child
+    .stdin
+    .take()
+    .unwrap()
+    .write_all(bundle.to_string().as_bytes())
+    .unwrap();
+  let deadline = Instant::now() + Duration::from_secs(25);
+  while child.try_wait().unwrap().is_none() {
+    if Instant::now() >= deadline {
+      child.kill().unwrap();
+      break;
     }
-    let output = child.wait_with_output().unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success() && stdout.contains("BROWSER_WINDOW_OK"),
-        "{stdout}\n{stderr}"
-    );
+    std::thread::sleep(Duration::from_millis(50));
+  }
+  let output = child.wait_with_output().unwrap();
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    output.status.success() && stdout.contains("BROWSER_WINDOW_OK"),
+    "{stdout}\n{stderr}"
+  );
 }
 
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires the macOS window server"]
 fn native_browser_window_extras_and_child_windows() {
-    use std::{
-        io::Write,
-        process::{Command, Stdio},
-        time::{Duration, Instant},
-    };
-    let lister = r#"
+  use std::{
+    io::Write,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+  };
+  let lister = r#"
         #import <Foundation/Foundation.h>
         #import <CoreGraphics/CoreGraphics.h>
         int main(int argc, char **argv) {
@@ -800,29 +797,29 @@ fn native_browser_window_extras_and_child_windows() {
             puts([[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:found options:0 error:nil] encoding:NSUTF8StringEncoding].UTF8String);
         }
     "#;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("windows.m"), lister).unwrap();
-    let binary = dir.path().join("windows");
-    let result = Command::new("xcrun")
-        .args([
-            "clang",
-            "-fobjc-arc",
-            "-framework",
-            "Foundation",
-            "-framework",
-            "CoreGraphics",
-            "-o",
-        ])
-        .arg(&binary)
-        .arg(dir.path().join("windows.m"))
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    let main = r#"
+  let dir = tempfile::tempdir().unwrap();
+  std::fs::write(dir.path().join("windows.m"), lister).unwrap();
+  let binary = dir.path().join("windows");
+  let result = Command::new("xcrun")
+    .args([
+      "clang",
+      "-fobjc-arc",
+      "-framework",
+      "Foundation",
+      "-framework",
+      "CoreGraphics",
+      "-o",
+    ])
+    .arg(&binary)
+    .arg(dir.path().join("windows.m"))
+    .output()
+    .unwrap();
+  assert!(
+    result.status.success(),
+    "{}",
+    String::from_utf8_lossy(&result.stderr)
+  );
+  let main = r#"
         const { app, BrowserWindow, child_process } = __apps;
         const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
         const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -927,36 +924,36 @@ fn native_browser_window_extras_and_child_windows() {
             app.quit();
         });
     "#;
-    let bundle = serde_json::json!({"files": [
+  let bundle = serde_json::json!({"files": [
         ["app.js", format!("$appsDefine({});", serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":main}))],
     ], "pages": []});
-    let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
-        .arg("--bundle-stdin")
-        .env("APPS_WINDOW_LIST", &binary)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(bundle.to_string().as_bytes())
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while child.try_wait().unwrap().is_none() {
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+  let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
+    .arg("--bundle-stdin")
+    .env("APPS_WINDOW_LIST", &binary)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  child
+    .stdin
+    .take()
+    .unwrap()
+    .write_all(bundle.to_string().as_bytes())
+    .unwrap();
+  let deadline = Instant::now() + Duration::from_secs(30);
+  while child.try_wait().unwrap().is_none() {
+    if Instant::now() >= deadline {
+      child.kill().unwrap();
+      break;
     }
-    let output = child.wait_with_output().unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success() && stdout.contains("BROWSER_WINDOW_EXTRAS_OK"),
-        "{stdout}\n{stderr}"
-    );
+    std::thread::sleep(Duration::from_millis(50));
+  }
+  let output = child.wait_with_output().unwrap();
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    output.status.success() && stdout.contains("BROWSER_WINDOW_EXTRAS_OK"),
+    "{stdout}\n{stderr}"
+  );
 }

@@ -1,19 +1,19 @@
 use apps_runtime::{
-    dom::Document,
-    host::Host,
-    host::context::JsContext,
-    jsc::{JavaScriptCore, Role},
-    render::Page,
+  dom::Document,
+  host::Host,
+  host::context::JsContext,
+  jsc::{JavaScriptCore, Role},
+  render::Page,
 };
 use std::{cell::RefCell, rc::Rc};
 
 fn offscreen_page(source: &str) -> (Rc<RefCell<Host>>, JsContext, String) {
-    let (wake, woken) = std::sync::mpsc::channel();
-    apps_runtime::jsc::Waker::install(move || {
-        let _ = wake.send(());
-    });
-    let (host, engine) = css_page("<body><canvas id=shown width=8 height=8></canvas></body>");
-    engine
+  let (wake, woken) = std::sync::mpsc::channel();
+  apps_runtime::jsc::Waker::install(move || {
+    let _ = wake.send(());
+  });
+  let (host, engine) = css_page("<body><canvas id=shown width=8 height=8></canvas></body>");
+  engine
         .eval(
             &format!(
                 r#"globalThis.testResult = 'pending';
@@ -27,25 +27,25 @@ fn offscreen_page(source: &str) -> (Rc<RefCell<Host>>, JsContext, String) {
             "test",
         )
         .unwrap();
-    let started = std::time::Instant::now();
-    let result = loop {
-        let result = engine.eval("testResult", "test").unwrap();
-        if result != "pending" {
-            break result;
-        }
-        let _ = woken.recv_timeout(std::time::Duration::from_millis(2));
-        engine.tick().unwrap();
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(30),
-            "Test timed out"
-        );
-    };
-    (host, engine, result)
+  let started = std::time::Instant::now();
+  let result = loop {
+    let result = engine.eval("testResult", "test").unwrap();
+    if result != "pending" {
+      break result;
+    }
+    let _ = woken.recv_timeout(std::time::Duration::from_millis(2));
+    engine.tick().unwrap();
+    assert!(
+      started.elapsed() < std::time::Duration::from_secs(30),
+      "Test timed out"
+    );
+  };
+  (host, engine, result)
 }
 
 fn checked_page(html: &str, script: &str) -> (Rc<RefCell<Host>>, JsContext) {
-    let (host, engine) = css_page(html);
-    let result = engine
+  let (host, engine) = css_page(html);
+  let result = engine
         .eval(
             &format!(
                 "(() => {{ const fails = []; const check = (name, fn) => {{ try {{ if (!fn()) fails.push(name); }} catch (e) {{ fails.push(name + ': ' + e.message); }} }}; {script}; return fails.join('\\n'); }})()"
@@ -53,26 +53,26 @@ fn checked_page(html: &str, script: &str) -> (Rc<RefCell<Host>>, JsContext) {
             "test",
         )
         .unwrap();
-    assert_eq!(result, "");
-    (host, engine)
+  assert_eq!(result, "");
+  (host, engine)
 }
 
 fn css_page(html: &str) -> (Rc<RefCell<Host>>, JsContext) {
-    let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow().store.borrow_mut().pages.insert(
-        1,
-        Page {
-            doc: Document::parse(html),
-            ..Default::default()
-        },
-    );
-    let engine = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        host.clone(),
-        Role::Renderer(1),
-    )
-    .unwrap();
-    (host, engine)
+  let host = Rc::new(RefCell::new(Host::default()));
+  host.borrow().store.borrow_mut().pages.insert(
+    1,
+    Page {
+      doc: Document::parse(html),
+      ..Default::default()
+    },
+  );
+  let engine = JsContext::new(
+    JavaScriptCore::load().unwrap(),
+    host.clone(),
+    Role::Renderer(1),
+  )
+  .unwrap();
+  (host, engine)
 }
 
 mod canvas;

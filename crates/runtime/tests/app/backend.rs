@@ -1,33 +1,33 @@
 use apps_runtime::{host::context::JsContext, jsc::JavaScriptCore, jsc::Role};
 use std::{
-    rc::Rc,
-    time::{Duration, Instant},
+  rc::Rc,
+  time::{Duration, Instant},
 };
 
 fn run(source: &str) {
-    let engine =
-        JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main).unwrap();
-    engine.eval(&format!("globalThis.result='pending'; (async()=>{{{source}}})().then(()=>result='ok',error=>result=String(error)+'\\n'+String(error.stack??''));"), "backend-tests").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        engine.tick().unwrap();
-        let result = engine.eval("result", "backend-result").unwrap();
-        if result != "pending" {
-            assert_eq!(result, "ok");
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "Backend test timed out: {}",
-            engine.eval("globalThis.phase", "phase").unwrap()
-        );
-        std::thread::sleep(Duration::from_millis(1));
+  let engine = JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main).unwrap();
+  engine.eval(&format!("globalThis.result='pending'; (async()=>{{{source}}})().then(()=>result='ok',error=>result=String(error)+'\\n'+String(error.stack??''));"), "backend-tests").unwrap();
+  let deadline = Instant::now() + Duration::from_secs(60);
+  loop {
+    engine.tick().unwrap();
+    let result = engine.eval("result", "backend-result").unwrap();
+    if result != "pending" {
+      assert_eq!(result, "ok");
+      break;
     }
+    assert!(
+      Instant::now() < deadline,
+      "Backend test timed out: {}",
+      engine.eval("globalThis.phase", "phase").unwrap()
+    );
+    std::thread::sleep(Duration::from_millis(1));
+  }
 }
 
 #[test]
 fn websocket_upgrade_protocols_binary_and_streaming_http() {
-    run(r#"
+  run(
+    r#"
         const assert=(v,m)=>{if(!v)throw Error(m)};
         let produced=false;
         const server=__apps.serve({hostname:'127.0.0.1',port:0,
@@ -61,12 +61,14 @@ fn websocket_upgrade_protocols_binary_and_streaming_http() {
         await received;assert(burst.every((v,i)=>v==='m'+i),'Burst sends are queued in order');
         const closed=new Promise(resolve=>socket.onclose=resolve);socket.close(3001,'complete');
         const close=await closed;assert(close.code===3001&&close.wasClean,'Close handshake');server.stop();
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn node_http_response_backpressure() {
-    run(r#"
+  run(
+    r#"
         let writes=0,full=0;
         const server=__apps.http.createServer((request,response)=>{const chunk=new Uint8Array(65536);const pump=()=>{while(writes<400){writes++;if(!response.write(chunk)){full++;response.once('drain',pump);return;}}response.end();};pump();}).listen(0,'127.0.0.1');
         await new Promise(resolve=>server.once('listening',resolve));
@@ -74,12 +76,14 @@ fn node_http_response_backpressure() {
         await new Promise(resolve=>setTimeout(resolve,100));const buffered=writes;
         for(;;){const {value,done}=await reader.read();if(done)break;size+=value.length;}server.close();
         if(!(full>0&&buffered<400&&size===400*65536))throw Error(`Unbounded response buffering: ${buffered} ${full} ${size}`);
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn signing_jwk_hmac_and_authenticated_encryption() {
-    run(r#"
+  run(
+    r#"
         const assert=(v,m)=>{if(!v)throw Error(m)}, bytes=new TextEncoder().encode('t3code');
         const pair=await crypto.subtle.generateKey({name:'ECDSA',namedCurve:'P-256'},true,['sign','verify']);
         const jwk=await crypto.subtle.exportKey('jwk',pair.privateKey);
@@ -96,12 +100,14 @@ fn signing_jwk_hmac_and_authenticated_encryption() {
         const hmac=await crypto.subtle.importKey('raw',bytes,{name:'HMAC',hash:'SHA-256'},false,['sign','verify']);
         const mac=await crypto.subtle.sign('HMAC',hmac,bytes);assert(await crypto.subtle.verify('HMAC',hmac,mac,bytes),'HMAC verification');
         assert(__apps.crypto.createHash('sha256').update('abc').digest('hex')==='ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad','Node hash');
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn workers_clone_sqlite_authorization_and_termination() {
-    run(r#"
+  run(
+    r#"
         const assert=(v,m)=>{if(!v)throw Error(m)};
         globalThis.phase="start";const {Worker}=__apps.worker_threads;
         const worker=new Worker(`const {parentPort,workerData}=require('node:worker_threads');const {DatabaseSync,constants}=require('node:sqlite');const db=new DatabaseSync(':memory:');db.exec('CREATE TABLE test(n INTEGER);INSERT INTO test VALUES (7)');db.setAuthorizer(action=>action===constants.SQLITE_DELETE?constants.SQLITE_DENY:constants.SQLITE_OK);parentPort.on('message',data=>{let denied=false;try{db.exec('DELETE FROM test')}catch{denied=true}parentPort.postMessage({n:db.prepare('SELECT * FROM test').get().n,columns:db.prepare('SELECT n FROM test').columns(),denied,data,workerData});});`,{eval:true,workerData:new Map([['key',4n]])});
@@ -122,12 +128,14 @@ fn workers_clone_sqlite_authorization_and_termination() {
         const finished=new Worker(`require('node:worker_threads').parentPort.postMessage('complete')`,{eval:true});
         assert(await new Promise((resolve,reject)=>{finished.on('exit',resolve);finished.on('error',reject)})===0,'Native worker exits when idle');await finished.terminate();
         const loop=new Worker('while(true){}',{eval:true});loop.on('error',()=>{});await new Promise(resolve=>setTimeout(resolve,30));phase='terminating-loop';await loop.terminate();phase='done';
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn sqlite_online_backup() {
-    run(r#"
+  run(
+    r#"
         const assert=(v,m)=>{if(!v)throw Error(m)},sqlite=__apps.sqlite,fs=__apps.fs;
         const folder=fs.mkdtempSync(__apps.os.tmpdir()+'/apps-backup-'),path=folder+'/copy.sqlite',db=new sqlite.DatabaseSync(':memory:');
         try{
@@ -135,12 +143,14 @@ fn sqlite_online_backup() {
             await sqlite.backup(db,path,{rate:1,progress:()=>progress++});
             const copy=new sqlite.DatabaseSync(path);assert(copy.prepare('SELECT value FROM records').get().value==='saved','Backup contains committed data');copy.close();assert(progress>0,'Backup progress');
         }finally{db.close();fs.rmSync(folder,{recursive:true,force:true})}
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn tcp_half_close_and_peer_addresses() {
-    run(r#"
+  run(
+    r#"
         const assert=(v,m)=>{if(!v)throw Error(m)},net=__apps.module.createRequire()('net');
         assert(net.isIP('::1')===6&&net.isIP('127.0.0.1')===4&&net.isIP('invalid')===0,'IP parsing');
         const server=net.createServer({allowHalfOpen:true},socket=>{
@@ -163,40 +173,42 @@ fn tcp_half_close_and_peer_addresses() {
         for(let i=0;i<500&&echoed.reduce((n,c)=>n+c.length,0)<payload.length;i++)await new Promise(resolve=>setTimeout(resolve,2));
         const joined=__apps.buffer.Buffer.concat(echoed);assert(joined.length===payload.length&&joined.every((v,i)=>v===payload[i]),'Unix socket options and binary echo');
         local.destroy();await new Promise(resolve=>ipc.close(resolve));assert(!__apps.fs.existsSync(path),'Closing removes the socket file');
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn durable_browser_storage_crypto_keys_and_transactions() {
-    if std::env::var_os("APPS_STORAGE_TEST_CHILD").is_none() {
-        let root = std::env::temp_dir().join(format!(
-            "apps-browser-storage-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "durable_browser_storage_crypto_keys_and_transactions",
-                "--nocapture",
-            ])
-            .env("APPS_STORAGE_TEST_CHILD", "1")
-            .env("APPS_DATA_DIR", &root)
-            .output()
-            .unwrap();
-        let _ = std::fs::remove_dir_all(root);
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
-    run(r#"
+  if std::env::var_os("APPS_STORAGE_TEST_CHILD").is_none() {
+    let root = std::env::temp_dir().join(format!(
+      "apps-browser-storage-{}-{}",
+      std::process::id(),
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+      .args([
+        "--exact",
+        "durable_browser_storage_crypto_keys_and_transactions",
+        "--nocapture",
+      ])
+      .env("APPS_STORAGE_TEST_CHILD", "1")
+      .env("APPS_DATA_DIR", &root)
+      .output()
+      .unwrap();
+    let _ = std::fs::remove_dir_all(root);
+    assert!(
+      output.status.success(),
+      "{}\n{}",
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr)
+    );
+    return;
+  }
+  run(
+    r#"
         const assert=(v,m)=>{if(!v)throw Error(m)};
         const req=request=>new Promise((resolve,reject)=>{request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error)});
         const done=tx=>new Promise((resolve,reject)=>{tx.oncomplete=resolve;tx.onabort=()=>reject(tx.error)});
@@ -230,8 +242,10 @@ fn durable_browser_storage_crypto_keys_and_transactions() {
         const popped=new Promise(resolve=>addEventListener('popstate',resolve,{once:true}));history.back();await popped;assert(location.pathname==='/start','History back');
         const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));location.hash='chat';await changed;assert(location.hash==='#chat','Hash change');
         assert(globalThis.__appsStorageClone===undefined&&globalThis.__appsCryptoCodec===undefined&&globalThis.__appsBytes===undefined&&globalThis.__appsRetries===undefined,'Private key codecs hidden');
-    "#);
-    run(r#"
+    "#,
+  );
+  run(
+    r#"
         const assert=(v,m)=>{if(!v)throw Error(m)};
         const req=request=>new Promise((resolve,reject)=>{request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error)});
         assert(localStorage.getItem('language')==='en'&&sessionStorage.getItem('tab')==='saved','Storage survives context recreation');
@@ -240,12 +254,14 @@ fn durable_browser_storage_crypto_keys_and_transactions() {
         const bytes=new TextEncoder().encode('persisted proof'), algorithm={name:'ECDSA',hash:'SHA-256'},signature=await crypto.subtle.sign(algorithm,pair.privateKey,bytes);
         assert(await crypto.subtle.verify(algorithm,pair.publicKey,signature,bytes),'Persisted key signs');
         let denied=false;try{await crypto.subtle.exportKey('jwk',pair.privateKey)}catch{denied=true}assert(denied,'Persisted private key still nonextractable');db.close();
-    "#);
+    "#,
+  );
 }
 
 #[test]
 fn workers_never_block_on_post_and_own_no_process_state() {
-    run(r#"
+  run(
+    r#"
         const assert=(v,m)=>{if(!v)throw Error(m)};
         const {Worker}=__apps.worker_threads,fs=__apps.fs;
         const shared=new Int32Array(new SharedArrayBuffer(4));
@@ -260,5 +276,6 @@ fn workers_never_block_on_post_and_own_no_process_state() {
         assert(reply.chdir==='ERR_WORKER_UNSUPPORTED_OPERATION','Worker chdir: '+reply.chdir);
         await probe.terminate();fs.closeSync(fd);fs.rmSync(dir,{recursive:true});
         process.chdir(process.cwd());
-    "#);
+    "#,
+  );
 }

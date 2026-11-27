@@ -1,13 +1,13 @@
 use crate::css::{
-    properties::Prop, sheet::Declaration, sheet::Declarations, sheet::MediaQuery, sheet::Rule,
-    sheet::Stylesheet, value::grammar::computed, value::grammar::registered_matches,
-    value::grammar::registrable, value::grammar::supports, value::tokens::components,
+  properties::Prop, sheet::Declaration, sheet::Declarations, sheet::MediaQuery, sheet::Rule,
+  sheet::Stylesheet, value::grammar::computed, value::grammar::registered_matches,
+  value::grammar::registrable, value::grammar::supports, value::tokens::components,
 };
 use crate::css::{selector::Selector, selector::SelectorList, value::units::Lengths};
 use cssparser::{
-    AtRuleParser, CowRcStr, DeclarationParser, Delimiter, ParseError, Parser, ParserState,
-    QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser, StyleSheetParser, Token,
-    TokenSerializationType, parse_important,
+  AtRuleParser, CowRcStr, DeclarationParser, Delimiter, ParseError, Parser, ParserState,
+  QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser, StyleSheetParser, Token,
+  TokenSerializationType, parse_important,
 };
 use std::rc::Rc;
 
@@ -23,1700 +23,1693 @@ thread_local! {
 
 #[derive(Default)]
 struct Rules {
-    parent: Option<SelectorList>,
-    top_level: bool,
-    declarations_only: bool,
-    descriptors: bool,
-    theme: bool,
-    // In an `@scope` rule, the selector that keeps a rule in the scope.
-    scope: Option<String>,
-    suffix: String,
+  parent: Option<SelectorList>,
+  top_level: bool,
+  declarations_only: bool,
+  descriptors: bool,
+  theme: bool,
+  // In an `@scope` rule, the selector that keeps a rule in the scope.
+  scope: Option<String>,
+  suffix: String,
 }
 
 enum Item {
-    Rule(Rule),
-    Scope(String, Option<String>),
-    Starting,
-    Declaration(Declaration),
+  Rule(Rule),
+  Scope(String, Option<String>),
+  Starting,
+  Declaration(Declaration),
 }
 
 impl Stylesheet {
-    pub(crate) fn parse(source: &str) -> Self {
-        let mut input = Parser::new(source);
-        input.set_nested_block_limit(128);
-        let mut parser = Rules {
-            top_level: true,
-            ..Rules::default()
-        };
-        Self(
-            StyleSheetParser::new(&mut input, &mut parser)
-                .filter_map(|item| match item.ok()? {
-                    Item::Rule(rule) => Some(Rc::new(rule)),
-                    _ => None,
-                })
-                .collect(),
-        )
-    }
+  pub(crate) fn parse(source: &str) -> Self {
+    let mut input = Parser::new(source);
+    input.set_nested_block_limit(128);
+    let mut parser = Rules {
+      top_level: true,
+      ..Rules::default()
+    };
+    Self(
+      StyleSheetParser::new(&mut input, &mut parser)
+        .filter_map(|item| match item.ok()? {
+          Item::Rule(rule) => Some(Rc::new(rule)),
+          _ => None,
+        })
+        .collect(),
+    )
+  }
 }
 
 impl Rule {
-    pub(crate) fn parse_nested(source: &str, parent: &SelectorList) -> Vec<Rule> {
-        let mut input = Parser::new(source);
-        input.set_nested_block_limit(128);
-        Rules {
-            parent: Some(parent.clone()),
-            ..Rules::default()
-        }
-        .body(&mut input)
+  pub(crate) fn parse_nested(source: &str, parent: &SelectorList) -> Vec<Rule> {
+    let mut input = Parser::new(source);
+    input.set_nested_block_limit(128);
+    Rules {
+      parent: Some(parent.clone()),
+      ..Rules::default()
     }
+    .body(&mut input)
+  }
 }
 
 impl Declarations {
-    pub(crate) fn parse(source: &str) -> Self {
-        Self::parse_input(&mut Parser::new(source), false)
-    }
+  pub(crate) fn parse(source: &str) -> Self {
+    Self::parse_input(&mut Parser::new(source), false)
+  }
 
-    pub(crate) fn descriptors(source: &str) -> Self {
-        Self::parse_input(&mut Parser::new(source), true)
-    }
+  pub(crate) fn descriptors(source: &str) -> Self {
+    Self::parse_input(&mut Parser::new(source), true)
+  }
 
-    pub(crate) fn parse_input(input: &mut Parser<'_>, descriptors: bool) -> Self {
-        let mut parser = Rules {
-            declarations_only: true,
-            descriptors,
-            ..Rules::default()
-        };
-        Self(
-            RuleBodyParser::new(input, &mut parser)
-                .filter_map(|item| match item.ok()? {
-                    Item::Declaration(declaration) => Some(declaration),
-                    _ => None,
-                })
-                .collect(),
-        )
-    }
+  pub(crate) fn parse_input(input: &mut Parser<'_>, descriptors: bool) -> Self {
+    let mut parser = Rules {
+      declarations_only: true,
+      descriptors,
+      ..Rules::default()
+    };
+    Self(
+      RuleBodyParser::new(input, &mut parser)
+        .filter_map(|item| match item.ok()? {
+          Item::Declaration(declaration) => Some(declaration),
+          _ => None,
+        })
+        .collect(),
+    )
+  }
 }
 
 impl Rules {
-    pub(crate) fn body(&mut self, input: &mut Parser<'_>) -> Vec<Rule> {
-        let theme = self.theme;
-        let mut rules = Vec::new();
-        for item in RuleBodyParser::new(input, self) {
-            let declaration = match item {
-                Ok(Item::Rule(rule)) => {
-                    rules.push(rule);
-                    continue;
-                }
-                Ok(Item::Declaration(declaration)) => declaration,
-                Ok(Item::Scope(..) | Item::Starting) => continue,
-                // `--color-*: initial` is no declaration for the tokenizer, so it comes as an error.
-                Err((_, source, _)) if theme => match source.split_once(':') {
-                    Some((name, value))
-                        if name.trim().starts_with("--")
-                            && name.trim().ends_with("-*")
-                            && value.trim().trim_end_matches(';').trim() == "initial" =>
-                    {
-                        Declaration::Property(name.trim().into(), "initial".into())
-                    }
-                    _ => continue,
-                },
-                Err(_) => continue,
-            };
-            if let Some(Rule::Declarations(values)) = rules.last_mut() {
-                values.0.push(declaration);
-            } else {
-                rules.push(Rule::Declarations(Declarations(vec![declaration])));
-            }
+  pub(crate) fn body(&mut self, input: &mut Parser<'_>) -> Vec<Rule> {
+    let theme = self.theme;
+    let mut rules = Vec::new();
+    for item in RuleBodyParser::new(input, self) {
+      let declaration = match item {
+        Ok(Item::Rule(rule)) => {
+          rules.push(rule);
+          continue;
         }
-        rules
+        Ok(Item::Declaration(declaration)) => declaration,
+        Ok(Item::Scope(..) | Item::Starting) => continue,
+        // `--color-*: initial` is no declaration for the tokenizer, so it comes as an error.
+        Err((_, source, _)) if theme => match source.split_once(':') {
+          Some((name, value))
+            if name.trim().starts_with("--")
+              && name.trim().ends_with("-*")
+              && value.trim().trim_end_matches(';').trim() == "initial" =>
+          {
+            Declaration::Property(name.trim().into(), "initial".into())
+          }
+          _ => continue,
+        },
+        Err(_) => continue,
+      };
+      if let Some(Rule::Declarations(values)) = rules.last_mut() {
+        values.0.push(declaration);
+      } else {
+        rules.push(Rule::Declarations(Declarations(vec![declaration])));
+      }
     }
+    rules
+  }
 }
 
 impl<'i> DeclarationParser<'i> for Rules {
-    type Declaration = Item;
-    type Error = ();
+  type Declaration = Item;
+  type Error = ();
 
-    fn parse_value(
-        &mut self,
-        name: CowRcStr<'i>,
-        input: &mut Parser<'i>,
-        _: &ParserState,
-    ) -> Result<Item, ParseError<()>> {
-        let custom = name.starts_with("--");
-        input.skip_whitespace();
-        let mut value = String::new();
-        let separator = if custom { "/**/" } else { " " };
-        let delimiters = if custom {
-            Delimiter::Bang
-        } else {
-            Delimiter::Bang | Delimiter::CurlyBracketBlock
-        };
-        let start = input.position();
-        input.parse_until_before(delimiters, |input| source(input, &mut value, separator))?;
-        // Like Chrome, a custom property keeps its text as written.
-        if custom {
-            value = input.slice_from(start).to_owned();
-        }
-        value.truncate(value.trim_end().len());
-        if value.contains("-webkit-calc(") {
-            value = value.replace("-webkit-calc(", "calc(");
-        }
-        if value.contains("env(") {
-            value = environment(&value);
-        }
-        if value.is_empty() && !custom {
-            return Err(ParseError::unexpected_token());
-        }
-        if input.try_parse(parse_important).is_ok() {
-            value.push_str(" !important");
-        }
-        input.expect_exhausted()?;
-        let name = if custom {
-            name.to_string()
-        } else if name.eq_ignore_ascii_case("-webkit-app-region") {
-            "app-region".into()
-        } else {
-            let name = name.to_ascii_lowercase();
-            match Prop::unprefixed(&name) {
-                Some(base) => base.to_owned(),
-                None => name,
-            }
-        };
-        // Like Chrome, a font weight is `normal`, `bold`, `auto`, or one or two numbers in [1, 1000].
-        if self.descriptors && name == "font-weight" {
-            let weights = components(&value, ' ');
-            if weights.len() > 2
-                || weights.iter().any(|weight| match weight.parse::<f64>() {
-                    Ok(weight) => !(1. ..=1000.).contains(&weight),
-                    Err(_) => {
-                        !(weight.starts_with("calc(")
-                            || weights.len() == 1 && matches!(*weight, "normal" | "bold" | "auto"))
-                    }
-                })
-            {
-                return Err(ParseError::unexpected_token());
-            }
-        }
-        if !custom
-            && !self.descriptors
-            && !self.theme
-            && invalid(&name, value.strip_suffix(" !important").unwrap_or(&value))
-        {
-            DROPPED.with_borrow_mut(|dropped| {
-                if dropped.len() < 256 {
-                    dropped.insert(format!("{name}: {value}"));
-                }
-            });
-            return Err(ParseError::unexpected_token());
-        }
-        Ok(Item::Declaration(Declaration::Property(name, value)))
+  fn parse_value(
+    &mut self,
+    name: CowRcStr<'i>,
+    input: &mut Parser<'i>,
+    _: &ParserState,
+  ) -> Result<Item, ParseError<()>> {
+    let custom = name.starts_with("--");
+    input.skip_whitespace();
+    let mut value = String::new();
+    let separator = if custom { "/**/" } else { " " };
+    let delimiters = if custom {
+      Delimiter::Bang
+    } else {
+      Delimiter::Bang | Delimiter::CurlyBracketBlock
+    };
+    let start = input.position();
+    input.parse_until_before(delimiters, |input| source(input, &mut value, separator))?;
+    // Like Chrome, a custom property keeps its text as written.
+    if custom {
+      value = input.slice_from(start).to_owned();
     }
+    value.truncate(value.trim_end().len());
+    if value.contains("-webkit-calc(") {
+      value = value.replace("-webkit-calc(", "calc(");
+    }
+    if value.contains("env(") {
+      value = environment(&value);
+    }
+    if value.is_empty() && !custom {
+      return Err(ParseError::unexpected_token());
+    }
+    if input.try_parse(parse_important).is_ok() {
+      value.push_str(" !important");
+    }
+    input.expect_exhausted()?;
+    let name = if custom {
+      name.to_string()
+    } else if name.eq_ignore_ascii_case("-webkit-app-region") {
+      "app-region".into()
+    } else {
+      let name = name.to_ascii_lowercase();
+      match Prop::unprefixed(&name) {
+        Some(base) => base.to_owned(),
+        None => name,
+      }
+    };
+    // Like Chrome, a font weight is `normal`, `bold`, `auto`, or one or two numbers in [1, 1000].
+    if self.descriptors && name == "font-weight" {
+      let weights = components(&value, ' ');
+      if weights.len() > 2
+        || weights.iter().any(|weight| match weight.parse::<f64>() {
+          Ok(weight) => !(1. ..=1000.).contains(&weight),
+          Err(_) => {
+            !(weight.starts_with("calc(")
+              || weights.len() == 1 && matches!(*weight, "normal" | "bold" | "auto"))
+          }
+        })
+      {
+        return Err(ParseError::unexpected_token());
+      }
+    }
+    if !custom
+      && !self.descriptors
+      && !self.theme
+      && invalid(&name, value.strip_suffix(" !important").unwrap_or(&value))
+    {
+      DROPPED.with_borrow_mut(|dropped| {
+        if dropped.len() < 256 {
+          dropped.insert(format!("{name}: {value}"));
+        }
+      });
+      return Err(ParseError::unexpected_token());
+    }
+    Ok(Item::Declaration(Declaration::Property(name, value)))
+  }
 }
 
 // Sheets and `var()` results repeat declarations, so each `property:value` is checked once.
 pub(crate) fn invalid(name: &str, plain: &str) -> bool {
-    VALID.with_borrow_mut(|(key, valid)| {
-        // An exact key starts with a zero byte. A miss also tries the shared key that follows it.
-        key.clear();
-        key.push(0);
-        key.extend_from_slice(name.as_bytes());
-        key.push(b':');
-        key.extend_from_slice(plain.as_bytes());
-        if let Some(&result) = valid.get(key.as_slice()) {
-            return result;
+  VALID.with_borrow_mut(|(key, valid)| {
+    // An exact key starts with a zero byte. A miss also tries the shared key that follows it.
+    key.clear();
+    key.push(0);
+    key.extend_from_slice(name.as_bytes());
+    key.push(b':');
+    key.extend_from_slice(plain.as_bytes());
+    if let Some(&result) = valid.get(key.as_slice()) {
+      return result;
+    }
+    let exact = key.len();
+    key.extend_from_slice(name.as_bytes());
+    key.push(b':');
+    // Validity never depends on which nonzero digits a number with a unit has, so `1px` and `27px` share an
+    // entry. Plain numbers can have a range, like `cubic-bezier(2, 0, 0, 1)`, and with an exponent every digit
+    // counts, like `1.25e1`, so these stay as written.
+    let (bytes, mut index, mut word) = (plain.as_bytes(), 0, false);
+    while let Some(&byte) = bytes.get(index) {
+      index += 1;
+      if byte.is_ascii_digit() && !word {
+        let (start, mut zero) = (index - 1, byte == b'0');
+        while let Some(&digit) = bytes.get(index).filter(|b| b.is_ascii_digit()) {
+          zero &= digit == b'0';
+          index += 1;
         }
-        let exact = key.len();
-        key.extend_from_slice(name.as_bytes());
-        key.push(b':');
-        // Validity never depends on which nonzero digits a number with a unit has, so `1px` and `27px` share an
-        // entry. Plain numbers can have a range, like `cubic-bezier(2, 0, 0, 1)`, and with an exponent every digit
-        // counts, like `1.25e1`, so these stay as written.
-        let (bytes, mut index, mut word) = (plain.as_bytes(), 0, false);
-        while let Some(&byte) = bytes.get(index) {
-            index += 1;
-            if byte.is_ascii_digit() && !word {
-                let (start, mut zero) = (index - 1, byte == b'0');
-                while let Some(&digit) = bytes.get(index).filter(|b| b.is_ascii_digit()) {
-                    zero &= digit == b'0';
-                    index += 1;
-                }
-                if matches!(bytes.get(index), Some(b'e' | b'E')) {
-                    let sign = usize::from(matches!(bytes.get(index + 1), Some(b'+' | b'-')));
-                    if bytes.get(index + 1 + sign).is_some_and(u8::is_ascii_digit) {
-                        index += 2 + sign;
-                        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-                            index += 1;
-                        }
-                        key.extend_from_slice(&bytes[start..index]);
-                        continue;
-                    }
-                }
-                match bytes.get(index) {
-                    Some(unit) if unit.is_ascii_alphabetic() || *unit == b'%' => {
-                        key.push(if zero { b'0' } else { b'1' })
-                    }
-                    _ => key.extend_from_slice(&bytes[start..index]),
-                }
-                continue;
+        if matches!(bytes.get(index), Some(b'e' | b'E')) {
+          let sign = usize::from(matches!(bytes.get(index + 1), Some(b'+' | b'-')));
+          if bytes.get(index + 1 + sign).is_some_and(u8::is_ascii_digit) {
+            index += 2 + sign;
+            while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+              index += 1;
             }
-            word = byte.is_ascii_alphanumeric()
-                || byte >= 0x80
-                || matches!(byte, b'#' | b'_' | b'\\')
-                || byte == b'-' && word;
-            key.push(byte);
+            key.extend_from_slice(&bytes[start..index]);
+            continue;
+          }
         }
-        let shared = valid.get(&key[exact..]).copied();
-        let result = shared.unwrap_or_else(|| {
-            !["env(", "attr(", "theme(", "--spacing(", "--alpha("]
-                .iter()
-                .any(|function| plain.contains(function))
-                && supports(name, plain) == Some(false)
-        });
-        if valid.len() > 8192 {
-            valid.clear();
+        match bytes.get(index) {
+          Some(unit) if unit.is_ascii_alphabetic() || *unit == b'%' => {
+            key.push(if zero { b'0' } else { b'1' })
+          }
+          _ => key.extend_from_slice(&bytes[start..index]),
         }
-        if shared.is_none() || valid.is_empty() {
-            valid.insert(key[exact..].into(), result);
-        }
-        valid.insert(key[..exact].into(), result);
-        result
-    })
+        continue;
+      }
+      word = byte.is_ascii_alphanumeric()
+        || byte >= 0x80
+        || matches!(byte, b'#' | b'_' | b'\\')
+        || byte == b'-' && word;
+      key.push(byte);
+    }
+    let shared = valid.get(&key[exact..]).copied();
+    let result = shared.unwrap_or_else(|| {
+      !["env(", "attr(", "theme(", "--spacing(", "--alpha("]
+        .iter()
+        .any(|function| plain.contains(function))
+        && supports(name, plain) == Some(false)
+    });
+    if valid.len() > 8192 {
+      valid.clear();
+    }
+    if shared.is_none() || valid.is_empty() {
+      valid.insert(key[exact..].into(), result);
+    }
+    valid.insert(key[..exact].into(), result);
+    result
+  })
 }
 
 impl<'i> QualifiedRuleParser<'i> for Rules {
-    type Prelude = SelectorList;
-    type QualifiedRule = Item;
-    type Error = ();
+  type Prelude = SelectorList;
+  type QualifiedRule = Item;
+  type Error = ();
 
-    fn parse_prelude(&mut self, input: &mut Parser<'i>) -> Result<SelectorList, ParseError<()>> {
-        let mut value = String::new();
-        source(input, &mut value, "/**/")?;
-        if self.scope.is_some() || !self.suffix.is_empty() {
-            let mut depth = 0;
-            // Each selector, and whether it has `&` or `:scope` outside of functions.
-            let mut parts = vec![(String::new(), false)];
-            for (at, c) in value.char_indices() {
-                depth += i32::from(matches!(c, '(' | '[')) - i32::from(matches!(c, ')' | ']'));
-                match parts.last_mut() {
-                    Some(_) if c == ',' && depth == 0 => parts.push((String::new(), false)),
-                    Some((part, top)) => {
-                        *top |= depth == 0 && (c == '&' || value[at..].starts_with(":scope"));
-                        part.push(c);
-                    }
-                    None => {}
-                }
+  fn parse_prelude(&mut self, input: &mut Parser<'i>) -> Result<SelectorList, ParseError<()>> {
+    let mut value = String::new();
+    source(input, &mut value, "/**/")?;
+    if self.scope.is_some() || !self.suffix.is_empty() {
+      let mut depth = 0;
+      // Each selector, and whether it has `&` or `:scope` outside of functions.
+      let mut parts = vec![(String::new(), false)];
+      for (at, c) in value.char_indices() {
+        depth += i32::from(matches!(c, '(' | '[')) - i32::from(matches!(c, ')' | ']'));
+        match parts.last_mut() {
+          Some(_) if c == ',' && depth == 0 => parts.push((String::new(), false)),
+          Some((part, top)) => {
+            *top |= depth == 0 && (c == '&' || value[at..].starts_with(":scope"));
+            part.push(c);
+          }
+          None => {}
+        }
+      }
+      value = parts
+        .iter()
+        .map(|(part, top)| {
+          // `&` or `:scope` only inside a function, like `:not(:scope)`, doesn't keep the selector
+          // in the scope.
+          let bound = match &self.scope {
+            Some(bound) if !top && (part.contains('&') || part.contains(":scope")) => {
+              bound.as_str()
             }
-            value = parts
-                .iter()
-                .map(|(part, top)| {
-                    // `&` or `:scope` only inside a function, like `:not(:scope)`, doesn't keep the selector
-                    // in the scope.
-                    let bound = match &self.scope {
-                        Some(bound) if !top && (part.contains('&') || part.contains(":scope")) => {
-                            bound.as_str()
-                        }
-                        _ => "",
-                    };
-                    format!("{}{bound}{}", part.trim(), self.suffix)
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-        }
-        let selectors = if self.scope.is_some() {
-            Selector::parse_scoped(&value, self.parent.as_ref())
-        } else {
-            Selector::parse(&value, self.parent.as_ref())
-        };
-        if selectors.is_empty() {
-            return Err(ParseError::unexpected_token());
-        }
-        Ok(Rc::new(selectors))
+            _ => "",
+          };
+          format!("{}{bound}{}", part.trim(), self.suffix)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     }
+    let selectors = if self.scope.is_some() {
+      Selector::parse_scoped(&value, self.parent.as_ref())
+    } else {
+      Selector::parse(&value, self.parent.as_ref())
+    };
+    if selectors.is_empty() {
+      return Err(ParseError::unexpected_token());
+    }
+    Ok(Rc::new(selectors))
+  }
 
-    fn parse_block(
-        &mut self,
-        selectors: SelectorList,
-        _: &ParserState,
-        input: &mut Parser<'i>,
-    ) -> Result<Item, ParseError<()>> {
-        let children = Rules {
-            parent: Some(selectors.clone()),
-            ..Rules::default()
-        }
-        .body(input);
-        Ok(Item::Rule(Rule::Style(selectors, children)))
+  fn parse_block(
+    &mut self,
+    selectors: SelectorList,
+    _: &ParserState,
+    input: &mut Parser<'i>,
+  ) -> Result<Item, ParseError<()>> {
+    let children = Rules {
+      parent: Some(selectors.clone()),
+      ..Rules::default()
     }
+    .body(input);
+    Ok(Item::Rule(Rule::Style(selectors, children)))
+  }
 }
 
 impl<'i> AtRuleParser<'i> for Rules {
-    type Prelude = Item;
-    type AtRule = Item;
-    type Error = ();
+  type Prelude = Item;
+  type AtRule = Item;
+  type Error = ();
 
-    fn parse_prelude(
-        &mut self,
-        name: CowRcStr<'i>,
-        input: &mut Parser<'i>,
-    ) -> Result<Item, ParseError<()>> {
-        if name.eq_ignore_ascii_case("import") && self.top_level {
-            let url = input.expect_url_or_string()?.clone();
-            let name = url.strip_suffix(".css").unwrap_or(&url);
-            if !matches!(
-                name,
-                "tailwindcss"
-                    | "tailwindcss/index"
-                    | "tailwindcss/preflight"
-                    | "tailwindcss/theme"
-                    | "tailwindcss/utilities"
-            ) {
-                return Err(ParseError::unexpected_token());
-            }
-            let options = text(input)?;
-            return Ok(Item::Rule(Rule::Tailwind(format!(
-                "import \"{name}\" {options}"
-            ))));
-        }
-        if (name.eq_ignore_ascii_case("reference") || name.eq_ignore_ascii_case("source"))
-            && self.top_level
-        {
-            let options = text(input)?;
-            let name = name.to_ascii_lowercase();
-            return Ok(Item::Rule(Rule::Tailwind(format!("{name} {options}"))));
-        }
-        if name.eq_ignore_ascii_case("tailwind") && self.parent.is_none() {
-            input.expect_ident_matching("utilities")?;
-            while input.next().is_ok() {}
-            return Ok(Item::Rule(Rule::Tailwind("tailwind utilities".into())));
-        }
-        if (name.eq_ignore_ascii_case("keyframes")
-            || name.eq_ignore_ascii_case("-webkit-keyframes"))
-            && !self.declarations_only
-        {
-            let name = input.expect_ident_or_string()?.to_string();
-            input.expect_exhausted()?;
-            return Ok(Item::Rule(Rule::Keyframes(name, Vec::new())));
-        }
-        let custom = name.eq_ignore_ascii_case("custom-variant") && self.top_level;
-        if custom || name.eq_ignore_ascii_case("variant") && !self.declarations_only {
-            let text = text(input)?;
-            let end = text
-                .find(|c: char| c == '(' || c.is_whitespace())
-                .unwrap_or(text.len());
-            let (name, template) = (&text[..end], text[end..].trim());
-            return Ok(Item::Rule(match template.strip_prefix('(') {
-                Some(template) if self.top_level => Rule::CustomVariant(
-                    name.to_owned(),
-                    template
-                        .strip_suffix(')')
-                        .unwrap_or(template)
-                        .trim()
-                        .to_owned(),
-                ),
-                _ if custom && !template.is_empty() => return Err(ParseError::unexpected_token()),
-                _ if custom => Rule::CustomVariant(text, String::new()),
-                _ => Rule::VariantBlock(text, String::new()),
-            }));
-        }
-        if name.eq_ignore_ascii_case("theme") && self.parent.is_none() {
-            return Ok(Item::Rule(Rule::Theme(text(input)?, Vec::new())));
-        }
-        if name.eq_ignore_ascii_case("property")
-            && self.parent.is_none()
-            && !self.declarations_only
-            && !self.theme
-        {
-            let name = input.expect_ident_cloned()?.to_string();
-            input.expect_exhausted()?;
-            if !name.starts_with("--") {
-                return Err(ParseError::unexpected_token());
-            }
-            return Ok(Item::Rule(Rule::Property(name, String::new(), false, None)));
-        }
-        if name.eq_ignore_ascii_case("scope") && !self.declarations_only && !self.theme {
-            let group = |input: &mut Parser<'i>| -> Result<String, ParseError<()>> {
-                input.expect_parenthesis_block()?;
-                let mut text = String::new();
-                input.parse_nested_block(|input| source(input, &mut text, "/**/"))?;
-                Ok(text.trim().to_owned())
-            };
-            let start = input.try_parse(group).ok();
-            let end = input
-                .try_parse(|input| {
-                    input.expect_ident_matching("to")?;
-                    group(input)
-                })
-                .ok();
-            input.expect_exhausted()?;
-            return Ok(Item::Scope(start.unwrap_or_else(|| ":root".into()), end));
-        }
-        if name.eq_ignore_ascii_case("starting-style") && !self.declarations_only && !self.theme {
-            input.expect_exhausted()?;
-            return Ok(Item::Starting);
-        }
-        if name.eq_ignore_ascii_case("font-face")
-            && self.parent.is_none()
-            && !self.declarations_only
-            && !self.theme
-        {
-            input.expect_exhausted()?;
-            return Ok(Item::Rule(Rule::FontFace(Declarations::default())));
-        }
-        if name.eq_ignore_ascii_case("position-try")
-            && self.parent.is_none()
-            && !self.declarations_only
-            && !self.theme
-        {
-            let name = input.expect_ident_cloned()?.to_string();
-            input.expect_exhausted()?;
-            if !name.starts_with("--") {
-                return Err(ParseError::unexpected_token());
-            }
-            return Ok(Item::Rule(Rule::PositionTry(name, Declarations::default())));
-        }
-        if name.eq_ignore_ascii_case("utility") && self.top_level {
-            let mut name = text(input)?;
-            name.retain(|c| !c.is_whitespace());
-            return Ok(Item::Rule(Rule::Utility(name, String::new())));
-        }
-        if name.eq_ignore_ascii_case("apply") && self.parse_declarations() {
-            // Class names keep adjacent tokens as written, like `py-1.5`.
-            return Ok(Item::Declaration(Declaration::Apply(
-                components(&text(input)?, ' ')
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect(),
-            )));
-        }
-        if name.eq_ignore_ascii_case("layer") && !self.declarations_only {
-            let mut value = String::new();
-            source(input, &mut value, "/**/")?;
-            return Ok(Item::Rule(Rule::Layer(
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-                    .collect(),
-                Vec::new(),
-            )));
-        }
-        if name.eq_ignore_ascii_case("supports") && !self.declarations_only {
-            input.skip_whitespace();
-            let start = input.state();
-            let supported =
-                condition(input, true, true)?.matches(0., 0., false, 0, Lengths::new(16., 0., 0.))
-                    == Some(true);
-            input.expect_exhausted()?;
-            input.reset(&start);
-            let mut value = String::new();
-            source(input, &mut value, "/**/")?;
-            return Ok(Item::Rule(Rule::Supports(value, supported, Vec::new())));
-        }
-        if name.eq_ignore_ascii_case("container") && !self.declarations_only {
-            let container = input
-                .try_parse(|input| -> Result<String, ParseError<()>> {
-                    let name = input.expect_ident_cloned()?;
-                    if ["not", "and", "or", "none"]
-                        .iter()
-                        .any(|word| name.eq_ignore_ascii_case(word))
-                    {
-                        return Err(ParseError::unexpected_token());
-                    }
-                    Ok(name.to_string())
-                })
-                .ok();
-            let mut query = condition(input, true, false)?;
-            input.expect_exhausted()?;
-            let mut block = false;
-            let mut pending = vec![&mut query];
-            while let Some(query) = pending.pop() {
-                let replaced = match query {
-                    MediaQuery::Not(inner) | MediaQuery::Range(_, inner) => {
-                        pending.push(inner);
-                        continue;
-                    }
-                    MediaQuery::And(items) | MediaQuery::Or(items) => {
-                        pending.extend(items.iter_mut());
-                        continue;
-                    }
-                    MediaQuery::Unknown(text)
-                        if text.to_ascii_lowercase().starts_with("style(") =>
-                    {
-                        let inner = text[6..].strip_suffix(')').unwrap_or_default();
-                        let (name, value) = inner.split_once(':').unwrap_or((inner, ""));
-                        let name = name.trim();
-                        if !name.starts_with("--") {
-                            continue;
-                        }
-                        MediaQuery::Style(name.into(), value.trim().into())
-                    }
-                    MediaQuery::Feature(name, op, value) => match name.as_str() {
-                        "width" | "inline-size" => {
-                            *name = "width".into();
-                            continue;
-                        }
-                        "height" | "block-size" | "aspect-ratio" => {
-                            block = true;
-                            if name == "block-size" {
-                                *name = "height".into();
-                            }
-                            continue;
-                        }
-                        "orientation"
-                            if op == ":" && matches!(value.as_str(), "portrait" | "landscape") =>
-                        {
-                            block = true;
-                            MediaQuery::Feature(
-                                "aspect-ratio".into(),
-                                if value == "portrait" { "<=" } else { ">" }.into(),
-                                "1".into(),
-                            )
-                        }
-                        _ => MediaQuery::Unknown(format!("({name}{op}{value})")),
-                    },
-                    _ => continue,
-                };
-                *query = replaced;
-            }
-            return Ok(Item::Rule(Rule::Container(
-                container,
-                block,
-                query,
-                Vec::new(),
-            )));
-        }
-        if name.eq_ignore_ascii_case("media") && !self.declarations_only {
-            let queries = if input.is_exhausted() {
-                Vec::new()
-            } else {
-                input.parse_comma_separated_ignoring_errors(|input| {
-                    let query = input.try_parse(|input| {
-                        input.parse_entirely(|input| {
-                            if let Ok(query) = input.try_parse(|input| {
-                                input.parse_entirely(|input| condition(input, true, false))
-                            }) {
-                                return Ok(query);
-                            }
-                            let not = input
-                                .try_parse(|input| input.expect_ident_matching("not"))
-                                .is_ok();
-                            let only = !not
-                                && input
-                                    .try_parse(|input| input.expect_ident_matching("only"))
-                                    .is_ok();
-                            let medium = input.expect_ident_cloned()?;
-                            if ["not", "only", "and", "or", "layer"]
-                                .iter()
-                                .any(|word| medium.eq_ignore_ascii_case(word))
-                            {
-                                return Err(ParseError::unexpected_token());
-                            }
-                            let query = if input.is_exhausted() {
-                                MediaQuery::All
-                            } else {
-                                input.expect_ident_matching("and")?;
-                                condition(input, false, false)?
-                            };
-                            let prefix = match (not, only) {
-                                (true, _) => "not ",
-                                (_, true) => "only ",
-                                _ => "",
-                            };
-                            Ok(MediaQuery::Typed(
-                                format!("{prefix}{}", medium.to_ascii_lowercase()),
-                                Box::new(query),
-                            ))
-                        })
-                    });
-                    Ok::<_, ParseError<()>>(query.unwrap_or_else(|_| {
-                        while input.next().is_ok() {}
-                        MediaQuery::Not(Box::new(MediaQuery::All))
-                    }))
-                })
-            };
-            return Ok(Item::Rule(Rule::Media(queries, Vec::new())));
-        }
-        if !name.eq_ignore_ascii_case("charset") {
-            DROPPED.with_borrow_mut(|dropped| {
-                if dropped.len() < 256 {
-                    dropped.insert(name.to_ascii_lowercase());
-                }
-            });
-        }
-        Err(ParseError::unexpected_token())
+  fn parse_prelude(
+    &mut self,
+    name: CowRcStr<'i>,
+    input: &mut Parser<'i>,
+  ) -> Result<Item, ParseError<()>> {
+    if name.eq_ignore_ascii_case("import") && self.top_level {
+      let url = input.expect_url_or_string()?.clone();
+      let name = url.strip_suffix(".css").unwrap_or(&url);
+      if !matches!(
+        name,
+        "tailwindcss"
+          | "tailwindcss/index"
+          | "tailwindcss/preflight"
+          | "tailwindcss/theme"
+          | "tailwindcss/utilities"
+      ) {
+        return Err(ParseError::unexpected_token());
+      }
+      let options = text(input)?;
+      return Ok(Item::Rule(Rule::Tailwind(format!(
+        "import \"{name}\" {options}"
+      ))));
     }
-
-    fn rule_without_block(&mut self, item: Item, _: &ParserState) -> Result<Item, ()> {
-        match item {
-            Item::Rule(Rule::Tailwind(_) | Rule::Layer(..)) | Item::Declaration(_) => Ok(item),
-            Item::Rule(Rule::CustomVariant(_, ref template)) if !template.is_empty() => Ok(item),
-            _ => Err(()),
-        }
+    if (name.eq_ignore_ascii_case("reference") || name.eq_ignore_ascii_case("source"))
+      && self.top_level
+    {
+      let options = text(input)?;
+      let name = name.to_ascii_lowercase();
+      return Ok(Item::Rule(Rule::Tailwind(format!("{name} {options}"))));
     }
-
-    fn parse_block(
-        &mut self,
-        item: Item,
-        _: &ParserState,
-        input: &mut Parser<'i>,
-    ) -> Result<Item, ParseError<()>> {
-        let nested = |input: &mut Parser<'i>| {
-            Rules {
-                parent: self.parent.clone(),
-                scope: self.scope.clone(),
-                suffix: self.suffix.clone(),
-                ..Rules::default()
+    if name.eq_ignore_ascii_case("tailwind") && self.parent.is_none() {
+      input.expect_ident_matching("utilities")?;
+      while input.next().is_ok() {}
+      return Ok(Item::Rule(Rule::Tailwind("tailwind utilities".into())));
+    }
+    if (name.eq_ignore_ascii_case("keyframes") || name.eq_ignore_ascii_case("-webkit-keyframes"))
+      && !self.declarations_only
+    {
+      let name = input.expect_ident_or_string()?.to_string();
+      input.expect_exhausted()?;
+      return Ok(Item::Rule(Rule::Keyframes(name, Vec::new())));
+    }
+    let custom = name.eq_ignore_ascii_case("custom-variant") && self.top_level;
+    if custom || name.eq_ignore_ascii_case("variant") && !self.declarations_only {
+      let text = text(input)?;
+      let end = text
+        .find(|c: char| c == '(' || c.is_whitespace())
+        .unwrap_or(text.len());
+      let (name, template) = (&text[..end], text[end..].trim());
+      return Ok(Item::Rule(match template.strip_prefix('(') {
+        Some(template) if self.top_level => Rule::CustomVariant(
+          name.to_owned(),
+          template
+            .strip_suffix(')')
+            .unwrap_or(template)
+            .trim()
+            .to_owned(),
+        ),
+        _ if custom && !template.is_empty() => return Err(ParseError::unexpected_token()),
+        _ if custom => Rule::CustomVariant(text, String::new()),
+        _ => Rule::VariantBlock(text, String::new()),
+      }));
+    }
+    if name.eq_ignore_ascii_case("theme") && self.parent.is_none() {
+      return Ok(Item::Rule(Rule::Theme(text(input)?, Vec::new())));
+    }
+    if name.eq_ignore_ascii_case("property")
+      && self.parent.is_none()
+      && !self.declarations_only
+      && !self.theme
+    {
+      let name = input.expect_ident_cloned()?.to_string();
+      input.expect_exhausted()?;
+      if !name.starts_with("--") {
+        return Err(ParseError::unexpected_token());
+      }
+      return Ok(Item::Rule(Rule::Property(name, String::new(), false, None)));
+    }
+    if name.eq_ignore_ascii_case("scope") && !self.declarations_only && !self.theme {
+      let group = |input: &mut Parser<'i>| -> Result<String, ParseError<()>> {
+        input.expect_parenthesis_block()?;
+        let mut text = String::new();
+        input.parse_nested_block(|input| source(input, &mut text, "/**/"))?;
+        Ok(text.trim().to_owned())
+      };
+      let start = input.try_parse(group).ok();
+      let end = input
+        .try_parse(|input| {
+          input.expect_ident_matching("to")?;
+          group(input)
+        })
+        .ok();
+      input.expect_exhausted()?;
+      return Ok(Item::Scope(start.unwrap_or_else(|| ":root".into()), end));
+    }
+    if name.eq_ignore_ascii_case("starting-style") && !self.declarations_only && !self.theme {
+      input.expect_exhausted()?;
+      return Ok(Item::Starting);
+    }
+    if name.eq_ignore_ascii_case("font-face")
+      && self.parent.is_none()
+      && !self.declarations_only
+      && !self.theme
+    {
+      input.expect_exhausted()?;
+      return Ok(Item::Rule(Rule::FontFace(Declarations::default())));
+    }
+    if name.eq_ignore_ascii_case("position-try")
+      && self.parent.is_none()
+      && !self.declarations_only
+      && !self.theme
+    {
+      let name = input.expect_ident_cloned()?.to_string();
+      input.expect_exhausted()?;
+      if !name.starts_with("--") {
+        return Err(ParseError::unexpected_token());
+      }
+      return Ok(Item::Rule(Rule::PositionTry(name, Declarations::default())));
+    }
+    if name.eq_ignore_ascii_case("utility") && self.top_level {
+      let mut name = text(input)?;
+      name.retain(|c| !c.is_whitespace());
+      return Ok(Item::Rule(Rule::Utility(name, String::new())));
+    }
+    if name.eq_ignore_ascii_case("apply") && self.parse_declarations() {
+      // Class names keep adjacent tokens as written, like `py-1.5`.
+      return Ok(Item::Declaration(Declaration::Apply(
+        components(&text(input)?, ' ')
+          .into_iter()
+          .map(str::to_owned)
+          .collect(),
+      )));
+    }
+    if name.eq_ignore_ascii_case("layer") && !self.declarations_only {
+      let mut value = String::new();
+      source(input, &mut value, "/**/")?;
+      return Ok(Item::Rule(Rule::Layer(
+        value
+          .split(',')
+          .map(str::trim)
+          .filter(|s| !s.is_empty())
+          .map(str::to_owned)
+          .collect(),
+        Vec::new(),
+      )));
+    }
+    if name.eq_ignore_ascii_case("supports") && !self.declarations_only {
+      input.skip_whitespace();
+      let start = input.state();
+      let supported =
+        condition(input, true, true)?.matches(0., 0., false, 0, Lengths::new(16., 0., 0.))
+          == Some(true);
+      input.expect_exhausted()?;
+      input.reset(&start);
+      let mut value = String::new();
+      source(input, &mut value, "/**/")?;
+      return Ok(Item::Rule(Rule::Supports(value, supported, Vec::new())));
+    }
+    if name.eq_ignore_ascii_case("container") && !self.declarations_only {
+      let container = input
+        .try_parse(|input| -> Result<String, ParseError<()>> {
+          let name = input.expect_ident_cloned()?;
+          if ["not", "and", "or", "none"]
+            .iter()
+            .any(|word| name.eq_ignore_ascii_case(word))
+          {
+            return Err(ParseError::unexpected_token());
+          }
+          Ok(name.to_string())
+        })
+        .ok();
+      let mut query = condition(input, true, false)?;
+      input.expect_exhausted()?;
+      let mut block = false;
+      let mut pending = vec![&mut query];
+      while let Some(query) = pending.pop() {
+        let replaced = match query {
+          MediaQuery::Not(inner) | MediaQuery::Range(_, inner) => {
+            pending.push(inner);
+            continue;
+          }
+          MediaQuery::And(items) | MediaQuery::Or(items) => {
+            pending.extend(items.iter_mut());
+            continue;
+          }
+          MediaQuery::Unknown(text) if text.to_ascii_lowercase().starts_with("style(") => {
+            let inner = text[6..].strip_suffix(')').unwrap_or_default();
+            let (name, value) = inner.split_once(':').unwrap_or((inner, ""));
+            let name = name.trim();
+            if !name.starts_with("--") {
+              continue;
             }
-            .body(input)
+            MediaQuery::Style(name.into(), value.trim().into())
+          }
+          MediaQuery::Feature(name, op, value) => match name.as_str() {
+            "width" | "inline-size" => {
+              *name = "width".into();
+              continue;
+            }
+            "height" | "block-size" | "aspect-ratio" => {
+              block = true;
+              if name == "block-size" {
+                *name = "height".into();
+              }
+              continue;
+            }
+            "orientation" if op == ":" && matches!(value.as_str(), "portrait" | "landscape") => {
+              block = true;
+              MediaQuery::Feature(
+                "aspect-ratio".into(),
+                if value == "portrait" { "<=" } else { ">" }.into(),
+                "1".into(),
+              )
+            }
+            _ => MediaQuery::Unknown(format!("({name}{op}{value})")),
+          },
+          _ => continue,
         };
-        Ok(Item::Rule(match item {
-            Item::Scope(start, end) => {
-                let root = Rc::new(Selector::parse(
-                    &format!(":where({start})"),
-                    self.parent.as_ref(),
-                ));
-                if root.is_empty() {
-                    return Err(ParseError::unexpected_token());
-                }
-                let suffix = end.map_or_else(String::new, |end| {
-                    format!(":not(:where({start}) :where({end}), :where({start}) :where({end}) *)")
-                });
-                let children = Rules {
-                    parent: Some(root.clone()),
-                    scope: Some(format!(":where(:where({start}), :where({start}) *)")),
-                    suffix,
-                    ..Rules::default()
-                }
-                .body(input);
-                Rule::Style(root, children)
-            }
-            Item::Starting => Rule::Starting(match &self.parent {
-                Some(parent) => {
-                    let own = Rc::new(Selector::parse("&::starting-style", Some(parent)));
-                    let children = Rules {
-                        parent: Some(own.clone()),
-                        ..Rules::default()
-                    }
-                    .body(input);
-                    vec![Rule::Style(own, children)]
-                }
-                None => Rules {
-                    suffix: "::starting-style".into(),
-                    ..Rules::default()
-                }
-                .body(input),
-            }),
-            Item::Rule(Rule::Layer(names, _)) => Rule::Layer(names, nested(input)),
-            Item::Rule(Rule::Supports(condition, supported, _)) => {
-                Rule::Supports(condition, supported, nested(input))
-            }
-            Item::Rule(Rule::Theme(options, _)) => Rule::Theme(
-                options,
-                Rules {
-                    theme: true,
-                    ..Rules::default()
-                }
-                .body(input),
-            ),
-            Item::Rule(Rule::PositionTry(name, _)) => Rule::PositionTry(
-                name,
-                Declarations::position_try(Declarations::parse_input(input, false)),
-            ),
-            Item::Rule(Rule::FontFace(_)) => Rule::FontFace(Declarations::parse_input(input, true)),
-            Item::Rule(Rule::Property(name, ..)) => {
-                let (mut syntax, mut inherits, mut initial) = (None, None, None);
-                for declaration in Declarations::parse_input(input, true).0 {
-                    if let Declaration::Property(key, value) = declaration {
-                        match key.as_str() {
-                            "syntax" => syntax = Some(value.trim_matches(['"', '\'']).to_owned()),
-                            "inherits" => {
-                                inherits = ["false", "true"]
-                                    .iter()
-                                    .position(|word| value.eq_ignore_ascii_case(word))
-                            }
-                            "initial-value" => initial = Some(value),
-                            _ => {}
-                        }
-                    }
-                }
-                let (Some(syntax), Some(inherits)) = (syntax, inherits) else {
-                    return Err(ParseError::unexpected_token());
-                };
-                // The initial value must not depend on an element, so `2em` drops the rule.
-                if !registrable(&syntax)
-                    || (syntax.trim() != "*"
-                        && !initial.as_deref().is_some_and(|value| {
-                            !value.contains("var(")
-                                && registered_matches(&syntax, value)
-                                && computed(&syntax, value, None).1
-                        }))
-                {
-                    return Err(ParseError::unexpected_token());
-                }
-                Rule::Property(name, syntax, inherits == 1, initial)
-            }
-            Item::Rule(Rule::Utility(name, _)) => {
-                let mut body = String::new();
-                source(input, &mut body, "/**/")?;
-                Rule::Utility(name, body)
-            }
-            // Like Tailwind, a top-level `@variant` block with `@slot` is a definition too.
-            Item::Rule(
-                Rule::CustomVariant(name, template) | Rule::VariantBlock(name, template),
-            ) if template.is_empty() => {
-                let mut body = String::new();
-                source(input, &mut body, "/**/")?;
-                match self.top_level && body.contains("@slot") {
-                    true => Rule::CustomVariant(name, body),
-                    false => Rule::VariantBlock(name, body),
-                }
-            }
-            Item::Rule(Rule::Keyframes(name, _)) => Rule::Keyframes(
-                name,
-                StyleSheetParser::new(input, &mut Keyframes)
-                    .flatten()
-                    .flatten()
-                    .collect(),
-            ),
-            Item::Rule(Rule::Media(queries, _)) => Rule::Media(queries, nested(input)),
-            Item::Rule(Rule::Container(name, block, query, _)) => {
-                Rule::Container(name, block, query, nested(input))
-            }
-            _ => return Err(ParseError::unexpected_token()),
-        }))
+        *query = replaced;
+      }
+      return Ok(Item::Rule(Rule::Container(
+        container,
+        block,
+        query,
+        Vec::new(),
+      )));
     }
+    if name.eq_ignore_ascii_case("media") && !self.declarations_only {
+      let queries = if input.is_exhausted() {
+        Vec::new()
+      } else {
+        input.parse_comma_separated_ignoring_errors(|input| {
+          let query = input.try_parse(|input| {
+            input.parse_entirely(|input| {
+              if let Ok(query) =
+                input.try_parse(|input| input.parse_entirely(|input| condition(input, true, false)))
+              {
+                return Ok(query);
+              }
+              let not = input
+                .try_parse(|input| input.expect_ident_matching("not"))
+                .is_ok();
+              let only = !not
+                && input
+                  .try_parse(|input| input.expect_ident_matching("only"))
+                  .is_ok();
+              let medium = input.expect_ident_cloned()?;
+              if ["not", "only", "and", "or", "layer"]
+                .iter()
+                .any(|word| medium.eq_ignore_ascii_case(word))
+              {
+                return Err(ParseError::unexpected_token());
+              }
+              let query = if input.is_exhausted() {
+                MediaQuery::All
+              } else {
+                input.expect_ident_matching("and")?;
+                condition(input, false, false)?
+              };
+              let prefix = match (not, only) {
+                (true, _) => "not ",
+                (_, true) => "only ",
+                _ => "",
+              };
+              Ok(MediaQuery::Typed(
+                format!("{prefix}{}", medium.to_ascii_lowercase()),
+                Box::new(query),
+              ))
+            })
+          });
+          Ok::<_, ParseError<()>>(query.unwrap_or_else(|_| {
+            while input.next().is_ok() {}
+            MediaQuery::Not(Box::new(MediaQuery::All))
+          }))
+        })
+      };
+      return Ok(Item::Rule(Rule::Media(queries, Vec::new())));
+    }
+    if !name.eq_ignore_ascii_case("charset") {
+      DROPPED.with_borrow_mut(|dropped| {
+        if dropped.len() < 256 {
+          dropped.insert(name.to_ascii_lowercase());
+        }
+      });
+    }
+    Err(ParseError::unexpected_token())
+  }
+
+  fn rule_without_block(&mut self, item: Item, _: &ParserState) -> Result<Item, ()> {
+    match item {
+      Item::Rule(Rule::Tailwind(_) | Rule::Layer(..)) | Item::Declaration(_) => Ok(item),
+      Item::Rule(Rule::CustomVariant(_, ref template)) if !template.is_empty() => Ok(item),
+      _ => Err(()),
+    }
+  }
+
+  fn parse_block(
+    &mut self,
+    item: Item,
+    _: &ParserState,
+    input: &mut Parser<'i>,
+  ) -> Result<Item, ParseError<()>> {
+    let nested = |input: &mut Parser<'i>| {
+      Rules {
+        parent: self.parent.clone(),
+        scope: self.scope.clone(),
+        suffix: self.suffix.clone(),
+        ..Rules::default()
+      }
+      .body(input)
+    };
+    Ok(Item::Rule(match item {
+      Item::Scope(start, end) => {
+        let root = Rc::new(Selector::parse(
+          &format!(":where({start})"),
+          self.parent.as_ref(),
+        ));
+        if root.is_empty() {
+          return Err(ParseError::unexpected_token());
+        }
+        let suffix = end.map_or_else(String::new, |end| {
+          format!(":not(:where({start}) :where({end}), :where({start}) :where({end}) *)")
+        });
+        let children = Rules {
+          parent: Some(root.clone()),
+          scope: Some(format!(":where(:where({start}), :where({start}) *)")),
+          suffix,
+          ..Rules::default()
+        }
+        .body(input);
+        Rule::Style(root, children)
+      }
+      Item::Starting => Rule::Starting(match &self.parent {
+        Some(parent) => {
+          let own = Rc::new(Selector::parse("&::starting-style", Some(parent)));
+          let children = Rules {
+            parent: Some(own.clone()),
+            ..Rules::default()
+          }
+          .body(input);
+          vec![Rule::Style(own, children)]
+        }
+        None => Rules {
+          suffix: "::starting-style".into(),
+          ..Rules::default()
+        }
+        .body(input),
+      }),
+      Item::Rule(Rule::Layer(names, _)) => Rule::Layer(names, nested(input)),
+      Item::Rule(Rule::Supports(condition, supported, _)) => {
+        Rule::Supports(condition, supported, nested(input))
+      }
+      Item::Rule(Rule::Theme(options, _)) => Rule::Theme(
+        options,
+        Rules {
+          theme: true,
+          ..Rules::default()
+        }
+        .body(input),
+      ),
+      Item::Rule(Rule::PositionTry(name, _)) => Rule::PositionTry(
+        name,
+        Declarations::position_try(Declarations::parse_input(input, false)),
+      ),
+      Item::Rule(Rule::FontFace(_)) => Rule::FontFace(Declarations::parse_input(input, true)),
+      Item::Rule(Rule::Property(name, ..)) => {
+        let (mut syntax, mut inherits, mut initial) = (None, None, None);
+        for declaration in Declarations::parse_input(input, true).0 {
+          if let Declaration::Property(key, value) = declaration {
+            match key.as_str() {
+              "syntax" => syntax = Some(value.trim_matches(['"', '\'']).to_owned()),
+              "inherits" => {
+                inherits = ["false", "true"]
+                  .iter()
+                  .position(|word| value.eq_ignore_ascii_case(word))
+              }
+              "initial-value" => initial = Some(value),
+              _ => {}
+            }
+          }
+        }
+        let (Some(syntax), Some(inherits)) = (syntax, inherits) else {
+          return Err(ParseError::unexpected_token());
+        };
+        // The initial value must not depend on an element, so `2em` drops the rule.
+        if !registrable(&syntax)
+          || (syntax.trim() != "*"
+            && !initial.as_deref().is_some_and(|value| {
+              !value.contains("var(")
+                && registered_matches(&syntax, value)
+                && computed(&syntax, value, None).1
+            }))
+        {
+          return Err(ParseError::unexpected_token());
+        }
+        Rule::Property(name, syntax, inherits == 1, initial)
+      }
+      Item::Rule(Rule::Utility(name, _)) => {
+        let mut body = String::new();
+        source(input, &mut body, "/**/")?;
+        Rule::Utility(name, body)
+      }
+      // Like Tailwind, a top-level `@variant` block with `@slot` is a definition too.
+      Item::Rule(Rule::CustomVariant(name, template) | Rule::VariantBlock(name, template))
+        if template.is_empty() =>
+      {
+        let mut body = String::new();
+        source(input, &mut body, "/**/")?;
+        match self.top_level && body.contains("@slot") {
+          true => Rule::CustomVariant(name, body),
+          false => Rule::VariantBlock(name, body),
+        }
+      }
+      Item::Rule(Rule::Keyframes(name, _)) => Rule::Keyframes(
+        name,
+        StyleSheetParser::new(input, &mut Keyframes)
+          .flatten()
+          .flatten()
+          .collect(),
+      ),
+      Item::Rule(Rule::Media(queries, _)) => Rule::Media(queries, nested(input)),
+      Item::Rule(Rule::Container(name, block, query, _)) => {
+        Rule::Container(name, block, query, nested(input))
+      }
+      _ => return Err(ParseError::unexpected_token()),
+    }))
+  }
 }
 
 impl<'i> RuleBodyItemParser<'i, Item, ()> for Rules {
-    fn parse_declarations(&self) -> bool {
-        self.declarations_only || self.theme || self.parent.is_some()
-    }
+  fn parse_declarations(&self) -> bool {
+    self.declarations_only || self.theme || self.parent.is_some()
+  }
 
-    fn parse_qualified(&self) -> bool {
-        !self.declarations_only && !self.theme
-    }
+  fn parse_qualified(&self) -> bool {
+    !self.declarations_only && !self.theme
+  }
 }
 
 const AT_RULES: [&str; 12] = [
-    "-webkit-keyframes",
-    "container",
-    "font-face",
-    "import",
-    "keyframes",
-    "layer",
-    "media",
-    "namespace",
-    "property",
-    "scope",
-    "starting-style",
-    "supports",
+  "-webkit-keyframes",
+  "container",
+  "font-face",
+  "import",
+  "keyframes",
+  "layer",
+  "media",
+  "namespace",
+  "property",
+  "scope",
+  "starting-style",
+  "supports",
 ];
 
 fn condition(
-    input: &mut Parser<'_>,
-    or: bool,
-    supports: bool,
+  input: &mut Parser<'_>,
+  or: bool,
+  supports: bool,
 ) -> Result<MediaQuery, ParseError<()>> {
-    let not = input
-        .try_parse(|input| input.expect_ident_matching("not"))
-        .is_ok();
-    let mut items = Vec::new();
-    let mut and = true;
-    loop {
-        let start = input.position();
-        let selector = match input.next()? {
-            Token::ParenthesisBlock => None,
-            Token::Function(name) => Some(name.to_ascii_lowercase()),
-            _ => return Err(ParseError::unexpected_token()),
+  let not = input
+    .try_parse(|input| input.expect_ident_matching("not"))
+    .is_ok();
+  let mut items = Vec::new();
+  let mut and = true;
+  loop {
+    let start = input.position();
+    let selector = match input.next()? {
+      Token::ParenthesisBlock => None,
+      Token::Function(name) => Some(name.to_ascii_lowercase()),
+      _ => return Err(ParseError::unexpected_token()),
+    };
+    let item = input.parse_nested_block(|input| {
+      if selector.is_none()
+        && let Ok(query) =
+          input.try_parse(|input| input.parse_entirely(|input| condition(input, true, supports)))
+      {
+        return Ok(Some(query));
+      }
+      let mut text = String::new();
+      source(input, &mut text, "/**/")?;
+      let text = text.trim();
+      if supports {
+        let supported = match selector.as_deref() {
+          Some("selector") => !Selector::parse(text, None).is_empty(),
+          Some("font-format") => FONT_FORMATS
+            .iter()
+            .any(|format| text.eq_ignore_ascii_case(format)),
+          Some("font-tech") => FONT_TECHS
+            .iter()
+            .any(|tech| text.eq_ignore_ascii_case(tech)),
+          Some("at-rule") => text
+            .strip_prefix('@')
+            .is_some_and(|name| AT_RULES.contains(&&*name.to_ascii_lowercase())),
+          Some(_) => false,
+          None => text.split_once(':').is_some_and(|(name, value)| {
+            let value = value.trim();
+            crate::css::value::grammar::supports(
+              &name.trim().to_ascii_lowercase(),
+              value
+                .strip_suffix("!important")
+                .map_or(value, str::trim_end),
+            ) == Some(true)
+          }),
         };
-        let item = input.parse_nested_block(|input| {
-            if selector.is_none()
-                && let Ok(query) = input.try_parse(|input| {
-                    input.parse_entirely(|input| condition(input, true, supports))
-                })
-            {
-                return Ok(Some(query));
-            }
-            let mut text = String::new();
-            source(input, &mut text, "/**/")?;
-            let text = text.trim();
-            if supports {
-                let supported = match selector.as_deref() {
-                    Some("selector") => !Selector::parse(text, None).is_empty(),
-                    Some("font-format") => FONT_FORMATS
-                        .iter()
-                        .any(|format| text.eq_ignore_ascii_case(format)),
-                    Some("font-tech") => FONT_TECHS
-                        .iter()
-                        .any(|tech| text.eq_ignore_ascii_case(tech)),
-                    Some("at-rule") => text
-                        .strip_prefix('@')
-                        .is_some_and(|name| AT_RULES.contains(&&*name.to_ascii_lowercase())),
-                    Some(_) => false,
-                    None => text.split_once(':').is_some_and(|(name, value)| {
-                        let value = value.trim();
-                        crate::css::value::grammar::supports(
-                            &name.trim().to_ascii_lowercase(),
-                            value
-                                .strip_suffix("!important")
-                                .map_or(value, str::trim_end),
-                        ) == Some(true)
-                    }),
-                };
-                return Ok(Some(if supported {
-                    MediaQuery::All
-                } else {
-                    MediaQuery::Not(Box::new(MediaQuery::All))
-                }));
-            }
-            if selector.is_some() {
-                return Ok(None);
-            }
-            let text = text.to_ascii_lowercase();
-            let ident = |name: &str| {
-                name.trim_start_matches('-')
-                    .starts_with(|c: char| c.is_ascii_alphabetic())
-                    && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-            };
-            let feature = |name: &str, op: &str, value: &str| {
-                let value = match name.ends_with("aspect-ratio") {
-                    true => value
-                        .split('/')
-                        .map(str::trim)
-                        .collect::<Vec<_>>()
-                        .join(" / "),
-                    false => value.into(),
-                };
-                MediaQuery::Feature(name.into(), op.into(), value)
-            };
-            if let Some((name, value)) = text.split_once(':') {
-                let name = name
-                    .trim()
-                    .replacen("-webkit-min-", "min--webkit-", 1)
-                    .replacen("-webkit-max-", "max--webkit-", 1);
-                let (name, value) = (name.as_str(), value.trim());
-                return Ok((ident(name) && !value.is_empty()).then(|| {
-                    // `min` and `max` keep the form that was written, for the text of the rule.
-                    if let Some(name) = name.strip_prefix("min-") {
-                        feature(name, "min", value)
-                    } else if let Some(name) = name.strip_prefix("max-") {
-                        feature(name, "max", value)
-                    } else {
-                        feature(name, ":", value)
-                    }
-                }));
-            }
-            if ident(&text) {
-                return Ok(Some(feature(&text, "", "")));
-            }
-            let mut parts = [""; 3];
-            let mut ops = [""; 2];
-            let mut count = 0;
-            let mut rest = text.as_str();
-            while let Some(index) = rest.find(['<', '>', '=']) {
-                let length = 1 + usize::from(
-                    !rest[index..].starts_with('=') && rest[index + 1..].starts_with('='),
-                );
-                if count == 2 {
-                    return Ok(None);
-                }
-                parts[count] = rest[..index].trim();
-                ops[count] = &rest[index..index + length];
-                count += 1;
-                rest = &rest[index + length..];
-            }
-            parts[count] = rest.trim();
-            let flip = |op: &str| match op {
-                "<" => ">",
-                "<=" => ">=",
-                ">" => "<",
-                ">=" => "<=",
-                _ => "=",
-            };
-            // Forms with the value first keep their text, like Chrome.
-            let text = || {
-                let ratio = |part: &str| {
-                    part.split('/')
-                        .map(str::trim)
-                        .collect::<Vec<_>>()
-                        .join(" / ")
-                };
-                match count {
-                    1 => format!("({} {} {})", ratio(parts[0]), ops[0], parts[1]),
-                    _ => format!(
-                        "({} {} {} {} {})",
-                        ratio(parts[0]),
-                        ops[0],
-                        parts[1],
-                        ops[1],
-                        ratio(parts[2])
-                    ),
-                }
-            };
-            Ok(match count {
-                1 if ident(parts[0]) && !parts[1].is_empty() => {
-                    Some(feature(parts[0], ops[0], parts[1]))
-                }
-                1 if ident(parts[1]) && !parts[0].is_empty() => Some(MediaQuery::Range(
-                    text(),
-                    Box::new(feature(parts[1], flip(ops[0]), parts[0])),
-                )),
-                2 if ident(parts[1])
-                    && ops[0] != "="
-                    && ops[0].as_bytes().first() == ops[1].as_bytes().first()
-                    && !parts[0].is_empty()
-                    && !parts[2].is_empty() =>
-                {
-                    Some(MediaQuery::Range(
-                        text(),
-                        Box::new(MediaQuery::And(vec![
-                            feature(parts[1], flip(ops[0]), parts[0]),
-                            feature(parts[1], ops[1], parts[2]),
-                        ])),
-                    ))
-                }
-                _ => None,
-            })
-        })?;
-        let item =
-            item.unwrap_or_else(|| MediaQuery::Unknown(input.slice_from(start).trim().to_owned()));
-        if not {
-            return Ok(MediaQuery::Not(Box::new(item)));
-        }
-        items.push(item);
-        let Ok(word) = input.try_parse(Parser::expect_ident_cloned) else {
-            break;
+        return Ok(Some(if supported {
+          MediaQuery::All
+        } else {
+          MediaQuery::Not(Box::new(MediaQuery::All))
+        }));
+      }
+      if selector.is_some() {
+        return Ok(None);
+      }
+      let text = text.to_ascii_lowercase();
+      let ident = |name: &str| {
+        name
+          .trim_start_matches('-')
+          .starts_with(|c: char| c.is_ascii_alphabetic())
+          && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+      };
+      let feature = |name: &str, op: &str, value: &str| {
+        let value = match name.ends_with("aspect-ratio") {
+          true => value
+            .split('/')
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" / "),
+          false => value.into(),
         };
-        let next = word.eq_ignore_ascii_case("and");
-        if !next && !(or && word.eq_ignore_ascii_case("or")) || items.len() > 1 && next != and {
-            return Err(ParseError::unexpected_token());
+        MediaQuery::Feature(name.into(), op.into(), value)
+      };
+      if let Some((name, value)) = text.split_once(':') {
+        let name = name
+          .trim()
+          .replacen("-webkit-min-", "min--webkit-", 1)
+          .replacen("-webkit-max-", "max--webkit-", 1);
+        let (name, value) = (name.as_str(), value.trim());
+        return Ok((ident(name) && !value.is_empty()).then(|| {
+          // `min` and `max` keep the form that was written, for the text of the rule.
+          if let Some(name) = name.strip_prefix("min-") {
+            feature(name, "min", value)
+          } else if let Some(name) = name.strip_prefix("max-") {
+            feature(name, "max", value)
+          } else {
+            feature(name, ":", value)
+          }
+        }));
+      }
+      if ident(&text) {
+        return Ok(Some(feature(&text, "", "")));
+      }
+      let mut parts = [""; 3];
+      let mut ops = [""; 2];
+      let mut count = 0;
+      let mut rest = text.as_str();
+      while let Some(index) = rest.find(['<', '>', '=']) {
+        let length =
+          1 + usize::from(!rest[index..].starts_with('=') && rest[index + 1..].starts_with('='));
+        if count == 2 {
+          return Ok(None);
         }
-        and = next;
+        parts[count] = rest[..index].trim();
+        ops[count] = &rest[index..index + length];
+        count += 1;
+        rest = &rest[index + length..];
+      }
+      parts[count] = rest.trim();
+      let flip = |op: &str| match op {
+        "<" => ">",
+        "<=" => ">=",
+        ">" => "<",
+        ">=" => "<=",
+        _ => "=",
+      };
+      // Forms with the value first keep their text, like Chrome.
+      let text = || {
+        let ratio = |part: &str| {
+          part
+            .split('/')
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" / ")
+        };
+        match count {
+          1 => format!("({} {} {})", ratio(parts[0]), ops[0], parts[1]),
+          _ => format!(
+            "({} {} {} {} {})",
+            ratio(parts[0]),
+            ops[0],
+            parts[1],
+            ops[1],
+            ratio(parts[2])
+          ),
+        }
+      };
+      Ok(match count {
+        1 if ident(parts[0]) && !parts[1].is_empty() => Some(feature(parts[0], ops[0], parts[1])),
+        1 if ident(parts[1]) && !parts[0].is_empty() => Some(MediaQuery::Range(
+          text(),
+          Box::new(feature(parts[1], flip(ops[0]), parts[0])),
+        )),
+        2 if ident(parts[1])
+          && ops[0] != "="
+          && ops[0].as_bytes().first() == ops[1].as_bytes().first()
+          && !parts[0].is_empty()
+          && !parts[2].is_empty() =>
+        {
+          Some(MediaQuery::Range(
+            text(),
+            Box::new(MediaQuery::And(vec![
+              feature(parts[1], flip(ops[0]), parts[0]),
+              feature(parts[1], ops[1], parts[2]),
+            ])),
+          ))
+        }
+        _ => None,
+      })
+    })?;
+    let item =
+      item.unwrap_or_else(|| MediaQuery::Unknown(input.slice_from(start).trim().to_owned()));
+    if not {
+      return Ok(MediaQuery::Not(Box::new(item)));
     }
-    if items.len() == 1
-        && let Some(item) = items.pop()
-    {
-        return Ok(item);
+    items.push(item);
+    let Ok(word) = input.try_parse(Parser::expect_ident_cloned) else {
+      break;
+    };
+    let next = word.eq_ignore_ascii_case("and");
+    if !next && !(or && word.eq_ignore_ascii_case("or")) || items.len() > 1 && next != and {
+      return Err(ParseError::unexpected_token());
     }
-    Ok(if and {
-        MediaQuery::And(items)
-    } else {
-        MediaQuery::Or(items)
-    })
+    and = next;
+  }
+  if items.len() == 1
+    && let Some(item) = items.pop()
+  {
+    return Ok(item);
+  }
+  Ok(if and {
+    MediaQuery::And(items)
+  } else {
+    MediaQuery::Or(items)
+  })
 }
 
 fn environment(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut rest = value;
-    let (mut quote, mut escaped) = (None, false);
-    while let Some(start) = rest.find("env(") {
-        for c in rest[..start].chars() {
-            match c {
-                _ if escaped => escaped = false,
-                '\\' => escaped = true,
-                '"' | '\'' if quote.is_none_or(|quote| quote == c) => quote = quote.xor(Some(c)),
-                _ => {}
-            }
-        }
-        if quote.is_some() || escaped {
-            escaped = false;
-            out.push_str(&rest[..start + 4]);
-            rest = &rest[start + 4..];
-            continue;
-        }
-        let body = &rest[start + 4..];
-        let (mut depth, mut comma, mut end) = (1, None, None);
-        for (index, c) in body.char_indices() {
-            match c {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = Some(index);
-                        break;
-                    }
-                }
-                ',' if depth == 1 && comma.is_none() => comma = Some(index),
-                _ => {}
-            }
-        }
-        let name = body[..comma.or(end).unwrap_or(body.len())].trim();
-        let replacement =
-            if rest[..start].ends_with(|c: char| c.is_alphanumeric() || matches!(c, '-' | '_')) {
-                None
-            } else if [
-                "safe-area-inset-",
-                "safe-area-max-inset-",
-                "keyboard-inset-",
-            ]
-            .iter()
-            .any(|prefix| name.starts_with(prefix))
-            {
-                Some("0px")
-            } else {
-                comma
-                    .zip(end)
-                    .map(|(comma, end)| body[comma + 1..end].trim())
-            };
-        match (replacement, end) {
-            (Some(replacement), Some(end)) => {
-                out.push_str(&rest[..start]);
-                out.push_str(replacement);
-                rest = &body[end + 1..];
-            }
-            _ => {
-                out.push_str(&rest[..start + 4]);
-                rest = body;
-            }
-        }
+  let mut out = String::with_capacity(value.len());
+  let mut rest = value;
+  let (mut quote, mut escaped) = (None, false);
+  while let Some(start) = rest.find("env(") {
+    for c in rest[..start].chars() {
+      match c {
+        _ if escaped => escaped = false,
+        '\\' => escaped = true,
+        '"' | '\'' if quote.is_none_or(|quote| quote == c) => quote = quote.xor(Some(c)),
+        _ => {}
+      }
     }
-    out.push_str(rest);
-    out
+    if quote.is_some() || escaped {
+      escaped = false;
+      out.push_str(&rest[..start + 4]);
+      rest = &rest[start + 4..];
+      continue;
+    }
+    let body = &rest[start + 4..];
+    let (mut depth, mut comma, mut end) = (1, None, None);
+    for (index, c) in body.char_indices() {
+      match c {
+        '(' => depth += 1,
+        ')' => {
+          depth -= 1;
+          if depth == 0 {
+            end = Some(index);
+            break;
+          }
+        }
+        ',' if depth == 1 && comma.is_none() => comma = Some(index),
+        _ => {}
+      }
+    }
+    let name = body[..comma.or(end).unwrap_or(body.len())].trim();
+    let replacement =
+      if rest[..start].ends_with(|c: char| c.is_alphanumeric() || matches!(c, '-' | '_')) {
+        None
+      } else if [
+        "safe-area-inset-",
+        "safe-area-max-inset-",
+        "keyboard-inset-",
+      ]
+      .iter()
+      .any(|prefix| name.starts_with(prefix))
+      {
+        Some("0px")
+      } else {
+        comma
+          .zip(end)
+          .map(|(comma, end)| body[comma + 1..end].trim())
+      };
+    match (replacement, end) {
+      (Some(replacement), Some(end)) => {
+        out.push_str(&rest[..start]);
+        out.push_str(replacement);
+        rest = &body[end + 1..];
+      }
+      _ => {
+        out.push_str(&rest[..start + 4]);
+        rest = body;
+      }
+    }
+  }
+  out.push_str(rest);
+  out
 }
 
 fn text(input: &mut Parser<'_>) -> Result<String, ParseError<()>> {
-    let mut text = String::new();
-    source(input, &mut text, "")?;
-    Ok(text.trim().to_owned())
+  let mut text = String::new();
+  source(input, &mut text, "")?;
+  Ok(text.trim().to_owned())
 }
 
 fn source(
-    input: &mut Parser<'_>,
-    output: &mut String,
-    separator: &str,
+  input: &mut Parser<'_>,
+  output: &mut String,
+  separator: &str,
 ) -> Result<(), ParseError<()>> {
-    let (mut previous, mut comment) = (TokenSerializationType::Nothing, false);
-    loop {
-        let start = input.position();
-        let Ok(token) = input.next_including_whitespace_and_comments() else {
-            return Ok(());
-        };
-        if matches!(token, Token::Comment(_)) {
-            comment = true;
-            continue;
-        }
-        if token.is_parse_error() {
-            return Err(ParseError::unexpected_token());
-        }
-        let current = token.serialization_type();
-        let ident = match token {
-            Token::Ident(name) if separator == " " => Some(name.clone()),
-            _ => None,
-        };
-        let close = match token {
-            Token::Function(_) | Token::ParenthesisBlock => Some(')'),
-            Token::SquareBracketBlock => Some(']'),
-            Token::CurlyBracketBlock => Some('}'),
-            _ => None,
-        };
-        // Values keep adjacent tokens as written, like `spacing.2`, and only a dropped comment separates them.
-        if previous.needs_separator_when_before(current) && (separator != " " || comment) {
-            output.push_str(separator);
-        }
-        comment = false;
-        let text = input.slice_from(start);
-        match ident.filter(|name| {
-            text.contains('\\')
-                && !name
-                    .trim_start_matches('-')
-                    .starts_with(|c: char| c.is_ascii_digit())
-                && name
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
-        }) {
-            Some(name) => output.push_str(&name),
-            None => output.push_str(text),
-        }
-        previous = current;
-        if let Some(close) = close {
-            input.parse_nested_block(|input| source(input, output, separator))?;
-            output.push(close);
-            previous = TokenSerializationType::Other;
-        }
+  let (mut previous, mut comment) = (TokenSerializationType::Nothing, false);
+  loop {
+    let start = input.position();
+    let Ok(token) = input.next_including_whitespace_and_comments() else {
+      return Ok(());
+    };
+    if matches!(token, Token::Comment(_)) {
+      comment = true;
+      continue;
     }
+    if token.is_parse_error() {
+      return Err(ParseError::unexpected_token());
+    }
+    let current = token.serialization_type();
+    let ident = match token {
+      Token::Ident(name) if separator == " " => Some(name.clone()),
+      _ => None,
+    };
+    let close = match token {
+      Token::Function(_) | Token::ParenthesisBlock => Some(')'),
+      Token::SquareBracketBlock => Some(']'),
+      Token::CurlyBracketBlock => Some('}'),
+      _ => None,
+    };
+    // Values keep adjacent tokens as written, like `spacing.2`, and only a dropped comment separates them.
+    if previous.needs_separator_when_before(current) && (separator != " " || comment) {
+      output.push_str(separator);
+    }
+    comment = false;
+    let text = input.slice_from(start);
+    match ident.filter(|name| {
+      text.contains('\\')
+        && !name
+          .trim_start_matches('-')
+          .starts_with(|c: char| c.is_ascii_digit())
+        && name
+          .chars()
+          .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+    }) {
+      Some(name) => output.push_str(&name),
+      None => output.push_str(text),
+    }
+    previous = current;
+    if let Some(close) = close {
+      input.parse_nested_block(|input| source(input, output, separator))?;
+      output.push(close);
+      previous = TokenSerializationType::Other;
+    }
+  }
 }
 
 struct Keyframes;
 impl<'i> AtRuleParser<'i> for Keyframes {
-    type Prelude = ();
-    type AtRule = Vec<(f32, Declarations)>;
-    type Error = ();
+  type Prelude = ();
+  type AtRule = Vec<(f32, Declarations)>;
+  type Error = ();
 }
 impl<'i> QualifiedRuleParser<'i> for Keyframes {
-    type Prelude = Vec<f32>;
-    type QualifiedRule = Vec<(f32, Declarations)>;
-    type Error = ();
-    fn parse_prelude(&mut self, input: &mut Parser<'i>) -> Result<Vec<f32>, ParseError<()>> {
-        input.parse_comma_separated(|input| match input.next()? {
-            Token::Ident(name) if name.eq_ignore_ascii_case("from") => Ok(0.),
-            Token::Ident(name) if name.eq_ignore_ascii_case("to") => Ok(1.),
-            Token::Percentage { unit_value, .. } if (0. ..=1.).contains(unit_value) => {
-                Ok(*unit_value)
-            }
-            _ => Err(ParseError::unexpected_token()),
-        })
-    }
-    fn parse_block(
-        &mut self,
-        offsets: Vec<f32>,
-        _: &ParserState,
-        input: &mut Parser<'i>,
-    ) -> Result<Vec<(f32, Declarations)>, ParseError<()>> {
-        let values = Declarations::parse_input(input, false);
-        Ok(offsets
-            .into_iter()
-            .map(|offset| (offset, values.clone()))
-            .collect())
-    }
+  type Prelude = Vec<f32>;
+  type QualifiedRule = Vec<(f32, Declarations)>;
+  type Error = ();
+  fn parse_prelude(&mut self, input: &mut Parser<'i>) -> Result<Vec<f32>, ParseError<()>> {
+    input.parse_comma_separated(|input| match input.next()? {
+      Token::Ident(name) if name.eq_ignore_ascii_case("from") => Ok(0.),
+      Token::Ident(name) if name.eq_ignore_ascii_case("to") => Ok(1.),
+      Token::Percentage { unit_value, .. } if (0. ..=1.).contains(unit_value) => Ok(*unit_value),
+      _ => Err(ParseError::unexpected_token()),
+    })
+  }
+  fn parse_block(
+    &mut self,
+    offsets: Vec<f32>,
+    _: &ParserState,
+    input: &mut Parser<'i>,
+  ) -> Result<Vec<(f32, Declarations)>, ParseError<()>> {
+    let values = Declarations::parse_input(input, false);
+    Ok(
+      offsets
+        .into_iter()
+        .map(|offset| (offset, values.clone()))
+        .collect(),
+    )
+  }
 }
 
 pub(crate) fn supports_condition(condition: &str) -> bool {
-    let evaluate = |source: String| match Stylesheet::parse(&source).0.as_slice() {
-        [rule] => match **rule {
-            Rule::Supports(_, supported, _) => Some(supported),
-            _ => None,
-        },
-        _ => None,
-    };
-    evaluate(format!("@supports {condition}{{}}"))
-        .or_else(|| evaluate(format!("@supports ({condition}){{}}")))
-        .unwrap_or(false)
+  let evaluate = |source: String| match Stylesheet::parse(&source).0.as_slice() {
+    [rule] => match **rule {
+      Rule::Supports(_, supported, _) => Some(supported),
+      _ => None,
+    },
+    _ => None,
+  };
+  evaluate(format!("@supports {condition}{{}}"))
+    .or_else(|| evaluate(format!("@supports ({condition}){{}}")))
+    .unwrap_or(false)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::css::{value::units::FontUnits, value::units::Lengths};
+  use super::*;
+  use crate::css::{value::units::FontUnits, value::units::Lengths};
 
-    #[test]
-    fn numbers_with_exponents_keep_their_own_validity() {
-        // As in Chrome: a number with `.` or an exponent is not an `<integer>`.
-        let cases = [
-            ("z-index", "1.5e1", true),
-            ("z-index", "1.25e1", true),
-            ("z-index", "1e1", true),
-            ("z-index", "2E+1", true),
-            ("z-index", "20e-1", true),
-            ("z-index", "05", false),
-            ("column-count", "2e0", true),
-            ("column-count", "2.5e0", true),
-            (
-                "animation-timing-function",
-                "cubic-bezier(1e0,0,0,1)",
-                false,
-            ),
-            ("animation-timing-function", "cubic-bezier(2e0,0,0,1)", true),
-            (
-                "animation-timing-function",
-                "cubic-bezier(5e-1,0,0,1)",
-                false,
-            ),
-            ("flex-grow", "2e0", false),
-            ("width", "1e1px", false),
-            ("grid-row", "1e0", true),
-            ("grid-row", "span 1.5 / 2", true),
-            ("grid-row", "1 / span 2", false),
-            ("counter-reset", "c 1e1", true),
-            ("counter-reset", "c -2", false),
-        ];
-        // Each thread starts with an empty cache.
-        for reverse in [false, true] {
-            std::thread::spawn(move || {
-                let mut cases = cases.to_vec();
-                if reverse {
-                    cases.reverse();
-                }
-                for (name, value, expected) in cases {
-                    assert_eq!(invalid(name, value), expected, "{name}: {value}");
-                }
-            })
-            .join()
-            .unwrap();
+  #[test]
+  fn numbers_with_exponents_keep_their_own_validity() {
+    // As in Chrome: a number with `.` or an exponent is not an `<integer>`.
+    let cases = [
+      ("z-index", "1.5e1", true),
+      ("z-index", "1.25e1", true),
+      ("z-index", "1e1", true),
+      ("z-index", "2E+1", true),
+      ("z-index", "20e-1", true),
+      ("z-index", "05", false),
+      ("column-count", "2e0", true),
+      ("column-count", "2.5e0", true),
+      (
+        "animation-timing-function",
+        "cubic-bezier(1e0,0,0,1)",
+        false,
+      ),
+      ("animation-timing-function", "cubic-bezier(2e0,0,0,1)", true),
+      (
+        "animation-timing-function",
+        "cubic-bezier(5e-1,0,0,1)",
+        false,
+      ),
+      ("flex-grow", "2e0", false),
+      ("width", "1e1px", false),
+      ("grid-row", "1e0", true),
+      ("grid-row", "span 1.5 / 2", true),
+      ("grid-row", "1 / span 2", false),
+      ("counter-reset", "c 1e1", true),
+      ("counter-reset", "c -2", false),
+    ];
+    // Each thread starts with an empty cache.
+    for reverse in [false, true] {
+      std::thread::spawn(move || {
+        let mut cases = cases.to_vec();
+        if reverse {
+          cases.reverse();
         }
+        for (name, value, expected) in cases {
+          assert_eq!(invalid(name, value), expected, "{name}: {value}");
+        }
+      })
+      .join()
+      .unwrap();
     }
+  }
 
-    #[test]
-    fn viewport_font_and_absolute_units() {
-        let units = Lengths {
-            container: None,
-            font: FontUnits {
-                em: 20.,
-                ch: 12.,
-                ex: 9.,
-                cap: 14.,
-                ic: 20.,
-                lh: 30.,
-                absolute: false,
-                zoom: 1.,
-            },
-            root: FontUnits {
-                em: 24.,
-                ch: 14.,
-                ex: 11.,
-                cap: 18.,
-                ic: 24.,
-                lh: 36.,
-                absolute: false,
-                zoom: 1.,
-            },
-            viewport: [1200., 800.],
-        };
-        for (source, expected) in [
-            ("2em", 40.),
-            ("2rem", 48.),
-            ("2ch", 24.),
-            ("2rch", 28.),
-            ("2ex", 18.),
-            ("2rex", 22.),
-            ("2cap", 28.),
-            ("2rcap", 36.),
-            ("2ic", 40.),
-            ("2ric", 48.),
-            ("2lh", 60.),
-            ("2rlh", 72.),
-            ("10vw", 120.),
-            ("10vh", 80.),
-            ("10vmin", 80.),
-            ("10vmax", 120.),
-            ("10vi", 120.),
-            ("10vb", 80.),
-            ("25%", 100.),
-            ("1in", 96.),
-            ("2.54cm", 96.),
-            ("25.4mm", 96.),
-            ("101.6Q", 96.),
-            ("72pt", 96.),
-            ("6pc", 96.),
-            ("1e2px", 100.),
-            (".5EM", 10.),
-        ] {
-            let actual = units.resolve(source, 400.).unwrap();
-            assert!(
-                (actual - expected).abs() < 0.001,
-                "{source}: {actual} != {expected}"
-            );
-        }
-        for prefix in ["s", "l", "d"] {
-            for (unit, expected) in [
-                ("vw", 120.),
-                ("vh", 80.),
-                ("vi", 120.),
-                ("vb", 80.),
-                ("vmin", 80.),
-                ("vmax", 120.),
-            ] {
-                assert_eq!(
-                    units.resolve(&format!("10{prefix}{unit}"), 0.),
-                    Some(expected)
-                );
-            }
-        }
+  #[test]
+  fn viewport_font_and_absolute_units() {
+    let units = Lengths {
+      container: None,
+      font: FontUnits {
+        em: 20.,
+        ch: 12.,
+        ex: 9.,
+        cap: 14.,
+        ic: 20.,
+        lh: 30.,
+        absolute: false,
+        zoom: 1.,
+      },
+      root: FontUnits {
+        em: 24.,
+        ch: 14.,
+        ex: 11.,
+        cap: 18.,
+        ic: 24.,
+        lh: 36.,
+        absolute: false,
+        zoom: 1.,
+      },
+      viewport: [1200., 800.],
+    };
+    for (source, expected) in [
+      ("2em", 40.),
+      ("2rem", 48.),
+      ("2ch", 24.),
+      ("2rch", 28.),
+      ("2ex", 18.),
+      ("2rex", 22.),
+      ("2cap", 28.),
+      ("2rcap", 36.),
+      ("2ic", 40.),
+      ("2ric", 48.),
+      ("2lh", 60.),
+      ("2rlh", 72.),
+      ("10vw", 120.),
+      ("10vh", 80.),
+      ("10vmin", 80.),
+      ("10vmax", 120.),
+      ("10vi", 120.),
+      ("10vb", 80.),
+      ("25%", 100.),
+      ("1in", 96.),
+      ("2.54cm", 96.),
+      ("25.4mm", 96.),
+      ("101.6Q", 96.),
+      ("72pt", 96.),
+      ("6pc", 96.),
+      ("1e2px", 100.),
+      (".5EM", 10.),
+    ] {
+      let actual = units.resolve(source, 400.).unwrap();
+      assert!(
+        (actual - expected).abs() < 0.001,
+        "{source}: {actual} != {expected}"
+      );
+    }
+    for prefix in ["s", "l", "d"] {
+      for (unit, expected) in [
+        ("vw", 120.),
+        ("vh", 80.),
+        ("vi", 120.),
+        ("vb", 80.),
+        ("vmin", 80.),
+        ("vmax", 120.),
+      ] {
         assert_eq!(
-            Lengths::new(16., 800., 1200.).resolve("10vmin", 0.),
-            Some(80.)
+          units.resolve(&format!("10{prefix}{unit}"), 0.),
+          Some(expected)
         );
+      }
     }
+    assert_eq!(
+      Lengths::new(16., 800., 1200.).resolve("10vmin", 0.),
+      Some(80.)
+    );
+  }
 
-    #[test]
-    fn math_precedence_dimensions_and_comparison_functions() {
-        let units = Lengths::new(20., 1200., 800.);
-        for (source, expected) in [
-            ("calc(100% - 2rem)", 368.),
-            ("calc(2 * (3px + 4px) / 2)", 7.),
-            ("calc(2px + 3px * 4 - 5px)", 9.),
-            ("calc(2px - -3px)", 5.),
-            ("calc(-2 * 1rem)", -32.),
-            ("calc(calc(10vw - 2px) / 2)", 59.),
-            ("calc(1e-2 * 100px)", 1.),
-            ("min(50%, 300px, 40ch)", 200.),
-            ("max(50%, 300px)", 300.),
-            ("clamp(10px, 2vw, 40px)", 24.),
-            ("clamp(40px, 10px, 20px)", 40.),
-            ("calc(max(2em, 10px) + min(1rem, 20px))", 56.),
-            ("clamp(1rem, calc(100% / 4), 20vw)", 100.),
-            ("CALC(1PX + 2PX)", 3.),
-            ("round(33px, 10px)", 30.),
-            ("round(up, 31px, 10px)", 40.),
-            ("round(DOWN, 39px, 10px)", 30.),
-            ("round(to-zero, -39px, 10px)", -30.),
-            ("round(nearest, 15px, 10px)", 20.),
-            ("round(-2.5px)", -2.),
-            ("round(33%, 10px)", 130.),
-            ("calc(2px * round(1.5))", 4.),
-            ("abs(-5px)", 5.),
-            ("calc(sign(-3px) * 10px)", -10.),
-            ("calc(sign(0px) * 10px)", 0.),
-            ("mod(-7px, 3px)", 2.),
-            ("rem(-7px, 3px)", -1.),
-            ("calc(sin(30deg) * 100px)", 50.),
-            ("calc(cos(0.5turn) * 10px)", -10.),
-            ("calc(cos(200grad) * 10px)", -10.),
-            ("calc(sin(pi / 2) * 1px)", 1.),
-            ("calc(cos(acos(0.5)) * 2px)", 1.),
-            ("calc(10px * tan(atan2(1px, 1px)))", 10.),
-            ("calc(sin(asin(1)) * 1px)", 1.),
-            ("calc(cos(atan(0)) * 1px)", 1.),
-            ("calc(pow(2, 10) * 1px)", 1024.),
-            ("calc(sqrt(16) * 1px)", 4.),
-            ("hypot(3px, 4px)", 5.),
-            ("hypot(-3px)", 3.),
-            ("calc(log(e) * 1px)", 1.),
-            ("calc(log(8, 2) * 1px)", 3.),
-            ("calc(exp(0) * 1px)", 1.),
-            ("calc(1px / infinity)", 0.),
-            ("calc(-min(1px, 2px))", -1.),
-            ("max(1px, -min(-5px, -6px))", 6.),
-            ("clamp(1px, calc(abs(-2) * (1px + 1px)), 50px)", 4.),
-        ] {
-            let actual = units.resolve(source, 400.).unwrap_or(f32::NAN);
-            assert!((actual - expected).abs() < 1e-4, "{source}: {actual}");
-        }
-        assert_eq!(units.parse("sin(30deg)", 0.).map(|v| v.1), Some(false));
-        assert_eq!(
-            units.parse("calc(e)", 0.).map(|v| v.0),
-            Some(std::f32::consts::E)
-        );
-        assert_eq!(
-            units.parse("calc(PI)", 0.).map(|v| v.0),
-            Some(std::f32::consts::PI)
-        );
-        assert_eq!(units.parse("calc(6px / 2px)", 0.), Some((3., false)));
-        assert_eq!(units.parse("calc(1 + .5)", 0.), Some((1.5, false)));
+  #[test]
+  fn math_precedence_dimensions_and_comparison_functions() {
+    let units = Lengths::new(20., 1200., 800.);
+    for (source, expected) in [
+      ("calc(100% - 2rem)", 368.),
+      ("calc(2 * (3px + 4px) / 2)", 7.),
+      ("calc(2px + 3px * 4 - 5px)", 9.),
+      ("calc(2px - -3px)", 5.),
+      ("calc(-2 * 1rem)", -32.),
+      ("calc(calc(10vw - 2px) / 2)", 59.),
+      ("calc(1e-2 * 100px)", 1.),
+      ("min(50%, 300px, 40ch)", 200.),
+      ("max(50%, 300px)", 300.),
+      ("clamp(10px, 2vw, 40px)", 24.),
+      ("clamp(40px, 10px, 20px)", 40.),
+      ("calc(max(2em, 10px) + min(1rem, 20px))", 56.),
+      ("clamp(1rem, calc(100% / 4), 20vw)", 100.),
+      ("CALC(1PX + 2PX)", 3.),
+      ("round(33px, 10px)", 30.),
+      ("round(up, 31px, 10px)", 40.),
+      ("round(DOWN, 39px, 10px)", 30.),
+      ("round(to-zero, -39px, 10px)", -30.),
+      ("round(nearest, 15px, 10px)", 20.),
+      ("round(-2.5px)", -2.),
+      ("round(33%, 10px)", 130.),
+      ("calc(2px * round(1.5))", 4.),
+      ("abs(-5px)", 5.),
+      ("calc(sign(-3px) * 10px)", -10.),
+      ("calc(sign(0px) * 10px)", 0.),
+      ("mod(-7px, 3px)", 2.),
+      ("rem(-7px, 3px)", -1.),
+      ("calc(sin(30deg) * 100px)", 50.),
+      ("calc(cos(0.5turn) * 10px)", -10.),
+      ("calc(cos(200grad) * 10px)", -10.),
+      ("calc(sin(pi / 2) * 1px)", 1.),
+      ("calc(cos(acos(0.5)) * 2px)", 1.),
+      ("calc(10px * tan(atan2(1px, 1px)))", 10.),
+      ("calc(sin(asin(1)) * 1px)", 1.),
+      ("calc(cos(atan(0)) * 1px)", 1.),
+      ("calc(pow(2, 10) * 1px)", 1024.),
+      ("calc(sqrt(16) * 1px)", 4.),
+      ("hypot(3px, 4px)", 5.),
+      ("hypot(-3px)", 3.),
+      ("calc(log(e) * 1px)", 1.),
+      ("calc(log(8, 2) * 1px)", 3.),
+      ("calc(exp(0) * 1px)", 1.),
+      ("calc(1px / infinity)", 0.),
+      ("calc(-min(1px, 2px))", -1.),
+      ("max(1px, -min(-5px, -6px))", 6.),
+      ("clamp(1px, calc(abs(-2) * (1px + 1px)), 50px)", 4.),
+    ] {
+      let actual = units.resolve(source, 400.).unwrap_or(f32::NAN);
+      assert!((actual - expected).abs() < 1e-4, "{source}: {actual}");
     }
+    assert_eq!(units.parse("sin(30deg)", 0.).map(|v| v.1), Some(false));
+    assert_eq!(
+      units.parse("calc(e)", 0.).map(|v| v.0),
+      Some(std::f32::consts::E)
+    );
+    assert_eq!(
+      units.parse("calc(PI)", 0.).map(|v| v.0),
+      Some(std::f32::consts::PI)
+    );
+    assert_eq!(units.parse("calc(6px / 2px)", 0.), Some((3., false)));
+    assert_eq!(units.parse("calc(1 + .5)", 0.), Some((1.5, false)));
+  }
 
-    #[test]
-    fn invalid_math_does_not_produce_layout_values() {
-        let units = Lengths::new(16., 800., 600.);
-        for source in [
-            "",
-            "NaN",
-            "inf",
-            "1e999px",
-            "5unknown",
-            "2 px",
-            "1px garbage",
-            "calc()",
-            "calc(2px +)",
-            "calc(1px+2px)",
-            "calc(1px +2px)",
-            "calc(1px+ 2px)",
-            "calc(1px + 2)",
-            "calc(2px * 3px)",
-            "calc(2 / 1px)",
-            "calc(2px / 0)",
-            "calc(2px",
-            "calc(2px))",
-            "calc(2px, 3px)",
-            "min()",
-            "max(2px,)",
-            "min(2px, 3)",
-            "clamp(1px, 2px)",
-            "clamp(1px, 2px, 3px, 4px)",
-            "unknown(1px)",
-            "1px + 2px",
-            "calc(1 + 2)",
-            "calc(6px / 2px)",
-            "1.px",
-            "(1px)",
-            "calc(1e300 * 1e300)",
-            "round(33px, 0px)",
-            "round(33px, 10)",
-            "round(sideways, 33px, 10px)",
-            "mod(5px, 0px)",
-            "mod(5px, 2)",
-            "rem(1px)",
-            "abs(1px, 2px)",
-            "calc(asin(2) * 1px)",
-            "calc(sqrt(-1) * 1px)",
-            "calc(pow(1px, 2) * 1px)",
-            "sin(1px)",
-            "calc(30deg)",
-            "calc(1px + 30deg)",
-            "calc(NaN * 1px)",
-            "calc(1px * e)px",
-            "pi",
-            "e",
-            "hypot(1px, 2)",
-        ] {
-            assert_eq!(units.resolve(source, 100.), None, "{source}");
-        }
-        for (source, value) in [
-            ("1e40px", 33_554_428.),
-            ("calc(infinity * 1px)", 33_554_428.),
-            ("calc(-infinity * 1px)", -33_554_428.),
-            ("calc(pow(10, 400) * 1px)", 33_554_428.),
-            ("calc(exp(1000) * 1px)", 33_554_428.),
-            ("calc(log(0) * 1px)", -33_554_428.),
-        ] {
-            assert_eq!(units.resolve(source, 100.), Some(value), "{source}");
-        }
-        assert_eq!(
-            units.resolve(
-                &format!("{}1px{}", "calc(".repeat(100), ")".repeat(100)),
-                0.
-            ),
-            None
-        );
+  #[test]
+  fn invalid_math_does_not_produce_layout_values() {
+    let units = Lengths::new(16., 800., 600.);
+    for source in [
+      "",
+      "NaN",
+      "inf",
+      "1e999px",
+      "5unknown",
+      "2 px",
+      "1px garbage",
+      "calc()",
+      "calc(2px +)",
+      "calc(1px+2px)",
+      "calc(1px +2px)",
+      "calc(1px+ 2px)",
+      "calc(1px + 2)",
+      "calc(2px * 3px)",
+      "calc(2 / 1px)",
+      "calc(2px / 0)",
+      "calc(2px",
+      "calc(2px))",
+      "calc(2px, 3px)",
+      "min()",
+      "max(2px,)",
+      "min(2px, 3)",
+      "clamp(1px, 2px)",
+      "clamp(1px, 2px, 3px, 4px)",
+      "unknown(1px)",
+      "1px + 2px",
+      "calc(1 + 2)",
+      "calc(6px / 2px)",
+      "1.px",
+      "(1px)",
+      "calc(1e300 * 1e300)",
+      "round(33px, 0px)",
+      "round(33px, 10)",
+      "round(sideways, 33px, 10px)",
+      "mod(5px, 0px)",
+      "mod(5px, 2)",
+      "rem(1px)",
+      "abs(1px, 2px)",
+      "calc(asin(2) * 1px)",
+      "calc(sqrt(-1) * 1px)",
+      "calc(pow(1px, 2) * 1px)",
+      "sin(1px)",
+      "calc(30deg)",
+      "calc(1px + 30deg)",
+      "calc(NaN * 1px)",
+      "calc(1px * e)px",
+      "pi",
+      "e",
+      "hypot(1px, 2)",
+    ] {
+      assert_eq!(units.resolve(source, 100.), None, "{source}");
     }
+    for (source, value) in [
+      ("1e40px", 33_554_428.),
+      ("calc(infinity * 1px)", 33_554_428.),
+      ("calc(-infinity * 1px)", -33_554_428.),
+      ("calc(pow(10, 400) * 1px)", 33_554_428.),
+      ("calc(exp(1000) * 1px)", 33_554_428.),
+      ("calc(log(0) * 1px)", -33_554_428.),
+    ] {
+      assert_eq!(units.resolve(source, 100.), Some(value), "{source}");
+    }
+    assert_eq!(
+      units.resolve(
+        &format!("{}1px{}", "calc(".repeat(100), ")".repeat(100)),
+        0.
+      ),
+      None
+    );
+  }
 
-    #[test]
-    fn media_queries_follow_level_4_grammar_and_serialize() {
-        let evaluate = |query: &str| {
-            let sheet = Stylesheet::parse(&format!("@media {query}{{}}"));
-            let [rule] = sheet.0.as_slice() else {
-                return None;
-            };
-            let Rule::Media(queries, _) = &**rule else {
-                return None;
-            };
-            let matched = queries.is_empty()
-                || queries.iter().any(|query| {
-                    query.matches(800., 600., false, 0, Lengths::new(16., 800., 600.)) == Some(true)
-                });
-            Some((matched, sheet.source()))
-        };
-        for (query, expected) in [
-            ("", true),
-            ("all", true),
-            ("screen", true),
-            ("print", false),
-            ("speech", false),
-            ("not print", true),
-            ("not screen", false),
-            ("NOT PRINT", true),
-            ("only screen and (min-width: 600px)", true),
-            ("screen and (max-width: 600px)", false),
-            ("not screen and (max-width: 600px)", true),
-            ("print and (min-width: 1px)", false),
-            ("not print and (min-width: 1px)", true),
-            ("print, (min-width: 600px)", true),
-            ("(MIN-WIDTH: 600PX)", true),
-            ("(width > 799px)", true),
-            ("(width > 800px)", false),
-            ("(width >= 800px)", true),
-            ("(width = 800px)", true),
-            ("(width: 800px)", true),
-            ("(800px <= width)", true),
-            ("(800px < width)", false),
-            ("(400px < width < 900px)", true),
-            ("(900px > width > 400px)", true),
-            ("(400px <= width <= 700px)", false),
-            ("(400px < width > 900px)", false),
-            ("(height < 600px)", false),
-            ("(height <= 600px)", true),
-            ("(width >= calc(40em + 1px))", true),
-            ("(min-width: calc(50em + 1px))", false),
-            ("(min-width: 0)", true),
-            ("(min-width: 600)", false),
-            ("(min-width: 50%)", false),
-            ("(orientation: landscape)", true),
-            ("(orientation: portrait)", false),
-            ("(min-orientation: portrait)", false),
-            ("(aspect-ratio: 4/3)", true),
-            ("(aspect-ratio: 8 / 6)", true),
-            ("(min-aspect-ratio: 16/9)", false),
-            ("(aspect-ratio > 1)", true),
-            ("(min-resolution: 1dppx)", true),
-            ("(resolution >= 2x)", false),
-            ("(max-resolution: 96dpi)", true),
-            ("(hover: hover)", true),
-            ("(hover: none)", false),
-            ("(any-hover: hover)", true),
-            ("(pointer: fine)", true),
-            ("(any-pointer: coarse)", false),
-            ("(pointer)", true),
-            ("(prefers-color-scheme: light)", true),
-            ("(prefers-color-scheme: dark)", false),
-            ("(prefers-reduced-motion: no-preference)", true),
-            ("(prefers-reduced-motion)", false),
-            ("(prefers-contrast: no-preference)", true),
-            ("(prefers-contrast)", false),
-            ("(prefers-reduced-transparency: reduce)", false),
-            ("(forced-colors: none)", true),
-            ("(forced-colors)", false),
-            ("(inverted-colors: none)", true),
-            ("(display-mode: standalone)", false),
-            ("(display-mode: browser)", true),
-            ("(color)", true),
-            ("(min-color: 8)", true),
-            ("(color-index)", false),
-            ("(monochrome)", false),
-            ("(monochrome: 0)", true),
-            ("(update: fast)", true),
-            ("(scripting: enabled)", true),
-            ("(dynamic-range: standard)", true),
-            ("(dynamic-range: high)", false),
-            ("(color-gamut: srgb)", true),
-            ("(color-gamut: p3)", false),
-            ("(-webkit-min-device-pixel-ratio: 1)", true),
-            ("(-webkit-min-device-pixel-ratio: 2)", false),
-            ("(color-gamut)", true),
-            ("(min-width: 600px) and (max-width: 900px)", true),
-            ("(max-width: 600px) or (orientation: landscape)", true),
-            ("not (max-width: 600px)", true),
-            ("not ((min-width: 600px) and (max-width: 900px))", false),
-            (
-                "((min-width: 600px) or (max-width: 100px)) and (hover)",
-                true,
-            ),
-            ("(min-width: 1px) and (not (hover: none))", true),
-            ("not (not (hover))", true),
-            ("(unknown-feature)", false),
-            ("not (unknown-feature)", false),
-            ("(unknown-feature) or (min-width: 1px)", true),
-            ("(unknown-feature) and (min-width: 1px)", false),
-            ("foo(bar) or (hover)", true),
-            ("(prefers-color-scheme: blue)", false),
-            ("not (prefers-color-scheme: blue)", false),
-            ("(max-width: invalid)", false),
-            ("not (max-width: invalid)", false),
-            ("screen and (min-width: 1px) or (hover)", false),
-            ("(min-width: 1px) and (hover) or (pointer)", false),
-            ("not (hover) and (pointer)", false),
-            ("garbage!!", false),
-            ("screen, garbage!!", true),
-            ("not", false),
-            ("only", false),
-            ("and", false),
-            ("only (hover)", false),
-        ] {
-            let (matched, source) = evaluate(query).unwrap();
-            assert_eq!(matched, expected, "{query}");
-            let reparsed = source
-                .strip_prefix("@media ")
-                .and_then(|source| source.strip_suffix("{}"))
-                .unwrap();
-            assert_eq!(
-                evaluate(reparsed).unwrap().0,
-                expected,
-                "{query} -> {source}"
-            );
-        }
-        let retina = |query: &str| {
-            let sheet = Stylesheet::parse(&format!("@media {query}{{}}"));
-            let [rule] = sheet.0.as_slice() else {
-                return None;
-            };
-            let Rule::Media(queries, _) = &**rule else {
-                return None;
-            };
-            queries[0].matches(
-                800.,
-                600.,
-                false,
-                200 << 16 | 64,
-                Lengths::new(16., 800., 600.),
-            )
-        };
-        assert_eq!(retina("(min-resolution: 2dppx)"), Some(true));
-        assert_eq!(retina("(-webkit-min-device-pixel-ratio: 2)"), Some(true));
-        assert_eq!(retina("(min-resolution: 192dpi)"), Some(true));
-        assert_eq!(retina("(resolution > 2x)"), Some(false));
-        assert_eq!(retina("(color-gamut: p3)"), Some(true));
-        assert_eq!(retina("(color-gamut: rec2020)"), Some(false));
-        let deep = format!("{}(hover){}", "(".repeat(200), ")".repeat(200));
-        assert!(evaluate(&deep).is_none_or(|(matched, _)| !matched));
+  #[test]
+  fn media_queries_follow_level_4_grammar_and_serialize() {
+    let evaluate = |query: &str| {
+      let sheet = Stylesheet::parse(&format!("@media {query}{{}}"));
+      let [rule] = sheet.0.as_slice() else {
+        return None;
+      };
+      let Rule::Media(queries, _) = &**rule else {
+        return None;
+      };
+      let matched = queries.is_empty()
+        || queries.iter().any(|query| {
+          query.matches(800., 600., false, 0, Lengths::new(16., 800., 600.)) == Some(true)
+        });
+      Some((matched, sheet.source()))
+    };
+    for (query, expected) in [
+      ("", true),
+      ("all", true),
+      ("screen", true),
+      ("print", false),
+      ("speech", false),
+      ("not print", true),
+      ("not screen", false),
+      ("NOT PRINT", true),
+      ("only screen and (min-width: 600px)", true),
+      ("screen and (max-width: 600px)", false),
+      ("not screen and (max-width: 600px)", true),
+      ("print and (min-width: 1px)", false),
+      ("not print and (min-width: 1px)", true),
+      ("print, (min-width: 600px)", true),
+      ("(MIN-WIDTH: 600PX)", true),
+      ("(width > 799px)", true),
+      ("(width > 800px)", false),
+      ("(width >= 800px)", true),
+      ("(width = 800px)", true),
+      ("(width: 800px)", true),
+      ("(800px <= width)", true),
+      ("(800px < width)", false),
+      ("(400px < width < 900px)", true),
+      ("(900px > width > 400px)", true),
+      ("(400px <= width <= 700px)", false),
+      ("(400px < width > 900px)", false),
+      ("(height < 600px)", false),
+      ("(height <= 600px)", true),
+      ("(width >= calc(40em + 1px))", true),
+      ("(min-width: calc(50em + 1px))", false),
+      ("(min-width: 0)", true),
+      ("(min-width: 600)", false),
+      ("(min-width: 50%)", false),
+      ("(orientation: landscape)", true),
+      ("(orientation: portrait)", false),
+      ("(min-orientation: portrait)", false),
+      ("(aspect-ratio: 4/3)", true),
+      ("(aspect-ratio: 8 / 6)", true),
+      ("(min-aspect-ratio: 16/9)", false),
+      ("(aspect-ratio > 1)", true),
+      ("(min-resolution: 1dppx)", true),
+      ("(resolution >= 2x)", false),
+      ("(max-resolution: 96dpi)", true),
+      ("(hover: hover)", true),
+      ("(hover: none)", false),
+      ("(any-hover: hover)", true),
+      ("(pointer: fine)", true),
+      ("(any-pointer: coarse)", false),
+      ("(pointer)", true),
+      ("(prefers-color-scheme: light)", true),
+      ("(prefers-color-scheme: dark)", false),
+      ("(prefers-reduced-motion: no-preference)", true),
+      ("(prefers-reduced-motion)", false),
+      ("(prefers-contrast: no-preference)", true),
+      ("(prefers-contrast)", false),
+      ("(prefers-reduced-transparency: reduce)", false),
+      ("(forced-colors: none)", true),
+      ("(forced-colors)", false),
+      ("(inverted-colors: none)", true),
+      ("(display-mode: standalone)", false),
+      ("(display-mode: browser)", true),
+      ("(color)", true),
+      ("(min-color: 8)", true),
+      ("(color-index)", false),
+      ("(monochrome)", false),
+      ("(monochrome: 0)", true),
+      ("(update: fast)", true),
+      ("(scripting: enabled)", true),
+      ("(dynamic-range: standard)", true),
+      ("(dynamic-range: high)", false),
+      ("(color-gamut: srgb)", true),
+      ("(color-gamut: p3)", false),
+      ("(-webkit-min-device-pixel-ratio: 1)", true),
+      ("(-webkit-min-device-pixel-ratio: 2)", false),
+      ("(color-gamut)", true),
+      ("(min-width: 600px) and (max-width: 900px)", true),
+      ("(max-width: 600px) or (orientation: landscape)", true),
+      ("not (max-width: 600px)", true),
+      ("not ((min-width: 600px) and (max-width: 900px))", false),
+      (
+        "((min-width: 600px) or (max-width: 100px)) and (hover)",
+        true,
+      ),
+      ("(min-width: 1px) and (not (hover: none))", true),
+      ("not (not (hover))", true),
+      ("(unknown-feature)", false),
+      ("not (unknown-feature)", false),
+      ("(unknown-feature) or (min-width: 1px)", true),
+      ("(unknown-feature) and (min-width: 1px)", false),
+      ("foo(bar) or (hover)", true),
+      ("(prefers-color-scheme: blue)", false),
+      ("not (prefers-color-scheme: blue)", false),
+      ("(max-width: invalid)", false),
+      ("not (max-width: invalid)", false),
+      ("screen and (min-width: 1px) or (hover)", false),
+      ("(min-width: 1px) and (hover) or (pointer)", false),
+      ("not (hover) and (pointer)", false),
+      ("garbage!!", false),
+      ("screen, garbage!!", true),
+      ("not", false),
+      ("only", false),
+      ("and", false),
+      ("only (hover)", false),
+    ] {
+      let (matched, source) = evaluate(query).unwrap();
+      assert_eq!(matched, expected, "{query}");
+      let reparsed = source
+        .strip_prefix("@media ")
+        .and_then(|source| source.strip_suffix("{}"))
+        .unwrap();
+      assert_eq!(
+        evaluate(reparsed).unwrap().0,
+        expected,
+        "{query} -> {source}"
+      );
     }
+    let retina = |query: &str| {
+      let sheet = Stylesheet::parse(&format!("@media {query}{{}}"));
+      let [rule] = sheet.0.as_slice() else {
+        return None;
+      };
+      let Rule::Media(queries, _) = &**rule else {
+        return None;
+      };
+      queries[0].matches(
+        800.,
+        600.,
+        false,
+        200 << 16 | 64,
+        Lengths::new(16., 800., 600.),
+      )
+    };
+    assert_eq!(retina("(min-resolution: 2dppx)"), Some(true));
+    assert_eq!(retina("(-webkit-min-device-pixel-ratio: 2)"), Some(true));
+    assert_eq!(retina("(min-resolution: 192dpi)"), Some(true));
+    assert_eq!(retina("(resolution > 2x)"), Some(false));
+    assert_eq!(retina("(color-gamut: p3)"), Some(true));
+    assert_eq!(retina("(color-gamut: rec2020)"), Some(false));
+    let deep = format!("{}(hover){}", "(".repeat(200), ")".repeat(200));
+    assert!(evaluate(&deep).is_none_or(|(matched, _)| !matched));
+  }
 
-    #[test]
-    fn supports_conditions_check_properties_values_and_selectors() {
-        let supported = |condition: &str| match Stylesheet::parse(&format!(
-            "@supports {condition} {{ a {{ color: red }} }}"
-        ))
-        .0
-        .as_slice()
-        {
-            [rule] => match **rule {
-                Rule::Supports(_, supported, _) => Some(supported),
-                _ => None,
-            },
-            _ => None,
-        };
-        for (condition, expected) in [
-            ("(display: flex)", Some(true)),
-            ("(display: inline-grid)", Some(true)),
-            ("(display: contents)", Some(true)),
-            ("(DISPLAY: FLEX)", Some(true)),
-            ("(display: nonsense)", Some(false)),
-            ("not (display: nonsense)", Some(true)),
-            ("(display: flex !important)", Some(true)),
-            ("(position: sticky)", Some(true)),
-            ("(break-inside: avoid-column)", Some(true)),
-            ("(break-before: always)", Some(false)),
-            ("(page-break-before: always)", Some(true)),
-            ("(orphans: 3)", Some(true)),
-            ("(widows: 0)", Some(false)),
-            ("(gap: 1rem)", Some(true)),
-            ("(aspect-ratio: 16 / 9)", Some(true)),
-            ("(width: 1cqi)", Some(true)),
-            ("(width:)", Some(false)),
-            ("(color: color-mix(in lab, red, red))", Some(true)),
-            ("(color: rgb(from red r g b))", Some(true)),
-            ("(background-color: oklch(0.5 0.1 120))", Some(true)),
-            ("(color: nonsense)", Some(false)),
-            ("(color: var(--ink))", Some(true)),
-            ("(color: inherit)", Some(true)),
-            ("(--custom: anything)", Some(true)),
-            ("(margin-trim: inline)", Some(false)),
-            ("(-webkit-hyphens: none)", Some(false)),
-            ("(display: flex) and (gap: 1px)", Some(true)),
-            ("(display: flex) and (display: nonsense)", Some(false)),
-            ("(display: nonsense) or (display: grid)", Some(true)),
-            ("not ((display: nonsense) or (display: block))", Some(false)),
-            (
-                "((display: flex) and (not (display: nonsense)))",
-                Some(true),
-            ),
-            ("selector(a > b)", Some(true)),
-            ("not selector(a > b)", Some(false)),
-            ("font-tech(color-colrv1)", Some(false)),
-            ("font-tech(variations)", Some(true)),
-            ("at-rule(@Scope)", Some(true)),
-            ("at-rule(@counter-style)", Some(false)),
-            ("at-rule(scope)", Some(false)),
-            ("not font-format(woff2)", Some(false)),
-            ("font-format(opentype)", Some(true)),
-            ("font-format(embedded-opentype)", Some(false)),
-            ("(width: bogus)", Some(false)),
-            ("(width: calc(100% - 2px))", Some(true)),
-            ("(filter: blur(2px))", Some(true)),
-            ("(backdrop-filter: blur(1px) saturate(2))", Some(true)),
-            ("(-webkit-backdrop-filter: none)", Some(true)),
-            ("(mask-image: linear-gradient(red, blue))", Some(true)),
-            ("(clip-path: circle(50%))", Some(true)),
-            ("(scrollbar-width: thin)", Some(true)),
-            ("(scrollbar-color: red blue)", Some(true)),
-            ("(mix-blend-mode: multiply)", Some(true)),
-            ("(transform: translateX(1px) rotate(2deg))", Some(true)),
-            ("(transform: bogus)", Some(false)),
-            ("(margin: 1px auto)", Some(true)),
-            ("(margin: red)", Some(false)),
-            ("(opacity: 50%)", Some(true)),
-            ("(z-index: 1.5)", Some(false)),
-            ("(text-wrap: balance)", Some(true)),
-            ("(word-break: break-all)", Some(true)),
-            ("(word-break: keep-all)", Some(true)),
-            (
-                "((-webkit-hyphens: none) and (not (margin-trim: inline))) or ((-moz-orient: inline) and (not (color:rgb(from red r g b))))",
-                Some(false),
-            ),
-            ("(foo bar)", Some(false)),
-            ("not (foo bar)", Some(true)),
-            ("display: flex", None),
-            ("(display: flex) and", None),
-            ("(a: b) and (c: d) or (e: f)", None),
-            ("not (a: b) and (c: d)", None),
-        ] {
-            assert_eq!(supported(condition), expected, "{condition}");
-        }
+  #[test]
+  fn supports_conditions_check_properties_values_and_selectors() {
+    let supported = |condition: &str| match Stylesheet::parse(&format!(
+      "@supports {condition} {{ a {{ color: red }} }}"
+    ))
+    .0
+    .as_slice()
+    {
+      [rule] => match **rule {
+        Rule::Supports(_, supported, _) => Some(supported),
+        _ => None,
+      },
+      _ => None,
+    };
+    for (condition, expected) in [
+      ("(display: flex)", Some(true)),
+      ("(display: inline-grid)", Some(true)),
+      ("(display: contents)", Some(true)),
+      ("(DISPLAY: FLEX)", Some(true)),
+      ("(display: nonsense)", Some(false)),
+      ("not (display: nonsense)", Some(true)),
+      ("(display: flex !important)", Some(true)),
+      ("(position: sticky)", Some(true)),
+      ("(break-inside: avoid-column)", Some(true)),
+      ("(break-before: always)", Some(false)),
+      ("(page-break-before: always)", Some(true)),
+      ("(orphans: 3)", Some(true)),
+      ("(widows: 0)", Some(false)),
+      ("(gap: 1rem)", Some(true)),
+      ("(aspect-ratio: 16 / 9)", Some(true)),
+      ("(width: 1cqi)", Some(true)),
+      ("(width:)", Some(false)),
+      ("(color: color-mix(in lab, red, red))", Some(true)),
+      ("(color: rgb(from red r g b))", Some(true)),
+      ("(background-color: oklch(0.5 0.1 120))", Some(true)),
+      ("(color: nonsense)", Some(false)),
+      ("(color: var(--ink))", Some(true)),
+      ("(color: inherit)", Some(true)),
+      ("(--custom: anything)", Some(true)),
+      ("(margin-trim: inline)", Some(false)),
+      ("(-webkit-hyphens: none)", Some(false)),
+      ("(display: flex) and (gap: 1px)", Some(true)),
+      ("(display: flex) and (display: nonsense)", Some(false)),
+      ("(display: nonsense) or (display: grid)", Some(true)),
+      ("not ((display: nonsense) or (display: block))", Some(false)),
+      (
+        "((display: flex) and (not (display: nonsense)))",
+        Some(true),
+      ),
+      ("selector(a > b)", Some(true)),
+      ("not selector(a > b)", Some(false)),
+      ("font-tech(color-colrv1)", Some(false)),
+      ("font-tech(variations)", Some(true)),
+      ("at-rule(@Scope)", Some(true)),
+      ("at-rule(@counter-style)", Some(false)),
+      ("at-rule(scope)", Some(false)),
+      ("not font-format(woff2)", Some(false)),
+      ("font-format(opentype)", Some(true)),
+      ("font-format(embedded-opentype)", Some(false)),
+      ("(width: bogus)", Some(false)),
+      ("(width: calc(100% - 2px))", Some(true)),
+      ("(filter: blur(2px))", Some(true)),
+      ("(backdrop-filter: blur(1px) saturate(2))", Some(true)),
+      ("(-webkit-backdrop-filter: none)", Some(true)),
+      ("(mask-image: linear-gradient(red, blue))", Some(true)),
+      ("(clip-path: circle(50%))", Some(true)),
+      ("(scrollbar-width: thin)", Some(true)),
+      ("(scrollbar-color: red blue)", Some(true)),
+      ("(mix-blend-mode: multiply)", Some(true)),
+      ("(transform: translateX(1px) rotate(2deg))", Some(true)),
+      ("(transform: bogus)", Some(false)),
+      ("(margin: 1px auto)", Some(true)),
+      ("(margin: red)", Some(false)),
+      ("(opacity: 50%)", Some(true)),
+      ("(z-index: 1.5)", Some(false)),
+      ("(text-wrap: balance)", Some(true)),
+      ("(word-break: break-all)", Some(true)),
+      ("(word-break: keep-all)", Some(true)),
+      (
+        "((-webkit-hyphens: none) and (not (margin-trim: inline))) or ((-moz-orient: inline) and (not (color:rgb(from red r g b))))",
+        Some(false),
+      ),
+      ("(foo bar)", Some(false)),
+      ("not (foo bar)", Some(true)),
+      ("display: flex", None),
+      ("(display: flex) and", None),
+      ("(a: b) and (c: d) or (e: f)", None),
+      ("not (a: b) and (c: d)", None),
+    ] {
+      assert_eq!(supported(condition), expected, "{condition}");
     }
+  }
 
-    #[test]
-    fn media_features_named_style_are_no_style_queries() {
-        let sheet = crate::css::sheet::Stylesheet::parse("@media (style: x) { p { color: red } }");
-        let Rule::Media(queries, _) = &*sheet.0[0] else {
-            unreachable!()
-        };
-        assert_eq!(queries[0].source(), "(style: x)");
-    }
+  #[test]
+  fn media_features_named_style_are_no_style_queries() {
+    let sheet = crate::css::sheet::Stylesheet::parse("@media (style: x) { p { color: red } }");
+    let Rule::Media(queries, _) = &*sheet.0[0] else {
+      unreachable!()
+    };
+    assert_eq!(queries[0].source(), "(style: x)");
+  }
 }

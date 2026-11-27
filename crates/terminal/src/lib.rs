@@ -14,5 +14,5 @@ pub use terminal::*;
 #[cfg(not(ghostty))]
 #[unsafe(no_mangle)]
 pub extern "C" fn apps_terminal_abi() -> u32 {
-    0
+  0
 }

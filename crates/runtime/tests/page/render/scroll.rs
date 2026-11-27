@@ -3,8 +3,8 @@ use super::*;
 #[test]
 #[ignore = "requires the macOS window server"]
 fn absolute_boxes_keep_their_static_place_in_the_line_and_out_of_the_scroll_range() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const box = await run(`(r => [r.left, r.top].map(Math.round).join())(document.getElementById('i').getBoundingClientRect())`);
         const end = await run(`Math.round((g => (g.selectNodeContents(document.getElementById('p').firstChild), g.getClientRects()[1].right))(document.createRange()))`);
@@ -16,21 +16,21 @@ fn absolute_boxes_keep_their_static_place_in_the_line_and_out_of_the_scroll_rang
         const width = await run(`document.documentElement.scrollWidth`);
         if (width !== 400) fail('a box placed in another block scrolls from where it is: ' + width);
         "#,
-        &[(
-            "page.html",
-            "<head><style>body{margin:0;font:16px Helvetica} #p{width:120px;line-height:20px} #p i{position:absolute;width:10px;height:10px}\
+    &[(
+      "page.html",
+      "<head><style>body{margin:0;font:16px Helvetica} #p{width:120px;line-height:20px} #p i{position:absolute;width:10px;height:10px}\
              #q{position:relative;width:200px} #q::after{content:'';position:absolute;top:0;width:10px;height:10px}\
              #w{margin-left:100px} #w>u{position:absolute;left:300px;width:30px;height:30px}</style></head>\
              <body><div id=p>one two three four<i id=i></i> five</div><div id=q>abc</div><div id=w><u></u>x</div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn scroll_anchors_keep_the_content_in_view() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const step = async code => { const out = await run(code); await win.webContents.capturePage(); return out; };
         const read = () => run(`[...'abcde'].map(id => document.getElementById(id).scrollTop).join()`);
@@ -55,9 +55,9 @@ fn scroll_anchors_keep_the_content_in_view() {
         const events = await run(`events.join()`);
         if (!events.startsWith('a60,a70,') || !events.endsWith(',p300,p310')) fail('scroll events: ' + events);
         "#,
-        &[(
-            "page.html",
-            "<head><style>.s{display:inline-block;width:60px;height:100px;overflow:auto}\
+    &[(
+      "page.html",
+      "<head><style>.s{display:inline-block;width:60px;height:100px;overflow:auto}\
              .s>div,#p>div{height:20px}</style></head><body style='margin:0'>\
              <div id=a class=s></div><div id=b class=s style='overflow-anchor:none'></div><div id=c class=s></div>\
              <div id=d class=s></div><div id=e class=s></div><div id=p></div>\
@@ -66,15 +66,15 @@ fn scroll_anchors_keep_the_content_in_view() {
              document.getElementById('d3').style.overflowAnchor = 'none';\
              globalThis.events = []; document.getElementById('a').addEventListener('scroll', e => events.push('a' + e.target.scrollTop));\
              addEventListener('scroll', () => events.push('p' + scrollY));</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn pages_scroll_sideways_from_their_start() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('wide.html');
         const read = () => run(`[scrollX, document.scrollingElement.scrollWidth - innerWidth, document.body.scrollWidth].join()`);
         const step = async code => { await run(code); await win.webContents.capturePage(); return read(); };
@@ -89,18 +89,18 @@ fn pages_scroll_sideways_from_their_start() {
         ].join(' ');
         if (rtl !== `0,${m},1500 -${m},${m},1500 0,${m},1500 -${m},${m},1500`) fail('rtl: ' + rtl);
         "#,
-        &[(
-            "wide.html",
-            "<body style='margin:0'><div id=w style='width:1500px;height:40px'></div></body>",
-        )],
-    );
+    &[(
+      "wide.html",
+      "<body style='margin:0'><div id=w style='width:1500px;height:40px'></div></body>",
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn blocks_far_from_the_view_move_with_a_sideways_scroll() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const read = () => run(`[0, 15, 20, 39].map(i => Math.round(document.getElementById('r' + i).getBoundingClientRect().left)).join()`);
         const got = [await read()];
@@ -113,21 +113,21 @@ fn blocks_far_from_the_view_move_with_a_sideways_scroll() {
         const want = '9,9,9,9 -91,-91,-91,-91 -91,-91,-91,-91 -21,-21,-21,-21 -21,-21,-21,-21 -21,-21,-21,-21 -21,-21,-21,-21';
         if (got.join(' ') !== want) fail(got.join(' '));
         "#,
-        &[(
-            "page.html",
-            "<body style='margin:0'><div id=b style='width:150px;height:200px;overflow:auto;border:1px solid;margin:8px'>\
+    &[(
+      "page.html",
+      "<body style='margin:0'><div id=b style='width:150px;height:200px;overflow:auto;border:1px solid;margin:8px'>\
              <div style='width:600px;height:20px'></div></div>\
              <script type=module>const b = document.getElementById('b');\
              for (let i = 0; i < 40; i++) b.append(Object.assign(document.createElement('div'), { id: 'r' + i, style: 'height:40px' }));</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn right_to_left_and_reversed_boxes_scroll_from_their_end() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const read = id => run(`(s => (r => [s.scrollWidth, s.scrollLeft, s.scrollTop, Math.round(r.x), Math.round(r.y)].join())(s.firstElementChild.getBoundingClientRect()))(document.getElementById('${id}'))`);
         const set = (id, key, value) => run(`document.getElementById('${id}').${key} = ${value}`);
@@ -152,24 +152,24 @@ fn right_to_left_and_reversed_boxes_scroll_from_their_end() {
         const end = (await read('t')).split(',').map(Number);
         if (!(text[0] > 300 && Math.abs(end[1] + text[0] - 200) <= 0.5 && Math.abs(end[3] + end[1]) <= 0.5)) fail('text that overflows to the left: ' + text + ' ' + end);
         "#,
-        &[(
-            "page.html",
-            "<head><style>body{margin:0} div>div{flex:none;width:500px;height:20px} .s{width:200px;height:40px;overflow:auto}</style></head>\
+    &[(
+      "page.html",
+      "<head><style>body{margin:0} div>div{flex:none;width:500px;height:20px} .s{width:200px;height:40px;overflow:auto}</style></head>\
              <body><div id=r class=s dir=rtl><div></div></div>\
              <div id=f class=s style='display:flex;flex-direction:row-reverse'><div></div></div>\
              <div id=c class=s style='display:flex;flex-direction:column-reverse;height:120px'><div style='width:100px;height:200px'></div></div>\
              <div id=l class=s><div style='margin-left:-100px'></div></div>\
              <div id=t class=s dir=rtl><div style='width:auto;white-space:nowrap'>A line of text that is much wider than its box</div></div>\
              <div id=k class=s dir=rtl style='display:flex;flex-direction:column'><div></div></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn positioned_boxes_follow_their_containing_block_and_scroller() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         const rect = id => `(r => [r.x, r.y, r.height].join())(document.getElementById('${id}').getBoundingClientRect())`;
         const expect = async (step, code, value) => {
             const got = await run(code);
@@ -231,52 +231,52 @@ fn positioned_boxes_follow_their_containing_block_and_scroller() {
             await expect(step, stuck, value);
         }
         "#,
-        &[
-            (
-                "position.html",
-                "<body style='margin:0'>\
+    &[
+      (
+        "position.html",
+        "<body style='margin:0'>\
                  <div id=g style='margin:50px 0 0 100px;width:200px;height:100px'><div>\
                  <i id=a style='position:absolute;left:0;top:0;width:10px;height:10px'></i></div></div>\
                  <div style='display:grid;position:relative;min-height:300px;width:300px'><div>\
                  <i id=p style='position:absolute;top:0;width:10px;height:50%'></i></div></div>\
                  <script>globalThis.g = document.getElementById('g')</script></body>",
-            ),
-            (
-                "sticky.html",
-                "<body style='margin:0'><div style='height:200px'></div>\
+      ),
+      (
+        "sticky.html",
+        "<body style='margin:0'><div style='height:200px'></div>\
                  <div id=s style='height:100px;overflow:auto'><div style='height:300px'>\
                  <b id=t style='position:sticky;top:0;display:block;height:10px'></b></div></div>\
                  <div style='height:2000px'></div>\
                  <script>globalThis.s = document.getElementById('s')</script></body>",
-            ),
-            (
-                "escape.html",
-                "<body style='margin:0'><div id=s style='width:100px;height:100px;overflow:hidden'>\
+      ),
+      (
+        "escape.html",
+        "<body style='margin:0'><div id=s style='width:100px;height:100px;overflow:hidden'>\
                  <div id=menu style='position:absolute;left:150px;top:0;width:50px;height:50px'></div>\
                  <div id=overlay style='position:fixed;left:0;top:200px;width:300px;height:50px'></div>\
                  <div style='position:relative;height:100px'>\
                  <i id=clipped style='position:absolute;left:150px;top:120px;width:20px;height:20px'></i></div>\
                  <div><div id=host></div></div></div>\
                  <script>globalThis.s = document.getElementById('s')</script></body>",
-            ),
-            (
-                "outer-block.html",
-                "<body style='margin:0'><style>.s{overflow:auto;border:2px solid}.r{height:40px}</style>\
+      ),
+      (
+        "outer-block.html",
+        "<body style='margin:0'><style>.s{overflow:auto;border:2px solid}.r{height:40px}</style>\
                  <div class=s id=A style='position:relative;width:200px;height:150px;margin:20px'><div class=r></div>\
                  <div class=s id=B style='width:120px;height:80px'><div class=r></div>\
                  <div id=abs style='position:absolute;left:130px;top:10px;width:50px;height:50px'></div>\
                  <div class=r></div><div class=r></div></div><div class=r></div><div class=r></div><div class=r></div></div>\
                  <script>globalThis.A = document.getElementById('A'); globalThis.B = document.getElementById('B')</script></body>",
-            ),
-            (
-                "chain.html",
-                "<body style='margin:0'><style>.s{overflow:auto;border:2px solid}.r{height:40px}.x{position:absolute;width:20px;height:20px}</style><div style='display:flex'><div class=s id=A3 style='position:relative;width:150px;height:150px'><div class=r></div><div class=s id=B3 style='width:120px;height:100px'><div class=r></div><div class=s id=C3 style='width:90px;height:60px'><div class=r></div><i class=x id=x3 style='left:110px;top:20px'></i><div class=r></div><div class=r></div></div><div class=r></div><div class=r></div><div class=r></div></div><div class=r></div><div class=r></div><div class=r></div><div class=r></div></div>\
+      ),
+      (
+        "chain.html",
+        "<body style='margin:0'><style>.s{overflow:auto;border:2px solid}.r{height:40px}.x{position:absolute;width:20px;height:20px}</style><div style='display:flex'><div class=s id=A3 style='position:relative;width:150px;height:150px'><div class=r></div><div class=s id=B3 style='width:120px;height:100px'><div class=r></div><div class=s id=C3 style='width:90px;height:60px'><div class=r></div><i class=x id=x3 style='left:110px;top:20px'></i><div class=r></div><div class=r></div></div><div class=r></div><div class=r></div><div class=r></div></div><div class=r></div><div class=r></div><div class=r></div><div class=r></div></div>\
                  <div class=s id=A4 style='transform:translateZ(0);width:150px;height:150px'><div class=r></div><div class=s id=B4 style='width:100px;height:80px'><div class=r></div><i id=x4 style='position:fixed;left:110px;top:10px;width:20px;height:20px'></i><div class=r></div><div class=r></div><div class=r></div></div><div class=r></div><div class=r></div><div class=r></div><div class=r></div></div></div>\
                  <div class=s id=A6 style='position:relative;width:150px;height:120px'><div class=r></div><div class=s id=B6 style='width:100px;height:60px'><div class=r></div><div id=x6 style='position:absolute;left:110px;top:10px;width:30px;height:200px'><b id=st6 style='position:sticky;top:0;display:block;height:20px;background:#f00'></b></div><div class=r></div><div class=r></div><div class=r></div></div><div class=r></div><div class=r></div><div class=r></div><div class=r></div></div></body>",
-            ),
-            (
-                "restick.html",
-                "<body style='margin:0;height:2000px'><style>.s{overflow:auto;border:2px solid}.r{height:40px}</style>\
+      ),
+      (
+        "restick.html",
+        "<body style='margin:0;height:2000px'><style>.s{overflow:auto;border:2px solid}.r{height:40px}</style>\
                  <div style='height:100px'></div><div class=s id=A6 style='position:relative;width:150px;height:120px;margin:10px'>\
                  <div class=r></div><div class=s id=B6 style='width:100px;height:60px'><div class=r></div>\
                  <div id=x6 style='position:absolute;left:110px;top:10px;width:30px;height:400px'>\
@@ -284,22 +284,22 @@ fn positioned_boxes_follow_their_containing_block_and_scroller() {
                  <div class=r></div><div class=r></div><div class=r></div></div>\
                  <div class=r></div><div class=r></div><div class=r></div><div class=r></div></div>\
                  <script>globalThis.A6 = document.getElementById('A6')</script></body>",
-            ),
-            (
-                "nested-escape.html",
-                "<body style='margin:0'><p>Text</p>\
+      ),
+      (
+        "nested-escape.html",
+        "<body style='margin:0'><p>Text</p>\
                  <div style='position:absolute;left:10px;top:40px;width:40px;height:40px;background:#ccc'>\
                  <div id=f style='position:fixed;left:300px;top:0;width:10px;height:10px;background:red'></div></div></body>",
-            ),
-        ],
-    );
+      ),
+    ],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn drawable_elements_nest_scroll_and_go_to_workers_and_textures() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const frames = async (done, what) => {
             for (let n = 0; n < 60; n++) { await win.webContents.capturePage(); if (await run(done)) return; }
@@ -340,10 +340,10 @@ fn drawable_elements_nest_scroll_and_go_to_workers_and_textures() {
         // An animation inside a drawable element paints the canvas frame by frame.
         await frames('alphas.size > 3', 'an animation did not paint');
         "#,
-        &[
-            (
-                "page.html",
-                "<body style='margin:0;background:white;height:2000px'>\
+    &[
+      (
+        "page.html",
+        "<body style='margin:0;background:white;height:2000px'>\
                  <canvas id=c width=200 height=100 content=drawable style='display:block;width:200px;height:100px'>\
                  <div id=outer drawable style='width:60px;height:40px;background:rgb(255,0,0)'>\
                  <span id=inner drawable style='width:20px;height:10px;margin:5px;background:rgb(0,0,255)'></span></div></canvas>\
@@ -365,18 +365,18 @@ fn drawable_elements_nest_scroll_and_go_to_workers_and_textures() {
                  var e = document.getElementById('e'), faded = e.getContext('2d'), alphas = new Set();\
                  e.onpaint = () => { faded.reset(); faded.drawElementImage(document.getElementById('pulse'), 0, 0); alphas.add(faded.getImageData(5, 5, 1, 1).data[3]); };\
                  </script></body>",
-            ),
-            ("package.json", r#"{"features":["webgpu","jsExecute"]}"#),
-        ],
-    );
+      ),
+      ("package.json", r#"{"features":["webgpu","jsExecute"]}"#),
+    ],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn text_of_mixed_fonts_moves_with_a_scroll() {
-    run_hidden(
-        &format!(
-            r#"{INPUT}
+  run_hidden(
+    &format!(
+      r#"{INPUT}
         await load('page.html');
         const ink = async () => (await win.webContents.capturePage({{ x: 0, y: 0, width: 200, height: 30 }})).toBitmap().filter((value, index) => index % 4 === 0 && value < 128).length;
         const before = await ink();
@@ -387,22 +387,22 @@ fn text_of_mixed_fonts_moves_with_a_scroll() {
         // mixed fonts, which prepaint shapes, at its place before the scroll.
         if (await run("document.getElementById('list').scrollTop") !== 60 || !(after > before * 0.8)) fail('ink: ' + before + ' ' + after);
         "#
-        ),
-        &[(
-            "page.html",
-            "<body style='margin:0;background:#fff'><style>#list{height:100px;overflow:auto;font:16px sans-serif;color:#000}\
+    ),
+    &[(
+      "page.html",
+      "<body style='margin:0;background:#fff'><style>#list{height:100px;overflow:auto;font:16px sans-serif;color:#000}\
              #list>div{display:grid;grid-template-columns:16px 1fr auto;align-items:center;height:30px}\
              .e{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}</style><div id=list></div>\
              <script>for (let i = 0; i < 20; i++) document.getElementById('list').insertAdjacentHTML('beforeend', '<div><i></i><span class=e><span style=\"font-weight:400\">Part</span> two</span><b>81</b></div>');</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn boxes_that_stop_scrolling_report_their_content_extent() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const heights = () => run("['a','b'].map(id => document.getElementById(id).scrollHeight).join()");
         const first = await heights();
@@ -412,20 +412,20 @@ fn boxes_that_stop_scrolling_report_their_content_extent() {
         const second = await heights();
         if (first !== '500,500' || second !== '500,500') fail('scroll extents: ' + first + ' then ' + second);
         "#,
-        &[(
-            "page.html",
-            "<body style='margin:0'><div id=a style='height:50px'><div style='height:500px'></div></div>\
+    &[(
+      "page.html",
+      "<body style='margin:0'><div id=a style='height:50px'><div style='height:500px'></div></div>\
              <div id=b style='height:50px;overflow:hidden'><div style='height:500px'></div></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 // Debug builds check each copied paint against a fresh paint, so these frames fail when a copy is wrong.
 #[test]
 #[ignore = "requires the macOS window server"]
 fn nested_scrolls_copy_their_content_when_an_outer_scroll_moves_them() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('scroll.html');
         for (const code of ["o.scrollTop = 10", "i.scrollTop = 30", "o.scrollBy(0, 10)", "scrollTo(0, 50)", "o.scrollTop = 0", "scrollTo(0, 120)", "i.scrollTop = 0", "p.scrollTop = 20"]) {
             await run("(() => { const [o, i, p] = ['o', 'i', 'p'].map(id => document.getElementById(id)); " + code + " })()");
@@ -433,25 +433,25 @@ fn nested_scrolls_copy_their_content_when_an_outer_scroll_moves_them() {
             await win.webContents.capturePage();
         }
         "#,
-        &[(
-            "scroll.html",
-            "<body style='margin:8px;height:2000px'><style>\
+    &[(
+      "scroll.html",
+      "<body style='margin:8px;height:2000px'><style>\
              .s{width:200px;height:100px;overflow:auto;background:#eee}\
              .g{height:400px;background:repeating-linear-gradient(#9cf 0 20px,#fc9 20px 40px)}\
              </style><div class=s id=o><div style='height:150px'></div>\
              <div class=s id=i style='width:150px;height:60px'><div class=g style='height:120px'>text</div></div>\
              <div class=g></div></div>\
              <div style='opacity:.8'><div class=s id=p style='position:relative'><div class=g></div></div><div class=g></div></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn long_lists_keep_their_rows_while_they_scroll() {
-    let text = run_hidden(
-        &format!(
-            r#"{STEPS}{LIST}
+  let text = run_hidden(
+    &format!(
+      r#"{STEPS}{LIST}
             await load('list.html');
             await run("globalThis.s = document.getElementById('s'); globalThis.o = document.getElementById('o'); 1");
             await win.webContents.capturePage();
@@ -470,48 +470,48 @@ fn long_lists_keep_their_rows_while_they_scroll() {
             await step('shown', () => run("s.scrollTop = 29900"));
             await look('shown');
             "#
-        ),
-        &[("list.html", &long_list(true))],
-    );
-    check_looks(&text, 0.);
-    let rows = |built: &[&str]| built.iter().filter(|id| id.starts_with('r')).count();
-    let idle = built(&text, "idle");
+    ),
+    &[("list.html", &long_list(true))],
+  );
+  check_looks(&text, 0.);
+  let rows = |built: &[&str]| built.iter().filter(|id| id.starts_with('r')).count();
+  let idle = built(&text, "idle");
+  assert!(
+    idle.iter().all(|id| ["o", "body"].contains(id)),
+    "an unrelated change keeps the list: {idle:?}"
+  );
+  let slow: Vec<Vec<&str>> = (1..=30)
+    .map(|index| built(&text, &format!("slow{index}")))
+    .collect();
+  let planned = slow.iter().filter(|built| built.contains(&"list")).count();
+  assert!(
+    (1..10).contains(&planned),
+    "a slow scroll culls again only now and then: {planned} {slow:?}"
+  );
+  assert!(
+    slow.iter().map(|built| rows(built)).sum::<usize>() < 100,
+    "rows build once as they come near the view: {slow:?}"
+  );
+  for step in ["fast", "back"] {
+    let built = built(&text, step);
     assert!(
-        idle.iter().all(|id| ["o", "body"].contains(id)),
-        "an unrelated change keeps the list: {idle:?}"
+      built.contains(&"list") && rows(&built) < 60,
+      "a fast scroll builds only the rows that come into view: {step} {built:?}"
     );
-    let slow: Vec<Vec<&str>> = (1..=30)
-        .map(|index| built(&text, &format!("slow{index}")))
-        .collect();
-    let planned = slow.iter().filter(|built| built.contains(&"list")).count();
-    assert!(
-        (1..10).contains(&planned),
-        "a slow scroll culls again only now and then: {planned} {slow:?}"
-    );
-    assert!(
-        slow.iter().map(|built| rows(built)).sum::<usize>() < 100,
-        "rows build once as they come near the view: {slow:?}"
-    );
-    for step in ["fast", "back"] {
-        let built = built(&text, step);
-        assert!(
-            built.contains(&"list") && rows(&built) < 60,
-            "a fast scroll builds only the rows that come into view: {step} {built:?}"
-        );
-    }
-    assert_eq!(built(&text, "still"), [""; 0]);
-    assert!(
-        built(&text, "focus").contains(&"r1500"),
-        "a focused box is never culled: {text}"
-    );
+  }
+  assert_eq!(built(&text, "still"), [""; 0]);
+  assert!(
+    built(&text, "focus").contains(&"r1500"),
+    "a focused box is never culled: {text}"
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn long_pages_keep_their_rows_while_they_scroll() {
-    let text = run_hidden(
-        &format!(
-            r#"{STEPS}{LIST}
+  let text = run_hidden(
+    &format!(
+      r#"{STEPS}{LIST}
             await load('page.html');
             await run("globalThis.o = document.getElementById('o'); 1");
             await win.webContents.capturePage();
@@ -525,28 +525,28 @@ fn long_pages_keep_their_rows_while_they_scroll() {
             await look('fast');
             await step('still', () => win.webContents.capturePage());
             "#
-        ),
-        &[("page.html", &long_list(false))],
-    );
-    check_looks(&text, 20.);
-    let idle = built(&text, "idle");
-    assert!(
-        idle.iter().all(|id| ["o", "body"].contains(id)),
-        "an unrelated change keeps the list: {idle:?}"
-    );
-    let fast = built(&text, "fast");
-    assert!(
-        fast.iter().filter(|id| id.starts_with('r')).count() < 60,
-        "{fast:?}"
-    );
-    assert_eq!(built(&text, "still"), [""; 0]);
+    ),
+    &[("page.html", &long_list(false))],
+  );
+  check_looks(&text, 20.);
+  let idle = built(&text, "idle");
+  assert!(
+    idle.iter().all(|id| ["o", "body"].contains(id)),
+    "an unrelated change keeps the list: {idle:?}"
+  );
+  let fast = built(&text, "fast");
+  assert!(
+    fast.iter().filter(|id| id.starts_with('r')).count() < 60,
+    "{fast:?}"
+  );
+  assert_eq!(built(&text, "still"), [""; 0]);
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn scroll_sizes_count_overflowing_content_like_chrome() {
-    let text = run_hidden(
-        r#"await load('page.html');
+  let text = run_hidden(
+    r#"await load('page.html');
         console.log('SIZES ' + await run(`(() => {
             const box = style => '<div style="' + style + '"><div style="height:24px;padding-bottom:10px"></div></div>';
             const cases = ['overflow:hidden;height:0', 'overflow:hidden;height:0;padding:4px', 'height:0', 'display:inline'];
@@ -558,24 +558,24 @@ fn scroll_sizes_count_overflowing_content_like_chrome() {
             sizes.push(chat.scrollHeight);
             return sizes.join(',');
         })()`));"#,
-        &[("page.html", "<!doctype html><body style='margin:0'></body>")],
-    );
-    assert!(text.contains("SIZES 34,42,34,0,50,80"), "{text}");
+    &[("page.html", "<!doctype html><body style='margin:0'></body>")],
+  );
+  assert!(text.contains("SIZES 34,42,34,0,50,80"), "{text}");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn inline_pseudos_empty_boxes_grid_offsets_and_scroll_transforms_lay_out_like_chrome() {
-    let text = run_hidden(
-        &format!(
-            "{RECTS} await load('page.html');
+  let text = run_hidden(
+    &format!(
+      "{RECTS} await load('page.html');
             await win.webContents.capturePage();
             console.log('RECTS ' + await rects());
             console.log('SCROLL ' + await run(\"document.getElementById('scroll').scrollWidth\"));"
-        ),
-        &[(
-            "page.html",
-            "<!doctype html><body style='margin:0;font:16px/20px Helvetica'><div class=w style='width:400px'>\
+    ),
+    &[(
+      "page.html",
+      "<!doctype html><body style='margin:0;font:16px/20px Helvetica'><div class=w style='width:400px'>\
              <style>.b::before{content:'*'}.g{display:grid;grid-template-columns:100px 100px;grid-template-rows:100px;position:relative}\
              .f{float:left;width:40px;height:30px}.s{width:150px;height:60px;overflow:auto}</style>\
              <ul style='margin:0'><li class=b id=li>text<ul><li>y</li></ul></li></ul>\
@@ -593,36 +593,36 @@ fn inline_pseudos_empty_boxes_grid_offsets_and_scroll_transforms_lay_out_like_ch
              <div><div style='margin-bottom:10px'>a</div><div id=etop style='margin:20px 0 35px'></div></div>\
              <div style='display:grid'><div id=clr><div class=f></div><div class=f style='clear:right'></div></div></div>\
              <div style='display:flex;height:100px'><div><img id=fimg style='height:30%;width:10px'></div></div></div></body>",
-        )],
-    );
-    let rects = rects(&text);
-    for (id, rect) in [
-        ("li", "40,0,360,40"),
-        ("pad", "0,52.5,8,26.5"),
-        ("after", "0,92,400,20"),
-        ("rel", "0,132,100,10"),
-        ("abs", "190,192,20,20"),
-        ("ib", "0,212,20,50"),
-        ("det", "0,332,400,20"),
-        ("floats", "0,372,400,60"),
-        ("scroll", "0,432,150,60"),
-        ("video", "0,492,400,200"),
-        ("trail", "0,748.5,400,0"),
-        ("vpad", "0,748.5,400,0"),
-        ("etop", "0,788.5,400,0"),
-        ("clr", "0,803.5,400,30"),
-        ("fimg", "0,833.5,10,30"),
-    ] {
-        assert_eq!(rects[id], rect, "{id}, as in Chrome: {text}");
-    }
-    assert!(text.contains("SCROLL 200"), "as in Chrome: {text}");
+    )],
+  );
+  let rects = rects(&text);
+  for (id, rect) in [
+    ("li", "40,0,360,40"),
+    ("pad", "0,52.5,8,26.5"),
+    ("after", "0,92,400,20"),
+    ("rel", "0,132,100,10"),
+    ("abs", "190,192,20,20"),
+    ("ib", "0,212,20,50"),
+    ("det", "0,332,400,20"),
+    ("floats", "0,372,400,60"),
+    ("scroll", "0,432,150,60"),
+    ("video", "0,492,400,200"),
+    ("trail", "0,748.5,400,0"),
+    ("vpad", "0,748.5,400,0"),
+    ("etop", "0,788.5,400,0"),
+    ("clr", "0,803.5,400,30"),
+    ("fimg", "0,833.5,10,30"),
+  ] {
+    assert_eq!(rects[id], rect, "{id}, as in Chrome: {text}");
+  }
+  assert!(text.contains("SCROLL 200"), "as in Chrome: {text}");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn scroll_boxes_reach_content_below_fixed_height_boxes_like_chrome() {
-    let text = run_hidden(
-        r#"await load('page.html');
+  let text = run_hidden(
+    r#"await load('page.html');
         const sizes = () => run("(box => [document.documentElement.scrollHeight, scrollY, box.scrollHeight, box.scrollTop].join())(document.getElementById('box'))");
         console.log('START ' + await sizes());
         await run("scrollTo(0, 700); document.getElementById('box').scrollTop = 200");
@@ -632,51 +632,51 @@ fn scroll_boxes_reach_content_below_fixed_height_boxes_like_chrome() {
         await win.webContents.capturePage();
         await win.webContents.capturePage();
         console.log('SHORT ' + await sizes());"#,
-        &[(
-            "page.html",
-            "<!doctype html><style>html,body{height:100%}body{margin:0}</style><body>\
+    &[(
+      "page.html",
+      "<!doctype html><style>html,body{height:100%}body{margin:0}</style><body>\
              <div id=box style='height:100px;overflow:auto'><div style='height:50px'><div id=deep style='height:500px'></div></div></div>\
              <div style='height:1500px'></div></body>",
-        )],
-    );
-    for line in [
-        "START 1600,0,500,0",
-        "MOVED 1600,700,500,200",
-        "SHORT 1600,700,100,0",
-    ] {
-        assert!(text.contains(line), "{line}, as in Chrome: {text}");
-    }
+    )],
+  );
+  for line in [
+    "START 1600,0,500,0",
+    "MOVED 1600,700,500,200",
+    "SHORT 1600,700,100,0",
+  ] {
+    assert!(text.contains(line), "{line}, as in Chrome: {text}");
+  }
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn scroll_ranges_reach_overflowing_descendants_like_chrome() {
-    let text = run_hidden(
-        r#"await load('page.html');
+  let text = run_hidden(
+    r#"await load('page.html');
         console.log('SIZES ' + await run(`[...document.querySelectorAll('.s')].map(s => s.scrollWidth + 'x' + s.scrollHeight).join()`));"#,
-        &[(
-            "page.html",
-            "<body style='margin:0;font:10px/12px Menlo'><style>.s{width:100px;height:40px;overflow:auto;border:2px solid;padding:5px}\
+    &[(
+      "page.html",
+      "<body style='margin:0;font:10px/12px Menlo'><style>.s{width:100px;height:40px;overflow:auto;border:2px solid;padding:5px}\
              .w{width:150px;height:10px;flex:none}</style>\
              <div class=s><div class=w style='margin:3px 20px 30px 7px'></div></div>\
              <div class=s><div style='display:flex;gap:10px'><div class=w></div><div class=w></div></div></div>\
              <div class=s style='white-space:nowrap'>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</div>\
              <div class=s><div style='width:50px;height:10px'><div class=w style='height:80px'></div></div></div>\
              <div class=s style='overflow:hidden'><div style='overflow:hidden;width:50px'><div class=w></div></div></div></body>",
-        )],
-    );
-    // Chrome: end padding follows children and lines, not the overflow of boxes inside them.
-    assert!(
-        text.contains("SIZES 187x53,315x50,191x50,155x85,110x50"),
-        "{text}"
-    );
+    )],
+  );
+  // Chrome: end padding follows children and lines, not the overflow of boxes inside them.
+  assert!(
+    text.contains("SIZES 187x53,315x50,191x50,155x85,110x50"),
+    "{text}"
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn scroll_ranges_snap_to_device_pixels_like_chrome() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('scroll.html');
         const ends = await run("[...document.querySelectorAll('.s')].map(s => (s.scrollTop = 1e5, s.scrollTop)).join()");
         // Chrome snaps both sizes to device pixels.
@@ -684,22 +684,22 @@ fn scroll_ranges_snap_to_device_pixels_like_chrome() {
         const want = { 1: '48,101,100', 2: '48.5,100.5,100' }[dpr];
         if (ends !== want) fail('scroll ends at ' + dpr + 'x: ' + ends);
         "#,
-        &[(
-            "scroll.html",
-            "<body style='margin:0'><style>.s{overflow:auto;width:100px}</style>\
+    &[(
+      "scroll.html",
+      "<body style='margin:0'><style>.s{overflow:auto;width:100px}</style>\
              <div class=s style='height:100.5px;margin-top:10.3px'><div style='height:148.75px'></div></div>\
              <div class=s style='height:100px'><div style='height:200.5px'></div></div>\
              <div class=s style='height:100.25px;padding:3.3px'><div style='height:200.6px'></div></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 // The elements are those of Chrome.
 #[test]
 #[ignore = "requires the macOS window server"]
 fn hits_follow_clips_in_transforms_and_containment_like_chrome() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         const expect = async (step, code, value) => {
             const got = await run(code);
             if (got !== value) fail(step + ': ' + got + ' instead of ' + value);
@@ -711,9 +711,9 @@ fn hits_follow_clips_in_transforms_and_containment_like_chrome() {
         await expect('layer', hits([[15, 240], [40, 265], [65, 240], [75, 265]]), 'in,in,in,html');
         await expect('margin', hits([[155, 265], [195, 265], [211, 265]]), 'out,out,html');
         "#,
-        &[(
-            "hits.html",
-            "<body style='margin:0'><style>.c{position:absolute;contain:paint;width:100px;height:100px}.c>a{position:absolute;\
+    &[(
+      "hits.html",
+      "<body style='margin:0'><style>.c{position:absolute;contain:paint;width:100px;height:100px}.c>a{position:absolute;\
              left:80px;top:20px;width:100px;height:40px}</style>\
              <div class=c style='left:10px;top:10px'><a id=a></a></div><div class=c id=sib style='left:130px;top:10px;contain:none'></div>\
              <div class=c style='left:230px;top:10px;contain:strict'><a style='position:fixed'></a></div>\
@@ -725,15 +725,15 @@ fn hits_follow_clips_in_transforms_and_containment_like_chrome() {
              <b id=in style='display:block;width:100px;height:100px;margin:-20px'></b></div>\
              <div style='position:absolute;left:160px;top:235px'><div style='width:40px;height:40px;overflow:clip;overflow-clip-margin:10px'>\
              <b id=out style='display:block;width:100px;height:100px;margin:-20px'></b></div></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn kept_boxes_follow_their_containing_blocks_scrollers_and_transforms() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const off = (id, block) => run(`(([a, c]) => [c.right - a.right, c.bottom - a.bottom].map(Math.round).join())(['${id}', '${block}'].map(id => document.getElementById(id).getBoundingClientRect()))`);
         const turned = () => run(`(([b, t]) => [b.left - t.left, b.top - t.top].map(value => value.toFixed(1)).join())(['b', 't'].map(id => document.getElementById(id).getBoundingClientRect()))`);
@@ -771,9 +771,9 @@ fn kept_boxes_follow_their_containing_blocks_scrollers_and_transforms() {
         const bar = await run("document.getElementById('s').scrollTop");
         if (bar !== 50) fail('the inner scroll keeps its offset: ' + bar);
         "#,
-        &[(
-            "page.html",
-            "<body style='margin:0;height:3000px'><style>\
+    &[(
+      "page.html",
+      "<body style='margin:0;height:3000px'><style>\
              .c{position:relative;width:200px;height:200px;margin:20px;background:#eee}\
              .w{padding:10px} .a{position:absolute;right:0;bottom:0;width:10px;height:10px;background:red}\
              .sr{position:absolute;width:1px;height:1px;overflow:hidden}\
@@ -785,15 +785,15 @@ fn kept_boxes_follow_their_containing_blocks_scrollers_and_transforms() {
              <div class=t id=t><b id=b>x</b></div></div>\
              <div style='position:fixed;top:0;right:0;width:100px;height:60px'>\
              <div class=c id=fc style='margin:0;width:80px;height:30px'><div class=w><u class=a id=f></u></div></div></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn scroll_timelines_follow_the_offset_in_the_same_frame() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const step = async code => { await run(code); await win.webContents.capturePage(); };
         const read = () => run(`['a', 'b', 'c'].map(id => getComputedStyle(document.getElementById(id)).opacity).join()`);
@@ -809,23 +809,23 @@ fn scroll_timelines_follow_the_offset_in_the_same_frame() {
         const time = await run(`String(document.getElementById('b').getAnimations()[0].timeline.currentTime)`);
         if (time !== '50%') fail('the view timeline: ' + time);
         "#,
-        &[(
-            "page.html",
-            "<head><style>.s{width:100px;height:100px;overflow:auto} .c{height:300px}\
+    &[(
+      "page.html",
+      "<head><style>.s{width:100px;height:100px;overflow:auto} .c{height:300px}\
              i{display:block;width:20px;height:20px;animation:f linear both}\
              @keyframes f{from{opacity:0}to{opacity:1}}</style></head><body style='margin:0'>\
              <div class=s id=s><div class=c><i id=a style='animation-timeline:scroll()'></i></div></div>\
              <div class=s id=v><div class=c></div><i id=b style='height:100px;animation-timeline:view()'></i><div class=c></div></div>\
              <div class=s id=n><div class=c><i id=c style='animation-timeline:--none'></i></div></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn vertical_scroll_boxes_scroll_on_their_block_axis_like_chrome() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const read = id => run(`(e => { const out = [e.scrollWidth, e.scrollHeight]; for (const left of [-30, 30, -1000, 1000]) { e.scrollLeft = left; out.push(e.scrollLeft); } return out.join(); })(document.getElementById('${id}'))`);
         const rl = await read('rl'), lr = await read('lr');
@@ -836,21 +836,21 @@ fn vertical_scroll_boxes_scroll_on_their_block_axis_like_chrome() {
         const last = await run(`Math.round(document.getElementById('end').getBoundingClientRect().left)`);
         if (last !== -20) fail('the last line moves with the offset: ' + last);
         "#,
-        &[(
-            "page.html",
-            "<head><style>body{margin:0;font:16px/20px Helvetica} p{margin:0}\
+    &[(
+      "page.html",
+      "<head><style>body{margin:0;font:16px/20px Helvetica} p{margin:0}\
              div{width:100px;height:100px;overflow:auto;scrollbar-width:none}</style></head><body>\
              <div id=rl style='writing-mode:vertical-rl'><p>1</p><p>2</p><p>3</p><p>4</p><p>5</p><p>6</p><p>7</p><p id=end>8</p></div>\
              <div id=lr style='writing-mode:vertical-lr'><p>1</p><p>2</p><p>3</p><p>4</p><p>5</p><p>6</p><p>7</p><p>8</p></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn scroll_listeners_draw_in_the_frame_of_their_scroll() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
         const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap()].slice(0, 3).join();
@@ -884,9 +884,9 @@ fn scroll_listeners_draw_in_the_frame_of_their_scroll() {
         const log = await run('log.join()');
         if (log.split(',').some(entry => entry.startsWith('raf') && entry.split(':')[1] !== entry.split(':')[2])) fail('order: ' + log);
         "#,
-        &[(
-            "page.html",
-            "<head><style>body{margin:0;height:2000px;background:#fff}#s{position:relative;width:100px;height:100px;overflow:auto}\
+    &[(
+      "page.html",
+      "<head><style>body{margin:0;height:2000px;background:#fff}#s{position:relative;width:100px;height:100px;overflow:auto}\
              #m{position:absolute;left:0;top:0;width:20px;height:3px;background:red}#h{position:absolute;left:150px;top:0;width:20px;height:3px;background:blue}\
              #n{position:absolute;left:30px;top:0;width:20px;height:3px;background:lime}</style></head>\
              <body><div id=s><div id=m></div><div id=n></div><div style='height:1000px'></div></div><div id=h></div>\
@@ -896,16 +896,16 @@ fn scroll_listeners_draw_in_the_frame_of_their_scroll() {
              addEventListener('scroll', () => { h.style.top = scrollY + 'px'; });\
              const frame = () => { const now = Math.round(s.scrollTop) + ':' + Math.round(parseFloat(m.style.top || 0)); if (now !== seen) { seen = now; log.push('raf:' + now); } if (!stop) requestAnimationFrame(frame); };\
              requestAnimationFrame(frame);</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn wheel_events_of_a_gesture_go_to_the_node_where_it_began() {
-    run_hidden(
-        &format!(
-            r#"{INPUT}
+  run_hidden(
+    &format!(
+      r#"{INPUT}
         await load('page.html');
         const at = (y, delta_y, phase) => input({{ action: 'scroll', x: 20, y, delta_y, phase }});
         await at(20, 10, 'began');
@@ -923,22 +923,22 @@ fn wheel_events_of_a_gesture_go_to_the_node_where_it_began() {
         const got = await run('log.join()');
         if (got !== 'a,a,a,a,a,b,b,a,a,b') fail('targets: ' + got);
         "#
-        ),
-        &[(
-            "page.html",
-            "<body style='margin:0'><div id=a style='height:50px'></div><div id=b style='height:50px'></div>\
+    ),
+    &[(
+      "page.html",
+      "<body style='margin:0'><div id=a style='height:50px'></div><div id=b style='height:50px'></div>\
              <script>globalThis.log = []; globalThis.a = document.getElementById('a');\
              addEventListener('wheel', event => { log.push(event.target.id); document.body.dataset.n = log.length; });</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn scrollend_fires_when_each_kind_of_scroll_ends() {
-    run_hidden(
-        &format!(
-            r#"{INPUT}
+  run_hidden(
+    &format!(
+      r#"{INPUT}
         await load('page.html');
         const take = () => run('log.splice(0).join()');
         const step = async (name, want) => {{ const got = await take(); if (got !== want) fail(name + ': ' + got + ' instead of ' + want); }};
@@ -984,12 +984,12 @@ fn scrollend_fires_when_each_kind_of_scroll_ends() {
         await frames(700);
         await step('scrolls that move nothing', '');
         "#
-        ),
-        &[(
-            "page.html",
-            "<body style='margin:0'><div id=s style='width:200px;height:120px;overflow:auto'><div id=c style='height:2000px'></div></div>\
+    ),
+    &[(
+      "page.html",
+      "<body style='margin:0'><div id=s style='width:200px;height:120px;overflow:auto'><div id=c style='height:2000px'></div></div>\
              <script>globalThis.s = document.getElementById('s'); globalThis.c = document.getElementById('c'); globalThis.log = [];\
              s.addEventListener('scroll', () => log.push('s' + s.scrollTop)); s.addEventListener('scrollend', () => log.push('end' + s.scrollTop));</script></body>",
-        )],
-    );
+    )],
+  );
 }

@@ -3,8 +3,8 @@ use super::*;
 #[test]
 #[ignore = "requires the macOS window server"]
 fn scrollbars_fade_after_a_drag_that_ends_outside_the_window() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const input = body => fetch(MCP + '/input', { method: 'POST', body: JSON.stringify({ window: win.id, ...body }) }).then(response => response.text());
         // Counts the device pixels of the bar's column that are not the white page.
@@ -15,19 +15,19 @@ fn scrollbars_fade_after_a_drag_that_ends_outside_the_window() {
         const idle = await knob();
         if (!held || !top || idle) fail('bar after the drag: ' + held + ' knob pixels at ' + top + ', then ' + idle);
         "#,
-        &[(
-            "page.html",
-            "<body style='margin:0;background:#fff;overflow:hidden'>\
+    &[(
+      "page.html",
+      "<body style='margin:0;background:#fff;overflow:hidden'>\
              <div id=s style='width:400px;height:200px;overflow:auto'><div style='height:3000px'></div></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn background_images_decode_and_draw() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const red = async () => {
             const bytes = (await win.webContents.capturePage({ x: 10, y: 10, width: 40, height: 40 })).toBitmap();
@@ -39,60 +39,60 @@ fn background_images_decode_and_draw() {
         for (let n = 0; n < 40 && count < 1600; n++) count = await red();
         if (count < 1600) fail('background image did not draw: ' + count);
         "#,
-        &[(
-            "page.html",
-            "<body style='margin:0;background:white'><div style='width:60px;height:60px;background-size:100% 100%;\
+    &[(
+      "page.html",
+      "<body style='margin:0;background:white'><div style='width:60px;height:60px;background-size:100% 100%;\
              background-image:url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==)'></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn shadow_tree_tops_do_not_share_styles_with_light_boxes() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         for (let n = 0; n < 3; n++) await win.webContents.capturePage();
         const width = await run("document.getElementById('outer').shadowRoot.getElementById('mid').getBoundingClientRect().width === innerWidth");
         if (!width) fail('nested host is not as wide as the page');
         "#,
-        &[(
-            "page.html",
-            "<body style='margin:0'><div id=outer></div><div id=other></div><script>\
+    &[(
+      "page.html",
+      "<body style='margin:0'><div id=outer></div><div id=other></div><script>\
              const outer = document.getElementById('outer'), s1 = outer.attachShadow({ mode: 'open' });\
              s1.innerHTML = '<div id=mid></div><button>b1</button>';\
              s1.getElementById('mid').attachShadow({ mode: 'open' }).innerHTML = '<button>b2</button>';\
              document.getElementById('other').attachShadow({ mode: 'open' }).innerHTML = '<button>b3</button>';\
              </script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn inline_boxes_draw_their_outlines_on_each_row() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         // Counts the blue device pixels (BGRA) of each row of the paragraph.
         const pixels = async top => { const bytes = (await win.webContents.capturePage({ x: 0, y: top, width: 200, height: 20 })).toBitmap(); let count = 0; for (let at = 0; at < bytes.length; at += 4) if (bytes[at] > 200 && bytes[at + 1] < 80 && bytes[at + 2] < 80) count++; return count; };
         const rows = [await pixels(0), await pixels(20)];
         if (!(rows[0] > 100 && rows[1] > 100)) fail('outline pixels: ' + rows);
         "#,
-        &[(
-            "page.html",
-            "<body style='margin:0;background:#fff'><p style='margin:0;width:150px;font:16px/20px sans-serif'>\
+    &[(
+      "page.html",
+      "<body style='margin:0;background:#fff'><p style='margin:0;width:150px;font:16px/20px sans-serif'>\
              x <a href='#x' style='outline:2px solid #0000ff;color:#000;text-decoration:none'>an outlined link that wraps</a> y</p></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn window_focus_and_blur_reach_the_page_like_chrome() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         const expect = async (step, code, value) => { const got = await run(code); if (got !== value) fail(step + ': ' + got + ' instead of ' + value); };
         await load('focus.html');
         await expect('hidden window', "[document.hasFocus(), document.activeElement.localName].join()", 'false,body');
@@ -102,19 +102,19 @@ fn window_focus_and_blur_reach_the_page_like_chrome() {
         await expect('window blur', "__appsDispatch('window:blur', []), [document.hasFocus(), document.activeElement.id, log.splice(0).join(), t.value, __appsEditing().marked, t.matches(':focus')].join()", 'false,t,compositionend:か:t,blur:t,focusout:t,blur:win,か,,false');
         await expect('blur without events', "t.blur(), [document.activeElement.localName, log.splice(0).join()].join()", 'body,');
         "#,
-        &[(
-            "focus.html",
-            "<body><textarea id=t></textarea><script>globalThis.log = []; globalThis.t = document.getElementById('t');\
+    &[(
+      "focus.html",
+      "<body><textarea id=t></textarea><script>globalThis.log = []; globalThis.t = document.getElementById('t');\
              for (const type of ['focus', 'blur', 'focusin', 'focusout', 'compositionend']) addEventListener(type, event => log.push(type + (event.data ? ':' + event.data : '') + ':' + (event.target === window ? 'win' : event.target.id)), true);</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn shadow_hosts_take_pseudo_elements_and_container_rules() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         const state = "(r => [r.width, r.height, getComputedStyle(card).color, empty.getBoundingClientRect().height].join())(card.getBoundingClientRect())";
         const expect = async (step, code, value) => {
             await run(code);
@@ -128,9 +128,9 @@ fn shadow_hosts_take_pseudo_elements_and_container_rules() {
         await expect('wide', "outer.style.width = '600px'", '300,56,rgb(0, 128, 0),9');
         await expect('narrow', "outer.style.width = '200px'", '100,33,rgb(0, 0, 0),9');
         "#,
-        &[(
-            "host.html",
-            "<body style='margin:0'><div id=outer style='width:400px;container-type:inline-size'>\
+    &[(
+      "host.html",
+      "<body style='margin:0'><div id=outer style='width:400px;container-type:inline-size'>\
              <x-card id=card class=on><span>s</span></x-card><div id=empty></div></div>\
              <style>#empty{width:100px;container-type:inline-size}\
              @container (width < 150px){#empty::before{content:'';display:block;height:9px}}</style><script>\
@@ -145,15 +145,15 @@ fn shadow_hosts_take_pseudo_elements_and_container_rules() {
              slot{display:block;width:100px;container-type:inline-size}\
              @container (width < 150px){::slotted(span){display:block;height:11px}}\
              </style><slot></slot>`;</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn slotted_and_part_pseudo_elements_paint_and_query_inner_containers() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap().subarray(0, 3)].reverse().join();
         const state = "['s', 'p', 'q'].map(id => (id == 's' ? slotted : shadow.getElementById(id)).getBoundingClientRect().height).join()";
         const expect = async (step, code, value) => {
@@ -170,9 +170,9 @@ fn slotted_and_part_pseudo_elements_paint_and_query_inner_containers() {
         await expect('narrow', "shadow.getElementById('in').style.width = '100px'", '9,7,5');
         await expect('class', "slotted.className = ''", '0,7,5');
         "#,
-        &[(
-            "parts.html",
-            "<body style='margin:0;background:white'><div id=outer style='width:400px;container-type:inline-size'>\
+    &[(
+      "parts.html",
+      "<body style='margin:0;background:white'><div id=outer style='width:400px;container-type:inline-size'>\
              <x-card id=card><span id=s class=a></span></x-card></div>\
              <style>@container (width < 150px){#card::part(p)::after{content:'';display:block;height:7px}}</style><script>\
              globalThis.slotted = document.getElementById('s');\
@@ -181,16 +181,16 @@ fn slotted_and_part_pseudo_elements_paint_and_query_inner_containers() {
              ::slotted(.a)::before{content:'';display:block;height:9px;background:rgb(0, 128, 0)}\
              #in{width:100px;container-type:inline-size}:host::part(q)::before{content:'';display:block;height:5px}\
              </style><slot></slot><div id=in><div id=p part=p></div></div><div id=q part=q></div>`;</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn borders_that_the_interest_area_cut_draw_after_a_scroll_jump() {
-    // Debug builds check each copied paint against a fresh one. Rows below a short window are not painted.
-    run_hidden(
-        r#"
+  // Debug builds check each copied paint against a fresh one. Rows below a short window are not painted.
+  run_hidden(
+    r#"
         win.setContentSize(800, 600);
         await load('rows.html');
         await win.webContents.capturePage();
@@ -200,9 +200,9 @@ fn borders_that_the_interest_area_cut_draw_after_a_scroll_jump() {
             await win.webContents.capturePage();
         }
         "#,
-        &[(
-            "rows.html",
-            "<body style='margin:8px;font:12px/16px Helvetica'><style>\
+    &[(
+      "rows.html",
+      "<body style='margin:8px;font:12px/16px Helvetica'><style>\
              #s{width:150px;height:200px;overflow:auto;border:1px solid}\
              #s div{height:40px;border-bottom:1px solid #ccc;box-sizing:border-box}\
              #s div:nth-child(3n){border-top:2px solid #c66}</style><div id=s>\
@@ -213,25 +213,25 @@ fn borders_that_the_interest_area_cut_draw_after_a_scroll_jump() {
              <div>32</div><div>33</div><div>34</div><div>35</div><div>36</div><div>37</div><div>38</div><div>39</div>\
              <div>40</div><div>41</div><div>42</div><div>43</div><div>44</div><div>45</div><div>46</div><div>47</div>\
              </div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn scrolled_copies_follow_offsets_outlines_and_moving_interest_areas() {
-    // Debug builds check each copied paint and kept prepaint against a fresh one.
-    run_hidden(
-        r#"
+  // Debug builds check each copied paint and kept prepaint against a fresh one.
+  run_hidden(
+    r#"
         await load('copies.html');
         for (let index = 0; index < 120; index++) {
             await run('scrollBy(0, 7)');
             await win.webContents.capturePage();
         }
         "#,
-        &[(
-            "copies.html",
-            "<body style='margin:0;height:4000px'><style>\
+    &[(
+      "copies.html",
+      "<body style='margin:0;height:4000px'><style>\
              .b{width:180px;height:40px;margin:8px;background:#9cf;box-shadow:0 2px 6px #0006}\
              </style><div style='filter:drop-shadow(0 0 1px red);position:relative;z-index:1'>\
              <div class=b style='outline:2px solid #333'></div>\
@@ -239,23 +239,23 @@ fn scrolled_copies_follow_offsets_outlines_and_moving_interest_areas() {
              <div class=b style='position:relative;z-index:2'></div></div>\
              <div style='height:900px'></div><input style='width:180px;height:30px;border:2px solid #333'>\
              <div style='filter:opacity(.9)'><div class=b style='outline:2px solid #333'></div></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn gradients_that_scroll_into_view_draw_while_the_rest_copies() {
-    // Each box rasters its gradient in its first paint, while the boxes above copy their last paint. Debug builds
-    // check each copied paint against a fresh one.
-    let rows = (0..40)
+  // Each box rasters its gradient in its first paint, while the boxes above copy their last paint. Debug builds
+  // check each copied paint against a fresh one.
+  let rows = (0..40)
         .map(|i| {
             let [r, b] = [i * 6, 255 - i * 6];
             format!("<div id=b{i} style='height:60px;background:linear-gradient(rgb({r},0,{b}),rgb({r},0,{b}))'></div>")
         })
         .collect::<String>();
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap()].slice(0, 3).join();
         await load('rows.html');
         const seen = [];
@@ -268,21 +268,21 @@ fn gradients_that_scroll_into_view_draw_while_the_rest_copies() {
         }
         if (seen.length) fail('gradients: ' + seen.join(' '));
         "#,
-        &[(
-            "rows.html",
-            &format!("<body style='margin:0'>{rows}</body>"),
-        )],
-    );
+    &[(
+      "rows.html",
+      &format!("<body style='margin:0'>{rows}</body>"),
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn z_indexed_boxes_keep_the_cuts_of_scrolls_between_them_and_their_context() {
-    // The red boxes paint in the root context, cut by the viewports of the scrolls around them. A page scroll moves
-    // the viewport of #a with them, and a scroll of #b moves #c but not the viewport of #b. Debug builds check each
-    // shifted prepaint and copied paint against a fresh one.
-    run_hidden(
-        r#"
+  // The red boxes paint in the root context, cut by the viewports of the scrolls around them. A page scroll moves
+  // the viewport of #a with them, and a scroll of #b moves #c but not the viewport of #b. Debug builds check each
+  // shifted prepaint and copied paint against a fresh one.
+  run_hidden(
+    r#"
         const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap()].slice(0, 3).join();
         const edge = async id => JSON.parse(await run(`(r => JSON.stringify([r.top, r.bottom]))(document.getElementById('${id}').getBoundingClientRect())`));
         await load('cuts.html');
@@ -303,24 +303,24 @@ fn z_indexed_boxes_keep_the_cuts_of_scrolls_between_them_and_their_context() {
         }
         if (seen.some(pair => pair !== '0,0,255/255,255,255')) fail('cuts: ' + seen.join(' '));
         "#,
-        &[(
-            "cuts.html",
-            "<body style='margin:0;height:3000px;background:#fff'><style>\
+    &[(
+      "cuts.html",
+      "<body style='margin:0;height:3000px;background:#fff'><style>\
              .s{overflow:auto;scrollbar-width:none;width:150px;height:100px;background:#fff}\
              .r{position:absolute;left:0;top:-200px;width:100px;height:600px;background:#f00;z-index:1}</style>\
              <div id=a class=s style='position:absolute;top:110px;left:0'>\
              <div style='position:relative;height:300px'><div class=r></div></div></div>\
              <div id=b class=s style='position:absolute;top:60px;left:200px;height:150px'><div style='height:600px'>\
              <div id=c class=s><div style='position:relative;height:300px'><div class=r></div></div></div></div></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn fixed_root_backgrounds_fill_the_viewport_like_chrome() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('fixed.html');
         for (const top of [0, 500]) {
             await run(`scrollTo(0, ${top})`);
@@ -331,18 +331,18 @@ fn fixed_root_backgrounds_fill_the_viewport_like_chrome() {
             if (!(first[0] > 245 && first[2] < 10 && last[2] > 245 && last[0] < 10)) fail(top + ': ' + first + ' ' + last);
         }
         "#,
-        &[(
-            "fixed.html",
-            "<body style='margin:0;height:2000px'><style>html{background:linear-gradient(#f00,#00f) fixed}</style></body>",
-        )],
-    );
+    &[(
+      "fixed.html",
+      "<body style='margin:0;height:2000px'><style>html{background:linear-gradient(#f00,#00f) fixed}</style></body>",
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn borders_outlines_and_spaced_tiles_paint_like_chrome() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap().subarray(0, 3)].reverse();
         await load('paint.html');
         const near = (got, want) => got.every((value, at) => Math.abs(value - want[at]) < 12);
@@ -366,9 +366,9 @@ fn borders_outlines_and_spaced_tiles_paint_like_chrome() {
             if (!near(got, want)) fail(name + ': ' + got);
         }
         "#,
-        &[(
-            "paint.html",
-            "<body style='margin:0;background:#fff'>\
+    &[(
+      "paint.html",
+      "<body style='margin:0;background:#fff'>\
              <div style='position:absolute;left:0;top:0;width:60px;height:60px;border:10px solid rgba(0,0,0,.5);background:linear-gradient(#f00,#f00)'></div>\
              <div style='position:absolute;left:120px;top:20px;width:60px;height:50px;outline:8px groove rgb(200,150,100)'></div>\
              <div style='position:absolute;left:220px;top:20px;width:100px;height:40px;background:linear-gradient(#00f,#00f) 0 0/40px 40px space'></div>\
@@ -378,15 +378,15 @@ fn borders_outlines_and_spaced_tiles_paint_like_chrome() {
              <div style='position:absolute;left:200px;top:160px;width:102px;height:52px;border:4px dashed #a00;border-radius:20px 0 0 0'></div>\
              <div style='position:absolute;left:346px;top:160px;width:102px;height:52px;border:4px dotted #a00;border-radius:0 20px 0 20px'></div>\
              </body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn text_strokes_draw_hollow_glyphs_like_chrome() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('stroke.html');
         await win.webContents.capturePage();
         // One row through the middle of the `I`, as [red, green, blue] per pixel.
@@ -403,22 +403,22 @@ fn text_strokes_draw_hollow_glyphs_like_chrome() {
         const selected = await row(260);
         if (selected.some(pixel => blue(...pixel))) fail('a ::selection style keeps the stroke');
         "#,
-        &[(
-            "stroke.html",
-            "<style>body{margin:0;background:#fff}div{height:100px;font:700 100px/100px Helvetica;-webkit-text-stroke:4px #00f;-webkit-text-fill-color:transparent}\
+    &[(
+      "stroke.html",
+      "<style>body{margin:0;background:#fff}div{height:100px;font:700 100px/100px Helvetica;-webkit-text-stroke:4px #00f;-webkit-text-fill-color:transparent}\
              #s::selection{background:#fff}</style>\
              <div>I</div><canvas id=c width=100 height=100 style=display:block></canvas><div id=s>I</div>\
              <script>const x=document.getElementById('c').getContext('2d');x.font='700 100px Helvetica';x.lineWidth=4;x.strokeStyle='#0a0';x.strokeText('I',0,95);\
              const r=document.createRange();r.selectNodeContents(document.getElementById('s'));getSelection().addRange(r)</script>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn emphasis_marks_draw_over_letters_and_grow_the_line_like_chrome() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('marks.html');
         await win.webContents.capturePage();
         const bytes = (await win.webContents.capturePage({ x: 0, y: 0, width: 200, height: 200 })).toBitmap();
@@ -442,20 +442,20 @@ fn emphasis_marks_draw_over_letters_and_grow_the_line_like_chrome() {
         const height = await win.webContents.executeJavaScript('document.getElementById("a").getBoundingClientRect().height');
         if (height !== 59) fail('line height: ' + height);
         "#,
-        &[(
-            "marks.html",
-            "<style>body{margin:0;background:#fff}div{font:40px/1 Helvetica;display:flow-root;padding-left:10px}</style>\
+    &[(
+      "marks.html",
+      "<style>body{margin:0;background:#fff}div{font:40px/1 Helvetica;display:flow-root;padding-left:10px}</style>\
              <div id=a style='text-emphasis:circle #f00'>I I</div>\
              <div style='text-emphasis:circle #00f;text-emphasis-position:under'>I, I</div>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn focus_rings_paint_like_chrome() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap().subarray(0, 3)].reverse();
         await load('ring.html');
         await win.webContents.capturePage();
@@ -474,28 +474,28 @@ fn focus_rings_paint_like_chrome() {
             if (!near(got, want)) fail(name + ': ' + got);
         }
         "#,
-        &[(
-            "ring.html",
-            "<body style='margin:0;background:#333'>\
+    &[(
+      "ring.html",
+      "<body style='margin:0;background:#333'>\
              <div style='position:absolute;left:20px;top:20px;width:60px;height:40px;background:#808080;outline:auto;outline-color:#00f'></div>\
              <div style='position:absolute;left:120px;top:20px;width:60px;height:40px;background:#808080;border:4px solid #0f0;outline:auto #00f'></div>\
              <div style='position:absolute;left:220px;top:20px;width:60px;height:40px;background:#808080;outline:auto 1px -webkit-focus-ring-color'></div>\
              </body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn out_of_flow_boxes_follow_the_clip_of_their_containing_block() {
-    // The box with `overflow: hidden` stays where it was while the clip of the scroller around it changes.
-    let page = "<body style='margin:0'><div id=s style='height:200px;overflow:auto'>\
+  // The box with `overflow: hidden` stays where it was while the clip of the scroller around it changes.
+  let page = "<body style='margin:0'><div id=s style='height:200px;overflow:auto'>\
         <div style='position:relative;height:400px'><div style='overflow:hidden;width:100px;height:50px'>\
         <div id=a style='position:absolute;left:0;top:0;width:300px;height:300px;background:red;cursor:pointer'>\
         </div></div></div></div></body>";
-    let text = run_hidden(
-        &format!(
-            r#"{STEPS}
+  let text = run_hidden(
+    &format!(
+      r#"{STEPS}
             await load('page.html');
             const s = 'document.getElementById("s")';
             for (const [name, code, y] of [['short', `${{s}}.style.height = '120px'`, 110], ['tall', `${{s}}.style.height = '250px'`, 240], ['scroll', `${{s}}.scrollTop = 30`, 240]]) {{
@@ -503,60 +503,60 @@ fn out_of_flow_boxes_follow_the_clip_of_their_containing_block() {
                 console.log('PIXELS ' + name + ' ' + await pixel(150, y) + ' ' + await pixel(150, y + 15));
             }}
             "#
-        ),
-        &[("page.html", page)],
-    );
-    let pixels: Vec<_> = text
-        .lines()
-        .filter(|line| line.starts_with("PIXELS"))
-        .collect();
-    assert_eq!(
-        pixels,
-        [
-            "PIXELS short 0,0,255 255,255,255",
-            "PIXELS tall 0,0,255 255,255,255",
-            "PIXELS scroll 0,0,255 255,255,255",
-        ],
-        "{text}"
-    );
+    ),
+    &[("page.html", page)],
+  );
+  let pixels: Vec<_> = text
+    .lines()
+    .filter(|line| line.starts_with("PIXELS"))
+    .collect();
+  assert_eq!(
+    pixels,
+    [
+      "PIXELS short 0,0,255 255,255,255",
+      "PIXELS tall 0,0,255 255,255,255",
+      "PIXELS scroll 0,0,255 255,255,255",
+    ],
+    "{text}"
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn clip_paths_clip_out_of_flow_descendants_like_chrome() {
-    let page = "<body style='margin:0;background:white'><div style='position:relative;width:200px;height:50px'>\
+  let page = "<body style='margin:0;background:white'><div style='position:relative;width:200px;height:50px'>\
         <div id=c style='height:50px;clip-path:inset(0 50% 0 0)'>\
         <div style='position:absolute;inset:0;background:red'></div></div></div></body>";
-    let text = run_hidden(
-        &format!(
-            r#"{STEPS}
+  let text = run_hidden(
+    &format!(
+      r#"{STEPS}
             await load('page.html');
             console.log('PIXELS half ' + await pixel(50, 25) + ' ' + await pixel(150, 25));
             await step('narrow', () => run("document.getElementById('c').style.clipPath = 'inset(0 80% 0 0)'"));
             console.log('PIXELS narrow ' + await pixel(20, 25) + ' ' + await pixel(50, 25));
             "#
-        ),
-        &[("page.html", page)],
-    );
-    let pixels: Vec<_> = text
-        .lines()
-        .filter(|line| line.starts_with("PIXELS"))
-        .collect();
-    assert_eq!(
-        pixels,
-        [
-            "PIXELS half 0,0,255 255,255,255",
-            "PIXELS narrow 0,0,255 255,255,255",
-        ],
-        "{text}"
-    );
+    ),
+    &[("page.html", page)],
+  );
+  let pixels: Vec<_> = text
+    .lines()
+    .filter(|line| line.starts_with("PIXELS"))
+    .collect();
+  assert_eq!(
+    pixels,
+    [
+      "PIXELS half 0,0,255 255,255,255",
+      "PIXELS narrow 0,0,255 255,255,255",
+    ],
+    "{text}"
+  );
 }
 
 // The colors are those of Chrome.
 #[test]
 #[ignore = "requires the macOS window server"]
 fn shapes_mask_boxes_offset_paths_and_clip_margins_draw_like_chrome() {
-    let page = "<body style='margin:0;width:400px;background:white'><style>div{width:100px;height:100px;box-sizing:border-box;\
+  let page = "<body style='margin:0;width:400px;background:white'><style>div{width:100px;height:100px;box-sizing:border-box;\
         background:red;float:left}</style>\
         <div style='clip-path:shape(from 0 0,hline to 100%,vline by 50%,hline to 0,close)'></div>\
         <div style='clip-path:content-box;padding:20px'></div>\
@@ -566,55 +566,55 @@ fn shapes_mask_boxes_offset_paths_and_clip_margins_draw_like_chrome() {
         offset-path:ray(90deg);offset-distance:30px'></i></div>\
         <div style='background:none;overflow:clip;overflow-clip-margin:10px;width:50px;margin:0 50px 0 20px'>\
         <b style='display:block;width:200px;height:50px;background:red'></b></div></body>";
-    let text = run_hidden(
-        &format!(
-            r#"{STEPS}
+  let text = run_hidden(
+    &format!(
+      r#"{STEPS}
             await load('page.html');
             const row = async points => {{ const out = []; for (const [x, y] of points) out.push(await pixel(x, y) === '255,255,255' ? 'w' : 'r'); return out.join(''); }};
             console.log('PIXELS ' + await row([[50, 25], [50, 75], [150, 10], [150, 50], [240, 50], [260, 50], [350, 5], [350, 50], [80, 150], [50, 150], [115, 110], [125, 110], [175, 110], [185, 110]]));
             await step('padding', () => run("document.getElementById('m').style.padding = '2px'"));
             console.log('PIXELS ' + await row([[350, 5], [350, 1]]));
             "#
-        ),
-        &[("page.html", page)],
-    );
-    let pixels: Vec<_> = text
-        .lines()
-        .filter(|line| line.starts_with("PIXELS"))
-        .collect();
-    assert_eq!(pixels, ["PIXELS rwwrrwrwrwwrrw", "PIXELS wr"], "{text}");
+    ),
+    &[("page.html", page)],
+  );
+  let pixels: Vec<_> = text
+    .lines()
+    .filter(|line| line.starts_with("PIXELS"))
+    .collect();
+  assert_eq!(pixels, ["PIXELS rwwrrwrwrwwrrw", "PIXELS wr"], "{text}");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn faded_inline_text_stays_in_its_lines() {
-    let (text, rects) = picture_rects(
-        "faded.html",
-        "<body style='margin:0;font:20px/30px Helvetica'><style>.w{width:300px}</style>\
+  let (text, rects) = picture_rects(
+    "faded.html",
+    "<body style='margin:0;font:20px/30px Helvetica'><style>.w{width:300px}</style>\
          <div class=w><p id=p style='margin:0'>C <span id=c style='opacity:.5;padding:0 20px'>wraps across many \
          lines of text here to show line pieces</span> end</p></div>\
          <div class=w><p style='margin:0'>E <span style='opacity:.4'>box <b id=b style='display:inline-block;\
          width:40px;height:20px'></b> after</span></p></div></body>",
+  );
+  for (id, expected) in [
+    ("p", "0,0,300,90"),
+    ("c", "0,3.5,281.2,53"),
+    ("b", "56.7,2,40,20"),
+  ] {
+    let at: Vec<f32> = rects[id].split(',').map(|v| v.parse().unwrap()).collect();
+    let want: Vec<f32> = expected.split(',').map(|v| v.parse().unwrap()).collect();
+    assert!(
+      at.iter().zip(&want).all(|(a, b)| (a - b).abs() < 0.6),
+      "{id} at {expected}, as in Chrome: {text}"
     );
-    for (id, expected) in [
-        ("p", "0,0,300,90"),
-        ("c", "0,3.5,281.2,53"),
-        ("b", "56.7,2,40,20"),
-    ] {
-        let at: Vec<f32> = rects[id].split(',').map(|v| v.parse().unwrap()).collect();
-        let want: Vec<f32> = expected.split(',').map(|v| v.parse().unwrap()).collect();
-        assert!(
-            at.iter().zip(&want).all(|(a, b)| (a - b).abs() < 0.6),
-            "{id} at {expected}, as in Chrome: {text}"
-        );
-    }
+  }
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn faded_inline_boxes_with_backgrounds_draw_as_groups_in_their_lines() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('group.html');
         await win.webContents.capturePage();
         const rect = await run("(r => [r.x, r.y].map(Math.round).join())(document.getElementById('g').getBoundingClientRect())");
@@ -623,19 +623,19 @@ fn faded_inline_boxes_with_backgrounds_draw_as_groups_in_their_lines() {
         const back = await pixel(21, 26);
         if (!/^12[78],12[78],255$/.test(back)) fail('the background is not half faded: ' + back);
         "#,
-        &[(
-            "group.html",
-            "<body style='margin:0;font:20px/30px Helvetica'><p style='margin:0'>A <span id=g \
+    &[(
+      "group.html",
+      "<body style='margin:0;font:20px/30px Helvetica'><p style='margin:0'>A <span id=g \
              style='opacity:.5;background:rgb(0,0,255);color:#000'>faded</span> end</p></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn lines_pushed_down_by_tall_rows_paint_below_the_clip_top() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         await win.webContents.capturePage();
         // Counts the dark device pixels of the text. Each hard line holds a 100 px inline-block, so the
@@ -644,9 +644,9 @@ fn lines_pushed_down_by_tall_rows_paint_below_the_clip_top() {
         const ink = (await win.webContents.capturePage({ x: 0, y: 0, width: 400, height: 300 })).toBitmap().filter((value, index) => index % 4 === 0 && value < 128).length;
         if (ink < 50) fail('no text in view: ' + ink);
         "#,
-        &[(
-            "page.html",
-            "<body style='margin:0;background:#fff'>\
+    &[(
+      "page.html",
+      "<body style='margin:0;background:#fff'>\
              <p style='margin:0;position:relative;top:-250px;font-size:20px;line-height:20px;color:#000'>\
              XX<span style='display:inline-block;width:10px;height:100px'></span><br>\
              XX<span style='display:inline-block;width:10px;height:100px'></span><br>\
@@ -658,16 +658,16 @@ fn lines_pushed_down_by_tall_rows_paint_below_the_clip_top() {
              XX<span style='display:inline-block;width:10px;height:100px'></span><br>\
              XX<span style='display:inline-block;width:10px;height:100px'></span><br>\
              XX<span style='display:inline-block;width:10px;height:100px'></span></p></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn backgrounds_borders_and_outlines_paint_like_chrome() {
-    let dots = "url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20width=%2220%22%20height=%2220%22%3E%3Ccircle%20cx=%2210%22%20cy=%2210%22%20r=%228%22%20fill=%22teal%22/%3E%3C/svg%3E)";
-    let page = format!(
-        "<body style='margin:0;background:white'><style>div{{position:absolute;box-sizing:border-box}}</style>\
+  let dots = "url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20width=%2220%22%20height=%2220%22%3E%3Ccircle%20cx=%2210%22%20cy=%2210%22%20r=%228%22%20fill=%22teal%22/%3E%3C/svg%3E)";
+  let page = format!(
+    "<body style='margin:0;background:white'><style>div{{position:absolute;box-sizing:border-box}}</style>\
          <div style='left:0;top:0;width:100px;height:120px;border:10px solid transparent;background:linear-gradient(red,blue)'></div>\
          <div style='left:110px;top:0;width:100px;height:120px;border:10px solid black;background:linear-gradient(red,blue)'></div>\
          <div style='left:220px;top:0;width:100px;height:120px;border:10px solid transparent;background:yellow padding-box'></div>\
@@ -676,9 +676,9 @@ fn backgrounds_borders_and_outlines_paint_like_chrome() {
          <div style='left:220px;top:130px;width:100px;height:40px;background:{dots} no-repeat right 10px bottom 0'></div>\
          <div id=dashes style='left:0;top:200px;width:100px;height:20px;border:1px dashed black'></div>\
          <div style='left:150px;top:200px;width:50px;height:50px;outline:4px solid black;outline-offset:2px'></div></body>"
-    );
-    let text = run_hidden(
-        r#"
+  );
+  let text = run_hidden(
+    r#"
         await load('paint.html');
         await new Promise(done => setTimeout(done, 300));
         await win.webContents.capturePage();
@@ -697,52 +697,52 @@ fn backgrounds_borders_and_outlines_paint_like_chrome() {
         }
         console.log('DASHES ' + runs);
         "#,
-        &[("paint.html", &page)],
-    );
-    let pixel = |x: u32, y: u32| -> [u8; 3] {
-        let line = text
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("PIXEL {x} {y} ")))
-            .unwrap_or_else(|| panic!("{text}"));
-        let parts: Vec<u8> = line.split(' ').map(|v| v.parse().unwrap()).collect();
-        [parts[0], parts[1], parts[2]]
-    };
-    let near = |x: u32, y: u32, expected: [u8; 3]| {
-        let actual = pixel(x, y);
-        assert!(
-            actual
-                .iter()
-                .zip(expected)
-                .all(|(a, e)| a.abs_diff(e) <= 12),
-            "pixel at {x},{y} is {actual:?}, Chrome paints {expected:?}"
-        );
-    };
-    // The gradient repeats under a transparent border, so the top border shows its bottom end.
-    near(50, 5, [13, 0, 242]);
-    // A border paints over the layers under it.
-    near(115, 5, [0, 0, 0]);
-    // `padding-box` keeps the color out of the border.
-    near(225, 60, [255, 255, 255]);
-    // Gradients mix premultiplied colors, so red fades to transparent without gray.
-    near(50, 150, [255, 128, 128]);
-    // A small SVG image repeats at its own size.
-    near(120, 140, [0, 128, 128]);
-    // Four-value positions measure from the named edges.
-    near(300, 160, [0, 128, 128]);
-    near(230, 160, [255, 255, 255]);
-    // Outlines keep the square corners of the box.
-    near(145, 195, [0, 0, 0]);
+    &[("paint.html", &page)],
+  );
+  let pixel = |x: u32, y: u32| -> [u8; 3] {
+    let line = text
+      .lines()
+      .find_map(|line| line.strip_prefix(&format!("PIXEL {x} {y} ")))
+      .unwrap_or_else(|| panic!("{text}"));
+    let parts: Vec<u8> = line.split(' ').map(|v| v.parse().unwrap()).collect();
+    [parts[0], parts[1], parts[2]]
+  };
+  let near = |x: u32, y: u32, expected: [u8; 3]| {
+    let actual = pixel(x, y);
     assert!(
-        text.contains("DASHES 20"),
-        "1px dashes are 3px long with 2px gaps: {text}"
+      actual
+        .iter()
+        .zip(expected)
+        .all(|(a, e)| a.abs_diff(e) <= 12),
+      "pixel at {x},{y} is {actual:?}, Chrome paints {expected:?}"
     );
+  };
+  // The gradient repeats under a transparent border, so the top border shows its bottom end.
+  near(50, 5, [13, 0, 242]);
+  // A border paints over the layers under it.
+  near(115, 5, [0, 0, 0]);
+  // `padding-box` keeps the color out of the border.
+  near(225, 60, [255, 255, 255]);
+  // Gradients mix premultiplied colors, so red fades to transparent without gray.
+  near(50, 150, [255, 128, 128]);
+  // A small SVG image repeats at its own size.
+  near(120, 140, [0, 128, 128]);
+  // Four-value positions measure from the named edges.
+  near(300, 160, [0, 128, 128]);
+  near(230, 160, [255, 255, 255]);
+  // Outlines keep the square corners of the box.
+  near(145, 195, [0, 0, 0]);
+  assert!(
+    text.contains("DASHES 20"),
+    "1px dashes are 3px long with 2px gaps: {text}"
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn backdrop_blurs_and_drop_shadows_spread_like_chrome() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap().subarray(0, 3)].reverse();
         await load('effects.html');
         // Chrome reads only the backdrop under the box, so the red page around it doesn't bleed in.
@@ -754,67 +754,67 @@ fn backdrop_blurs_and_drop_shadows_spread_like_chrome() {
         const shadow = await pixel(256, 240);
         if (shadow[0] > 230 || shadow[0] < 190) fail('drop shadow: ' + shadow);
         "#,
-        &[(
-            "effects.html",
-            "<body style='margin:0;background:red'>\
+    &[(
+      "effects.html",
+      "<body style='margin:0;background:red'>\
              <div style='position:absolute;left:50px;top:50px;width:100px;height:100px;background:blue'>\
              <div style='height:100%;backdrop-filter:blur(8px)'></div></div>\
              <div style='position:absolute;left:200px;top:160px;width:150px;height:100px;background:white'>\
              <div style='margin:30px 0 0 30px;width:50px;height:44px;background:black;filter:drop-shadow(0 0 6px black)'></div></div>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn blurred_shadows_of_mixed_radii_have_no_seams_like_chrome() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap().subarray(0, 3)].reverse();
         await load('shadow.html');
         // Each side of the box takes its own corners: the shadow beside a straight edge under a big corner is smooth.
         const [above, below] = [await pixel(158, 139), await pixel(158, 141)];
         if (Math.abs(above[0] - below[0]) > 4) fail('seam: ' + above + ' / ' + below);
         "#,
-        &[(
-            "shadow.html",
-            "<body style='margin:0;background:white'><div style='position:absolute;left:50px;top:50px;width:100px;height:100px;\
+    &[(
+      "shadow.html",
+      "<body style='margin:0;background:white'><div style='position:absolute;left:50px;top:50px;width:100px;height:100px;\
              background:white;border-top-right-radius:90px;box-shadow:0 0 20px black'></div>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn text_wraps_inside_padding_and_borders_like_chrome() {
-    let (text, rects) = picture_rects(
-        "wrap.html",
-        "<body style='margin:0;font:10px/12px Menlo'><style>.w{width:200px}</style>\
+  let (text, rects) = picture_rects(
+    "wrap.html",
+    "<body style='margin:0;font:10px/12px Menlo'><style>.w{width:200px}</style>\
          <div class=w><div id=b0 style='width:50px;border:5px solid'>aaaa aaaa</div></div>\
          <div class=w><div id=b1 style='width:50px;padding:0 5px'>aaaa aaaa</div></div></body>",
-    );
-    assert_eq!(rects["b0"], "0,0,60,34", "{text}");
-    assert_eq!(rects["b1"], "0,0,60,24", "{text}");
+  );
+  assert_eq!(rects["b0"], "0,0,60,34", "{text}");
+  assert_eq!(rects["b1"], "0,0,60,24", "{text}");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn positioned_boxes_paint_after_in_flow_boxes_in_tree_order_like_chrome() {
-    let rows = [
-        "<div class=a></div><div class=g style='position:relative'></div>",
-        "<div class=g style='position:absolute'></div><div class=r></div>",
-        "<div class=a></div><div class=g style='opacity:.99'></div>",
-        "<div style='position:relative'><div class=g style='position:relative;z-index:2'></div></div><div class=a style='z-index:1'></div>",
-        "<div class=a><div class=a></div></div><div class=g style='position:relative'></div>",
-        "<div style='display:flex'><div class=a></div><div class=g style='position:relative'></div></div>",
-    ];
-    let page = format!(
-        "<body style='margin:0;background:white'><style>.p{{position:relative;height:40px}}\
+  let rows = [
+    "<div class=a></div><div class=g style='position:relative'></div>",
+    "<div class=g style='position:absolute'></div><div class=r></div>",
+    "<div class=a></div><div class=g style='opacity:.99'></div>",
+    "<div style='position:relative'><div class=g style='position:relative;z-index:2'></div></div><div class=a style='z-index:1'></div>",
+    "<div class=a><div class=a></div></div><div class=g style='position:relative'></div>",
+    "<div style='display:flex'><div class=a></div><div class=g style='position:relative'></div></div>",
+  ];
+  let page = format!(
+    "<body style='margin:0;background:white'><style>.p{{position:relative;height:40px}}\
          .a{{position:absolute;top:0;left:0;width:40px;height:40px;background:red}}\
          .r{{width:40px;height:40px;background:red}}.g{{width:40px;height:40px;background:lime}}</style>{}</body>",
-        rows.map(|row| format!("<div class=p>{row}</div>")).join("")
-    );
-    let text = run_hidden(
+    rows.map(|row| format!("<div class=p>{row}</div>")).join("")
+  );
+  let text = run_hidden(
         &format!(
             "await load('order.html');
             for (let row = 0; row < {}; row++) {{
@@ -825,72 +825,72 @@ fn positioned_boxes_paint_after_in_flow_boxes_in_tree_order_like_chrome() {
         ),
         &[("order.html", &page)],
     );
-    let green: Vec<u8> = text
-        .lines()
-        .filter_map(|line| line.strip_prefix("PIXEL "))
-        .map(|line| line.rsplit(' ').next().unwrap().parse().unwrap())
-        .collect();
-    assert_eq!(green.len(), rows.len(), "{text}");
-    for (row, value) in green.iter().enumerate() {
-        assert!(*value > 200, "the green box covers in row {row}: {text}");
-    }
+  let green: Vec<u8> = text
+    .lines()
+    .filter_map(|line| line.strip_prefix("PIXEL "))
+    .map(|line| line.rsplit(' ').next().unwrap().parse().unwrap())
+    .collect();
+  assert_eq!(green.len(), rows.len(), "{text}");
+  for (row, value) in green.iter().enumerate() {
+    assert!(*value > 200, "the green box covers in row {row}: {text}");
+  }
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn children_paint_over_borders_and_clip_at_the_padding_box_like_chrome() {
-    let text = run_hidden(
-        r#"await load('borders.html');
+  let text = run_hidden(
+    r#"await load('borders.html');
         for (const [x, y] of [[5, 25], [5, 85]]) {
             const image = await win.webContents.capturePage({ x, y, width: 1, height: 1 });
             console.log('PIXEL ' + [...image.toBitmap()].slice(0, 3).join(','));
         }"#,
-        &[(
-            "borders.html",
-            "<body style='margin:0;background:white'><style>.b{height:40px;border:10px solid red;margin-bottom:10px}\
+    &[(
+      "borders.html",
+      "<body style='margin:0;background:white'><style>.b{height:40px;border:10px solid red;margin-bottom:10px}\
              .g{height:40px;margin:-10px -10px 0;background:lime}</style>\
              <div class=b><div class=g></div></div>\
              <div class=b style='overflow:hidden;border-color:transparent'><div class=g></div></div></body>",
-        )],
-    );
-    let pixels: Vec<_> = text
-        .lines()
-        .filter_map(|line| line.strip_prefix("PIXEL "))
-        .collect();
-    assert_eq!(pixels, ["0,255,0", "255,255,255"], "{text}");
+    )],
+  );
+  let pixels: Vec<_> = text
+    .lines()
+    .filter_map(|line| line.strip_prefix("PIXEL "))
+    .collect();
+  assert_eq!(pixels, ["0,255,0", "255,255,255"], "{text}");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn outlines_stay_outside_the_overflow_clip_of_their_box_like_chrome() {
-    let text = run_hidden(
-        r#"await load('outline.html');
+  let text = run_hidden(
+    r#"await load('outline.html');
         await run(`document.getElementById('s').scrollTop = 40`);
         await win.webContents.capturePage();
         for (const [x, y] of [[8, 30], [40, 8], [40, 69]]) {
             const image = await win.webContents.capturePage({ x, y, width: 1, height: 1 });
             console.log('PIXEL ' + [...image.toBitmap()].slice(0, 3).join(','));
         }"#,
-        &[(
-            "outline.html",
-            "<body style='margin:0;background:white'>\
+    &[(
+      "outline.html",
+      "<body style='margin:0;background:white'>\
              <div id=s style='position:absolute;left:10px;top:10px;width:100px;height:58px;overflow:auto;outline:2px solid red'>\
              <div style='height:300px;background:lime'></div></div></body>",
-        )],
-    );
-    let pixels: Vec<_> = text
-        .lines()
-        .filter_map(|line| line.strip_prefix("PIXEL "))
-        .collect();
-    assert_eq!(pixels, ["0,0,255"; 3], "{text}");
+    )],
+  );
+  let pixels: Vec<_> = text
+    .lines()
+    .filter_map(|line| line.strip_prefix("PIXEL "))
+    .collect();
+  assert_eq!(pixels, ["0,0,255"; 3], "{text}");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn root_backgrounds_paint_the_whole_canvas_like_chrome() {
-    let page = "<body style='margin:20px;height:50px;background:linear-gradient(red,blue)'></body>";
-    let text = run_hidden(
-        r#"
+  let page = "<body style='margin:20px;height:50px;background:linear-gradient(red,blue)'></body>";
+  let text = run_hidden(
+    r#"
         await load('root.html');
         const shot = async step => {
             await new Promise(done => setTimeout(done, 200));
@@ -908,43 +908,43 @@ fn root_backgrounds_paint_the_whole_canvas_like_chrome() {
         await run('scrollTo(0, 700)');
         await shot(2);
         "#,
-        &[("root.html", page)],
+    &[("root.html", page)],
+  );
+  let near = |step: u32, x: u32, y: u32, expected: [i32; 3]| {
+    let line = text
+      .lines()
+      .find_map(|line| line.strip_prefix(&format!("PIXEL {step} {x} {y} ")))
+      .unwrap_or_else(|| panic!("{text}"));
+    let actual: Vec<i32> = line.split(' ').map(|v| v.parse().unwrap()).collect();
+    assert!(
+      actual
+        .iter()
+        .zip(expected)
+        .all(|(a, e)| (a - e).abs() <= 12),
+      "step {step}: pixel at {x},{y} is {actual:?}, Chrome paints {expected:?}"
     );
-    let near = |step: u32, x: u32, y: u32, expected: [i32; 3]| {
-        let line = text
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("PIXEL {step} {x} {y} ")))
-            .unwrap_or_else(|| panic!("{text}"));
-        let actual: Vec<i32> = line.split(' ').map(|v| v.parse().unwrap()).collect();
-        assert!(
-            actual
-                .iter()
-                .zip(expected)
-                .all(|(a, e)| (a - e).abs() <= 12),
-            "step {step}: pixel at {x},{y} is {actual:?}, Chrome paints {expected:?}"
-        );
-    };
-    // The body gradient covers the canvas in tiles of the root box, which is 90 px tall.
-    near(0, 5, 5, [240, 0, 15]);
-    near(0, 5, 95, [240, 0, 15]);
-    near(0, 5, 250, [56, 0, 199]);
-    // With a root background of its own, the body gradient stays in the body box.
-    near(1, 5, 5, [0, 255, 0]);
-    near(1, 5, 250, [0, 255, 0]);
-    near(1, 30, 30, [203, 0, 52]);
-    // Far below a root box of the viewport height (268 px), the tiles still cover the canvas.
-    near(2, 5, 5, [94, 0, 161]);
+  };
+  // The body gradient covers the canvas in tiles of the root box, which is 90 px tall.
+  near(0, 5, 5, [240, 0, 15]);
+  near(0, 5, 95, [240, 0, 15]);
+  near(0, 5, 250, [56, 0, 199]);
+  // With a root background of its own, the body gradient stays in the body box.
+  near(1, 5, 5, [0, 255, 0]);
+  near(1, 5, 250, [0, 255, 0]);
+  near(1, 30, 30, [203, 0, 52]);
+  // Far below a root box of the viewport height (268 px), the tiles still cover the canvas.
+  near(2, 5, 5, [94, 0, 161]);
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn svg_backgrounds_keep_the_ratio_of_their_view_box_like_chrome() {
-    let square = "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'%3E%3Crect width='10' height='10' fill='red'/%3E%3C/svg%3E\")";
-    let page = format!(
-        "<style>body{{margin:0;background:white}}div{{width:40px;height:20px;background:{square} no-repeat 0 0 / 40px 20px}}</style><body><div></div></body>"
-    );
-    let text = run_hidden(
-        r#"
+  let square = "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'%3E%3Crect width='10' height='10' fill='red'/%3E%3C/svg%3E\")";
+  let page = format!(
+    "<style>body{{margin:0;background:white}}div{{width:40px;height:20px;background:{square} no-repeat 0 0 / 40px 20px}}</style><body><div></div></body>"
+  );
+  let text = run_hidden(
+    r#"
         await load('svg.html');
         await new Promise(done => setTimeout(done, 300));
         await win.webContents.capturePage();
@@ -953,30 +953,30 @@ fn svg_backgrounds_keep_the_ratio_of_their_view_box_like_chrome() {
             console.log(`PIXEL ${x} ${r} ${g} ${b}`);
         }
         "#,
-        &[("svg.html", &page)],
+    &[("svg.html", &page)],
+  );
+  // The square fits the 40x20 tile as a 20 px square in its middle.
+  for (x, color) in [(5, "255 255 255"), (20, "255 0 0"), (35, "255 255 255")] {
+    assert!(
+      text.contains(&format!("PIXEL {x} {color}")),
+      "{x}, as in Chrome: {text}"
     );
-    // The square fits the 40x20 tile as a 20 px square in its middle.
-    for (x, color) in [(5, "255 255 255"), (20, "255 0 0"), (35, "255 255 255")] {
-        assert!(
-            text.contains(&format!("PIXEL {x} {color}")),
-            "{x}, as in Chrome: {text}"
-        );
-    }
+  }
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn gradients_that_repeat_on_one_axis_stay_sharp_on_wide_boxes_like_chrome() {
-    // One raster of these boxes would pass the raster limit and blur.
-    let page = "<style>body{margin:0;background:white}div{background:white linear-gradient(black 0 8px,white 8px) 4px 4px / 6px 16px}</style>\
+  // One raster of these boxes would pass the raster limit and blur.
+  let page = "<style>body{margin:0;background:white}div{background:white linear-gradient(black 0 8px,white 8px) 4px 4px / 6px 16px}</style>\
         <body><div style='width:20000px;height:20px;background-image:linear-gradient(to right,black 0 8px,white 8px);background-size:16px 6px;background-repeat:repeat-x'></div>\
         <div style='height:100px;overflow:hidden'><div style='width:20px;height:20000px;background-repeat:repeat-y'></div></div>\
         <div style='height:40px;overflow:hidden;background:white'><div style='width:20px;height:40000px;background-image:linear-gradient(black 0 1px,white 1px);background-size:16px 10px;background-position:2px 5px;background-repeat:repeat-x'></div></div></body>";
-    // The root box is empty, and its background still repeats over the canvas.
-    let root = "<html style='background:white linear-gradient(to right,red 0 3px,white 3px) 0 200px / 10px 20px repeat-x'><body style='margin:0'></body></html>";
-    let text = run_hidden(
-        &format!(
-            r#"{STEPS}
+  // The root box is empty, and its background still repeats over the canvas.
+  let root = "<html style='background:white linear-gradient(to right,red 0 3px,white 3px) 0 200px / 10px 20px repeat-x'><body style='margin:0'></body></html>";
+  let text = run_hidden(
+    &format!(
+      r#"{STEPS}
             await load('page.html');
             const pixels = [];
             for (const [x, y] of [[4, 6], [11, 6], [12, 6], [20, 6], [11, 2], [11, 12], [6, 24], [6, 31], [6, 32], [6, 40], [2, 31], [12, 31]]) pixels.push(await pixel(x, y));
@@ -985,112 +985,112 @@ fn gradients_that_repeat_on_one_axis_stay_sharp_on_wide_boxes_like_chrome() {
             await load('root.html');
             console.log('ROOT ' + [await pixel(1, 210), await pixel(5, 210), await pixel(11, 210), await pixel(1, 190)].join(' '));
             "#
-        ),
-        &[("page.html", page), ("root.html", root)],
-    );
-    // Tiles repeat only on their axis, and their edges are sharp.
-    assert!(
+    ),
+    &[("page.html", page), ("root.html", root)],
+  );
+  // Tiles repeat only on their axis, and their edges are sharp.
+  assert!(
         text.contains(
             "PIXELS 0,0,0 0,0,0 255,255,255 0,0,0 255,255,255 255,255,255 0,0,0 0,0,0 255,255,255 0,0,0 255,255,255 255,255,255"
         ),
         "{text}"
     );
-    // A box taller than a raster keeps a sharp tile on the axis that doesn't repeat.
-    assert!(
-        text.contains("TALL 255,255,255 0,0,0 255,255,255 255,255,255"),
-        "{text}"
-    );
-    assert!(
-        text.contains("ROOT 0,0,255 255,255,255 0,0,255 255,255,255"),
-        "{text}"
-    );
+  // A box taller than a raster keeps a sharp tile on the axis that doesn't repeat.
+  assert!(
+    text.contains("TALL 255,255,255 0,0,0 255,255,255 255,255,255"),
+    "{text}"
+  );
+  assert!(
+    text.contains("ROOT 0,0,255 255,255,255 0,0,255 255,255,255"),
+    "{text}"
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn inline_svgs_with_visible_overflow_paint_outside_their_box_like_chrome() {
-    let page = "<body style='margin:0;background:white'><style>svg{position:absolute;top:50px;width:10px;height:10px}</style>\
+  let page = "<body style='margin:0;background:white'><style>svg{position:absolute;top:50px;width:10px;height:10px}</style>\
         <svg style='left:50px;overflow:visible'><rect x=-20 y=-20 width=40 height=40 fill=red /><rect x=100 y=60 width=20 height=20 fill=blue /></svg>\
         <svg style='left:300px'><rect x=-20 y=-20 width=40 height=40 fill=red /></svg></body>";
-    // A long spill from a box far below the view keeps its device scale.
-    let far = "<body style='margin:0;background:white;height:7000px'><div style='position:absolute;top:6000px;left:10px'>\
+  // A long spill from a box far below the view keeps its device scale.
+  let far = "<body style='margin:0;background:white;height:7000px'><div style='position:absolute;top:6000px;left:10px'>\
         <svg width=10 height=10 style='overflow:visible;display:block'><rect y=-5990 width=21 height=90 fill=red /></svg></div>\
         <div style='position:absolute;top:1500px;left:100px'><div><svg width=10 height=10 style='overflow:visible;display:block'><rect y=-1490 width=20 height=1490 fill=red /></svg></div></div>\
         <div style='position:absolute;top:1500px;left:150px'><div><svg width=10 height=10 style='overflow:visible'><rect y=-1490 width=20 height=1490 fill=red /></svg></div></div>\
         <div style='position:absolute;top:0;left:200px;width:50px'><div style='height:1500px'></div><div><div>\
         <svg width=10 height=10 style='overflow:visible;display:block'><rect y=-1490 width=20 height=1490 fill=red /></svg></div></div></div></body>";
-    let text = run_hidden(
-        &format!(
-            r#"{STEPS}
+  let text = run_hidden(
+    &format!(
+      r#"{STEPS}
             await load('page.html');
             console.log('PIXELS ' + [await pixel(35, 35), await pixel(55, 55), await pixel(160, 120), await pixel(285, 55), await pixel(305, 55)].join(' '));
             await load('far.html');
             console.log('FAR ' + [await pixel(15, 50), await pixel(30, 99), await pixel(31, 50), await pixel(15, 100)].join(' '));
             console.log('AROUND ' + [await pixel(105, 50), await pixel(155, 50), await pixel(205, 50)].join(' '));
             "#
-        ),
-        &[("page.html", page), ("far.html", far)],
-    );
-    // An `<svg>` clips to its box by default, as in Chrome.
-    assert!(
-        text.contains("PIXELS 0,0,255 0,0,255 255,0,0 255,255,255 0,0,255"),
-        "{text}"
-    );
-    assert!(
-        text.contains("FAR 0,0,255 0,0,255 255,255,255 255,255,255"),
-        "{text}"
-    );
-    // The blocks around such an `<svg>` don't become spacers either.
-    assert!(text.contains("AROUND 0,0,255 0,0,255 0,0,255"), "{text}");
+    ),
+    &[("page.html", page), ("far.html", far)],
+  );
+  // An `<svg>` clips to its box by default, as in Chrome.
+  assert!(
+    text.contains("PIXELS 0,0,255 0,0,255 255,0,0 255,255,255 0,0,255"),
+    "{text}"
+  );
+  assert!(
+    text.contains("FAR 0,0,255 0,0,255 255,255,255 255,255,255"),
+    "{text}"
+  );
+  // The blocks around such an `<svg>` don't become spacers either.
+  assert!(text.contains("AROUND 0,0,255 0,0,255 0,0,255"), "{text}");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn plain_ranges_progress_bars_and_clipped_fields_paint_like_chrome() {
-    let text = run_hidden(
-        r#"await load('parts.html');
+  let text = run_hidden(
+    r#"await load('parts.html');
         await win.webContents.capturePage();
         for (const [x, y] of [[10, 10], [60, 10], [25, 45], [75, 45], [12, 80]]) {
             const image = await win.webContents.capturePage({ x, y, width: 1, height: 1 });
             console.log('PIXEL ' + [...image.toBitmap()].slice(0, 3).join(','));
         }"#,
-        &[(
-            "parts.html",
-            "<body style='margin:0;background:white'><style>*{position:absolute;left:0;margin:0}\
+    &[(
+      "parts.html",
+      "<body style='margin:0;background:white'><style>*{position:absolute;left:0;margin:0}\
              .r{appearance:none;top:0;width:100px;height:20px;padding:0;background:none}\
              .r::-webkit-slider-runnable-track{height:4px;background:#00f}\
              .r::-webkit-slider-thumb{appearance:none;width:20px;height:20px;margin-top:-8px;background:#f00}\
              progress{appearance:none;top:40px;width:100px;height:10px}\
              input:not(.r){top:60px;width:100px;height:40px;padding:0;border:0;font:40px/40px Menlo;color:#f00;background:#fff;background-clip:padding-box}</style>\
              <input class=r type=range value=0><progress value=50 max=100></progress><input value='\u{2588}\u{2588}'></body>",
-        )],
-    );
-    let pixels: Vec<_> = text
-        .lines()
-        .filter_map(|line| line.strip_prefix("PIXEL "))
-        .collect();
-    assert_eq!(
-        pixels,
-        ["0,0,255", "255,0,0", "0,128,0", "128,128,128", "0,0,255"],
-        "{text}"
-    );
+    )],
+  );
+  let pixels: Vec<_> = text
+    .lines()
+    .filter_map(|line| line.strip_prefix("PIXEL "))
+    .collect();
+  assert_eq!(
+    pixels,
+    ["0,0,255", "255,0,0", "0,128,0", "128,128,128", "0,0,255"],
+    "{text}"
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn background_clip_text_shows_the_background_through_the_text_like_chrome() {
-    let row = |id: &str, background: &str| {
-        format!(
-            "<div id={id} style='width:200px;font:40px Helvetica;color:transparent;{background};-webkit-background-clip:text;text-decoration:line-through 20px'>MMMM</div>"
-        )
-    };
-    let page = format!(
-        "<body style='margin:0'>{}{}</body>",
-        row("a", "background:linear-gradient(90deg,red,blue)"),
-        row("b", "background-color:#c33")
-    );
-    let text = run_hidden(
-        r#"
+  let row = |id: &str, background: &str| {
+    format!(
+      "<div id={id} style='width:200px;font:40px Helvetica;color:transparent;{background};-webkit-background-clip:text;text-decoration:line-through 20px'>MMMM</div>"
+    )
+  };
+  let page = format!(
+    "<body style='margin:0'>{}{}</body>",
+    row("a", "background:linear-gradient(90deg,red,blue)"),
+    row("b", "background-color:#c33")
+  );
+  let text = run_hidden(
+    r#"
         await load('clip.html');
         const shot = async step => {
             await new Promise(done => setTimeout(done, 200));
@@ -1106,42 +1106,42 @@ fn background_clip_text_shows_the_background_through_the_text_like_chrome() {
         await run("document.getElementById('a').style.backgroundClip = 'border-box'");
         await shot(2);
         "#,
-        &[("clip.html", &page)],
+    &[("clip.html", &page)],
+  );
+  let near = |step: u32, x: u32, y: u32, expected: [i32; 3]| {
+    let line = text
+      .lines()
+      .find_map(|line| line.strip_prefix(&format!("PIXEL {step} {x} {y} ")))
+      .unwrap_or_else(|| panic!("{text}"));
+    let actual: Vec<i32> = line.split(' ').map(|v| v.parse().unwrap()).collect();
+    assert!(
+      actual
+        .iter()
+        .zip(expected)
+        .all(|(a, e)| (a - e).abs() <= 12),
+      "step {step}: pixel at {x},{y} is {actual:?}, Chrome paints {expected:?}"
     );
-    let near = |step: u32, x: u32, y: u32, expected: [i32; 3]| {
-        let line = text
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("PIXEL {step} {x} {y} ")))
-            .unwrap_or_else(|| panic!("{text}"));
-        let actual: Vec<i32> = line.split(' ').map(|v| v.parse().unwrap()).collect();
-        assert!(
-            actual
-                .iter()
-                .zip(expected)
-                .all(|(a, e)| (a - e).abs() <= 12),
-            "step {step}: pixel at {x},{y} is {actual:?}, Chrome paints {expected:?}"
-        );
-    };
-    // The gradient shows only in the text and its line, with the colors of its place in the box.
-    near(0, 5, 22, [248, 0, 6]);
-    near(0, 120, 22, [101, 0, 153]);
-    near(0, 190, 22, [255, 255, 255]);
-    near(0, 5, 5, [255, 255, 255]);
-    // A background color fills only the text too.
-    near(0, 5, 68, [204, 51, 51]);
-    near(0, 190, 68, [255, 255, 255]);
-    // New text after the first frame shows the background.
-    near(1, 160, 22, [51, 0, 204]);
-    // Without the text clip, the gradient fills the box.
-    near(2, 5, 5, [248, 0, 6]);
-    near(2, 190, 22, [13, 0, 242]);
+  };
+  // The gradient shows only in the text and its line, with the colors of its place in the box.
+  near(0, 5, 22, [248, 0, 6]);
+  near(0, 120, 22, [101, 0, 153]);
+  near(0, 190, 22, [255, 255, 255]);
+  near(0, 5, 5, [255, 255, 255]);
+  // A background color fills only the text too.
+  near(0, 5, 68, [204, 51, 51]);
+  near(0, 190, 68, [255, 255, 255]);
+  // New text after the first frame shows the background.
+  near(1, 160, 22, [51, 0, 204]);
+  // Without the text clip, the gradient fills the box.
+  near(2, 5, 5, [248, 0, 6]);
+  near(2, 190, 22, [13, 0, 242]);
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn replaced_content_paints_above_gradient_backgrounds_like_chrome() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         await load('t.html');
         await run('redraw()');
         await win.webContents.capturePage();
@@ -1152,9 +1152,9 @@ fn replaced_content_paints_above_gradient_backgrounds_like_chrome() {
         }
         console.log('COLORS ' + out.join(' '));
         "#,
-        &[(
-            "t.html",
-            "<body style='margin:0;background:#fff'><style>canvas,svg{display:block;width:60px;height:40px}</style>\
+    &[(
+      "t.html",
+      "<body style='margin:0;background:#fff'><style>canvas,svg{display:block;width:60px;height:40px}</style>\
              <canvas id=a width=60 height=40 style='background:linear-gradient(#00f,#00f),radial-gradient(#0f0,#0f0)'></canvas>\
              <canvas id=b width=60 height=40 style='background:linear-gradient(90deg,#00f,#00f) 0 0/20px 20px,#0f0'></canvas>\
              <canvas id=c width=60 height=40 style='padding:5px;border:3px solid #000;background:linear-gradient(#00f,#00f)'></canvas>\
@@ -1162,21 +1162,21 @@ fn replaced_content_paints_above_gradient_backgrounds_like_chrome() {
              <canvas id=d width=60 height=40 style='background:conic-gradient(#00f 0 100%)'></canvas>\
              <script>const draw = (id, color) => { const ctx = document.getElementById(id).getContext('2d'); ctx.fillStyle = color; ctx.fillRect(10, 10, 20, 20) };\
              for (const id of 'abcd') draw(id, '#f00'); globalThis.redraw = () => { draw('a', '#ff0'); draw('c', '#ff0') }</script></body>",
-        )],
-    );
-    let colors = text
-        .lines()
-        .find_map(|line| line.strip_prefix("COLORS "))
-        .unwrap_or_else(|| panic!("{text}"));
-    // Chrome's colors: canvas and SVG pixels cover the background layers, also after a redraw.
-    assert_eq!(colors, "ff0 00f f00 00f ff0 00f 000 f00 00f f00 00f");
+    )],
+  );
+  let colors = text
+    .lines()
+    .find_map(|line| line.strip_prefix("COLORS "))
+    .unwrap_or_else(|| panic!("{text}"));
+  // Chrome's colors: canvas and SVG pixels cover the background layers, also after a redraw.
+  assert_eq!(colors, "ff0 00f f00 00f ff0 00f 000 f00 00f f00 00f");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn conic_gradients_take_math_angles_like_chrome() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         await load('t.html');
         const out = [];
         for (const box of [0, 100, 200]) for (const [x, y] of [[75, 25], [25, 25], [25, 75], [75, 75]]) {
@@ -1185,27 +1185,27 @@ fn conic_gradients_take_math_angles_like_chrome() {
         }
         console.log('COLORS ' + out.join(' '));
         "#,
-        &[(
-            "t.html",
-            "<body style='margin:0;background:#fff'><style>div>i{display:block;width:100px;height:100px}</style><div style='display:flex'>\
+    &[(
+      "t.html",
+      "<body style='margin:0;background:#fff'><style>div>i{display:block;width:100px;height:100px}</style><div style='display:flex'>\
              <i style='background:conic-gradient(red calc(0.25 * 360deg), transparent 0)'></i>\
              <i style='background:conic-gradient(red calc(0.25 * 360deg - 0.4deg), transparent calc(0.25 * 360deg + 0.4deg))'></i>\
              <i style='--share:0.25;background:conic-gradient(red calc(var(--share) * 360deg), transparent 0)'></i></div></body>",
-        )],
-    );
-    let colors = text
-        .lines()
-        .find_map(|line| line.strip_prefix("COLORS "))
-        .unwrap_or_else(|| panic!("{text}"));
-    // Chrome's colors: red fills the first quarter of the turn only.
-    assert_eq!(colors, ["f00 fff fff fff"; 3].join(" "));
+    )],
+  );
+  let colors = text
+    .lines()
+    .find_map(|line| line.strip_prefix("COLORS "))
+    .unwrap_or_else(|| panic!("{text}"));
+  // Chrome's colors: red fills the first quarter of the turn only.
+  assert_eq!(colors, ["f00 fff fff fff"; 3].join(" "));
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn conic_gradients_keep_thin_stops_and_masks_composite_like_chrome() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         await load('t.html');
         const out = [];
         for (const box of [0, 100, 200, 300]) for (const [x, y] of [[80, 20], [20, 20], [58, 42], [42, 58]]) {
@@ -1217,35 +1217,35 @@ fn conic_gradients_keep_thin_stops_and_masks_composite_like_chrome() {
         for (let at = 0; at < ticks.length; at += 4) if (ticks[at + 2] > 200 && ticks[at + 1] < 100) red++;
         console.log('COLORS ' + out.join(' ') + ' TICKS ' + red / (ticks.length / 4));
         "#,
-        &[(
-            "t.html",
-            "<body style='margin:0;background:#fff'><style>div>i{display:block;width:100px;height:100px;background:red;\
+    &[(
+      "t.html",
+      "<body style='margin:0;background:#fff'><style>div>i{display:block;width:100px;height:100px;background:red;\
              mask:radial-gradient(closest-side, transparent 60%, #000 60%), conic-gradient(#000 90deg, transparent 0)}</style>\
              <div style='display:flex'><i style='mask-composite:intersect'></i><i style='mask-composite:subtract'></i>\
              <i style='mask-composite:exclude'></i><i></i></div>\
              <b style='display:block;width:100px;height:100px;background:repeating-conic-gradient(from -0.15deg, red 0deg 0.3deg, transparent 0.3deg 6deg)'></b></body>",
-        )],
-    );
-    let line = text
-        .lines()
-        .find_map(|line| line.strip_prefix("COLORS "))
-        .unwrap_or_else(|| panic!("{text}"));
-    let (colors, ticks) = line.split_once(" TICKS ").unwrap();
-    // Chrome's colors: a point in the ring and the quarter, in the ring only, in the quarter only, and in neither.
-    assert_eq!(
-        colors,
-        "f00 fff fff fff fff f00 fff fff fff f00 f00 fff f00 f00 f00 fff"
-    );
-    // Lines of 0.3deg every 6deg cover 5% of the turn.
-    let ticks: f32 = ticks.parse().unwrap();
-    assert!((0.025..0.08).contains(&ticks), "{ticks}");
+    )],
+  );
+  let line = text
+    .lines()
+    .find_map(|line| line.strip_prefix("COLORS "))
+    .unwrap_or_else(|| panic!("{text}"));
+  let (colors, ticks) = line.split_once(" TICKS ").unwrap();
+  // Chrome's colors: a point in the ring and the quarter, in the ring only, in the quarter only, and in neither.
+  assert_eq!(
+    colors,
+    "f00 fff fff fff fff f00 fff fff fff f00 f00 fff f00 f00 f00 fff"
+  );
+  // Lines of 0.3deg every 6deg cover 5% of the turn.
+  let ticks: f32 = ticks.parse().unwrap();
+  assert!((0.025..0.08).contains(&ticks), "{ticks}");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn masks_place_and_repeat_image_layers_like_chrome() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         await load('t.html');
         const out = [];
         for (const [x, y] of [[15, 5], [100, 5], [185, 5], [15, 25], [100, 25], [185, 25], [15, 45], [28, 45], [40, 45], [50, 45], [100, 45]]) {
@@ -1254,30 +1254,30 @@ fn masks_place_and_repeat_image_layers_like_chrome() {
         }
         console.log('COLORS ' + out.join(' '));
         "#,
-        &[(
-            "t.html",
-            "<body style='margin:0;background:#fff'><style>.m{position:relative;width:200px;height:10px;margin-bottom:10px}\
+    &[(
+      "t.html",
+      "<body style='margin:0;background:#fff'><style>.m{position:relative;width:200px;height:10px;margin-bottom:10px}\
              .b,.p::before{position:absolute;inset:2px 8px;background:#f00;\
              mask:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 22 6'%3E%3Cpath d='M0 0H22V6H0Z'/%3E%3C/svg%3E\") left center / 22px 6px no-repeat,\
              url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 22 6'%3E%3Cpath d='M0 0H22V6H0Z'/%3E%3C/svg%3E\") right center / 22px 6px no-repeat}\
              .p::before{content:''}.r{position:absolute;inset:2px 8px;background:#00f;\
              mask:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 22 6'%3E%3Cpath d='M0 0H11V6H0Z'/%3E%3C/svg%3E\") 4px 0 / 22px 6px repeat-x}</style>\
              <div class=m><div class=b></div></div><div class='m p'></div><div class=m><div class=r></div></div></body>",
-        )],
-    );
-    let colors = text
-        .lines()
-        .find_map(|line| line.strip_prefix("COLORS "))
-        .unwrap_or_else(|| panic!("{text}"));
-    // Chrome's colors: each image layer has its size, place and repeat, also on a pseudo-element.
-    assert_eq!(colors, "f00 fff f00 f00 fff f00 00f fff 00f fff 00f");
+    )],
+  );
+  let colors = text
+    .lines()
+    .find_map(|line| line.strip_prefix("COLORS "))
+    .unwrap_or_else(|| panic!("{text}"));
+  // Chrome's colors: each image layer has its size, place and repeat, also on a pseudo-element.
+  assert_eq!(colors, "f00 fff f00 f00 fff f00 00f fff 00f fff 00f");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn bitmap_masks_draw_again_at_new_sizes() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const look = async (...xs) => {
             for (let n = 0; n < 3; n++) await win.webContents.capturePage();
@@ -1298,19 +1298,19 @@ fn bitmap_masks_draw_again_at_new_sizes() {
         const plain = await look(5, 75);
         if (plain !== 'f00 f00') fail('without mask: ' + plain);
         "#,
-        &[(
-            "page.html",
-            "<body style='margin:0;background:#fff'><div id=m style='width:40px;height:10px;background:#f00;\
+    &[(
+      "page.html",
+      "<body style='margin:0;background:#fff'><div id=m style='width:40px;height:10px;background:#f00;\
              mask:url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAAD0lEQVR4nGNgYGD4D8QMAAUEAQCwBUiSAAAAAElFTkSuQmCC) 0 0 / 100% 100% no-repeat'></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn border_images_replace_the_border_and_follow_changes_like_chrome() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const color = async (x, y) => {
             const bytes = (await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap();
@@ -1330,20 +1330,20 @@ fn border_images_replace_the_border_and_follow_changes_like_chrome() {
         const plain = await look();
         if (!plain.startsWith('000 ')) fail('normal border: ' + plain);
         "#,
-        &[(
-            "page.html",
-            "<body style='margin:0;background:white'><div style='display:flex'>\
+    &[(
+      "page.html",
+      "<body style='margin:0;background:white'><div style='display:flex'>\
              <div id=g style='width:40px;height:40px;border:10px solid black;border-image:linear-gradient(red, red) 1'></div>\
              <div id=i style='margin-left:20px;width:40px;height:40px;border:10px solid black;border-image:url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAMAAAADCAIAAADZSiLoAAAAFklEQVR4nGNgYPgPhiCa4T8QQFlgBACpdAr2Fc+7cAAAAABJRU5ErkJggg==) 1'></div></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn inset_shadows_stay_out_of_the_scroll_range_like_chrome() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         await load('t.html');
         await run("document.getElementById('p').showPopover(); document.getElementById('s').scrollTop = 100");
         for (let n = 0; n < 3; n++) await win.webContents.capturePage();
@@ -1351,27 +1351,27 @@ fn inset_shadows_stay_out_of_the_scroll_range_like_chrome() {
         const bytes = (await win.webContents.capturePage({ x: 205, y: 205, width: 1, height: 1 })).toBitmap();
         console.log('SIZES ' + sizes + ' EDGE ' + [bytes[2], bytes[1], bytes[0]].map(value => value > 200 ? 'f' : value < 60 ? '0' : '?').join(''));
         "#,
-        &[(
-            "t.html",
-            "<body style='margin:0'><style>.c{width:190px;padding:8px;box-sizing:border-box;overflow:auto;box-shadow:inset 0 1px 3px #000,0 0 0 5px #eee}.c i{display:block;height:30px}</style>\
+    &[(
+      "t.html",
+      "<body style='margin:0'><style>.c{width:190px;padding:8px;box-sizing:border-box;overflow:auto;box-shadow:inset 0 1px 3px #000,0 0 0 5px #eee}.c i{display:block;height:30px}</style>\
              <div class=c style='display:grid;gap:1px'>\n <i></i><i></i>\n</div>\
              <div class=c id=p popover=manual style='display:grid;gap:1px;position:fixed;inset:20px auto auto 200px;margin:0;border:0'><i></i><i></i></div>\
              <div class=c id=s style='position:absolute;left:200px;top:200px;width:80px;height:60px;padding:0;background:#fff;box-shadow:inset 0 0 0 8px #f00'><i style='height:300px'></i></div></body>",
-        )],
-    );
-    let line = text
-        .lines()
-        .find_map(|line| line.strip_prefix("SIZES "))
-        .unwrap_or_else(|| panic!("{text}"));
-    // Chrome's values: the children fit, so the boxes don't scroll, and the shadow of a scrolled box stays at its edge.
-    assert_eq!(line, "190,190,77,77 190,190,77,77 80,80,300,60 EDGE f00");
+    )],
+  );
+  let line = text
+    .lines()
+    .find_map(|line| line.strip_prefix("SIZES "))
+    .unwrap_or_else(|| panic!("{text}"));
+  // Chrome's values: the children fit, so the boxes don't scroll, and the shadow of a scrolled box stays at its edge.
+  assert_eq!(line, "190,190,77,77 190,190,77,77 80,80,300,60 EDGE f00");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn backgrounds_stay_out_of_the_scroll_range_like_chrome() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         await load('t.html');
         await run("document.getElementById('s').scrollTop = 100");
         for (let n = 0; n < 3; n++) await win.webContents.capturePage();
@@ -1379,27 +1379,27 @@ fn backgrounds_stay_out_of_the_scroll_range_like_chrome() {
         const bytes = (await win.webContents.capturePage({ x: 205, y: 205, width: 1, height: 1 })).toBitmap();
         console.log('SIZES ' + sizes + ' EDGE ' + [bytes[2], bytes[1], bytes[0]].map(value => value > 200 ? 'f' : value < 60 ? '0' : '?').join(''));
         "#,
-        &[(
-            "t.html",
-            "<body style='margin:0'><style>.c{width:120px;height:60px;padding:14px 16px;box-sizing:border-box;overflow-x:auto}.c i{display:block;height:20px}</style>\
+    &[(
+      "t.html",
+      "<body style='margin:0'><style>.c{width:120px;height:60px;padding:14px 16px;box-sizing:border-box;overflow-x:auto}.c i{display:block;height:20px}</style>\
              <div class=c style='background:radial-gradient(#111,#000)'><i></i></div>\
              <div class=c style='background:#000;background-clip:padding-box'><i></i></div>\
              <div class=c id=s style='position:absolute;left:200px;top:200px;padding:0;background:linear-gradient(#f00 0 20px,#fff 0)'><i style='height:300px'></i></div></body>",
-        )],
-    );
-    let line = text
-        .lines()
-        .find_map(|line| line.strip_prefix("SIZES "))
-        .unwrap_or_else(|| panic!("{text}"));
-    // Chrome's values: the child fits, so the boxes don't scroll, and the background of a scrolled box stays in place.
-    assert_eq!(line, "120,120,60,60 120,120,60,60 120,120,300,60 EDGE f00");
+    )],
+  );
+  let line = text
+    .lines()
+    .find_map(|line| line.strip_prefix("SIZES "))
+    .unwrap_or_else(|| panic!("{text}"));
+  // Chrome's values: the child fits, so the boxes don't scroll, and the background of a scrolled box stays in place.
+  assert_eq!(line, "120,120,60,60 120,120,60,60 120,120,300,60 EDGE f00");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn pseudo_element_layers_follow_the_inner_border_corner_like_chrome() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         await load('t.html');
         const out = [];
         for (const [x, y] of [[16, 16], [3, 30], [50, 30]]) {
@@ -1408,25 +1408,25 @@ fn pseudo_element_layers_follow_the_inner_border_corner_like_chrome() {
         }
         console.log('COLORS ' + out.join(' '));
         "#,
-        &[(
-            "t.html",
-            "<body style='margin:0;background:#fff'><style>p{margin:0}p::before{content:'';display:block;width:84px;height:44px;\
+    &[(
+      "t.html",
+      "<body style='margin:0;background:#fff'><style>p{margin:0}p::before{content:'';display:block;width:84px;height:44px;\
              border:8px solid red;border-radius:30px;background:linear-gradient(#000,#000)}</style><p></p></body>",
-        )],
-    );
-    let line = text
-        .lines()
-        .find_map(|line| line.strip_prefix("COLORS "))
-        .unwrap_or_else(|| panic!("{text}"));
-    // Chrome's colors: inside the inner corner curve, in the left border, and in the middle.
-    assert_eq!(line, "000 f00 000");
+    )],
+  );
+  let line = text
+    .lines()
+    .find_map(|line| line.strip_prefix("COLORS "))
+    .unwrap_or_else(|| panic!("{text}"));
+  // Chrome's colors: inside the inner corner curve, in the left border, and in the middle.
+  assert_eq!(line, "000 f00 000");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn fading_pseudo_elements_draw_at_their_animated_opacity_like_chrome() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         await load('t.html');
         const color = async () => {
             for (let n = 0; n < 3; n++) await win.webContents.capturePage();
@@ -1438,52 +1438,52 @@ fn fading_pseudo_elements_draw_at_their_animated_opacity_like_chrome() {
         const changed = await color();
         console.log('LOOK ' + first + ' ' + changed + ' ' + await run("getComputedStyle(document.getElementById('a'), '::before').opacity"));
         "#,
-        &[(
-            "t.html",
-            "<body style='margin:0;background:#fff'><style>@keyframes f{from,to{opacity:.5}}@keyframes g{from,to{opacity:.25}}\
+    &[(
+      "t.html",
+      "<body style='margin:0;background:#fff'><style>@keyframes f{from,to{opacity:.5}}@keyframes g{from,to{opacity:.25}}\
              #a::before{content:'';position:absolute;inset:0;background:#f00;animation:f 1s infinite}#a.on::before{animation-name:g}</style>\
              <div id=a style='position:relative;width:60px;height:60px'></div></body>",
-        )],
-    );
-    let look = text
-        .lines()
-        .find_map(|line| line.strip_prefix("LOOK "))
-        .unwrap_or_else(|| panic!("{text}"));
-    // Chrome's look: red at half opacity, then at a quarter, and the computed opacity follows the animation.
-    assert_eq!(look, "8.4.4 8.6.6 0.25");
+    )],
+  );
+  let look = text
+    .lines()
+    .find_map(|line| line.strip_prefix("LOOK "))
+    .unwrap_or_else(|| panic!("{text}"));
+  // Chrome's look: red at half opacity, then at a quarter, and the computed opacity follows the animation.
+  assert_eq!(look, "8.4.4 8.6.6 0.25");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn faded_leaves_with_overlapping_paints_fade_as_a_group() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         await load('t.html');
         for (let n = 0; n < 3; n++) await win.webContents.capturePage();
         const red = async (x, y) => (await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap()[2];
         console.log('LOOK ' + [await red(17, 40), await red(122, 40), await red(140, 140)].map(value => Math.round(value / 32)).join());
         "#,
-        &[(
-            "t.html",
-            "<body style='margin:0;background:#fff'><style>i{position:absolute;width:60px;height:60px;opacity:.5}</style>\
+    &[(
+      "t.html",
+      "<body style='margin:0;background:#fff'><style>i{position:absolute;width:60px;height:60px;opacity:.5}</style>\
              <i style='left:20px;top:20px;box-shadow:0 0 0 6px #fff,0 0 0 12px #000'></i>\
              <i style='left:120px;top:20px;background:#000;border:6px solid #fff'></i>\
              <i style='left:120px;top:120px;background:#000'></i></body>",
-        )],
-    );
-    let look = text
-        .lines()
-        .find_map(|line| line.strip_prefix("LOOK "))
-        .unwrap_or_else(|| panic!("{text}"));
-    // Chrome's look: the white ring and the border hide what is under them, and a lone background fades alone.
-    assert_eq!(look, "8,8,4");
+    )],
+  );
+  let look = text
+    .lines()
+    .find_map(|line| line.strip_prefix("LOOK "))
+    .unwrap_or_else(|| panic!("{text}"));
+  // Chrome's look: the white ring and the border hide what is under them, and a lone background fades alone.
+  assert_eq!(look, "8,8,4");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn blur_animations_draw_their_animated_blur_like_chrome() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         await load('t.html');
         for (let n = 0; n < 3; n++) await win.webContents.capturePage();
         const shades = [];
@@ -1493,49 +1493,49 @@ fn blur_animations_draw_their_animated_blur_like_chrome() {
         }
         console.log('SHADES ' + JSON.stringify(shades));
         "#,
-        &[(
-            "t.html",
-            "<body style='margin:0;background:#fff'><style>@keyframes f{from{filter:blur(0)}to{filter:blur(8px)}}\
+    &[(
+      "t.html",
+      "<body style='margin:0;background:#fff'><style>@keyframes f{from{filter:blur(0)}to{filter:blur(8px)}}\
              @keyframes g{from{backdrop-filter:blur(0)}to{backdrop-filter:blur(12px)}}\
              #s{position:absolute;left:20px;top:20px;width:40px;height:40px;background:#000;filter:blur(0);animation:f 1000s linear -500s}\
              #p{position:absolute;left:100px;top:0;width:100px;height:100px;background:linear-gradient(90deg,red 50%,blue 50%)}\
              #b{position:absolute;left:100px;top:20px;width:100px;height:60px;backdrop-filter:blur(0);animation:g 1000s linear -500s}</style>\
              <div id=s></div><div id=p></div><div id=b></div></body>",
-        )],
+    )],
+  );
+  let shades: Vec<[i32; 3]> = text
+    .lines()
+    .find_map(|line| line.strip_prefix("SHADES "))
+    .and_then(|json| serde_json::from_str(json).ok())
+    .unwrap_or_else(|| panic!("{text}"));
+  // Chrome halfway through: the square blurred by 4px, and the edge of the stripes under the backdrop by 6px.
+  let chrome = [
+    [253, 253, 253],
+    [206, 206, 206],
+    [115, 115, 115],
+    [33, 33, 33],
+    [1, 1, 1],
+    [240, 0, 15],
+    [184, 0, 71],
+    [119, 0, 136],
+    [58, 0, 197],
+    [10, 0, 245],
+    [255, 0, 0],
+  ];
+  for (shade, chrome) in shades.iter().zip(chrome) {
+    assert!(
+      shade.iter().zip(chrome).all(|(a, b)| (a - b).abs() <= 16),
+      "{shades:?}"
     );
-    let shades: Vec<[i32; 3]> = text
-        .lines()
-        .find_map(|line| line.strip_prefix("SHADES "))
-        .and_then(|json| serde_json::from_str(json).ok())
-        .unwrap_or_else(|| panic!("{text}"));
-    // Chrome halfway through: the square blurred by 4px, and the edge of the stripes under the backdrop by 6px.
-    let chrome = [
-        [253, 253, 253],
-        [206, 206, 206],
-        [115, 115, 115],
-        [33, 33, 33],
-        [1, 1, 1],
-        [240, 0, 15],
-        [184, 0, 71],
-        [119, 0, 136],
-        [58, 0, 197],
-        [10, 0, 245],
-        [255, 0, 0],
-    ];
-    for (shade, chrome) in shades.iter().zip(chrome) {
-        assert!(
-            shade.iter().zip(chrome).all(|(a, b)| (a - b).abs() <= 16),
-            "{shades:?}"
-        );
-    }
+  }
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn corner_shapes_draw_like_chrome() {
-    // Points that Chromium draws black (inside) or white (outside) for these shapes.
-    run_hidden(
-        r#"
+  // Points that Chromium draws black (inside) or white (outside) for these shapes.
+  run_hidden(
+    r#"
         await load('page.html');
         const shade = async (x, y) => (await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap()[1];
         const points = [
@@ -1555,21 +1555,21 @@ fn corner_shapes_draw_like_chrome() {
         })()`);
         if (style !== 'superellipse(2),superellipse(2),true,false') fail(style);
         "#,
-        &[(
-            "page.html",
-            "<body style='margin:0;background:white'><style>div{position:absolute;top:0;width:100px;height:100px;\
+    &[(
+      "page.html",
+      "<body style='margin:0;background:white'><style>div{position:absolute;top:0;width:100px;height:100px;\
              background:black;border-radius:40px}</style><div style='left:0;corner-shape:squircle'></div>\
              <div style='left:110px;corner-shape:bevel'></div><div style='left:220px;corner-shape:scoop'></div>\
              <div style='left:0;top:110px;corner-shape:notch'></div><div style='left:110px;top:110px'></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn wide_gamut_colors_draw_in_display_p3() {
-    // Values of Chromium with `--force-color-profile` srgb and display-p3-d65.
-    let page = "<body style='margin:0;background:white'><style>body>*{position:absolute;width:100px;height:100px}</style>\
+  // Values of Chromium with `--force-color-profile` srgb and display-p3-d65.
+  let page = "<body style='margin:0;background:white'><style>body>*{position:absolute;width:100px;height:100px}</style>\
         <div style='left:0;top:0;background:#f00'></div>\
         <div style='left:100px;top:0;background:rgb(200,100,50)'></div>\
         <div style='left:200px;top:0;background:oklch(0.64 0.31 48)'></div>\
@@ -1580,9 +1580,9 @@ fn wide_gamut_colors_draw_in_display_p3() {
         <div style='left:300px;top:100px;box-sizing:border-box;border:50px solid oklch(0.64 0.31 48)'></div>\
         <div style='left:0;top:200px;background:blue'><div style='height:100%;background:oklch(0.64 0.31 48 / .5)'></div></div>\
         <div style='left:100px;top:200px;background:linear-gradient(90deg,oklch(0.64 0.31 48),#00f)'></div></body>";
-    let main = |expected: &str| {
-        format!(
-            r#"
+  let main = |expected: &str| {
+    format!(
+      r#"
         await load('page.html');
         const points = [[50, 50], [150, 50], [250, 50], [350, 50], [50, 150], [150, 150], [250, 150], [350, 150], [50, 250], [150, 250]];
         const expected = {expected};
@@ -1590,28 +1590,28 @@ fn wide_gamut_colors_draw_in_display_p3() {
         for (const [x, y] of points) got.push([...(await win.webContents.capturePage({{ x, y, width: 1, height: 1 }})).toBitmap()].slice(0, 3).reverse());
         if (got.some((pixel, at) => pixel.some((value, channel) => Math.abs(value - expected[at][channel]) > 2))) fail(JSON.stringify(got));
         "#
-        )
-    };
-    let page = [("page.html", page)];
-    run_hidden(
-        &main(
-            "[[255,0,0],[200,100,50],[255,0,0],[0,255,0],[128,0,127],[126,0,128],[255,0,0],[255,0,0],[128,0,127],[145,90,136]]",
-        ),
-        &page,
-    );
-    run_hidden(
-        &(main(
-            "[[234,51,35],[187,105,62],[249,36,0],[0,255,0],[117,26,140],[115,20,124],[234,51,35],[249,36,0],[124,18,123],[137,92,133]]",
-        ) + "// FORCE_P3"),
-        &page,
-    );
+    )
+  };
+  let page = [("page.html", page)];
+  run_hidden(
+    &main(
+      "[[255,0,0],[200,100,50],[255,0,0],[0,255,0],[128,0,127],[126,0,128],[255,0,0],[255,0,0],[128,0,127],[145,90,136]]",
+    ),
+    &page,
+  );
+  run_hidden(
+    &(main(
+      "[[234,51,35],[187,105,62],[249,36,0],[0,255,0],[117,26,140],[115,20,124],[234,51,35],[249,36,0],[124,18,123],[137,92,133]]",
+    ) + "// FORCE_P3"),
+    &page,
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn scroll_containers_snap_like_chrome() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         await load('snap.html');
         console.log('SNAP ' + await run(`(() => {
             const box = document.getElementById('box'), out = [];
@@ -1623,20 +1623,20 @@ fn scroll_containers_snap_like_chrome() {
             return out.join();
         })()`));
         "#,
-        &[(
-            "snap.html",
-            "<body style='margin:0'><style>#box{width:200px;height:100px;overflow:auto;scroll-snap-type:y mandatory}#box>div{height:80px;scroll-snap-align:start}</style>\
+    &[(
+      "snap.html",
+      "<body style='margin:0'><style>#box{width:200px;height:100px;overflow:auto;scroll-snap-type:y mandatory}#box>div{height:80px;scroll-snap-align:start}</style>\
              <div id=box><div></div><div></div><div></div><div></div><div></div><div></div><div></div><div></div></div></body>",
-        )],
-    );
-    assert!(text.contains("SNAP 80,160,540,160,200,50,20"), "{text}");
+    )],
+  );
+  assert!(text.contains("SNAP 80,160,540,160,200,50,20"), "{text}");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn scroll_snaps_fire_events_and_reach_into_shadow_trees() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         await load('snap.html');
         const step = async (name, code) => {
             await run(code + ';0');
@@ -1652,9 +1652,9 @@ fn scroll_snaps_fire_events_and_reach_into_shadow_trees() {
         await step('off', "box.style.scrollSnapType = 'none'");
         await step('bars', "box.style.scrollSnapType = ''; bars.scrollTop = 110; log.splice(0); log.push(bars.scrollTop)");
         "#,
-        &[(
-            "snap.html",
-            "<body style='margin:0'><style>.s{width:200px;height:100px;overflow:auto;scroll-snap-type:y mandatory}#bars{overflow:scroll;scroll-snap-type:y proximity}#bars::-webkit-scrollbar{width:20px;height:20px}#bars>div{height:60px;margin-bottom:80px;scroll-snap-align:end}</style>\
+    &[(
+      "snap.html",
+      "<body style='margin:0'><style>.s{width:200px;height:100px;overflow:auto;scroll-snap-type:y mandatory}#bars{overflow:scroll;scroll-snap-type:y proximity}#bars::-webkit-scrollbar{width:20px;height:20px}#bars>div{height:60px;margin-bottom:80px;scroll-snap-align:end}</style>\
              <div class=s id=box><div id=host></div></div><div class=s id=bars><div id=b0></div><div id=b1></div><div id=b2></div></div><script>\
              globalThis.log = []; globalThis.box = document.getElementById('box'); globalThis.bars = document.getElementById('bars');\
              const root = document.getElementById('host').attachShadow({ mode: 'open' });\
@@ -1662,31 +1662,32 @@ fn scroll_snaps_fire_events_and_reach_into_shadow_trees() {
              globalThis.first = root.getElementById('p0');\
              for (const type of ['scrollsnapchanging', 'scrollsnapchange']) box['on' + type] = event => log.push(type.slice(10) + ':' + event.snapTargetBlock?.id + ',' + event.snapTargetInline + '@' + box.scrollTop);\
              </script></body>",
-        )],
+    )],
+  );
+  for line in [
+    "load change:p0,null@0",
+    "scroll changing:p1,null@80 change:p1,null@80",
+    "same ",
+    "layout ",
+    "hide ",
+    "show change:p1,null@100",
+    "off change:undefined,null@100",
+    "bars 120 change:p1,null@100",
+  ] {
+    assert!(
+      text
+        .lines()
+        .any(|out| out.trim_end() == format!("SNAP {line}").trim_end()),
+      "{line}: {text}"
     );
-    for line in [
-        "load change:p0,null@0",
-        "scroll changing:p1,null@80 change:p1,null@80",
-        "same ",
-        "layout ",
-        "hide ",
-        "show change:p1,null@100",
-        "off change:undefined,null@100",
-        "bars 120 change:p1,null@100",
-    ] {
-        assert!(
-            text.lines()
-                .any(|out| out.trim_end() == format!("SNAP {line}").trim_end()),
-            "{line}: {text}"
-        );
-    }
+  }
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn scroll_snaps_follow_chrome_in_events_focus_and_bars() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         await load('snap.html');
         const step = async (name, code) => {
             await run(code + ';0');
@@ -1699,9 +1700,9 @@ fn scroll_snaps_follow_chrome_in_events_focus_and_bars() {
         await step('focus', "b.children[1].firstChild.focus({ preventScroll: true }); b.scrollTop = 0; b.scrollTop = 85; log.push(b.scrollTop)");
         await step('page', 'const d = document.documentElement; scrollTo(9999, 0); log.push(d.clientWidth - innerWidth, d.clientHeight - innerHeight, d.scrollWidth, scrollX + d.clientWidth)');
         "#,
-        &[(
-            "snap.html",
-            "<body style='margin:0'><style>.s{width:200px;height:100px;overflow:auto;scroll-snap-type:y mandatory}.s::-webkit-scrollbar{display:none}.s>div{height:80px;scroll-snap-align:start}.s p{margin:0;height:80px;scroll-snap-align:start}\
+    &[(
+      "snap.html",
+      "<body style='margin:0'><style>.s{width:200px;height:100px;overflow:auto;scroll-snap-type:y mandatory}.s::-webkit-scrollbar{display:none}.s>div{height:80px;scroll-snap-align:start}.s p{margin:0;height:80px;scroll-snap-align:start}\
              .x{width:120px;height:40px;overflow:hidden;scroll-snap-type:x mandatory}.x>div{width:500px;height:40px;padding-left:40px;box-sizing:border-box}.x p{margin:0;width:90px;height:40px;scroll-snap-align:start}\
              #gutter{overflow:auto;scrollbar-gutter:stable both-edges}#gutter>div{padding-left:20px}::-webkit-scrollbar{width:20px;height:14px}</style>\
              <div class=s id=a><div></div><div></div><div></div><div></div></div><div class=s id=b><div><p tabindex=0></p></div><div><p tabindex=0></p></div><div></div><div></div></div>\
@@ -1709,28 +1710,29 @@ fn scroll_snaps_follow_chrome_in_events_focus_and_bars() {
              globalThis.log = [];for (const id of ['a', 'b', 'gap', 'gutter']) globalThis[id] = document.getElementById(id);\
              for (const box of [a, b]) for (const type of ['scrollsnapchanging', 'scrollsnapchange', 'scrollend']) box.addEventListener(type, event => log.push(box.id + ':' + type.replace('scrollsnap', '') + (event.snapTargetBlock ? [...box.children].indexOf(event.snapTargetBlock) : '')));\
              </script></body>",
-        )],
+    )],
+  );
+  for line in [
+    "load 40 40 80",
+    "order b:changing1 b:change1 b:scrollend a:changing1 a:change1 a:scrollend",
+    "anchor a:scrollend",
+    "focus 80 b:changing0 b:change0 b:scrollend",
+    "page -20 -14 1500 1500",
+  ] {
+    assert!(
+      text
+        .lines()
+        .any(|out| out.trim_end() == format!("SNAP {line}").trim_end()),
+      "{line}: {text}"
     );
-    for line in [
-        "load 40 40 80",
-        "order b:changing1 b:change1 b:scrollend a:changing1 a:change1 a:scrollend",
-        "anchor a:scrollend",
-        "focus 80 b:changing0 b:change0 b:scrollend",
-        "page -20 -14 1500 1500",
-    ] {
-        assert!(
-            text.lines()
-                .any(|out| out.trim_end() == format!("SNAP {line}").trim_end()),
-            "{line}: {text}"
-        );
-    }
+  }
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn page_bars_follow_chrome() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         const step = async (page, name, code) => {
             await load(page);
             for (let i = 0; i < 2; i++) await win.webContents.capturePage();
@@ -1744,54 +1746,55 @@ fn page_bars_follow_chrome() {
         await step('rtl.html', 'rtl', "(scrollTo(-9999, 0), [scrollX + d.scrollWidth - d.clientWidth]), (scrollTo(9999, 0), scrollX)");
         await step('ltr.html', 'ltr', "(scrollTo(50, 0), scrollX), (scrollTo(-50, 0), scrollX)");
         "#,
-        &[
-            (
-                "auto.html",
-                "<style>body{margin:0}::-webkit-scrollbar{width:20px;height:14px}</style><body><div id=all style='position:fixed;inset:0'></div><div id=end style='position:fixed;right:0;bottom:0;width:10px;height:10px'></div><div style='width:3000px;height:3000px'></div></body>",
-            ),
-            (
-                "scroll.html",
-                "<style>html{overflow-y:scroll}body{margin:0}::-webkit-scrollbar{width:20px;height:14px}</style><body><div style='width:3000px;height:3000px'></div></body>",
-            ),
-            (
-                "hidden.html",
-                "<style>html{overflow:hidden}body{margin:0}</style><body><div style='width:3000px;height:3000px'></div><script>document.querySelector('div').style.cssText = `width:${innerWidth + 100}px;height:${innerHeight + 200}px`</script></body>",
-            ),
-            (
-                "both.html",
-                "<style>body{margin:0}::-webkit-scrollbar{width:20px;height:14px}</style><body><div id=m></div><script>globalThis.m = document.getElementById('m'); m.style.cssText = `width:${innerWidth - 10}px;height:3000px`</script></body>",
-            ),
-            (
-                "rtl.html",
-                "<style>body{margin:0;direction:rtl}::-webkit-scrollbar{width:20px;height:14px}</style><body><div style='width:3000px;height:3000px'></div></body>",
-            ),
-            (
-                "ltr.html",
-                "<style>html{direction:rtl}body{margin:0;direction:ltr}</style><body><div style='width:3000px;height:3000px'></div></body>",
-            ),
-        ],
+    &[
+      (
+        "auto.html",
+        "<style>body{margin:0}::-webkit-scrollbar{width:20px;height:14px}</style><body><div id=all style='position:fixed;inset:0'></div><div id=end style='position:fixed;right:0;bottom:0;width:10px;height:10px'></div><div style='width:3000px;height:3000px'></div></body>",
+      ),
+      (
+        "scroll.html",
+        "<style>html{overflow-y:scroll}body{margin:0}::-webkit-scrollbar{width:20px;height:14px}</style><body><div style='width:3000px;height:3000px'></div></body>",
+      ),
+      (
+        "hidden.html",
+        "<style>html{overflow:hidden}body{margin:0}</style><body><div style='width:3000px;height:3000px'></div><script>document.querySelector('div').style.cssText = `width:${innerWidth + 100}px;height:${innerHeight + 200}px`</script></body>",
+      ),
+      (
+        "both.html",
+        "<style>body{margin:0}::-webkit-scrollbar{width:20px;height:14px}</style><body><div id=m></div><script>globalThis.m = document.getElementById('m'); m.style.cssText = `width:${innerWidth - 10}px;height:3000px`</script></body>",
+      ),
+      (
+        "rtl.html",
+        "<style>body{margin:0;direction:rtl}::-webkit-scrollbar{width:20px;height:14px}</style><body><div style='width:3000px;height:3000px'></div></body>",
+      ),
+      (
+        "ltr.html",
+        "<style>html{direction:rtl}body{margin:0;direction:ltr}</style><body><div style='width:3000px;height:3000px'></div></body>",
+      ),
+    ],
+  );
+  for line in [
+    "fixed 0,0,-20,-14,-20,-14",
+    "scroll 70,0,0",
+    "hidden 0,0,100,200,50,60",
+    "both -20,-14,0,0,0,0,-20,-14",
+    "rtl 0,0",
+    "ltr 50,0",
+  ] {
+    assert!(
+      text
+        .lines()
+        .any(|out| out.trim_end() == format!("BARS {line}")),
+      "{line}: {text}"
     );
-    for line in [
-        "fixed 0,0,-20,-14,-20,-14",
-        "scroll 70,0,0",
-        "hidden 0,0,100,200,50,60",
-        "both -20,-14,0,0,0,0,-20,-14",
-        "rtl 0,0",
-        "ltr 50,0",
-    ] {
-        assert!(
-            text.lines()
-                .any(|out| out.trim_end() == format!("BARS {line}")),
-            "{line}: {text}"
-        );
-    }
+  }
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn boxes_in_3d_rendering_contexts_draw_and_hit_by_depth_like_chrome() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         // BGRA to RGB.
         const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap()].slice(0, 3).reverse().join();
@@ -1818,24 +1821,24 @@ fn boxes_in_3d_rendering_contexts_draw_and_hit_by_depth_like_chrome() {
         const rect = JSON.parse(await run("card.className = 'edge', JSON.stringify(back.getBoundingClientRect())"));
         if (Math.abs(rect.x - 50) > 0.1 || rect.width > 0.1) fail('edge: ' + JSON.stringify(rect));
         "#,
-        &[(
-            "page.html",
-            "<style>body{margin:0;background:#fff}.s{position:absolute;top:0;width:100px;height:100px;transform-style:preserve-3d}\
+    &[(
+      "page.html",
+      "<style>body{margin:0;background:#fff}.s{position:absolute;top:0;width:100px;height:100px;transform-style:preserve-3d}\
              .s>div{position:absolute;inset:0}.turned{transform:rotateY(180deg)}.edge{transform:rotateY(90deg)}</style>\
              <div class=s style='left:0'><div id=card style='transform-style:preserve-3d'><div id=front style='position:absolute;inset:0;background:#f00;backface-visibility:hidden'></div>\
              <div id=back style='position:absolute;inset:0;background:#008000;backface-visibility:hidden;transform:rotateY(180deg)'></div></div></div>\
              <div class=s style='left:120px'><div id=near style='background:#f00;transform:translateZ(30px)'></div><div id=far style='background:#008000'></div></div>\
              <div class=s style='left:250px'><div id=one style='background:#f00;transform:rotateY(45deg)'></div><div id=two style='background:#008000;transform:rotateY(-45deg)'></div></div>\
              <script>const card = document.getElementById('card'), near = document.getElementById('near'), back = document.getElementById('back')</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn boxes_take_the_pointer_where_3d_transforms_put_them_like_chrome() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const hit = async (name, x, y, id) => {
             const found = await run(`(node => node && (node.id || node.localName))(document.elementFromPoint(${x}, ${y}))`);
@@ -1867,9 +1870,9 @@ fn boxes_take_the_pointer_where_3d_transforms_put_them_like_chrome() {
         const missed = await run("[...words.children].filter(word => { const r = word.getBoundingClientRect(); return document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2) !== word }).length");
         if (missed) fail('new words missed: ' + missed);
         "#,
-        &[(
-            "page.html",
-            "<style>body{margin:0;background:#fff}.s{position:absolute;top:0;width:100px;height:100px;perspective:100px;pointer-events:none}\
+    &[(
+      "page.html",
+      "<style>body{margin:0;background:#fff}.s{position:absolute;top:0;width:100px;height:100px;perspective:100px;pointer-events:none}\
              .s *{position:absolute;inset:0;pointer-events:auto}.k{background:#f00}#boxes i{position:absolute;display:block;width:30px;height:20px;transform:rotateX(40deg);left:0;top:300px}</style>\
              <div id=a style='position:absolute;inset:0 auto auto 0;width:100px;height:100px'></div><div id=b style='position:absolute;left:100px;top:0;width:100px;height:100px'></div>\
              <div class=s style='left:0'><div id=p style='transform-style:preserve-3d;pointer-events:none'><div id=c style='transform:translateZ(200px)'></div></div></div>\
@@ -1882,15 +1885,15 @@ fn boxes_take_the_pointer_where_3d_transforms_put_them_like_chrome() {
              <div id=boxes style='transform-style:preserve-3d;pointer-events:none'><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>\
              <div id=words style='position:absolute;top:0;width:400px'></div>\
              <script>const turned = document.getElementById('turned'), words = document.getElementById('words')</script></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn positioned_boxes_paint_in_their_new_order() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         for (let n = 0; n < 3; n++) await win.webContents.capturePage();
         await run("const box = document.getElementById('box'); box.append(box.firstChild)");
@@ -1898,19 +1901,19 @@ fn positioned_boxes_paint_in_their_new_order() {
         const seen = [...(await win.webContents.capturePage({ x: 10, y: 10, width: 1, height: 1 })).toBitmap()].slice(0, 3).reverse().join();
         if (seen !== '255,0,0') fail(seen);
         "#,
-        &[(
-            "page.html",
-            "<style>body{margin:0}#box{position:relative;height:90px}#box>div{position:absolute;inset:0;background:#f00}#box>.b{background:#00f}</style>\
+    &[(
+      "page.html",
+      "<style>body{margin:0}#box{position:relative;height:90px}#box>div{position:absolute;inset:0;background:#f00}#box>.b{background:#00f}</style>\
              <div id=box><div>a</div><div class=b>b</div></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn turning_3d_contexts_draw_their_last_frame() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         // BGRA to RGB.
         const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap()].slice(0, 3).reverse().join();
@@ -1920,21 +1923,21 @@ fn turning_3d_contexts_draw_their_last_frame() {
         const seen = await pixel(50, 50);
         if (seen !== '0,128,0') fail(seen);
         "#,
-        &[(
-            "page.html",
-            "<style>body{margin:0;background:#fff}#s{perspective:400px;width:100px}#card{height:100px;transform-style:preserve-3d;transition:transform .2s}\
+    &[(
+      "page.html",
+      "<style>body{margin:0;background:#fff}#s{perspective:400px;width:100px}#card{height:100px;transform-style:preserve-3d;transition:transform .2s}\
              .on #card{transform:rotateY(180deg)}#card>div{position:absolute;inset:0;background:#f00;backface-visibility:hidden}\
              #card>.b{background:#008000;transform:rotateY(180deg)}i{display:block;width:9px;height:9px;animation:m .2s infinite}@keyframes m{to{translate:9px}}</style>\
              <div id=s><div id=card><div><i></i></div><div class=b></div></div></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn pseudo_element_borders_draw_their_style_like_boxes() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         for (let n = 0; n < 3; n++) await win.webContents.capturePage();
         const rect = async (x, y) => (await win.webContents.capturePage({ x, y, width: 80, height: 30 })).toBitmap();
@@ -1944,9 +1947,9 @@ fn pseudo_element_borders_draw_their_style_like_boxes() {
             if (off >= 0) fail(name + ' differs at ' + (off >> 2) % 80 + ',' + Math.floor((off >> 2) / 80));
         }
         "#,
-        &[(
-            "page.html",
-            "<style>body{margin:0;background:#fff}.a{position:absolute;left:0;width:80px}\
+    &[(
+      "page.html",
+      "<style>body{margin:0;background:#fff}.a{position:absolute;left:0;width:80px}\
              .a::before,.a>i{content:'';display:block;box-sizing:border-box;width:80px;height:30px}.a>i{position:absolute;left:200px;top:0}\
              .d::before,.d>i{border:2px dashed #a00}.r::before,.r>i{border:6px ridge rgb(200,150,100)}\
              .m::before,.m>i{border:3px solid #00a;border-style:solid dashed}.o::before,.o>i{border:4px dotted #0a0}\
@@ -1954,15 +1957,15 @@ fn pseudo_element_borders_draw_their_style_like_boxes() {
              <div class='a d' style=top:0><i></i></div><div class='a r' style=top:40px><i></i></div>\
              <div class='a m' style=top:80px><i></i></div><div class='a o' style=top:120px><i></i></div>\
              <div class='a w' style=top:160px><i></i></div></body>",
-        )],
-    );
+    )],
+  );
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn broken_background_images_load_once() {
-    let text = run_hidden(
-        r#"
+  let text = run_hidden(
+    r#"
         await load('page.html');
         // A selection change paints the page again without a new box.
         for (let n = 0; n < 6; n++) {
@@ -1971,21 +1974,21 @@ fn broken_background_images_load_once() {
             await new Promise(resolve => setTimeout(resolve, 30));
         }
         "#,
-        &[(
-            "page.html",
-            "<body style='margin:0'><div style='width:60px;height:60px;background-image:url(data:image/png;base64,AAAA)'></div>\
+    &[(
+      "page.html",
+      "<body style='margin:0'><div style='width:60px;height:60px;background-image:url(data:image/png;base64,AAAA)'></div>\
              <p id=a>a</p><p id=b>b</p></body>",
-        )],
-    );
-    let errors = text.matches("apps: CSS image").count();
-    assert_eq!(errors, 1, "{text}");
+    )],
+  );
+  let errors = text.matches("apps: CSS image").count();
+  assert_eq!(errors, 1, "{text}");
 }
 
 #[test]
 #[ignore = "requires the macOS window server"]
 fn inline_boxes_round_their_corners_like_blocks() {
-    run_hidden(
-        r#"
+  run_hidden(
+    r#"
         await load('page.html');
         const bitmap = async (x, y) => (await win.webContents.capturePage({ x, y, width: 14, height: 14 })).toBitmap();
         for (const radius of ['16px', '16px / 12px', '50%', '9999px', '40% 10px']) {
@@ -2004,11 +2007,11 @@ fn inline_boxes_round_their_corners_like_blocks() {
             }
         }
         "#,
-        &[(
-            "page.html",
-            "<body style='margin:0;background:#fff;font:40px/60px sans-serif'><p style='margin:0'>\
+    &[(
+      "page.html",
+      "<body style='margin:0;background:#fff;font:40px/60px sans-serif'><p style='margin:0'>\
              <span id=span style='background:#f00;color:transparent;padding:0 30px'>ab</span></p>\
              <div id=block style='position:absolute;box-sizing:border-box;background:#f00'></div></body>",
-        )],
-    );
+    )],
+  );
 }
