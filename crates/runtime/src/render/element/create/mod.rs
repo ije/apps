@@ -965,7 +965,13 @@ pub(super) fn create(
         slot.is_some(),
     );
     if slot.is_none() {
-        reader.log(Query::Margins, depth, hashed(margin.map(f32::to_bits)));
+        // The style of a box of `bounded_end` differs.
+        let bounded = super::margin::bounded_end(build, id, containing[0]).is_some();
+        reader.log(
+            Query::Margins,
+            depth,
+            hashed((margin.map(f32::to_bits), bounded)),
+        );
     }
     if hit.is_none() {
         el = el

@@ -159,6 +159,8 @@ struct Cold {
     inputs: Option<LayoutInput>,
     // The floats that the box placed in the context of its parent when no other float reached it, from its origin.
     spill: Option<Spill>,
+    // Whether the height of a box with `Style::fits` was the bottom of its content in its last layout.
+    fits: Option<bool>,
     // The content height of a box with floats, and what it depends on, for one layout.
     natural: Option<(Vec<f32>, f32)>,
     // The boxes inside that the box listed in the stacking context around it, which a skip of the box lists again.
@@ -1918,6 +1920,34 @@ impl LayoutTree<'_> {
                     taffy::compute_oof_layout(tree, node, &mut output);
                 }
                 output.baselines = tree.baselines(usize::from(node), &output);
+                if tree.slots[index].style.fits {
+                    let calc = |value, basis| crate::style::resolve_calc(value, basis);
+                    let bottom = (tree.slots[index].children.iter())
+                        .map(|&child| &tree.slots[usize::from(child)])
+                        .filter(|slot| {
+                            let style = slot.taffy();
+                            style.display != taffy::Display::None
+                                && style.position != taffy::Position::Absolute
+                                && slot.style.flow & Flow::FLOAT == 0
+                        })
+                        .map(|slot| {
+                            let (style, layout) = (slot.taffy(), &slot.layout);
+                            let shift = match style.position {
+                                taffy::Position::Relative => {
+                                    let [top, bottom] =
+                                        [style.inset.top, style.inset.bottom].map(|side| {
+                                            taffy::MaybeResolve::maybe_resolve(side, None, calc)
+                                        });
+                                    top.or(bottom.map(|bottom| -bottom)).unwrap_or(0.)
+                                }
+                                _ => 0.,
+                            };
+                            layout.location.y - shift + layout.size.height + layout.margin.bottom
+                        })
+                        .fold(0f32, f32::max);
+                    tree.slots[index].cold_mut().fits =
+                        Some((output.size.height - bottom).abs() < 0.01);
+                }
             }
             output
         };

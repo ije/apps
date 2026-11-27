@@ -101,10 +101,11 @@ pub(super) fn margins(
                 .is_some_and(css::value::content_size)
         };
         open[1] |= collapses
-            && [Prop::HEIGHT, Prop::MIN_HEIGHT, Prop::MAX_HEIGHT]
-                .into_iter()
-                .any(sized)
-            && margin_collapses_through(build, parent, 3, width);
+            && (bounded_end(build, parent, width).is_some()
+                || [Prop::HEIGHT, Prop::MIN_HEIGHT, Prop::MAX_HEIGHT]
+                    .into_iter()
+                    .any(sized)
+                    && margin_collapses_through(build, parent, 3, width));
         // Skip animated boxes. Clear walks when fonts or the viewport change: the key excludes them.
         let key = (
             build.info[parent].revision,
@@ -325,6 +326,53 @@ pub(super) fn margin_collapses_through(
     side: usize,
     width: f32,
 ) -> bool {
+    if side == 2
+        && let Some(ends) = bounded_end(build, id, width)
+    {
+        return ends;
+    }
+    let style = &build.styles.values[id];
+    open(build, id, side, width)
+        && (side == 0
+            || min_free(build, id, width)
+                && (side == 3
+                    || style.get(Prop::HEIGHT).is_none_or(css::value::auto_size)
+                        && style
+                            .get(Prop::MAX_HEIGHT)
+                            .is_none_or(|value| value == "none")))
+}
+
+fn min_free(build: &Build<'_>, id: usize, width: f32) -> bool {
+    build.styles.values[id]
+        .get(Prop::MIN_HEIGHT)
+        .is_none_or(|value| {
+            value == "auto"
+                || build.styles.lengths[id]
+                    .resolve(value, width)
+                    .is_none_or(|n| n == 0.)
+        })
+}
+
+// For a box whose `min-height` or `max-height` can change its auto height: whether the last margin in it passes out.
+// Like Chrome, it does when the height is the content height, which the last layout found, see `NodeCx::fits`.
+pub(super) fn bounded_end(build: &Build<'_>, id: usize, width: f32) -> Option<bool> {
+    let style = &build.styles.values[id];
+    let min = min_free(build, id, width);
+    (!(min
+        && style
+            .get(Prop::MAX_HEIGHT)
+            .is_none_or(|value| value == "none"))
+        && style.get(Prop::HEIGHT).is_none_or(css::value::auto_size)
+        && open(build, id, 2, width))
+    .then(|| {
+        let store = build.view.store.borrow();
+        (store.page_state(build.view.id))
+            .and_then(|dom| dom.layout.ends.get(&id).copied())
+            .unwrap_or(min)
+    })
+}
+
+fn open(build: &Build<'_>, id: usize, side: usize, width: f32) -> bool {
     let (doc, styles) = (build.doc, build.styles);
     let style = &styles.values[id];
     let edge = |prop: Prop| {
@@ -408,23 +456,6 @@ pub(super) fn margin_collapses_through(
             || style
                 .get(kind)
                 .is_none_or(|value| matches!(value, "none" | "hidden")))
-        && (side == 0
-            || (side == 3
-                || style.get(Prop::HEIGHT).is_none_or(css::value::auto_size)
-                    && (style.get(Prop::MAX_HEIGHT)).is_none_or(|value| {
-                        // Like Chrome, only a `calc-size()` that can cut its content holds the last margin.
-                        css::value::calc_size(value).is_none_or(|(basis, size)| {
-                            css::value::auto_size(basis)
-                                && [0f32, 1e6].into_iter().all(|at| {
-                                    let calc = css::value::with_size(size, &format!("({at}px)"));
-                                    (styles.lengths[id].resolve(&format!("calc({calc})"), width))
-                                        .is_some_and(|got| got >= at)
-                                })
-                        })
-                    }))
-                && style
-                    .get(Prop::MIN_HEIGHT)
-                    .is_none_or(|value| value == "auto" || edge(Prop::MIN_HEIGHT) == 0.))
 }
 
 // Whether the block around the line of a box has a definite height, which its percent heights resolve against.

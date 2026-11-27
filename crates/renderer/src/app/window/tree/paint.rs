@@ -355,6 +355,7 @@ impl Tree {
                             unscroll: slot.unscroll,
                             inset: inset(&slot.layout, scale),
                             baselines: self.baselines(index, scale),
+                            fits: None,
                             text: &slot.text,
                             style,
                             state: slot.state.as_ref(),

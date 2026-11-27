@@ -11,7 +11,9 @@ pub(crate) mod svg;
 
 use self::create::create;
 use self::kept::{Call, Kept, Patch, Query, Read, Replay, hashed};
-use self::margin::{definite_height, definite_line, float_side, margins, shrinks_around};
+use self::margin::{
+    bounded_end, definite_height, definite_line, float_side, margins, shrinks_around,
+};
 #[cfg(debug_assertions)]
 use self::oracle::{TRACE, check, print};
 pub(crate) use self::query::box_parent;
@@ -123,10 +125,11 @@ impl<'a> Build<'a> {
             Query::Margins => {
                 let mut units = styles.lengths[id];
                 units.container = Some(container);
-                hashed(
+                hashed((
                     margins(self, id, &units, width, self.flex_parent, cell.is_some())
                         .map(f32::to_bits),
-                )
+                    bounded_end(self, id, width).is_some(),
+                ))
             }
             Query::Parent(prop) => hashed(parent_style(doc, styles, id, prop)),
             Query::ParentFont => hashed(parent_font(doc, styles, id)),

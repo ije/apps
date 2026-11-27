@@ -1,6 +1,6 @@
 use super::super::Build;
 use super::super::kept::{Query, Read, Shared, hashed};
-use super::super::margin::{clear_bits, float_side};
+use super::super::margin::{bounded_end, clear_bits, float_side};
 use super::super::query::{boxless, collapses, insets, padding_start, scroller};
 use super::cx::{Cx, Frame};
 use crate::css;
@@ -285,6 +285,14 @@ pub(super) fn finish(
             }
         }
     }
+    let ends = fr
+        .turn
+        .is_none()
+        .then(|| bounded_end(reader, id, containing[0]))
+        .flatten();
+    if ends.is_some() && !el.style_ref().fits {
+        el.style().fits = true;
+    }
     let mut el = match &fr.turn {
         Some(turn) => {
             let mut outer = renderer::node()
@@ -373,6 +381,7 @@ pub(super) fn finish(
             sides
         },
         margin,
+        ends,
         cell: slot.as_ref().and(parent),
         grid: slot
             .as_ref()

@@ -711,6 +711,8 @@ pub(crate) struct DomBox {
     pub(crate) revision: u64,
     pub(crate) sides: [f32; 2],
     pub(crate) margin: [f32; 4],
+    // What `bounded_end` gave the build, which layout checks.
+    pub(crate) ends: Option<bool>,
     pub(crate) cell: Option<usize>,
     pub(crate) grid: Option<(usize, bool)>,
     pub(crate) parts: Option<Rc<Parts>>,
@@ -1084,7 +1086,7 @@ impl Hooks for DomBox {
 
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let parts: Vec<_> = cx.fragments().collect();
-        let (exact, baselines, unscrolled) = (cx.exact, cx.baselines, cx.unscroll);
+        let (exact, baselines, unscrolled, fits) = (cx.exact, cx.baselines, cx.unscroll, cx.fits);
         let anchored = cx.style.anchored.as_deref();
         let window = &mut *cx.window;
         let mut bounds = exact;
@@ -1360,6 +1362,13 @@ impl Hooks for DomBox {
                 view.reaching
                     .borrow_mut()
                     .push(([f32::INFINITY, f32::NEG_INFINITY], self.plans));
+                if let (Some(ends), Some(fits)) = (self.ends, fits)
+                    && ends != fits
+                {
+                    dom.layout.ends.insert(self.id, fits);
+                    dom.layout.relayout(self.id);
+                    window.redraw();
+                }
                 if dom
                     .layout
                     .containers

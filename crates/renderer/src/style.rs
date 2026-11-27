@@ -279,6 +279,8 @@ style! {
     inline: Inline = Inline::None,
     /// A block container: the auto heights of its children are not definite, unlike the flexed sizes of flex items.
     block: bool = false,
+    /// Layout finds whether the height of the box is the bottom of its content, for [`NodeCx::fits`].
+    fits: bool = false,
     background: Option<Color> = None,
     border_color: Option<Color> = None,
     border_style: BorderStyle = BorderStyle::Solid,
