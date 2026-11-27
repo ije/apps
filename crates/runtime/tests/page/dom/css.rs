@@ -123,8 +123,8 @@ fn custom_elements_shadow_styles_and_lifecycle() {
     "#, "test").unwrap();
 }
 
-// Debug builds also compare each patched tree walk, list and mark with a full pass. Shadow trees, which take
-// the full pass, come late.
+// Debug builds also compare each patched tree walk, list and mark with a full pass. Shadow trees have named slots
+// that take other nodes and names.
 #[test]
 fn computed_styles_follow_random_tree_changes() {
     let host = Rc::new(RefCell::new(Host::default()));
@@ -140,15 +140,23 @@ fn computed_styles_follow_random_tree_changes() {
     .unwrap();
     engine.eval(r#"
         const rules = [['body', 'rgb(1, 1, 1)'], ['p + p', 'rgb(6, 6, 6)'], ['.a', 'rgb(2, 2, 2)'], ['li:first-child', 'rgb(4, 4, 4)'], ['li:nth-child(3n)', 'rgb(5, 5, 5)'], ['div:empty', 'rgb(7, 7, 7)'], ['[inert] span', 'rgb(8, 8, 8)'], ['td:last-child', 'rgb(9, 9, 9)'], ['.a > .b', 'rgb(3, 3, 3)']];
-        const expected = el => { for (let i = rules.length; i--;) if (el.matches(rules[i][0])) return rules[i][1]; return el.parentElement ? expected(el.parentElement) : 'rgb(0, 0, 0)'; };
+        const up = el => el.assignedSlot ?? el.parentElement ?? el.parentNode?.host ?? null;
+        const expected = el => {
+            if (el.getRootNode() !== document) { if (el.matches('slot[name=x]')) return 'rgb(11, 11, 11)'; }
+            else for (let i = rules.length; i--;) if (el.matches(rules[i][0])) return rules[i][1];
+            return up(el) ? expected(up(el)) : 'rgb(0, 0, 0)';
+        };
         const places = [['span ~ p', 'rgb(1, 0, 0)'], ['div:has(+ div)', 'rgb(2, 0, 0)'], ['li:last-child', 'rgb(3, 0, 0)'], ['li:only-child', 'rgb(4, 0, 0)'], ['li:nth-last-child(2)', 'rgb(5, 0, 0)'], ['li:has(> .a)', 'rgb(6, 0, 0)'], ['td:has(~ .a)', 'rgb(7, 0, 0)'], ['ul:has(.b) p', 'rgb(8, 0, 0)'], ['body:has(.flat) td', 'rgb(9, 0, 0)']];
-        let seed = 12345, step = 0;
+        let seed = 12345, step = 0, slotted = 0;
         const random = below => (seed = Math.imul(seed, 1103515245) + 12345 >>> 0, (seed >>> 8) % below);
         const list = document.getElementById('list'), rows = document.getElementById('rows'), box = document.getElementById('box');
         const make = (tag, text) => { const el = document.createElement(tag); if (random(3) === 0) el.className = ['a', 'b', 'flat'][random(3)]; if (text) el.textContent = text; return el; };
         const item = () => { const li = make('li'); li.append(make('span', 'item'), make('p', 'one'), make('p', 'two')); return li; };
         const any = () => { const all = document.body.querySelectorAll('*'); return all[random(all.length)]; };
         const holder = () => { for (;;) { const el = any(); if (!['TABLE', 'TBODY', 'TR', 'STYLE'].includes(el.tagName)) return el; } };
+        const hosts = () => Array.from(document.body.querySelectorAll('*')).filter(el => el.shadowRoot);
+        const host = () => { const all = hosts(); return all[random(all.length)]; };
+        const names = ['', 'x', 'y', 'z'];
         for (let i = 0; i < 12; i++) list.append(item());
         const steps = [
             () => list.insertBefore(item(), list.children[random(list.children.length + 1)] ?? null),
@@ -164,7 +172,21 @@ fn computed_styles_follow_random_tree_changes() {
             () => { const el = holder(); if (el !== box && !el.contains(box)) box.append(el); },
             () => { const style = document.head.querySelector('style + style'); style ? style.remove() : document.head.append(make('style', '.none{color:rgb(10, 10, 10)}')); },
             () => { const el = holder(); if (el.id || el.children.length > 20) return; const wrap = make('div'); el.replaceWith(wrap); wrap.append(el); },
-            () => { if (step < 120) return; const el = make('div'); el.attachShadow({ mode: 'open' }).append(make('span', 'shadow'), document.createElement('slot')); el.append(make('p', 'light')); box.append(el); },
+            () => steps[14](),
+            () => {
+                const el = make('div'), root = el.attachShadow({ mode: 'open' }), named = document.createElement('slot'), inner = make('div');
+                named.name = names[1 + random(3)];
+                inner.append(document.createElement('slot'), make('span', 'deep'));
+                root.append(make('style', 'slot[name=x]{color:rgb(11, 11, 11)}'), make('span', 'shadow'), named, inner);
+                for (let i = random(4); i--;) { const p = make('p', 'light'); p.slot = names[random(4)]; el.append(p); }
+                holder().append(el);
+            },
+            () => { const el = host()?.children[0]; if (el) el.slot = names[random(4)]; },
+            () => { const slot = host()?.shadowRoot.querySelectorAll('slot')[random(3)]; if (slot) slot.name = names[random(4)]; },
+            () => { const el = host(); if (el) el.shadowRoot.querySelectorAll('div, span')[random(3)]?.append(document.createElement('slot')); },
+            () => { const el = host(); if (el) el.shadowRoot.querySelectorAll('slot')[random(3)]?.remove(); },
+            () => { const from = host(), to = host(); if (from?.children.length && to && !from.children[0].contains(to)) (random(2) ? to : to.shadowRoot).append(from.children[0]); },
+            () => { const el = host(); const moved = el?.shadowRoot.querySelector('span'); if (moved) holder().append(moved); },
             () => { const el = box.children[random(box.children.length)]; if (el) el.remove(); },
             () => { const el = holder(); if (!el.id) el.remove(); },
         ];
@@ -172,6 +194,12 @@ fn computed_styles_follow_random_tree_changes() {
             for (let count = 1 + random(3); count--;) steps[random(steps.length)]();
             if (list.children.length > 30) list.replaceChildren(...Array.from(list.children).slice(0, 8));
             if (document.body.querySelectorAll('*').length > 400) box.replaceChildren();
+            const shadowed = hosts().flatMap(el => Array.from(el.shadowRoot.querySelectorAll('*')).filter(el => el.tagName !== 'STYLE'));
+            slotted += shadowed.filter(el => el.tagName === 'SLOT' && el.assignedNodes().length).length;
+            for (const el of shadowed) {
+                const color = getComputedStyle(el).color;
+                if (color !== expected(el)) throw Error(`step ${step}: shadow <${el.tagName} name="${el.getAttribute('name')}"> is ${color}, not ${expected(el)}`);
+            }
             for (const el of document.body.querySelectorAll('*')) {
                 const color = getComputedStyle(el).color;
                 if (color !== expected(el)) throw Error(`step ${step}: <${el.tagName} class="${el.className}"> is ${color}, not ${expected(el)}`);
@@ -179,6 +207,7 @@ fn computed_styles_follow_random_tree_changes() {
                 if (back !== place) throw Error(`step ${step}: <${el.tagName} class="${el.className}"> has ${back}, not ${place}`);
             }
         }
+        if (slotted < 100) throw Error(`only ${slotted} slots with nodes`);
     "#, "test").unwrap();
 }
 
