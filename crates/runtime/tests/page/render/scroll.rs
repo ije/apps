@@ -899,3 +899,64 @@ fn scroll_listeners_draw_in_the_frame_of_their_scroll() {
         )],
     );
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn scrollend_fires_when_each_kind_of_scroll_ends() {
+    run_hidden(
+        &format!(
+            r#"{INPUT}
+        await load('page.html');
+        const take = () => run('log.splice(0).join()');
+        const step = async (name, want) => {{ const got = await take(); if (got !== want) fail(name + ': ' + got + ' instead of ' + want); }};
+        const at = {{ x: 60, y: 60 }};
+        await run('s.scrollTop = 100; s.scrollTop = 100');
+        await frames(50);
+        await step('a script scroll ends in its frame', 's100,end100');
+        await run('s.scrollTop = 100; s.scrollTo(0, 100)');
+        await frames(50);
+        await step('a scroll to the same place', '');
+        await run("c.style.height = '200px'");
+        await frames(100);
+        await step('a layout that clamps the offset', 's80,end80');
+        await run("c.style.height = '2000px'; s.scrollHeight; s.scrollTo({{ top: 300, behavior: 'smooth' }})");
+        await frames(900);
+        const smooth = (await take()).split(',');
+        if (smooth.slice(-2).join() !== 's300,end300' || smooth.filter(event => event.startsWith('end')).length !== 1) fail('a smooth scroll ends with its last step: ' + smooth);
+        await input({{ action: 'scroll', ...at, delta_y: 40 }});
+        await frames(150);
+        await step('a wheel without phases waits for more ticks', 's340');
+        await frames(500);
+        await step('and then ends', 'end340');
+        await input({{ action: 'scroll', ...at, delta_y: 20, phase: 'began' }});
+        await input({{ action: 'scroll', ...at, delta_y: 20, phase: 'changed' }});
+        await input({{ action: 'scroll', ...at, delta_y: 0, phase: 'ended' }});
+        await input({{ action: 'scroll', ...at, delta_y: 20, phase: 'momentum' }});
+        await input({{ action: 'scroll', ...at, delta_y: 0, phase: 'momentum_ended' }});
+        await frames(200);
+        const fling = (await take()).split(',');
+        if (fling.at(-1) !== 'end' + fling.at(-2).slice(1) || fling.filter(event => event.startsWith('end')).length !== 1) fail('a gesture ends after its momentum: ' + fling);
+        await input({{ action: 'scroll', ...at, delta_y: 20, phase: 'began' }});
+        await input({{ action: 'scroll', ...at, delta_y: 0, phase: 'ended' }});
+        const held = await take();
+        await frames(200);
+        const ended = await take();
+        if (held.includes('end') || !/^end\d+$/.test(ended)) fail('a gesture without momentum ends after a wait for it: ' + held + ' then ' + ended);
+        await run('s.scrollTop = 0');
+        await frames(50);
+        await take();
+        await input({{ action: 'scroll', ...at, delta_y: -40 }});
+        await input({{ action: 'scroll', ...at, delta_y: -20, phase: 'began' }});
+        await input({{ action: 'scroll', ...at, delta_y: 0, phase: 'ended' }});
+        await frames(700);
+        await step('scrolls that move nothing', '');
+        "#
+        ),
+        &[(
+            "page.html",
+            "<body style='margin:0'><div id=s style='width:200px;height:120px;overflow:auto'><div id=c style='height:2000px'></div></div>\
+             <script>globalThis.s = document.getElementById('s'); globalThis.c = document.getElementById('c'); globalThis.log = [];\
+             s.addEventListener('scroll', () => log.push('s' + s.scrollTop)); s.addEventListener('scrollend', () => log.push('end' + s.scrollTop));</script></body>",
+        )],
+    );
+}

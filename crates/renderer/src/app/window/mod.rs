@@ -1486,6 +1486,10 @@ impl Window {
             if handle.release(self.gesture.speed, self) {
                 self.gesture.spent = true;
             }
+            match phase {
+                WheelPhase::Ended => handle.hold_for(scroll::MOMENTUM_WAIT, self),
+                _ => handle.unhold(),
+            }
             handle.settle(self);
         }
         if phase == WheelPhase::MomentumEnded {

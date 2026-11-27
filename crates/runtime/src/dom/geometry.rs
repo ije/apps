@@ -109,25 +109,29 @@ impl Geometry {
             .fold([0.; 2], |[x, y], (by, ..)| [x + by[0], y + by[1]])
     }
 
-    // The scroll events since the last call in their order: the box, the event (0 `scroll` of a scroll that can still
-    // go on, 1 `scroll`, 2 `scrollsnapchanging`, 3 `scrollsnapchange`, 4 `scrollend`), and the block and the inline
-    // area. It clamps offsets to their range and marks the mirror as moved.
+    // The scroll events since the last call in their order: the box, the event (1 `scroll`, 2 `scrollsnapchanging`,
+    // 3 `scrollsnapchange`, 4 `scrollend`), and the block and the inline area. It clamps offsets to their range and
+    // marks the mirror as moved.
     pub(crate) fn scroll_events(&mut self) -> Vec<(usize, u8, Option<u64>, Option<u64>)> {
         let mut events = Vec::new();
         let mut changed = Vec::new();
         for (&id, handle) in &self.scroll {
-            let (fired, moved) = handle.take_events();
             let offset = scroll_offset(handle, handle.offset());
             // A new place stops a smooth scroll, so this only runs when the range clamps the offset.
             if offset != handle.offset() {
                 handle.limit(offset);
             }
+            let (fired, ending) = handle.take_events();
             let previous = self.scroll_offsets.entry(id).or_default();
             if *previous != offset {
                 *previous = offset;
                 changed.push(id);
                 if !fired.iter().any(|(_, event)| *event == ScrollEvent::Scroll) {
-                    events.push((0, (id, u8::from(!moved), None, None)));
+                    events.push((0, (id, 1, None, None)));
+                    // As in Chrome, a move of a layout or a scroll anchor ends at once.
+                    if !ending && !fired.iter().any(|(_, event)| *event == ScrollEvent::End) {
+                        events.push((0, (id, 4, None, None)));
+                    }
                 }
             }
             events.extend(fired.into_iter().map(|(order, event)| {

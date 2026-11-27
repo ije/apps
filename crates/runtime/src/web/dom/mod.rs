@@ -100,9 +100,6 @@ pub fn call(
         "dom.scrollEvents" => geometry::scroll_events(state),
         "dom.hitTest" => geometry::hit_test(args, doc, state, viewport),
         "dom.scrolled" => geometry::scrolled(id()?, state),
-        "dom.snapping" => Ok(json!(
-            (state.geometry.scroll.get(&id()?)).is_some_and(renderer::ScrollRef::snapping)
-        )),
         "dom.scroll" => geometry::scroll(id()?, args, doc, state, viewport),
         "dom.fragments" => geometry::fragments(id()?, state),
         "dom.client" => geometry::client(id()?, args, doc, state, viewport),

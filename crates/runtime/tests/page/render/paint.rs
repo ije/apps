@@ -1714,7 +1714,7 @@ fn scroll_snaps_follow_chrome_in_events_focus_and_bars() {
     for line in [
         "load 40 40 80",
         "order b:changing1 b:change1 b:scrollend a:changing1 a:change1 a:scrollend",
-        "anchor ",
+        "anchor a:scrollend",
         "focus 80 b:changing0 b:change0 b:scrollend",
         "page -20 -14 1500 1500",
     ] {

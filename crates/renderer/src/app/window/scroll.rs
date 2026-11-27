@@ -89,6 +89,7 @@ impl Wheel {
                     .0
                     .borrow_mut()
                     .sweep([to.x != from.x, to.y != from.y]);
+                handle.hold_for(WHEEL_END, window);
                 handle.settle(window);
                 handle.drive(window);
             } else if stops {
@@ -140,6 +141,7 @@ impl Wheel {
             handle.grab();
             if phase == WheelPhase::None {
                 handle.loosen(window);
+                handle.hold_for(WHEEL_END, window);
                 handle.settle(window);
             }
             handle.drive(window);
@@ -184,8 +186,11 @@ struct ScrollState {
     aimed: Option<[Option<u64>; 2]>,
     // The user or a smooth scroll moved the box since it was at rest.
     scrolled: bool,
-    // A scroll, and not only layouts, moved the box since the last events.
-    moved: bool,
+    // A scroll moved the box, and `scrollend` fires when it comes to rest.
+    ending: bool,
+    // The user can move the box again until then, so its scroll doesn't end before.
+    held: Option<Instant>,
+    waking: bool,
     // The axes that the user moved since the box last snapped. The other ones keep their areas.
     swept: [bool; 2],
     // The events to fire, in order over all boxes.
@@ -206,7 +211,8 @@ thread_local! {
     static MOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Counts the moves of all scroll offsets on this thread, so a page can tell that it has scroll events to fire.
+/// Counts the moves of all scroll offsets and the scrolls that came to rest on this thread, so a page can tell
+/// that it has scroll events to fire.
 pub fn scroll_moves() -> u64 {
     MOVES.get()
 }
@@ -259,6 +265,10 @@ impl Spring {
 }
 
 const WHEEL: Duration = Duration::from_millis(150);
+// As in Chrome, the scroll of a wheel without phases ends this long after its last event, and a gesture waits this
+// long after its end for its momentum.
+pub(crate) const WHEEL_END: Duration = Duration::from_millis(500);
+pub(crate) const MOMENTUM_WAIT: Duration = Duration::from_millis(100);
 
 struct Animation {
     from: Point<Pixels>,
@@ -317,14 +327,14 @@ impl ScrollState {
         };
         let [low, high] = self.range;
         let mut aim = self.glide.as_ref().map_or(self.offset, |glide| glide.to);
-        let resting = aim == self.offset;
+        let (resting, before) = (aim == self.offset, aim);
         let (moved_x, x) = axis(&mut aim.x, &mut self.stretch.x, [low.x, high.x], delta.x);
         let (moved_y, y) = axis(&mut aim.y, &mut self.stretch.y, [low.y, high.y], delta.y);
         let moved = moved_x || moved_y;
         if moved {
             self.animation = None;
             self.spring = None;
-            self.moved = true;
+            self.ending |= aim != before;
             self.sweep([moved_x, moved_y]);
         }
         match sent {
@@ -393,7 +403,7 @@ impl ScrollState {
         });
         self.set(from);
         self.glide = None;
-        self.moved = true;
+        self.ending |= distance > 0.;
     }
 
     // Where the box is when the running scroll ends.
@@ -403,6 +413,13 @@ impl ScrollState {
             (None, Some(glide)) => glide.to,
             (None, None) => self.offset,
         }
+    }
+
+    fn rests(&self, now: Instant) -> bool {
+        !self.busy()
+            && self.spring.is_none()
+            && !self.loose
+            && self.held.is_none_or(|until| until <= now)
     }
 
     fn busy(&self) -> bool {
@@ -459,6 +476,7 @@ impl ScrollState {
         self.fire(ScrollEvent::Scroll);
         self.change();
         self.fire(ScrollEvent::End);
+        self.ending = false;
     }
 
     fn snap(&mut self) {
@@ -529,7 +547,10 @@ impl ScrollState {
             self.stretch = stretch.unwrap_or_default();
             moved = true;
         }
-        self.moved |= moved;
+        // A scroll that comes to rest has its `scrollend` to fire.
+        if self.ending && self.rests(now) {
+            MOVES.set(MOVES.get() + 1);
+        }
         moved
     }
 }
@@ -623,8 +644,8 @@ impl ScrollRef {
 
     pub fn set_offset(&self, offset: Point<Pixels>) {
         let scroll = &mut *self.0.borrow_mut();
+        scroll.ending |= offset != scroll.offset;
         scroll.place(offset);
-        scroll.moved = true;
     }
 
     /// The range of a new layout moves the offset.
@@ -716,13 +737,7 @@ impl ScrollRef {
         (scroll.snapped, scroll.reported, scroll.aimed) = Default::default();
     }
 
-    /// Whether the box still scrolls to a snap area, or has the event for it to fire.
-    pub fn snapping(&self) -> bool {
-        let scroll = self.0.borrow();
-        scroll.snaps.is_some() && (scroll.busy() || scroll.scrolled)
-    }
-
-    /// The events to fire with their order, and whether a scroll moved the box since the last call.
+    /// The events to fire with their order, and whether a scroll of the box goes on and ends later.
     pub fn take_events(&self) -> (Vec<(u64, ScrollEvent)>, bool) {
         let scroll = &mut *self.0.borrow_mut();
         if let Some(snaps) = &scroll.snaps {
@@ -739,10 +754,50 @@ impl ScrollRef {
                 scroll.scrolled = false;
             }
         }
-        (
-            std::mem::take(&mut scroll.events),
-            std::mem::take(&mut scroll.moved),
-        )
+        if scroll.ending && scroll.rests(Instant::now()) {
+            scroll.ending = false;
+            scroll.fire(ScrollEvent::End);
+        }
+        (std::mem::take(&mut scroll.events), scroll.ending)
+    }
+
+    /// The user can go on with the scroll for `wait`, so it ends after that at the earliest.
+    pub(crate) fn hold_for(&self, wait: Duration, window: &mut Window) {
+        let until = Instant::now() + wait;
+        let scroll = &mut *self.0.borrow_mut();
+        scroll.held = Some(until);
+        if !std::mem::replace(&mut scroll.waking, true) {
+            self.wake_at(until, window);
+        }
+    }
+
+    pub(crate) fn unhold(&self) {
+        self.0.borrow_mut().held = None;
+    }
+
+    // One timer per box: a later hold moves it on when it fires.
+    fn wake_at(&self, until: Instant, window: &Window) {
+        let handle = self.clone();
+        let wait = until.saturating_duration_since(Instant::now());
+        (window.timer(wait, move |window, _| {
+            let held = handle.0.borrow().held;
+            match held {
+                Some(until) if until > Instant::now() => handle.wake_at(until, window),
+                _ => {
+                    handle.0.borrow_mut().waking = false;
+                    handle.wake(window);
+                }
+            }
+        }))
+        .detach();
+    }
+
+    // The box can be at rest now, so the page looks for its `scrollend`.
+    fn wake(&self, window: &mut Window) {
+        if self.0.borrow().ending {
+            MOVES.set(MOVES.get() + 1);
+            window.request_frame();
+        }
     }
 
     pub fn grab(&self) {
@@ -760,6 +815,7 @@ impl ScrollRef {
             scroll.scrolled = true;
         }
         self.drive(window);
+        self.wake(window);
     }
 
     // The first event of the momentum tells where it ends. True when the box goes to a snap area there instead.
