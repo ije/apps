@@ -372,7 +372,14 @@ impl Desktop {
                 }
                 match action {
                     "create" => self.open(id, args, cx.as_deref_mut(), runtime)?,
-                    "load" | "loadFile" => self.load(id, action, args, cx.as_deref_mut())?,
+                    "load" | "loadFile" => {
+                        // A close stops the scripts of the page, so its load fails and must not end the app.
+                        if let Err(error) = self.load(id, action, args, cx.as_deref_mut())
+                            && !crate::host::context::stopping(id)
+                        {
+                            return Err(error);
+                        }
+                    }
                     "deliver" => {
                         let name = match args[2].as_str() {
                             Some("webviewEvent") => "__appsWebviewEvent",

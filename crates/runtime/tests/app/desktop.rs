@@ -394,6 +394,56 @@ fn native_captures_repeat_and_fatal_errors_exit_with_failure() {
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires the macOS window server"]
+fn closing_a_loading_window_keeps_the_app() {
+    // The big value makes the bridge sync of the page slow, so a close can stop it.
+    let page = "<script type='preload'>__apps.contextBridge.exposeInMainWorld('big', Array.from({length: 1500000}, (_, i) => ({i, s: 'x' + i})))</script><script>for (const end = Date.now() + 300; Date.now() < end;);</script><body>x</body>";
+    let common = r#"
+        const { app, BrowserWindow } = __apps;
+        const closeLoading = async delay => {
+            const win = new BrowserWindow({ width: 200, height: 150, show: false });
+            const load = win.loadFile('apps:///index.html').then(() => 'resolved', error => error.code);
+            const closed = new Promise(resolve => win.once('closed', resolve));
+            if (delay < 0) win.close(); else setTimeout(() => win.close(), delay);
+            await closed;
+            const result = await load;
+            if (result !== 'ERR_ABORTED' && (delay <= 0 || result !== 'resolved')) throw Error('Load settled with ' + result);
+        };
+        const run = async () => {
+            setTimeout(() => process.exit(3), 11000);
+            for (const delay of [-1, 0, 25, 50, 75, 100, 125, 150, 175, 200, 250, 300, 350]) await closeLoading(delay);
+            new BrowserWindow({ show: false }).loadFile('apps:///index.html');
+        };
+    "#;
+    let others = r#"
+        app.whenReady().then(async () => {
+            const other = new BrowserWindow({ width: 200, height: 150, show: false });
+            await run();
+            if (other.isDestroyed()) throw Error('Other window is gone');
+            console.log('CLOSE_LOADING_OK'); app.quit();
+        });
+    "#;
+    let listener = r#"
+        app.on('window-all-closed', () => {});
+        app.whenReady().then(async () => {
+            await run();
+            console.log('CLOSE_LOADING_OK'); app.quit();
+        });
+    "#;
+    for main in [others, listener] {
+        let output = run_window_test(&format!("{common}{main}"), page);
+        let text =
+            String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && text.contains("CLOSE_LOADING_OK"),
+            "{:?} {text}",
+            output.status
+        );
+    }
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires the macOS window server"]
 fn animation_end_handlers_run_before_the_final_frame() {
     use base64::Engine;
 

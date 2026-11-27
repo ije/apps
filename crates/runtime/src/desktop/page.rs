@@ -321,13 +321,13 @@ impl Desktop {
         view.renderer = None;
         let preload = (trusted && scripts.iter().any(|(kind, _)| *kind == "preload"))
             .then(|| JsContext::new(self.api.clone(), self.host.clone(), Role::Preload(id)))
-            .transpose();
-        let renderer = JsContext::new(self.api.clone(), self.host.clone(), Role::Renderer(id));
-        if (preload.is_err() || renderer.is_err()) && crate::host::context::stopping(id) {
-            return Ok(());
-        }
-        let preload = preload?.map(Rc::new);
-        let renderer = Rc::new(renderer?);
+            .transpose()?
+            .map(Rc::new);
+        let renderer = Rc::new(JsContext::new(
+            self.api.clone(),
+            self.host.clone(),
+            Role::Renderer(id),
+        )?);
         if cx.is_none() {
             renderer.eval(
                     "addEventListener('error', event => queueMicrotask(() => { if (!event.defaultPrevented) __appsTrackModule(Promise.reject(event.error)); }))",
