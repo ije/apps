@@ -23,6 +23,7 @@ impl Tree {
         self.depths.clear();
         self.blocks.clear();
         self.scrolled.clear();
+        self.ports.clear();
         self.hidden.clear();
         self.anchoring.clear();
         #[cfg(debug_assertions)]
@@ -97,6 +98,7 @@ impl Tree {
             self.stacks.clear();
             self.blocks.clear();
             self.scrolled.clear();
+            self.ports.clear();
             self.full = true;
             self.prepaint_node(index_of(root), Point::default(), false, window);
             self.full = false;
@@ -445,9 +447,12 @@ impl Tree {
                     self.scrolled.push(self.scrolled(offset));
                 }
                 let interest = scroll.map(|_| (bounds.origin, offset));
-                self.slots[index as usize].viewport = (interest.is_some()
-                    && window.opens_interest())
-                .then(|| window.content_mask().bounds);
+                let viewport = (interest.is_some() && window.opens_interest())
+                    .then(|| window.content_mask().bounds);
+                let last = mem::replace(&mut self.slots[index as usize].viewport, viewport);
+                if scrolls {
+                    self.ports.push([last, viewport]);
+                }
                 window.scope(Scope::Offset(offset), |window| {
                     window.with_interest(interest, |window| {
                         for child in 0..self.slots[index as usize].children.len() {
@@ -460,6 +465,7 @@ impl Tree {
                 });
                 if scrolls {
                     self.scrolled.pop();
+                    self.ports.pop();
                 }
                 // Outlines don't scroll with the content.
                 for child in 0..self.slots[index as usize].children.len() {
@@ -1325,8 +1331,9 @@ impl Tree {
         (listing.is_empty() || !self.stacks.is_empty())
             && listing.iter().all(|&at| {
                 let slot = &self.slots[at as usize];
-                // The viewports that cut the mask of an out-of-flow box don't move with the box.
-                if slot.cuts {
+                // The viewports that cut the mask of an out-of-flow box move with the box: they are in it, or a scroll
+                // moved them by `by` too.
+                if slot.cuts && !self.ported(depth, slot.cut as usize, by) {
                     return false;
                 }
                 let since = match self.ran(at, visited) {
@@ -1350,6 +1357,21 @@ impl Tree {
                     }) || self.unpainted(slot)
                         && (slot.reach).is_some_and(|reach| !(reach + by).intersects(mask.bounds)))
             })
+    }
+
+    // The scroll viewports from depth `from` to `to` around the current box moved by `by` since the last pass.
+    fn ported(&self, from: usize, to: usize, by: Point<Pixels>) -> bool {
+        let near = |a: Pixels, b: Pixels| (a - b).0.abs() < 1e-3;
+        (self.ports.get(from..to.min(self.ports.len()))).is_some_and(|ports| {
+            ports.iter().all(|[last, now]| match (last, now) {
+                (Some(last), Some(now)) => {
+                    last.size == now.size
+                        && near(last.origin.x + by.x, now.origin.x)
+                        && near(last.origin.y + by.y, now.origin.y)
+                }
+                (last, now) => last.is_none() && now.is_none(),
+            })
+        })
     }
 
     // Lists again the boxes that a skip of a box kept, and moves them as `relists` checked.
@@ -1443,9 +1465,12 @@ impl Tree {
                     self.scrolled.push(self.scrolled(offset));
                 }
                 let interest = offset.map(|offset| (bounds.origin, offset));
-                self.slots[index as usize].viewport = (interest.is_some()
-                    && window.opens_interest())
-                .then(|| window.content_mask().bounds);
+                let viewport = (interest.is_some() && window.opens_interest())
+                    .then(|| window.content_mask().bounds);
+                let last = mem::replace(&mut self.slots[index as usize].viewport, viewport);
+                if offset.is_some() {
+                    self.ports.push([last, viewport]);
+                }
                 window.scope(Scope::Offset(offset.unwrap_or_default()), |window| {
                     window.with_interest(interest, |window| {
                         self.keep_children(index, origin, false, window)
@@ -1453,6 +1478,7 @@ impl Tree {
                 });
                 if offset.is_some() {
                     self.scrolled.pop();
+                    self.ports.pop();
                 }
                 self.keep_children(index, origin, true, window);
                 if style.contains != 0 {

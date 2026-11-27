@@ -245,6 +245,47 @@ fn scrolled_copies_follow_offsets_outlines_and_moving_interest_areas() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn z_indexed_boxes_keep_the_cuts_of_scrolls_between_them_and_their_context() {
+    // The red boxes paint in the root context, cut by the viewports of the scrolls around them. A page scroll moves
+    // the viewport of #a with them, and a scroll of #b moves #c but not the viewport of #b. Debug builds check each
+    // shifted prepaint and copied paint against a fresh one.
+    run_hidden(
+        r#"
+        const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap()].slice(0, 3).join();
+        const edge = async id => JSON.parse(await run(`(r => JSON.stringify([r.top, r.bottom]))(document.getElementById('${id}').getBoundingClientRect())`));
+        await load('cuts.html');
+        const seen = [];
+        for (let step = 0; step < 12; step++) {
+            await run('scrollBy(0, 7)');
+            await win.webContents.capturePage();
+            const [, bottom] = await edge('a');
+            seen.push(await pixel(50, bottom - 3) + '/' + await pixel(50, bottom + 3));
+        }
+        await run('scrollTo(0, 0)');
+        await win.webContents.capturePage();
+        for (let step = 0; step < 12; step++) {
+            await run("document.getElementById('b').scrollTop += 5");
+            await win.webContents.capturePage();
+            const [top] = await edge('b');
+            seen.push(await pixel(250, top + 3) + '/' + await pixel(250, top - 3));
+        }
+        if (seen.some(pair => pair !== '0,0,255/255,255,255')) fail('cuts: ' + seen.join(' '));
+        "#,
+        &[(
+            "cuts.html",
+            "<body style='margin:0;height:3000px;background:#fff'><style>\
+             .s{overflow:auto;scrollbar-width:none;width:150px;height:100px;background:#fff}\
+             .r{position:absolute;left:0;top:-200px;width:100px;height:600px;background:#f00;z-index:1}</style>\
+             <div id=a class=s style='position:absolute;top:110px;left:0'>\
+             <div style='position:relative;height:300px'><div class=r></div></div></div>\
+             <div id=b class=s style='position:absolute;top:60px;left:200px;height:150px'><div style='height:600px'>\
+             <div id=c class=s><div style='position:relative;height:300px'><div class=r></div></div></div></div></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn fixed_root_backgrounds_fill_the_viewport_like_chrome() {
     run_hidden(
         r#"

@@ -460,6 +460,8 @@ pub struct Tree {
     blocks: Vec<Block>,
     // The scroll offsets around the current box, each with the ones outside it.
     scrolled: Vec<Point<Pixels>>,
+    // For each scroll in `scrolled`, its viewport in the last pass and in this one.
+    ports: Vec<[Option<Rect<Pixels>>; 2]>,
     painting: Vec<u32>,
     unbounded: u32,
     prepaints: u32,
