@@ -745,7 +745,7 @@ fn pages_share_one_shared_worker() {
         .unwrap();
         page.eval(&format!(r#"
             globalThis.replies=[];
-            globalThis.source='let count=0;onconnect=e=>{{const port=e.ports[0];port.onmessage=m=>port.postMessage([new TextDecoder().decode(m.data),++count,name,typeof process,e.source===port,new Uint8Array([count])])}}';
+            globalThis.source='let count=0;const all=[];onconnect=e=>{{const port=e.ports[0];all.push(port);port.onmessage=m=>port.postMessage(m.data===\'open\'?[all.filter(p=>!p._closed).length]:[new TextDecoder().decode(m.data),++count,name,typeof process,e.source===port,new Uint8Array([count])])}}';
             const worker=new SharedWorker('data:text/javascript,'+encodeURIComponent(source),'counter');
             worker.port.onmessage=e=>replies.push(e.data.join(' '));
             const bytes=new TextEncoder().encode('page{id}');worker.port.postMessage(bytes,[bytes.buffer]);
@@ -777,8 +777,14 @@ fn pages_share_one_shared_worker() {
         wait(&one, 2),
         "page1 1 counter undefined true 1,again 3 counter undefined true 3"
     );
+    // A page that goes away closes its ports in the worker.
+    two.eval("worker.port.postMessage('open')", "test").unwrap();
+    assert_eq!(wait(&two, 2), "page2 2 counter undefined true 2,3");
+    drop(one);
+    two.eval("worker.port.postMessage('open')", "test").unwrap();
+    assert_eq!(wait(&two, 3), "page2 2 counter undefined true 2,3,1");
     // The worker ends with its last page, so a new page gets a new one.
-    drop((one, two));
+    drop(two);
     let three = open(3);
     assert_eq!(wait(&three, 1), "page3 1 counter undefined true 1");
     three

@@ -264,6 +264,7 @@ globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes, take, jsE
       ports.set(id, port); dispatchEvent(event);
       try { onconnect?.call(globalThis, event); } catch (error) { fail(error); }
     };
+    globalThis.__appsWorkerDisconnect = id => { ports.get(id)?.close(); ports.delete(id); };
     globalThis.__appsWorkerReceive = (wire, id) => { const data = decode(wire, () => call('web.worker.buffers')); ports.get(id)?._receive(data); };
   }
   // As in browsers, all pages of the app that make a SharedWorker with the same URL and name connect to one worker.

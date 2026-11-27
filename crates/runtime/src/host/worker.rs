@@ -92,6 +92,9 @@ pub(crate) fn run(mut job: Job) -> Result<()> {
                         Value::Number(port) => {
                             engine.call("__appsWorkerConnect", &[&port.to_string()])?;
                         }
+                        Value::Null if message.value[1].is_u64() => {
+                            engine.call("__appsWorkerDisconnect", &[&port])?;
+                        }
                         _ => {}
                     }
                 }

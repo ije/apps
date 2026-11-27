@@ -153,6 +153,9 @@ impl Drop for Link {
         });
         if last {
             shared.remove(key);
+        } else {
+            // The worker closes its side of the port.
+            let _ = self.input.send(json!([null, id]).into());
         }
     }
 }
