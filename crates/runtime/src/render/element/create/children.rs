@@ -449,19 +449,25 @@ pub(super) fn children(
             el = el.child(line);
         }
     }
+    // Only a box that confines can hold boxes whose changes don't reach it.
     if build.zone.is_some() {
+        let confines = |child: &usize| info[*child].flags & cull::CONFINES != 0;
         let mut set = view.culled.borrow_mut();
-        if !set.is_empty() {
-            for child in &children {
-                set.remove(child);
-            }
+        for child in children.iter().filter(|child| confines(child)) {
+            set.remove(child);
         }
-        set.extend(culled.iter().map(|&(child, _)| child));
+        set.extend(
+            culled
+                .iter()
+                .map(|(child, _)| child)
+                .filter(|child| confines(child)),
+        );
         if let Some((_, runs, ..)) = &plan {
             set.extend(
                 runs.iter()
                     .flatten()
-                    .flat_map(|run| run.members.iter().copied()),
+                    .flat_map(|run| &run.members)
+                    .filter(|child| confines(child)),
             );
         }
     }
