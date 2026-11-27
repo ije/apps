@@ -244,6 +244,24 @@ opt-level = "s"
 [profile.release.package.alsa]
 opt-level = "s"
 
+[profile.release.package.imagesize]
+opt-level = "s"
+
+[profile.release.package.libloading]
+opt-level = "s"
+
+[profile.release.package.xmlwriter]
+opt-level = "s"
+
+[profile.release.package.kurbo]
+opt-level = "s"
+
+[profile.release.package.hyper-rustls]
+opt-level = "s"
+
+[profile.release.package.coreaudio-rs]
+opt-level = "s"
+
 # build.rs of apps-runtime packs text with zopfli.
 [profile.release.package.zopfli]
 opt-level = 3
