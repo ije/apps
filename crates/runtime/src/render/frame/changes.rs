@@ -156,7 +156,7 @@ pub(super) fn detect(
     };
     for (id, style) in paint {
         info[*id].flags = own_flags(&cx.doc.nodes[*id].tag, style, *id)
-            & (cull::MOVES_CONTENT | cull::UNCULLABLE);
+            & (cull::MOVES_CONTENT | cull::UNCULLABLE | cull::PINNED);
     }
     // Children come before their parents. A partial pass visits the marked nodes only.
     let mut order: Vec<(u32, usize)> = list
@@ -173,6 +173,13 @@ pub(super) fn detect(
     let nodes: &mut dyn Iterator<Item = usize> = match partial {
         true => &mut some,
         false => &mut every,
+    };
+    // The node is in a box that a spacer stands for.
+    let culled = |id: usize| {
+        let culled = cx.view.culled.borrow();
+        !culled.is_empty()
+            && std::iter::successors(cx.doc.nodes[id].parent, |&at| cx.doc.nodes[at].parent)
+                .any(|at| culled.contains(&at))
     };
     for id in nodes {
         let node = &cx.doc.nodes[id];
@@ -263,6 +270,11 @@ pub(super) fn detect(
                 )
             }
         };
+        // A box that a transform moves in a box that a spacer stands for builds that box again, for its geometry.
+        let resized = resized
+            || restyled
+                && old.is_some_and(|old| (old.flags | flags) & cull::MOVES_CONTENT != 0)
+                && culled(id);
         let (mut list, mut kids) = (
             rustc_hash::FxHasher::default(),
             rustc_hash::FxHasher::default(),
@@ -271,7 +283,7 @@ pub(super) fn detect(
         let (mut positioned, mut any) = (rustc_hash::FxHasher::default(), false);
         for &child in &node.children {
             let child_info = &info[child];
-            below |= child_info.flags;
+            below |= child_info.flags & !cull::CONFINES;
             if child_info.flags & cull::OUT_OF_FLOW != 0 {
                 std::hash::Hasher::write_usize(&mut positioned, child);
                 any = true;
@@ -279,7 +291,8 @@ pub(super) fn detect(
                 // boxes in it changed.
                 let inside = child_info.flags & cull::HIDDEN == 0
                     && cx.view.outs.borrow().contains_key(&child)
-                    && cx.view.kept.borrow().contains_key(&child);
+                    && cx.view.kept.borrow().contains_key(&child)
+                    && !culled(child);
                 // Positioned boxes paint in their order.
                 out = (out.rotate_left(5)
                     ^ match inside {
@@ -368,6 +381,12 @@ pub(super) fn detect(
                 old.pseudos = pseudos.cloned();
             }
         }
+        // A box that confines what the boxes in it paint can still become a spacer.
+        if below & (cull::UNCULLABLE | cull::PINNED) == cull::UNCULLABLE
+            && cull::confines(&node.tag, style)
+        {
+            below = below & !cull::UNCULLABLE | cull::CONFINES;
+        }
         let layout = dom.layout.layout_nodes[id].as_ref();
         info[id] = cull::Info {
             revision: layout.map_or(0, |node| node.geometry),
@@ -381,11 +400,13 @@ pub(super) fn detect(
                     | (u32::from(reshaped) * cull::CHANGED)
                     | (u32::from(relisted) * cull::CHILDREN_CHANGED)
                     | marks
-                    | (u32::from(
-                        dom.interaction.focus == Some(id) || dom.layout.cull.spills.contains(&id),
-                    ) * cull::UNCULLABLE)
+                    | (u32::from(dom.interaction.focus == Some(id))
+                        * (cull::UNCULLABLE | cull::PINNED))
+                    | (u32::from(dom.layout.cull.spills.contains(&id)) * cull::UNCULLABLE)
                     | below
                         & (cull::UNCULLABLE
+                            | cull::PINNED
+                            | cull::CONFINES
                             | cull::READS_VIEWPORT
                             | cull::READS_LAST_FRAME
                             | cull::READS_HEIGHT)

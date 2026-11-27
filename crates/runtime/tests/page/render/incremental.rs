@@ -459,6 +459,63 @@ fn far_tiles_place_the_items_of_a_flexed_grid_at_its_new_size() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn clipping_tiles_far_from_the_view_are_spacers_with_exact_boxes_inside() {
+    // Each tile clips and positions what is in it, like the tiles of ui-sink. Tile 28 has a canvas, which is
+    // uncullable inside any box.
+    let mut page = String::from(
+        "<style>body{margin:0;font:14px sans-serif}#g{display:grid;grid-template-columns:1fr 1fr;\
+         grid-auto-rows:200px;gap:10px}.t{position:relative;display:flex;flex-direction:column;overflow:hidden}\
+         .s{position:relative;flex:1;display:grid;place-items:center;overflow:hidden}\
+         .r{display:inline-block;transform:rotate(10deg);padding:4px}.a{position:absolute;right:4px;top:4px}</style><body id=body><p id=o style='margin:0'>x</p><main id=g>",
+    );
+    for index in 0..30 {
+        let canvas = ["", "<canvas width=8 height=8></canvas>"][usize::from(index == 28)];
+        page.push_str(&format!(
+            "<article class=t id=t{index}><div class=s id=s{index}><span class=r id=r{index}>R</span>\
+             <b class=a id=a{index}>A</b>{canvas}</div><p id=c{index} style='margin:0'>tile</p></article>"
+        ));
+    }
+    page.push_str("</main></body>");
+    let text = run_hidden(
+        &format!(
+            r#"{STEPS}
+            const rects = id => run(`JSON.stringify(['r', 'a', 's'].map(part => {{
+                const box = document.getElementById(part + '${{id}}').getBoundingClientRect(), tile = document.getElementById('t${{id}}').getBoundingClientRect();
+                return [box.x - tile.x, box.y - tile.y, box.width, box.height].map(v => Math.round(v * 10) / 10).join();
+            }}))`);
+            await load('tiles.html');
+            await win.webContents.capturePage();
+            await step('edit', () => run("document.getElementById('c0').style.height = '30px'"));
+            await step('pinned', () => run("document.getElementById('t28').scrollIntoView()"));
+            await step('back', () => run("scrollTo(0, 0)"));
+            await step('far', () => run("document.getElementById('c25').style.height = '40px'; document.getElementById('r25').style.transform = 'rotate(45deg)'; document.getElementById('a25').textContent = 'longer'"));
+            console.log('FAR ' + await rects(25));
+            await step('near', () => run("document.getElementById('t25').scrollIntoView()"));
+            console.log('NEAR ' + await rects(25));
+            "#
+        ),
+        &[("tiles.html", &page)],
+    );
+    let built = built(&text, "pinned");
+    assert!(
+        built.contains(&"s29") && !built.contains(&"s28"),
+        "far tiles are spacers that build again near the view, but not one with a canvas: {built:?}"
+    );
+    let line = |prefix: &str| {
+        (text.lines())
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert_eq!(
+        line("FAR "),
+        line("NEAR "),
+        "boxes in a far tile take its changes: {text}"
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn cleared_blocks_far_below_floats_stay_spacers() {
     let mut page =
         String::from("<body id=body style='margin:0'><p id=o style='margin:0'>x</p><div>");

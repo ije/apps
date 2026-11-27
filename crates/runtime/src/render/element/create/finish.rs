@@ -368,7 +368,7 @@ pub(super) fn finish(
             Box::new((perspective, parent, borders))
         }),
         units,
-        revision: info[id].revision,
+        revision: cull::revision(info[id]),
         sides: {
             let mut sides = [
                 padding[1] + padding[3] + borders[1] + borders[3],

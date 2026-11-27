@@ -25,6 +25,20 @@ pub(crate) const SKIPS: u32 = 65536;
 // A `content-visibility: auto` box that shows its contents, or a box forced to show them, set each frame. Culling
 // would keep its skipped size.
 pub(crate) const SHOWN: u32 = 131072;
+// The box is uncullable also inside a box that confines what it paints: replaced and drawable elements, fixed,
+// sticky and anchored boxes, size containers and the focus.
+pub(crate) const PINNED: u32 = 262144;
+// The box confines what uncullable boxes in it paint, so it can become a spacer. Its place then holds while none of
+// the boxes in it changed.
+pub(crate) const CONFINES: u32 = 524288;
+
+// The revision of the box that its place holds for.
+pub(crate) fn revision(info: Info) -> u64 {
+    match info.flags & CONFINES {
+        0 => info.revision,
+        _ => info.subtree,
+    }
+}
 
 // The box can skip its contents, or remember its size for `contain-intrinsic-size: auto`. Like in Chrome, tables
 // show their contents.
@@ -379,16 +393,24 @@ pub(crate) fn flags(
         || style
             .get(Prop::WRITING_MODE)
             .is_some_and(|value| value.starts_with("vertical") || value.starts_with("sideways"));
-    // A float can hang out of its block into the boxes after it, so no block around it becomes a spacer.
-    let blocked = moved
-        || replaced(tag)
+    let pinned = replaced(tag)
         // The page can draw all of a drawable element, also the parts far from the view.
         || style.get(Prop::CANVAS_CONTENT) == Some("drawable")
-        || matches!(position, "absolute" | "fixed" | "sticky")
-        || style.get(Prop::FLOAT).is_some_and(|value| value != "none")
+        || matches!(position, "fixed" | "sticky")
+        || position == "absolute"
+            && (style.contains(Prop::POSITION_ANCHOR)
+                || style.contains(Prop::POSITION_AREA)
+                || [Prop::TOP, Prop::RIGHT, Prop::BOTTOM, Prop::LEFT]
+                    .into_iter()
+                    .any(|prop| style.get(prop).is_some_and(|value| value.contains("anchor"))))
         || style
             .get(Prop::CONTAINER_TYPE)
-            .is_some_and(|value| value != "normal")
+            .is_some_and(|value| value != "normal");
+    let blocked = moved
+        || pinned
+        || position == "absolute"
+        // A float can hang out of its block into the boxes after it, so no block around it becomes a spacer.
+        || style.get(Prop::FLOAT).is_some_and(|value| value != "none")
         || style.get(Prop::BOX_SHADOW).is_some_and(|value| {
             css::value::box_shadows(units, value, false).iter().any(|shadow| {
                 f32::from(shadow.offset.y.abs() + shadow.blur_radius + shadow.spread_radius)
@@ -458,6 +480,7 @@ pub(crate) fn flags(
     [
         (moved, MOVES_CONTENT),
         (blocked, UNCULLABLE),
+        (pinned, PINNED),
         (framed, READS_LAST_FRAME),
         (
             display == "none" || matches!(position, "absolute" | "fixed"),
@@ -495,6 +518,32 @@ pub(crate) fn flags(
     .fold(0, |flags, (on, bit)| if on { flags | bit } else { flags })
 }
 
+// The box clips the boxes in it on both axes and contains their absolute boxes, so it confines what they paint
+// outside their own boxes.
+pub(crate) fn confines(tag: &str, style: &css::properties::Style) -> bool {
+    !matches!(tag, "html" | "body")
+        && matches!(
+            style.get(Prop::DISPLAY),
+            Some(
+                "block"
+                    | "inline-block"
+                    | "flex"
+                    | "inline-flex"
+                    | "grid"
+                    | "inline-grid"
+                    | "flow-root"
+            )
+        )
+        && matches!(
+            style.get(Prop::POSITION),
+            Some("relative" | "absolute" | "sticky")
+        )
+        && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+            .into_iter()
+            .all(|prop| style.get(prop).is_some_and(|value| value != "visible"))
+        && !style.contains(Prop::OVERFLOW_CLIP_MARGIN)
+}
+
 pub(crate) fn member(
     info: Info,
     (placed, [width, _], margins): (u64, [f32; 2], [f32; 4]),
@@ -506,7 +555,7 @@ pub(crate) fn member(
     let fits = info.flags & (UNCULLABLE | PLAIN_BLOCK | SHOWN) == PLAIN_BLOCK
         && (!flex || info.flags & DEFINITE_SIZE == 0)
         && (!zone.resized || info.flags & READS_VIEWPORT == 0);
-    if !fits || info.revision == 0 || placed != info.revision {
+    if !fits || info.revision == 0 || placed != revision(info) {
         return None;
     }
     let [x, y, _, height] = *bounds?;

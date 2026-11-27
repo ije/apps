@@ -341,7 +341,7 @@ impl ViewState {
             && !relaid
             && paint.iter().all(|(id, style)| {
                 let flags = cull::flags(&doc.nodes[*id].tag, style, &styles.lengths[*id], height)
-                    & (cull::MOVES_CONTENT | cull::UNCULLABLE);
+                    & (cull::MOVES_CONTENT | cull::UNCULLABLE | cull::PINNED);
                 info.get(*id)
                     .is_some_and(|info| info.flags & flags == flags)
             });

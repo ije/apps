@@ -77,6 +77,8 @@ pub(crate) struct ViewState {
     plans: RefCell<element::plan::Plans>,
     repaint: RefCell<rustc_hash::FxHashSet<usize>>,
     built: RefCell<rustc_hash::FxHashSet<usize>>,
+    // The boxes that spacers stand for.
+    culled: RefCell<rustc_hash::FxHashSet<usize>>,
     animated: RefCell<Vec<usize>>,
     #[cfg(debug_assertions)]
     around: RefCell<rustc_hash::FxHashSet<usize>>,
@@ -289,6 +291,7 @@ impl ViewState {
             plans: RefCell::default(),
             repaint: RefCell::default(),
             built: RefCell::default(),
+            culled: RefCell::default(),
             animated: RefCell::default(),
             #[cfg(debug_assertions)]
             around: RefCell::default(),

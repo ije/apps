@@ -347,7 +347,7 @@ pub(super) fn children(
                                 .get(child)
                                 .copied()
                                 .unwrap_or_default();
-                            if placed.0 != info[child].revision {
+                            if placed.0 != cull::revision(info[child]) {
                                 watch.push((child, placed.1[0]));
                             }
                         }
@@ -447,6 +447,22 @@ pub(super) fn children(
                 .baseline(renderer::Baseline::Bottom);
             line.style().baseline_source = true;
             el = el.child(line);
+        }
+    }
+    if build.zone.is_some() {
+        let mut set = view.culled.borrow_mut();
+        if !set.is_empty() {
+            for child in &children {
+                set.remove(child);
+            }
+        }
+        set.extend(culled.iter().map(|&(child, _)| child));
+        if let Some((_, runs, ..)) = &plan {
+            set.extend(
+                runs.iter()
+                    .flatten()
+                    .flat_map(|run| run.members.iter().copied()),
+            );
         }
     }
     macro_rules! place {
