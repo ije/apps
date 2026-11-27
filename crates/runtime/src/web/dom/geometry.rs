@@ -194,23 +194,53 @@ pub(super) fn overflow(
     let right = args[3].as_f64().map(|right| right as f32);
     let styles = state.restyle(doc, viewport);
     let mirror = &state.geometry.mirror;
-    let kids = |id: usize| styles.children.get(&id).unwrap_or(&doc.nodes[id].children);
+    let flat = !styles.children.is_empty();
+    let kids = |id: usize| {
+        (flat.then(|| styles.children.get(&id)).flatten()).unwrap_or(&doc.nodes[id].children)
+    };
     let own = crate::render::effects::establishes(&styles.values[id]);
     let mut pending: Vec<_> = (kids(id).iter())
         .map(|&kid| (kid, own.absolute, own.fixed))
         .collect();
+    // What the walk reads of a style: 1 absolute, 2 fixed, 4 hidden, 8 clips, 16 and 32 the containing blocks it makes,
+    // and 64 inline, whose lines hold its text.
+    let mut kinds = rustc_hash::FxHashMap::default();
     let mut end = 0f32;
     while let Some((kid, absolute, fixed)) = pending.pop() {
         let Some(style) = styles.values.get(kid) else {
             continue;
         };
-        if !doc.nodes[kid].tag.starts_with('#')
-            && match style.get(Prop::POSITION) {
-                Some("absolute") => !absolute,
-                Some("fixed") => !fixed,
-                _ => style.get(Prop::DISPLAY) == Some("none"),
-            }
-        {
+        let text = doc.nodes[kid].tag.starts_with('#');
+        let kind = match text {
+            true => 0,
+            false => *kinds.entry(std::rc::Rc::as_ptr(style)).or_insert_with(|| {
+                let made = crate::render::effects::establishes(style);
+                let clips = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+                    .into_iter()
+                    .any(|prop| style.get(prop).is_some_and(|value| value != "visible"))
+                    || style.get(Prop::CONTAIN).is_some_and(|value| {
+                        ["paint", "strict", "content"]
+                            .iter()
+                            .any(|kind| value.contains(kind))
+                    });
+                let display = style.get(Prop::DISPLAY);
+                let position = match style.get(Prop::POSITION) {
+                    Some("absolute") => 1,
+                    Some("fixed") => 2,
+                    _ => u8::from(display == Some("none")) * 4,
+                };
+                [
+                    clips,
+                    made.absolute,
+                    made.fixed,
+                    display.is_none_or(|v| v == "inline"),
+                ]
+                .into_iter()
+                .enumerate()
+                .fold(position, |kind, (bit, on)| kind | u8::from(on) << (bit + 3))
+            }),
+        };
+        if kind & 4 != 0 || kind & 1 != 0 && !absolute || kind & 2 != 0 && !fixed {
             continue;
         }
         if let Some(&[x, y, width, height]) = mirror.get(&kid).filter(|_| mirror.shown(kid))
@@ -221,30 +251,19 @@ pub(super) fn overflow(
                     right - x
                 }),
             );
-            if [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
-                .into_iter()
-                .any(|prop| style.get(prop).is_some_and(|value| value != "visible"))
-                || style.get(Prop::CONTAIN).is_some_and(|value| {
-                    ["paint", "strict", "content"]
-                        .iter()
-                        .any(|kind| value.contains(kind))
-                })
-            {
+            if kind & 8 != 0 {
                 continue;
             }
         }
-        let next = kids(kid);
-        if next.is_empty() {
-            continue;
+        if !text {
+            let (absolute, fixed) = (absolute || kind & 16 != 0, fixed || kind & 32 != 0);
+            let inline = kind & 64 != 0 && mirror.get(&kid).is_some();
+            pending.extend(
+                (kids(kid).iter())
+                    .filter(|&&next| !inline || !doc.nodes[next].tag.starts_with('#'))
+                    .map(|&next| (next, absolute, fixed)),
+            );
         }
-        let (absolute, fixed) = match absolute && fixed {
-            true => (true, true),
-            false => {
-                let made = crate::render::effects::establishes(style);
-                (absolute || made.absolute, fixed || made.fixed)
-            }
-        };
-        pending.extend(next.iter().map(|&next| (next, absolute, fixed)));
     }
     Ok(json!(end))
 }
