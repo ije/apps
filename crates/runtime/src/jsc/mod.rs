@@ -432,6 +432,10 @@ impl JavaScriptCore {
                     // In JSC's cell cage every block the heap holds stays resident. AOT images use wide
                     // references, which need no cage.
                     (c"JSC_markedBlockCageSizeInMB", c"0"),
+                    // Start the baseline JIT 4x later, so code that runs only at startup keeps no machine code.
+                    // This saves about 4 MB.
+                    (c"JSC_thresholdForJITAfterWarmUp", c"2000"),
+                    (c"JSC_thresholdForJITSoon", c"400"),
                 ];
                 for (name, value) in options {
                     set_option(name, value);
