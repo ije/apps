@@ -156,6 +156,9 @@ pub(super) struct Entry {
     scroll: u32,
     // The item of the window layer that holds the entry, as `item`.
     top: u32,
+    // What an entry of the window layer draws, without its place and the clips that don't move with it, or 0.
+    free: u64,
+    origin: Point<f32>,
 }
 
 // How a nested layer shows its pixels in its parent.
@@ -191,25 +194,19 @@ fn unmasked(clip: Rect<f32>, viewport: Rect<f32>, area: Rect<f32>) -> Rect<f32> 
     Rect::between(start, end).intersect(area)
 }
 
-fn instance_hash(instance: &Instance, origin: Point<f32>, viewport: Option<&Clip<f32>>) -> u64 {
+fn pair(a: f32, b: f32) -> u64 {
+    u64::from(a.to_bits()) << 32 | u64::from(b.to_bits())
+}
+
+// What an instance draws, without its place and its clips.
+fn drawing_hash(instance: &Instance) -> u64 {
     let mut copy = *instance;
-    let shift = |[x, y, width, height]: [f32; 4]| [x - origin.x, y - origin.y, width, height];
-    copy.rect = shift(instance.rect);
-    copy.clip = shift(match viewport {
-        Some(viewport) => {
-            unmasked(rect(instance.clip), viewport.bounds, instance.area()).to_array()
-        }
-        None => instance.reach().to_array(),
-    });
-    copy.round = match instance.round_radii == [0.; 8] {
-        true => [0.; 4],
-        false if viewport.is_some_and(|viewport| instance.round == viewport.rounded.to_array()) => {
-            [f32::MIN; 4]
-        }
-        false => shift(instance.round),
-    };
+    let [x, y, width, height] = instance.rect;
+    copy.rect = [0., 0., width, height];
+    (copy.clip, copy.round) = ([0.; 4], [0.; 4]);
     if instance.kind() == SHADOW {
-        copy.aux = shift(instance.aux);
+        let [left, top, width, height] = instance.aux;
+        copy.aux = [left - x, top - y, width, height];
     }
     // Four lanes don't wait for each other.
     let (rows, _) = bytes(slice::from_ref(&copy)).as_chunks::<32>();
@@ -221,6 +218,87 @@ fn instance_hash(instance: &Instance, origin: Point<f32>, viewport: Option<&Clip
         }
     }
     lanes.into_iter().fold(0, mix)
+}
+
+// `drawing` at the place and with the clips of the instance, relative to `origin`.
+fn placed_hash(
+    drawing: u64,
+    instance: &Instance,
+    origin: Point<f32>,
+    viewport: Option<&Clip<f32>>,
+) -> u64 {
+    let shift = |[x, y, width, height]: [f32; 4]| [x - origin.x, y - origin.y, width, height];
+    let [x, y, ..] = shift(instance.rect);
+    let clip = shift(match viewport {
+        Some(viewport) => {
+            unmasked(rect(instance.clip), viewport.bounds, instance.area()).to_array()
+        }
+        None => instance.reach().to_array(),
+    });
+    let round = match instance.round_radii == [0.; 8] {
+        true => [0.; 4],
+        false if viewport.is_some_and(|viewport| instance.round == viewport.rounded.to_array()) => {
+            [f32::MIN; 4]
+        }
+        false => shift(instance.round),
+    };
+    [
+        pair(x, y),
+        pair(clip[0], clip[1]),
+        pair(clip[2], clip[3]),
+        pair(round[0], round[1]),
+        pair(round[2], round[3]),
+    ]
+    .into_iter()
+    .fold(drawing, mix)
+}
+
+fn instance_hash(instance: &Instance, origin: Point<f32>, viewport: Option<&Clip<f32>>) -> u64 {
+    placed_hash(drawing_hash(instance), instance, origin, viewport)
+}
+
+// A box of one color all over.
+fn plain(instance: &Instance) -> bool {
+    instance.kind() == crate::gpu::BOX
+        && instance.radii == [0.; 8]
+        && instance.round_radii == [0.; 8]
+        && (instance.aux == [0.; 4] || instance.border_color[3] == 0.)
+}
+
+// The drawing of an instance with its rounded clip, which must move with it. A plain box has only its color, so
+// it is 1 plus an even number, and other drawings are even.
+fn free_hash(drawing: u64, instance: &Instance) -> u64 {
+    if plain(instance) {
+        let [red, green, blue, alpha] = instance.color;
+        return mix(pair(red, green), pair(blue, alpha)) | 1;
+    }
+    if instance.round_radii == [0.; 8] {
+        return drawing & !1;
+    }
+    let [x, y, width, height] = instance.round;
+    let at = pair(x - instance.rect[0], y - instance.rect[1]);
+    mix(mix(drawing, at), pair(width, height)) & !1
+}
+
+// Gives `add` the parts of `rect` outside `other`.
+fn outside(rect: Rect<f32>, other: Rect<f32>, mut add: impl FnMut(Rect<f32>)) {
+    let cut = rect.intersect(other);
+    if cut.is_empty() {
+        return add(rect);
+    }
+    add(Rect::between(rect.origin, point(rect.right(), cut.top())));
+    add(Rect::between(
+        point(rect.left(), cut.bottom()),
+        rect.bottom_right(),
+    ));
+    add(Rect::between(
+        point(rect.left(), cut.top()),
+        point(cut.left(), cut.bottom()),
+    ));
+    add(Rect::between(
+        point(cut.right(), cut.top()),
+        point(rect.right(), cut.bottom()),
+    ));
 }
 
 // The pixels of `rect` in a layer reach this in its parent.
@@ -746,6 +824,10 @@ impl Scene {
         };
         let (old, new) = (&self.prior, &self.entries);
         let mut index: Option<(FxHashMap<u64, u32>, Vec<u32>)> = None;
+        // The entries without a match, in paint order, each with the count of matches before it.
+        let mut came: Vec<(u32, u32)> = Vec::new();
+        let mut gone: Vec<(u32, u32)> = Vec::new();
+        let mut matches = 0;
         let mut next = 0;
         for at in 0..new.len() {
             if damage.whole {
@@ -754,6 +836,7 @@ impl Scene {
             let hash = new[at].hash;
             if old.get(next).is_some_and(|entry| entry.hash == hash) {
                 next += 1;
+                matches += 1;
                 continue;
             }
             // A replaced entry, like a canvas with a new tile, keeps the old ones after it, so it needs no index.
@@ -762,8 +845,8 @@ impl Scene {
                 && (new.get(at + 1).map(|entry| entry.hash))
                     == old.get(next + 1).map(|entry| entry.hash)
             {
-                added(&mut damage, &mut under, new, &self.maps, at);
-                removed(&mut damage, &mut under, old, &self.prior_maps, next);
+                came.push((at as u32, matches));
+                gone.push((next as u32, matches));
                 next += 1;
                 continue;
             }
@@ -791,19 +874,158 @@ impl Scene {
                 .zip(old.get(next))
                 .is_some_and(|(new, old)| new.hash == old.hash);
             if found == u32::MAX || (found as usize) < next || inserted {
-                added(&mut damage, &mut under, new, &self.maps, at);
+                came.push((at as u32, matches));
                 continue;
             }
-            for skipped in next..found as usize {
-                removed(&mut damage, &mut under, old, &self.prior_maps, skipped);
-            }
+            gone.extend((next as u32..found).map(|skipped| (skipped, matches)));
             next = found as usize + 1;
+            matches += 1;
         }
-        for skipped in next..old.len() {
-            if damage.whole {
-                break;
+        if !damage.whole {
+            gone.extend((next as u32..old.len() as u32).map(|skipped| (skipped, matches)));
+        }
+        // An entry of the window layer that came pairs with one that left between the same matches when both draw
+        // the same, and the window pixels of the old one moved as it did: with the copy inside the copied scroll,
+        // and not at all elsewhere. Boxes of one color pair where the window pixels of the old one meet the new
+        // one, of any size. Then only the pixels that one of the two doesn't cover draw again.
+        //
+        // Entries that left by `free`, each with the next one of the same hash.
+        let mut first: FxHashMap<u64, u32> = FxHashMap::default();
+        let mut chain = vec![u32::MAX; gone.len()];
+        if !came.is_empty() {
+            for (at, &(entry, _)) in gone.iter().enumerate().rev() {
+                let entry = &old[entry as usize];
+                if entry.layer == 0
+                    && entry.free != 0
+                    && let Some(later) = first.insert(entry.free, at as u32)
+                {
+                    chain[at] = later;
+                }
             }
-            removed(&mut damage, &mut under, old, &self.prior_maps, skipped);
+        }
+        // Entries in the layers of a pair moved with it. The ones of other layers wait for all pairs.
+        let mut paired: [Vec<u32>; 2] = Default::default();
+        let mut inner_came: Vec<u32> = Vec::new();
+        let mut inner_gone: Vec<u32> = Vec::new();
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        let mut next = 0;
+        for &(at, gap) in &came {
+            let entry = &new[at as usize];
+            if entry.layer != 0 {
+                inner_came.push(at);
+                continue;
+            }
+            let inside = entry.scroll != 0 && inside_new[entry.scroll as usize - 1];
+            let by = if inside { by } else { Point::default() };
+            let was = |prior: &Entry| match inside {
+                true => (prior.reach - by).intersect(viewport),
+                false => prior.reach,
+            };
+            let plain = entry.free & 1 != 0;
+            let mut found = first.get(&entry.free).copied().unwrap_or(u32::MAX);
+            let mut tries = 0;
+            while found != u32::MAX {
+                let (prior, prior_gap) = gone[found as usize];
+                let prior = &old[prior as usize];
+                if (found as usize) < next || prior_gap < gap {
+                    found = chain[found as usize];
+                    first.insert(entry.free, found);
+                    continue;
+                }
+                let delta = entry.origin - prior.origin;
+                if prior_gap == gap
+                    && inside == (prior.scroll != 0 && inside_old[prior.scroll as usize - 1])
+                    && match plain {
+                        true => was(prior).intersects(entry.reach),
+                        false => near(delta.x, -by.x) && near(delta.y, -by.y),
+                    }
+                {
+                    break;
+                }
+                tries += 1;
+                found = match prior_gap == gap && tries < 8 {
+                    true => chain[found as usize],
+                    false => u32::MAX,
+                };
+            }
+            let end = match found {
+                u32::MAX => gone.partition_point(|&(_, prior)| prior < gap).max(next),
+                found => found as usize,
+            };
+            for &(skipped, _) in &gone[next..end] {
+                match old[skipped as usize].layer {
+                    0 => removed(
+                        &mut damage,
+                        &mut under,
+                        old,
+                        &self.prior_maps,
+                        skipped as usize,
+                    ),
+                    _ => inner_gone.push(skipped),
+                }
+            }
+            next = end;
+            if found == u32::MAX {
+                added(&mut damage, &mut under, new, &self.maps, at as usize);
+                continue;
+            }
+            next += 1;
+            let prior = &old[gone[found as usize].0 as usize];
+            if entry.item & NESTED != 0 {
+                paired[0].push(prior.top);
+                paired[1].push(entry.top);
+            }
+            let (was, reach) = (was(prior), entry.reach);
+            let same = [
+                (reach.left(), was.left()),
+                (reach.top(), was.top()),
+                (reach.right(), was.right()),
+                (reach.bottom(), was.bottom()),
+            ]
+            .into_iter()
+            .all(|(a, b)| near(a, b));
+            if same {
+                continue;
+            }
+            // A pixel at an edge holds a part of the color. Each edge that the copy moved away is next to a part
+            // that draws again, and the regions reach one pixel past their parts.
+            let both = reach.intersect(was);
+            let (after_new, after_old) = (after_new(entry.top), after_old(prior.top));
+            outside(reach, both, |part| {
+                damage.add(part);
+                if !after_new {
+                    under.add(part);
+                }
+            });
+            outside(was, both, |part| {
+                damage.add(part);
+                if !after_old {
+                    under.add(part);
+                }
+            });
+        }
+        for &(skipped, _) in &gone[next..] {
+            match old[skipped as usize].layer {
+                0 => removed(
+                    &mut damage,
+                    &mut under,
+                    old,
+                    &self.prior_maps,
+                    skipped as usize,
+                ),
+                _ => inner_gone.push(skipped),
+            }
+        }
+        paired.iter_mut().for_each(|tops| tops.sort_unstable());
+        for at in inner_came {
+            if paired[1].binary_search(&new[at as usize].top).is_err() {
+                added(&mut damage, &mut under, new, &self.maps, at as usize);
+            }
+        }
+        for at in inner_gone {
+            if paired[0].binary_search(&old[at as usize].top).is_err() {
+                removed(&mut damage, &mut under, old, &self.prior_maps, at as usize);
+            }
         }
         // What the viewport shows outside the copied scroll moved with the copy, unless it is one color all over.
         if copy.is_some() {
@@ -820,11 +1042,7 @@ impl Scene {
                 }
                 if entry.layer == 0 && entry.item & NESTED == 0 {
                     let instance = &self.layers[0].instances[entry.item as usize];
-                    let plain = instance.kind() == crate::gpu::BOX
-                        && instance.radii == [0.; 8]
-                        && instance.round_radii == [0.; 8]
-                        && (instance.aux == [0.; 4] || instance.border_color[3] == 0.);
-                    if plain && reach.intersect(viewport) == viewport {
+                    if plain(instance) && reach.intersect(viewport) == viewport {
                         continue;
                     }
                 }
@@ -993,10 +1211,11 @@ impl Walk<'_> {
                 continue;
             }
             let scroll = self.find(layer, at, false).or(scroll);
+            let drawing = drawing_hash(instance);
             // The window layer has no digest, so its entries in a scroll hash only their place in the content.
             let hash = match (layer, scroll) {
                 (0, Some(_)) => 0,
-                _ => instance_hash(instance, origin, None),
+                _ => placed_hash(drawing, instance, origin, None),
             };
             digest = mix(digest, hash);
             let entry = match scroll {
@@ -1012,7 +1231,7 @@ impl Walk<'_> {
                         uncut.clip = *clip;
                     }
                     mix(
-                        instance_hash(&uncut, base, Some(&scroll.viewport)),
+                        placed_hash(drawing, &uncut, base, Some(&scroll.viewport)),
                         mix(scroll.id, self.frames[scroll_at]),
                     )
                 }
@@ -1025,6 +1244,11 @@ impl Walk<'_> {
                 item: at as u32,
                 scroll: scroll.map_or(0, |at| at as u32 + 1),
                 top: if layer == 0 { at as u32 } else { top },
+                free: match layer {
+                    0 => free_hash(drawing, instance),
+                    _ => 0,
+                },
+                origin: point(instance.rect[0], instance.rect[1]),
             });
         }
         for (index, _) in nested {
@@ -1220,7 +1444,10 @@ impl Walk<'_> {
             item: nested.layer as u32 | NESTED,
             scroll: scroll.map_or(0, |at| at as u32 + 1),
             top,
+            free: 0,
+            origin: nested.bounds.origin,
         });
+        let entry = self.entries.len() - 1;
         self.maps[nested.layer] = Map {
             parent: parent as u32,
             clip: nested.clip.bounds,
@@ -1240,9 +1467,52 @@ impl Walk<'_> {
         }
         let inner = origin(&layers[nested.layer]);
         let offset = place(point(inner.x - base.x, inner.y - base.y));
-        mix(
-            mix(own, offset),
-            self.layer(nested.layer, mix(inner_context, context), scroll, top),
-        )
+        let digest = self.layer(nested.layer, mix(inner_context, context), scroll, top);
+        // A layer that reads the window, or that a matrix places, draws otherwise at another place.
+        let moves = effect.transform.is_none()
+            && effect.backdrop.is_none()
+            && effect.glass.is_none()
+            && effect.text_mask.is_none()
+            && effect.blend_mode == crate::BlendMode::Normal;
+        if parent == 0 && moves {
+            let at = nested.bounds.origin;
+            let rect = |rect: Rect<f32>| {
+                bits([
+                    rect.origin.x - at.x,
+                    rect.origin.y - at.y,
+                    rect.size.width,
+                    rect.size.height,
+                ])
+            };
+            let mut hasher = rustc_hash::FxHasher::default();
+            (
+                effect.opacity.to_bits(),
+                effect.color_matrix.map(bits),
+                effect.blur.to_bits(),
+                effect.shadow.map(|(by, sigma, color)| {
+                    bits([by.x, by.y, sigma, color.r, color.g, color.b, color.a])
+                }),
+                effect
+                    .clip
+                    .map(|(bounds, radii)| (rect(bounds), bits(radii.to_array()), radii.shape)),
+                effect.mask.as_ref().map(|(tile, bounds)| {
+                    (
+                        tile.page,
+                        bits(tile.rect.map(|value| value as f32).to_array()),
+                        tile.id,
+                        rect(*bounds),
+                    )
+                }),
+                bits([nested.bounds.size.width, nested.bounds.size.height]),
+                (nested.clip.radii != Default::default()).then(|| rect(nested.clip.rounded)),
+                bits(nested.clip.radii.to_array()),
+                nested.clip.radii.shape,
+                place(point(inner.x - at.x, inner.y - at.y)),
+                digest,
+            )
+                .hash(&mut hasher);
+            self.entries[entry].free = hasher.finish() & !1;
+        }
+        mix(mix(own, offset), digest)
     }
 }

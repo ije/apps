@@ -682,3 +682,206 @@ fn scrolled_content_copies_the_last_frame_moved() {
         last = offset;
     }
 }
+
+#[test]
+fn paired_entries_draw_only_where_they_differ_like_a_full_frame() {
+    use crate::{
+        Clip, Corners, Radii,
+        gpu::scene::{EffectState, Scene, effect},
+        gpu::{BOX, Instance, SHADOW, rect},
+        point,
+    };
+    use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandQueue};
+    // What the content of the scroll draws: a box that scrolls or stays in the window, under one of three clips.
+    #[derive(Clone, Copy)]
+    struct Item {
+        at: [f32; 4],
+        color: [f32; 4],
+        stays: bool,
+        // 0 the viewport, 1 a clip that stays in the window, 2 a rounded clip around the box.
+        clip: u32,
+        // 0 one color, 1 round corners, 2 a border, 3 a shadow, 4 in a layer.
+        look: u32,
+    }
+    const STEPS: usize = 600;
+    let (send, receive) = std::sync::mpsc::channel();
+    let job = move || {
+        let size = objc2_core_foundation::CGSize::new(200., 120.);
+        let [mut renderer, mut reference] = [(), ()].map(|_| {
+            let mut renderer = super::Renderer::new(false).unwrap();
+            renderer.set_drawable_size(size);
+            renderer
+        });
+        let read = |renderer: &super::Renderer| {
+            let last = renderer.last.clone().unwrap();
+            let commands = renderer.queue.commandBuffer().unwrap();
+            let buffer = renderer.read_back(&commands, &last, [200, 120]).unwrap();
+            commands.commit();
+            commands.waitUntilCompleted();
+            // SAFETY: the GPU finished writing the shared buffer.
+            let mut pixels = unsafe {
+                std::slice::from_raw_parts(buffer.contents().as_ptr().cast::<u8>(), buffer.length())
+            }
+            .to_vec();
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
+            pixels
+        };
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut random = move |below: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 20) as u32 % below
+        };
+        let item = |random: &mut dyn FnMut(u32) -> u32| {
+            let part = |random: &mut dyn FnMut(u32) -> u32| random(4) as f32 / 4.;
+            let stays = random(4) == 0;
+            Item {
+                at: [
+                    12. + random(120) as f32 + part(random),
+                    match stays {
+                        true => 12. + random(80) as f32,
+                        false => random(260) as f32,
+                    } + part(random),
+                    20. + random(140) as f32,
+                    6. + random(if stays { 100 } else { 40 }) as f32 + part(random),
+                ],
+                // Few colors, so boxes of one color meet.
+                color: [
+                    random(2) as f32,
+                    random(3) as f32 / 2.,
+                    0.5,
+                    [1., 1., 0.5][random(3) as usize],
+                ],
+                stays,
+                clip: random(3),
+                look: match random(2) {
+                    0 => 0,
+                    _ => random(5),
+                },
+            }
+        };
+        let mut items: Vec<Item> = (0..14).map(|_| item(&mut random)).collect();
+        let window = Clip::from(rect([0., 0., 200., 120.]));
+        let viewport = Clip::from(rect([10., 10., 180., 100.]));
+        let mut offset = 60.;
+        let mut held = rect([16., 20., 150., 70.]);
+        let mut scene = Scene::default();
+        for _ in 0..STEPS {
+            match random(10) {
+                0 => {}
+                1 => offset += 0.5,
+                _ => offset = (offset + random(41) as f32 - 20.).clamp(0., 160.),
+            }
+            match random(8) {
+                0 => {
+                    let at = random(items.len() as u32) as usize;
+                    items[at].color[1] = random(3) as f32 / 2.;
+                }
+                1 => {
+                    let at = random(items.len() as u32 - 1) as usize;
+                    items.swap(at, at + 1);
+                }
+                2 => {
+                    let at = random(items.len() as u32) as usize;
+                    items[at] = item(&mut random);
+                }
+                3 => {
+                    let at = random(items.len() as u32) as usize;
+                    items[at].at[0] += random(9) as f32 - 4.;
+                    items[at].at[1] += random(9) as f32 - 4.;
+                    items[at].at[3] += random(9) as f32;
+                }
+                4 if items.len() > 8 => {
+                    items.remove(random(items.len() as u32) as usize);
+                }
+                5 if items.len() < 20 => {
+                    let at = random(items.len() as u32) as usize;
+                    items.insert(at, item(&mut random));
+                }
+                6 => held = rect([16. + random(8) as f32, 20., 150., 60. + random(20) as f32]),
+                _ => {}
+            }
+            scene.clear();
+            let mut back = Instance::new(BOX, rect([0., 0., 200., 120.]), window);
+            back.color = [0.9, 0.9, 0.85, 1.];
+            scene.push(back);
+            scene.begin_scroll(7, viewport, point(0., offset), false);
+            for item in &items {
+                let [x, y, width, height] = item.at;
+                let y = if item.stays { y } else { y - offset };
+                let bounds = rect([x, y, width, height]);
+                let clip = match item.clip {
+                    0 => viewport,
+                    1 => Clip::from(held),
+                    // Paint snaps its clips to pixels.
+                    _ => {
+                        let bounds = rect([x + 4., y - 2., width - 10., height]).map(f32::floor);
+                        Clip {
+                            bounds: bounds.intersect(viewport.bounds),
+                            rounded: bounds,
+                            radii: Radii::from(Corners::all(5.)),
+                        }
+                    }
+                };
+                let mut instance = Instance::new(BOX, bounds, clip);
+                instance.color = item.color;
+                match item.look {
+                    1 => instance.radii = [4.; 8],
+                    2 => {
+                        instance.aux = [2.; 4];
+                        instance.border_color = [0.1, 0.1, 0.1, 1.];
+                    }
+                    3 => {
+                        instance.info = [SHADOW as f32, 0., 3., 0.];
+                        instance.aux = [x + 2., y + 2., width - 4., height - 4.];
+                    }
+                    _ => {}
+                }
+                if item.look == 4 {
+                    let state = EffectState {
+                        opacity: 0.6,
+                        ..effect(clip)
+                    };
+                    scene.push_effect(state, None);
+                }
+                scene.push(instance);
+                if item.look == 4 {
+                    scene.pop_effect();
+                }
+            }
+            scene.end_scroll();
+            // A bar over the viewport.
+            let mut bar = Instance::new(BOX, rect([0., 0., 200., 18.]), window);
+            bar.color = [0.1, 0.5, 0.3, 0.8];
+            scene.push(bar);
+            scene.diff(Some(&[]));
+            renderer.draw(&scene, false);
+            scene.drawn();
+            let area: i32 = (renderer.frame.damage().iter())
+                .map(|region| region[2] * region[3])
+                .sum();
+            let pixels = read(&renderer);
+            let (_, full) = reference.draw(&scene, true).unwrap().unwrap();
+            let wrong = (pixels.as_chunks::<4>().0.iter())
+                .zip(full.as_chunks::<4>().0)
+                .position(|(a, b)| a != b);
+            send.send((area, wrong.map(|at| [at % 200, at / 200])))
+                .unwrap();
+        }
+        super::super::threads::end_thread();
+    };
+    super::super::threads::spawn_render(job, || {});
+    let mut partial = 0;
+    for step in 0..STEPS {
+        let (area, wrong) = receive.recv().unwrap();
+        assert_eq!(wrong, None, "step {step}: the frame matches a full frame");
+        partial += usize::from(area > 0 && area < 200 * 120 / 2);
+    }
+    assert!(
+        partial > STEPS / 5,
+        "{partial} frames draw a part of the window"
+    );
+}

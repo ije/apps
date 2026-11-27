@@ -199,6 +199,91 @@ fn a_scroll_in_moved_content_draws_only_the_exposed_edge() {
 }
 
 #[test]
+fn content_that_stays_in_a_scrolled_viewport_draws_only_where_it_differs() {
+    let mut scene = Scene::default();
+    let mut frame = |pass: u32, scroll: f32, height: f32| {
+        scene.begin_paint(pass, &mut Vec::new());
+        let viewport = Clip::from(bounds([0., 0., 400., 300.]));
+        // A clip that stays in the window, like the one of a sticky box.
+        let held = Clip::from(bounds([0., 50., 400., 200.]));
+        let round = |x: f32, y: f32| {
+            let mut instance = Instance::new(BOX, bounds([x, y - scroll, 50., 60.]), held);
+            instance.radii = [4.; 8];
+            instance
+        };
+        scene.begin_scroll(1, viewport, point(0., scroll), false);
+        // A background that stays, a box of one color that stays and changes its height, a box that scrolls
+        // inside the clip, and one that scrolls across its edge.
+        scene.push(Instance::new(BOX, bounds([0., 0., 400., 300.]), viewport));
+        let mut side = Instance::new(BOX, bounds([300., 100., 50., height]), viewport);
+        side.color = [1., 0., 0., 1.];
+        scene.push(side);
+        scene.push(round(10., 100.));
+        scene.push(round(100., 40.));
+        scene.end_scroll();
+        scene.diff(Some(&[]));
+        let mut damage = (scene.damage.rects.iter())
+            .map(|rect| rect.to_array())
+            .collect::<Vec<_>>();
+        damage.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        scene.drawn();
+        scene.clear();
+        damage
+    };
+    frame(1, 0., 100.);
+    // The exposed edge, and what the clip hid of the box across it. The copy moved the side box up.
+    assert_eq!(
+        frame(2, 10., 100.),
+        [
+            [0., 290., 400., 10.],
+            [100., 40., 50., 10.],
+            [300., 90., 50., 10.],
+            [300., 190., 50., 10.]
+        ]
+    );
+    assert_eq!(
+        frame(3, 20., 130.),
+        [
+            [0., 290., 400., 10.],
+            [100., 40., 50., 10.],
+            [300., 90., 50., 10.],
+            [300., 190., 50., 40.]
+        ]
+    );
+}
+
+#[test]
+fn boxes_that_change_their_paint_order_draw_again() {
+    let mut scene = Scene::default();
+    let mut frame = |pass: u32, swapped: bool| {
+        scene.begin_paint(pass, &mut Vec::new());
+        let window = Clip::from(bounds([0., 0., 400., 300.]));
+        let round = |x: f32, color: f32| {
+            let mut instance = Instance::new(BOX, bounds([x, 20., 50., 60.]), window);
+            (instance.radii, instance.color) = ([4.; 8], [color, 0., 0., 1.]);
+            instance
+        };
+        let mut boxes = [round(10., 0.2), round(30., 0.4), round(200., 0.6)];
+        if swapped {
+            boxes.swap(0, 1);
+        }
+        for instance in boxes {
+            scene.push(instance);
+        }
+        scene.diff(Some(&[]));
+        let damage = (scene.damage.rects.iter())
+            .map(|rect| rect.to_array())
+            .collect::<Vec<_>>();
+        scene.drawn();
+        scene.clear();
+        damage
+    };
+    frame(1, false);
+    assert_eq!(frame(2, true), [[30., 20., 50., 60.]]);
+    assert_eq!(frame(3, true), [[0.; 4]; 0]);
+}
+
+#[test]
 fn nested_escapes_close_their_cuts() {
     // A fixed box in an absolute box: both escape the scroll, one inside the other.
     let viewport = Clip::from(bounds([0., 0., 100., 100.]));
