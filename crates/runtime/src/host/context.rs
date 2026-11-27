@@ -1062,9 +1062,9 @@ mod tests {
             bounds.touch();
         };
         layout();
-        page.eval("__appsLayout()", "test").unwrap();
+        page.eval("__appsObserve(true)", "test").unwrap();
         page.eval(
-            "box.style.padding = '10px'; box.style.width = '90px'; __appsLayout()",
+            "box.style.padding = '10px'; box.style.width = '90px'; __appsObserve(true)",
             "test",
         )
         .unwrap();
@@ -1072,7 +1072,8 @@ mod tests {
             .unwrap();
         layout();
         assert_eq!(
-            page.eval("__appsLayout(); seen.join()", "test").unwrap(),
+            page.eval("__appsObserve(true); seen.join()", "test")
+                .unwrap(),
             "100,90"
         );
     }

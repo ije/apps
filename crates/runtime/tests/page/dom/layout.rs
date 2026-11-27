@@ -343,21 +343,35 @@ fn layout_mirror_feeds_observers_offsets_and_scrolling() {
         ("rel", [10., 300., 200., 100.]),
         ("c", [30., 320., 20., 10.]),
     ]);
-    engine.eval(r#"
+    // Intersection observers note their changes after the layout of a frame, and their callbacks run in a task.
+    let observe = |code: &str| {
+        engine
+            .eval(&format!("{code}; __appsObserve(true)"), "test")
+            .unwrap();
+        engine.tick().unwrap();
+    };
+    observe(
+        r#"
         globalThis.seen = [];
         let margin; try { new IntersectionObserver(() => {}, { rootMargin: 'foo' }); } catch (e) { margin = e.name; }
         if (margin !== 'SyntaxError' || new IntersectionObserver(() => {}, { rootMargin: '10px 5%' }).rootMargin !== '10px 5% 10px 5%') throw Error('rootMargin ' + margin);
-        let reported; addEventListener('error', event => { reported = event.error.message; event.preventDefault(); }, { once: true });
+        addEventListener('error', event => { globalThis.reported = event.error.message; event.preventDefault(); }, { once: true });
         new IntersectionObserver(() => { throw Error('failing observer'); }).observe(document.getElementById('a'));
-        const io = new IntersectionObserver(entries => seen.push(...entries.map(e => [e.target.id, e.isIntersecting, e.intersectionRatio, e.intersectionRect.y, e.intersectionRect.height].join())), { threshold: [0, 0.5, 1] });
-        for (const id of ['a', 'b', 'c', 'gone']) io.observe(document.getElementById(id));
-        __appsLayout();
+        globalThis.io = new IntersectionObserver(entries => seen.push(...entries.map(e => [e.target.id, e.isIntersecting, e.intersectionRatio, e.intersectionRect.y, e.intersectionRect.height].join())), { threshold: [0, 0.5, 1] });
+        for (const id of ['a', 'b', 'c', 'gone']) io.observe(document.getElementById(id))"#,
+    );
+    observe(
+        r#"
         if (seen.join(';') !== 'a,true,0.5,50,50;b,false,0,200,0;c,true,1,320,10;gone,false,0,0,0' || reported !== 'failing observer') throw Error(seen.join(';'));
-        seen.length = 0; __appsLayout();
+        seen.length = 0"#,
+    );
+    observe(
+        r#"
         if (seen.length) throw Error('Unchanged targets reported');
-        let entry;
-        const pageObserver = new IntersectionObserver(([e]) => entry = e, { root: document });
-        pageObserver.observe(document.getElementById('a')); __appsLayout();
+        globalThis.pageObserver = new IntersectionObserver(([e]) => globalThis.entry = e, { root: document });
+        pageObserver.observe(document.getElementById('a'))"#,
+    );
+    engine.eval(r#"
         if (entry?.intersectionRatio !== 0.5 || entry.rootBounds.width !== innerWidth || entry.rootBounds.height !== innerHeight) throw Error('Document root bounds');
         pageObserver.disconnect();
         const c = document.getElementById('c'), clip = document.getElementById('clip');
@@ -372,8 +386,8 @@ fn layout_mirror_feeds_observers_offsets_and_scrolling() {
         late.at(-1).id = 'late';
     "#, "test").unwrap();
     place(&[("a", [0., 0., 100., 100.]), ("late", [1., 2., 3., 4.])]);
+    observe("");
     engine.eval(r#"
-        __appsLayout();
         if (seen.join(';') !== 'a,true,1,0,100') throw Error(seen.join(';'));
         if (late.at(-1).getBoundingClientRect().height !== 4 || document.getElementById('c').getBoundingClientRect().x !== 30) throw Error('Grown mirror');
     "#, "test").unwrap();
@@ -638,8 +652,8 @@ fn throwing_resize_observer_does_not_stop_layout_callbacks() {
         new ResizeObserver(() => seen.push('resize')).observe(box);
         box.addEventListener('scroll', () => seen.push('scroll'));
         box.scrollTo(0, 5);
-        __appsLayout();
-        if (seen.join() !== 'error,resize,scroll') throw Error(seen.join());
+        __appsLayout(); __appsObserve(true);
+        if (seen.join() !== 'scroll,error,resize') throw Error(seen.join());
     "#,
             "test",
         )

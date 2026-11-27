@@ -3045,11 +3045,11 @@
   const intersectionObservers=new Set();
   class IntersectionObserver {
     constructor(callback,options={}){if(typeof callback!=='function')throw new TypeError('Expected a callback');this.callback=callback;this.root=options.root??null;if(this.root!==null&&!(this.root instanceof Element||this.root instanceof Document))throw new TypeError('Expected an Element or Document root');const margins=String(options.rootMargin??'0px').trim().split(/\s+/).map(value=>{const match=/^([-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)(px|%)?$/i.exec(value);if(!match||!match[2]&&+match[1]!==0)throw new DOMException('Invalid rootMargin','SyntaxError');return [+match[1],match[2]==='%'];});if(margins.length>4)throw new DOMException('Invalid rootMargin','SyntaxError');const [top,right=top,bottom=top,left=right]=margins;this._margins=[top,right,bottom,left];this.rootMargin=this._margins.map(([v,p])=>v+(p?'%':'px')).join(' ');this.thresholds=[...new Set(Array.isArray(options.threshold)?options.threshold:[options.threshold??0])].sort((a,b)=>a-b);if(this.thresholds.some(v=>v<0||v>1))throw new RangeError('Invalid intersection threshold');this.targets=new Map();this.records=[];this._ref=null;}
-    observe(target){if(this.targets.has(target._m.ref))return;watch(this,target,null,intersectionObservers);host('dom.requestFrame');}unobserve(target){unwatch(this,target,intersectionObservers);}disconnect(){unwatchAll(this,intersectionObservers);this.records=[];}takeRecords(){return this.records.splice(0);}
+    observe(target){if(this.targets.has(target._m.ref))return;watch(this,target,null,intersectionObservers);host('dom.observe',true);}unobserve(target){unwatch(this,target,intersectionObservers);}disconnect(){unwatchAll(this,intersectionObservers);this.records=[];}takeRecords(){return this.records.splice(0);}
   }
   const resizeObservers = new Set();
   const atomicTags = /^(img|svg|canvas|video|audio|iframe|embed|object|input|select|textarea|button|math)$/;
-  class ResizeObserver { constructor(callback) { if (typeof callback !== 'function') throw new TypeError('Expected a callback'); this.callback = callback; this.targets = new Map(); this._ref = null; } observe(target, options) { const box = String(options?.box ?? 'content-box'); if (this.targets.has(target._m.ref) && (this._boxes ??= new WeakMap()).get(target) === box) return; (this._boxes ??= new WeakMap()).set(target, box); watch(this, target, null, resizeObservers); host('dom.requestFrame'); } unobserve(target) { unwatch(this, target, resizeObservers); } disconnect() { unwatchAll(this, resizeObservers); } }
+  class ResizeObserver { constructor(callback) { if (typeof callback !== 'function') throw new TypeError('Expected a callback'); this.callback = callback; this.targets = new Map(); this._ref = null; } observe(target, options) { const box = String(options?.box ?? 'content-box'); if (this.targets.has(target._m.ref) && (this._boxes ??= new WeakMap()).get(target) === box) return; (this._boxes ??= new WeakMap()).set(target, box); watch(this, target, null, resizeObservers); host('dom.observe', true); } unobserve(target) { unwatch(this, target, resizeObservers); } disconnect() { unwatchAll(this, resizeObservers); } }
   const breakout = /^(b|big|blockquote|body|br|center|code|dd|div|dl|dt|em|embed|h[1-6]|head|hr|i|img|li|listing|menu|meta|nobr|ol|p|pre|ruby|s|small|span|strong|strike|sub|sup|table|tt|u|ul|var)$/;
   const wrap = id => {
     let rec = records[id], node = rec?.ref?.deref();
@@ -4815,7 +4815,6 @@
     if (i >= limit || marks[id] & 128) return 'l' + geometry[2];
     return moves[1] + ':' + (j < limit ? geometry[j + 2] : '') + (marks[id] & 2 ? ':' + geometry[i + 6] + ':' + geometry[i + 7] : '');
   };
-  // Use the last frame's observer flags. A forced layout here adds work every frame.
   globalThis.__appsLayout = () => {
     if (active) { observing = true; const lost = !focusable(active); observing = false; if (lost) active.blur(); }
     if (webviewScan) { webviewScan = false; document.querySelectorAll('webview'); }
@@ -4838,17 +4837,6 @@
       const visible = bounds.width > 0 && bounds.height > 0 && getComputedStyle(view).visibility !== 'hidden', key = `${bounds.x},${bounds.y},${bounds.width},${bounds.height},${visible}`;
       if (key !== view._bounds) { view._bounds = key; call('dom.open', 'webview', 'bounds', view._guest, { bounds, visible }); }
     }
-    // Before the first frame there is no last layout, so observers would see empty boxes.
-    if ((resizeObservers.size || intersectionObservers.size) && !geometry[2]) laidOut();
-    for (const ref of resizeObservers) { const observer = ref.deref(); if (!observer) { resizeObservers.delete(ref); continue; } const entries = []; observing = true; try { for (const [key, previous] of observer.targets) { const target = key.deref(); if (!target) { observer.targets.delete(key); continue; } const rect = target.getBoundingClientRect(), at = inputs(target); if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === at) continue; let [, , clientWidth, clientHeight, top, right, bottom, left, borderWidth, borderHeight, , , inline] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom);
-      // As in Chrome, an SVG element other than `<svg>` reports its bounding box, and a non-replaced inline box nothing.
-      if (target instanceof SVGElement && !(target instanceof SVGSVGElement)) { const box = target.getBBox(); top = left = 0; borderWidth = width = box.width; borderHeight = height = box.height; } else if (!atomicTags.test(target.localName)) { if (inline) top = left = borderWidth = borderHeight = width = height = 0; }
-      // An atomic inline box like `<math>` has no client box, so its content box comes from its border box.
-      else if (!clientWidth && !clientHeight && (borderWidth || borderHeight)) { const s = getComputedStyle(target), side = name => parseFloat(s['padding' + name]) + parseFloat(s['border' + name + 'Width']); left = parseFloat(s.paddingLeft); top = parseFloat(s.paddingTop); width = Math.max(0, borderWidth - side('Left') - side('Right')); height = Math.max(0, borderHeight - side('Top') - side('Bottom')); }
-      const z = zoomOf(target); if (z !== 1) [top, left, borderWidth, borderHeight, width, height] = [top, left, borderWidth, borderHeight, width, height].map(value => value / z);
-      // Sizes are in 1/64 pixels, like Chrome's layout units, so float noise reports no change.
-      const unit = value => Math.round(value * 64) / 64; [borderWidth, borderHeight, width, height] = [borderWidth, borderHeight, width, height].map(unit);
-      const value = observer._boxes?.get(target) === 'border-box' ? borderWidth + ':' + borderHeight : width + ':' + height; observer.targets.set(key, [rect.width, rect.height, at, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: borderWidth, blockSize: borderHeight }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: Math.round(width * z * devicePixelRatio), blockSize: Math.round(height * z * devicePixelRatio) }] }); } } } finally { observing = false; } if (entries.length) try { observer.callback(entries, observer); } catch (error) { report(error); } }
     for (const event of call('dom.scrollEvents')) {
       // The last item can list `content-visibility: auto` boxes, each with whether it skips its contents now.
       if (event.skips) { for (const [id, skipped] of event.skips) wrap(id)?.dispatchEvent(new ContentVisibilityAutoStateChangeEvent('contentvisibilityautostatechange', { bubbles: true, skipped })); continue; }
@@ -4858,32 +4846,86 @@
       hoverVersion = -1; node.dispatchEvent(new Event('scroll', { bubbles: !id }));
     }
     __appsMediaChanged();
-    if(!intersectionObservers.size)return;
-    call('dom.layout',false,true);
-    let viewport;
-    for(const ref of intersectionObservers){
-      const observer=ref.deref();
-      if(!observer){intersectionObservers.delete(ref);continue;}
-      observing=true;
-      try{
-      const m=layout(),root=observer.root==null||observer.root.nodeType===9?new DOMRect(0,0,...(viewport??=host('dom.viewport'))):observer.root.getBoundingClientRect();
-      const [mt,mr,mb,ml]=observer._margins,top=mt[1]?mt[0]*root.height/100:mt[0],right=mr[1]?mr[0]*root.width/100:mr[0],bottom=mb[1]?mb[0]*root.height/100:mb[0],left=ml[1]?ml[0]*root.width/100:ml[0],stop=observer.root?._m;
-      const rootBounds=new DOMRect(root.x-left,root.y-top,root.width+left+right,root.height+top+bottom),rl=rootBounds.left,rt=rootBounds.top,rr=rootBounds.right,rb=rootBounds.bottom;
-      for(const [key,previous]of observer.targets){
-        const target=key.deref();
-        if(!target){observer.targets.delete(key);continue;}
-        const i=4+target._id*8,inside=i<limit&&(marks[target._id]&17)===1,bx=inside?m[i]:0,by=inside?m[i+1]:0,bw=inside?m[i+2]:0,bh=inside?m[i+3]:0;
-        let x=Math.max(bx,rl),y=Math.max(by,rt),r=Math.min(bx+bw,rr),b=Math.min(by+bh,rb);
-        for(let rec=target._m.up;rec&&rec.tag[0]!=='#'&&rec!==stop;rec=rec.up){if(marks[rec.id]&4){const j=4+rec.id*8;x=Math.max(x,m[j]);y=Math.max(y,m[j+1]);r=Math.min(r,m[j]+m[j+2]);b=Math.min(b,m[j+1]+m[j+3]);}}
-        const isIntersecting=inside&&target.isConnected&&r>=x&&b>=y,area=bw*bh,ratio=isIntersecting?(area?Math.max(0,r-x)*Math.max(0,b-y)/area:1):0;
-        let changed=previous===null||previous.isIntersecting!==isIntersecting;
-        for(let k=0;!changed&&k<observer.thresholds.length;k++)changed=(previous.ratio<observer.thresholds[k])!==(ratio<observer.thresholds[k]);
-        if(changed)observer.records.push({time:performance.now(),target,rootBounds,boundingClientRect:new DOMRect(bx,by,bw,bh),intersectionRect:new DOMRect(x,y,Math.max(0,r-x),Math.max(0,b-y)),isIntersecting,intersectionRatio:ratio});
-        if(previous===null)observer.targets.set(key,{ratio,isIntersecting});else{previous.ratio=ratio;previous.isIntersecting=isIntersecting;}
+  };
+  // As in the HTML rendering steps, resize observers run after the layout of a frame and before its paint. A callback
+  // that changes the page lays it out again, and then only boxes deeper than the shallowest one that got an entry get
+  // theirs in this frame. Intersection observers then take the last layout, and their callbacks run in a task.
+  let observedDepth = 0, intersectionTask = false;
+  const depthOf = node => { let depth = 0; for (let rec = node._m.up; rec; rec = rec.up) depth++; return depth; };
+  globalThis.__appsObserve = first => {
+    if (!resizeObservers.size && !intersectionObservers.size) { host('dom.observe', false); return false; }
+    if (first) observedDepth = 0;
+    layout();
+    const laidAt = geometry[2], changedAt = version;
+    for (;;) {
+      const batches = []; let shallowest = Infinity, skipped = false;
+      observing = true;
+      try {
+        for (const ref of resizeObservers) {
+          const observer = ref.deref(); if (!observer) { resizeObservers.delete(ref); continue; }
+          const entries = [];
+          for (const [key, previous] of observer.targets) {
+            const target = key.deref(); if (!target) { observer.targets.delete(key); continue; }
+            const rect = target.getBoundingClientRect(), at = inputs(target);
+            if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === at) continue;
+            let [, , clientWidth, clientHeight, top, right, bottom, left, borderWidth, borderHeight, , , inline] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom);
+            // As in Chrome, an SVG element other than `<svg>` reports its bounding box, and a non-replaced inline box nothing.
+            if (target instanceof SVGElement && !(target instanceof SVGSVGElement)) { const box = target.getBBox(); top = left = 0; borderWidth = width = box.width; borderHeight = height = box.height; } else if (!atomicTags.test(target.localName)) { if (inline) top = left = borderWidth = borderHeight = width = height = 0; }
+            // An atomic inline box like `<math>` has no client box, so its content box comes from its border box.
+            else if (!clientWidth && !clientHeight && (borderWidth || borderHeight)) { const s = getComputedStyle(target), side = name => parseFloat(s['padding' + name]) + parseFloat(s['border' + name + 'Width']); left = parseFloat(s.paddingLeft); top = parseFloat(s.paddingTop); width = Math.max(0, borderWidth - side('Left') - side('Right')); height = Math.max(0, borderHeight - side('Top') - side('Bottom')); }
+            const z = zoomOf(target); if (z !== 1) [top, left, borderWidth, borderHeight, width, height] = [top, left, borderWidth, borderHeight, width, height].map(value => value / z);
+            // Sizes are in 1/64 pixels, like Chrome's layout units, so float noise reports no change.
+            const unit = value => Math.round(value * 64) / 64; [borderWidth, borderHeight, width, height] = [borderWidth, borderHeight, width, height].map(unit);
+            const value = observer._boxes?.get(target) === 'border-box' ? borderWidth + ':' + borderHeight : width + ':' + height;
+            if (value !== previous?.[3]) { const depth = depthOf(target); if (depth <= observedDepth) { skipped = true; continue; } shallowest = Math.min(shallowest, depth); entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: borderWidth, blockSize: borderHeight }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: Math.round(width * z * devicePixelRatio), blockSize: Math.round(height * z * devicePixelRatio) }] }); }
+            observer.targets.set(key, [rect.width, rect.height, at, value]);
+          }
+          if (entries.length) batches.push([observer, entries]);
+        }
+      } finally { observing = false; }
+      if (!batches.length) {
+        // The skipped boxes get their entries in the next frame.
+        if (skipped) { const event = new ErrorEvent('error', { cancelable: true, message: 'ResizeObserver loop completed with undelivered notifications.' }); dispatch(globalThis, event); if (!event.defaultPrevented) console.error(event.message); host('dom.observe', true); }
+        break;
       }
-      }catch(error){report(error);}finally{observing=false;}
-      const entries=observer.takeRecords();if(entries.length)try{observer.callback(entries,observer);}catch(error){report(error);}
+      for (const [observer, entries] of batches) { try { observer.callback.call(observer, entries, observer); } catch (error) { report(error); } drainMicrotasks?.(); }
+      observedDepth = shallowest;
+      flush();
+      if (version !== changedAt || geometry[2] !== laidAt) return true;
     }
+    if (!intersectionObservers.size) return false;
+    call('dom.layout', false, true);
+    const m = layout(); let viewport, queued = false;
+    for (const ref of intersectionObservers) {
+      const observer = ref.deref();
+      if (!observer) { intersectionObservers.delete(ref); continue; }
+      observing = true;
+      try {
+        const root = observer.root == null || observer.root.nodeType === 9 ? new DOMRect(0, 0, ...(viewport ??= host('dom.viewport'))) : observer.root.getBoundingClientRect();
+        const [mt, mr, mb, ml] = observer._margins, top = mt[1] ? mt[0] * root.height / 100 : mt[0], right = mr[1] ? mr[0] * root.width / 100 : mr[0], bottom = mb[1] ? mb[0] * root.height / 100 : mb[0], left = ml[1] ? ml[0] * root.width / 100 : ml[0], stop = observer.root?._m;
+        const rootBounds = new DOMRect(root.x - left, root.y - top, root.width + left + right, root.height + top + bottom), rl = rootBounds.left, rt = rootBounds.top, rr = rootBounds.right, rb = rootBounds.bottom;
+        for (const [key, previous] of observer.targets) {
+          const target = key.deref();
+          if (!target) { observer.targets.delete(key); continue; }
+          const i = 4 + target._id * 8, inside = i < limit && (marks[target._id] & 17) === 1, bx = inside ? m[i] : 0, by = inside ? m[i + 1] : 0, bw = inside ? m[i + 2] : 0, bh = inside ? m[i + 3] : 0;
+          let x = Math.max(bx, rl), y = Math.max(by, rt), r = Math.min(bx + bw, rr), b = Math.min(by + bh, rb);
+          for (let rec = target._m.up; rec && rec.tag[0] !== '#' && rec !== stop; rec = rec.up) { if (marks[rec.id] & 4) { const j = 4 + rec.id * 8; x = Math.max(x, m[j]); y = Math.max(y, m[j + 1]); r = Math.min(r, m[j] + m[j + 2]); b = Math.min(b, m[j + 1] + m[j + 3]); } }
+          const isIntersecting = inside && target.isConnected && r >= x && b >= y, area = bw * bh, ratio = isIntersecting ? (area ? Math.max(0, r - x) * Math.max(0, b - y) / area : 1) : 0;
+          let changed = previous === null || previous.isIntersecting !== isIntersecting;
+          for (let k = 0; !changed && k < observer.thresholds.length; k++) changed = (previous.ratio < observer.thresholds[k]) !== (ratio < observer.thresholds[k]);
+          if (changed) { queued = true; observer.records.push({ time: performance.now(), target, rootBounds, boundingClientRect: new DOMRect(bx, by, bw, bh), intersectionRect: new DOMRect(x, y, Math.max(0, r - x), Math.max(0, b - y)), isIntersecting, intersectionRatio: ratio }); }
+          if (previous === null) observer.targets.set(key, { ratio, isIntersecting }); else { previous.ratio = ratio; previous.isIntersecting = isIntersecting; }
+        }
+      } catch (error) { report(error); } finally { observing = false; }
+    }
+    if (queued && !intersectionTask) {
+      intersectionTask = true;
+      setTimeout(() => {
+        intersectionTask = false;
+        for (const ref of intersectionObservers) { const observer = ref.deref(), entries = observer?.takeRecords(); if (entries?.length) try { observer.callback.call(observer, entries, observer); } catch (error) { report(error); } }
+      });
+    }
+    return false;
   };
 
   globalThis.__appsEditing = () => terminalOf(active) ? { id: active._id, text: active._preedit, start: active._preedit.length, end: active._preedit.length, marked: composing } : editable(active) ? { id: active._id, text: active.value, start: active._direction === 'backward' ? active._end ?? 0 : active._start ?? 0, end: active._direction === 'backward' ? active._start ?? 0 : active._end ?? 0, marked: composing } : active?.isContentEditable ? { id: active._id, text: active.textContent, start: textOffset(active,selection.anchorNode,selection.anchorOffset), end: textOffset(active,selection.focusNode,selection.focusOffset), node: selection.focusNode?._id, offset: selection.focusOffset, marked: composing } : null;

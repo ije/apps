@@ -211,7 +211,7 @@ fn editing_fragments_observers_and_layout() {
         .geometry
         .mirror
         .insert(id, [20., 30., 200., 80.]);
-    engine.eval("__appsLayout(); __appsLayout(); if (observed.join() !== '194,200' || input.getBoundingClientRect().x !== 20 || input.clientHeight !== 78 || input.offsetHeight !== 80 || input.clientLeft !== 1) throw Error('Layout observation ' + observed.join());", "test").unwrap();
+    engine.eval("__appsObserve(true); __appsObserve(true); if (observed.join() !== '194,200' || input.getBoundingClientRect().x !== 20 || input.clientHeight !== 78 || input.offsetHeight !== 80 || input.clientLeft !== 1) throw Error('Layout observation ' + observed.join());", "test").unwrap();
 }
 
 #[test]

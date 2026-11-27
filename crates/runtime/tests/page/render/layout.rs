@@ -1658,6 +1658,46 @@ fn observing_a_target_again_reports_nothing_new_like_chrome() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn observers_run_after_the_layout_of_their_frame_like_chrome() {
+    run_hidden(
+        r#"
+        await load('t.html');
+        const frames = async n => { for (let i = 0; i < n; i++) await win.webContents.capturePage(); };
+        await frames(3);
+        // Chrome's orders: each entry has the animation frames since the change, so the scroll events of the next frame,
+        // which run before its callbacks, count 0.
+        for (const [step, want] of [
+            ["go('', () => $('a').style.width = '150px')", '0:raf,0:ro a 150'],
+            ["go('down', () => $('p').style.width = '110px')", '0:raf,0:ro p 110,0:ro c 60'],
+            ["go('up', () => $('c').style.width = '70px')", '0:raf,0:ro c 70,0:error ResizeObserver loop completed with undelivered notifications.,1:ro p 130'],
+            ["go('', () => $('s').scrollTop = 400)", '0:raf,0:io true,0:scroll'],
+            ["go('', () => new ResizeObserver(e => L('new ' + e[0].contentRect.width)).observe($('a')))", '0:raf,0:new 150'],
+        ]) {
+            await run('log.length = 0; ' + step);
+            await frames(4);
+            const got = await run('log.join()');
+            if (got !== want) fail(step + ': ' + got + ' instead of ' + want);
+        }
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0'><style>#a{width:100px;height:50px} #p{width:100px} #c{width:50px;height:10px} #s{height:100px;overflow:auto} #s>div{height:400px} #t{height:10px}</style>\
+             <div id=a></div><div id=p><div id=c></div></div><div id=s><div></div><div id=t></div></div><script>\
+             let F = 0, F0 = 0, mode = ''; globalThis.log = []; globalThis.$ = id => document.getElementById(id); globalThis.L = text => log.push((F - F0) + ':' + text);\
+             (function loop() { F++; requestAnimationFrame(loop); })();\
+             addEventListener('error', e => { L('error ' + e.message); e.preventDefault(); });\
+             new ResizeObserver(e => L('ro a ' + e[0].contentRect.width)).observe($('a'));\
+             new ResizeObserver(e => { L('ro p ' + e[0].contentRect.width); if (mode === 'down') $('c').style.width = '60px'; }).observe($('p'));\
+             new ResizeObserver(e => { L('ro c ' + e[0].contentRect.width); if (mode === 'up') { mode = ''; $('p').style.width = '130px'; } }).observe($('c'));\
+             new IntersectionObserver(e => L('io ' + e[0].isIntersecting)).observe($('t'));\
+             $('s').addEventListener('scroll', () => L('scroll'));\
+             globalThis.go = (next, change) => { mode = next; requestAnimationFrame(() => { F0 = F; L('raf'); change(); }); };</script></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn transform_animations_draw_content_that_moves_far_into_view() {
     // The animated belt is 1000px left of its place, so the box at 1050px shows at 50px.
     run_hidden(

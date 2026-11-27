@@ -52,6 +52,11 @@ pub trait View: 'static {
     fn drawn(&mut self, _snapshots: Vec<Snapshot>, _window: &mut Window, _app: &mut App) {}
     /// Runs at the start of each frame, after the steps of running scrolls and before the frame callbacks.
     fn frame(&mut self, _window: &mut Window, _app: &mut App) {}
+    /// Runs after the layout of the pass that a frame paints, before its paint, with `first` for the first such
+    /// pass of the frame. True when it changed the view, which then takes another pass.
+    fn laid_out(&mut self, _first: bool, _window: &mut Window, _app: &mut App) -> bool {
+        false
+    }
     /// While true, frames draw nothing, so the window keeps its last frame.
     fn suppressed(&self) -> bool {
         false
@@ -632,6 +637,8 @@ pub struct Window {
     marks: Vec<(u64, Point<Pixels>, Option<bool>)>,
     restart: bool,
     restarts: u8,
+    // The passes of this frame that `View::laid_out` asked for.
+    observed: u16,
     rebuild: bool,
     patches: Vec<crate::Node>,
     // The boxes whose style moved or sized them since the last layout, which keeps the offset for scroll anchors in
@@ -723,6 +730,7 @@ impl Window {
             marks: Vec::new(),
             restart: false,
             restarts: 0,
+            observed: 0,
             rebuild: false,
             patches: Vec::new(),
             unanchored: Default::default(),
@@ -1241,6 +1249,7 @@ impl Window {
         self.drawn_at = Instant::now();
         self.frames_drawn += 1;
         loop {
+            let mut observed = false;
             self.dirty = false;
             self.drawing = true;
             self.clear_pending();
@@ -1250,7 +1259,7 @@ impl Window {
                 self.caret = None;
             }
             // Keyed state survives the passes of one frame. Between frames, state that was not used goes.
-            if self.settling || self.restarts > 0 {
+            if self.settling || self.restarts > 0 || self.observed > 0 {
                 let states = mem::take(&mut self.next_states);
                 self.states.extend(states);
             } else {
@@ -1275,12 +1284,24 @@ impl Window {
                     let again = self.again || self.restart;
                     let rebar = self.rebar && self.rebars < self.most_rebars;
                     if !restarting && (!again || self.settling && !rebar) {
-                        tree.paint(root, self);
+                        self.tree = Some(tree);
+                        observed = self.observe(app);
+                        tree = self.tree.take().unwrap_or_default();
+                        if !observed {
+                            tree.paint(root, self);
+                        }
                     }
                 }
                 self.tree = Some(tree);
             }
             self.drawing = false;
+            if observed {
+                self.observed += 1;
+                (self.again, self.rebar, self.restart) = (false, false, false);
+                (self.settling, self.rebars, self.restarts) = (false, 0, 0);
+                self.most_rebars = REBARS;
+                continue;
+            }
             let restart = mem::take(&mut self.restart);
             if restart && self.restarts < 4 {
                 self.restarts += 1;
@@ -1298,6 +1319,7 @@ impl Window {
             self.rebars = 0;
             self.most_rebars = REBARS;
             self.restarts = 0;
+            self.observed = 0;
             if again {
                 self.refresh();
             }
@@ -1363,6 +1385,15 @@ impl Window {
         }
         self.update_cursor(app);
         self.with_view(app, |view, window, app| view.drawn(snapshots, window, app));
+    }
+
+    // The view runs its scripts, which can lay out the window, so this is no longer a draw while it does.
+    fn observe(&mut self, app: &mut App) -> bool {
+        let first = self.observed == 0;
+        self.drawing = false;
+        let changed = self.with_view(app, |view, window, app| view.laid_out(first, window, app));
+        self.drawing = true;
+        changed == Some(true)
     }
 
     fn build(

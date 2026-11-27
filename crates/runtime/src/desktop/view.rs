@@ -84,7 +84,7 @@ impl PageView {
 
 impl Input {
     // As in the HTML rendering steps, the scroll events of a frame run before its animation frame callbacks, so the
-    // frame draws what their listeners change with the new offsets. The observers of the last layout run first.
+    // frame draws what their listeners change with the new offsets. Observers run after its layout, in `laid_out`.
     fn frame(self: &Rc<Self>, window: &mut Window, cx: &mut App) {
         let moves = renderer::scroll_moves();
         if !self.layout_queued.replace(false) && self.moves.get() == moves {
@@ -593,6 +593,31 @@ impl renderer::View for PageView {
 
     fn frame(&mut self, window: &mut Window, cx: &mut App) {
         self.input.frame(window, cx);
+    }
+
+    // Resize observers run after the layout of the frame, and intersection observers after them.
+    fn laid_out(&mut self, first: bool, window: &mut Window, cx: &mut App) -> bool {
+        let input = &self.input;
+        if !(input.store.try_borrow())
+            .is_ok_and(|store| store.page_state(input.id).is_some_and(|dom| dom.observers))
+        {
+            return false;
+        }
+        let Some(renderer) = input.try_renderer() else {
+            return false;
+        };
+        let script = if first {
+            "__appsObserve(true)"
+        } else {
+            "__appsObserve(false)"
+        };
+        match scripted(cx, Some(window), || renderer.eval(script, "apps:observe")) {
+            Ok(changed) => changed == "true",
+            Err(error) => {
+                eprintln!("apps: {error}");
+                false
+            }
+        }
     }
 
     fn suppressed(&self) -> bool {

@@ -22,6 +22,8 @@ pub struct PageState {
     pub(crate) dirty: bool,
     pub frame_requested: bool,
     pub(crate) wheel: bool,
+    // The page has resize or intersection observers, which run after the layout of each frame.
+    pub(crate) observers: bool,
     pub(crate) window: renderer::WindowState,
     pub pixel_ratio: f32,
     pub(crate) paint_requested: bool,

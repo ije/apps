@@ -31,6 +31,12 @@ pub fn call(
         state.frame_requested = true;
         return Ok(json!(state.fonts.system.is_some()));
     }
+    // A new observation gets its first notification after the layout of the next frame.
+    if op == "dom.observe" {
+        state.observers = args[0].as_bool() == Some(true);
+        state.dirty |= state.observers;
+        return Ok(Value::Null);
+    }
     if op == "dom.requestPaint" {
         state.paint_requested = true;
         state.dirty = true;
