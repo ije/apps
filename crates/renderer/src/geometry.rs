@@ -827,6 +827,12 @@ pub fn faces_away(m: &[f32; 16]) -> bool {
     minor * det < 0.
 }
 
+/// How much a transform scales its plane. A 3D or skewed transform gives the larger axis.
+pub fn scale_of(m: &[f32; 16]) -> f32 {
+    let axis = |x: f32, y: f32| (x * x + y * y).sqrt();
+    axis(m[0], m[1]).max(axis(m[4], m[5]))
+}
+
 /// Whether a transform has no inverse, so its box draws nothing and takes no pointer.
 pub fn singular(m: &[f32; 16]) -> bool {
     determinant(m).0.abs() < 1e-12
