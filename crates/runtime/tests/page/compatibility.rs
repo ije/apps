@@ -724,6 +724,93 @@ fn renderer_cannot_forge_native_worker_requests() {
 }
 
 #[test]
+fn pages_share_one_shared_worker() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().update_app(|app| {
+        app.scripts = std::sync::Arc::new(
+            [(
+                "echo.js".to_owned(),
+                "onconnect=e=>e.ports[0].postMessage(name)"
+                    .to_owned()
+                    .into(),
+            )]
+            .into(),
+        )
+    });
+    for id in [1, 2, 3] {
+        host.borrow().store.borrow_mut().pages.insert(
+            id,
+            Page {
+                doc: Document::parse("<body></body>"),
+                dirty: false,
+                ..Default::default()
+            },
+        );
+    }
+    let open = |id| {
+        let page = JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            host.clone(),
+            Role::Renderer(id),
+        )
+        .unwrap();
+        page.eval(&format!(r#"
+            globalThis.replies=[];
+            globalThis.source='let count=0;const all=[];onconnect=e=>{{const port=e.ports[0];all.push(port);port.onmessage=m=>port.postMessage(m.data===\'open\'?[all.filter(p=>!p._closed).length]:[new TextDecoder().decode(m.data),++count,name,typeof process,e.source===port,new Uint8Array([count])])}}';
+            const worker=new SharedWorker('data:text/javascript,'+encodeURIComponent(source),'counter');
+            worker.port.onmessage=e=>replies.push(e.data.join(' '));
+            const bytes=new TextEncoder().encode('page{id}');worker.port.postMessage(bytes,[bytes.buffer]);
+            worker.onerror=e=>replies.push('error '+e.message);
+            new SharedWorker('data:text/javascript,'+encodeURIComponent(source),{{name:'other'}}).port.addEventListener('message',e=>replies.push('other '+e.data.join(' ')));
+        "#), "test").unwrap();
+        page
+    };
+    let wait = |page: &JsContext, count: usize| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            page.tick().unwrap();
+            let replies = page.eval("replies.join()", "test").unwrap();
+            if replies.split(',').count() >= count && !replies.is_empty() {
+                return replies;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Shared worker did not reply: {replies}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    let (one, two) = (open(1), open(2));
+    assert_eq!(wait(&one, 1), "page1 1 counter undefined true 1");
+    assert_eq!(wait(&two, 1), "page2 2 counter undefined true 2");
+    one.eval("const w=new SharedWorker('data:text/javascript,'+encodeURIComponent(source),'counter');w.port.start();w.port.addEventListener('message',e=>replies.push(e.data.join(' ')));w.port.postMessage(new TextEncoder().encode('again'))", "test").unwrap();
+    assert_eq!(
+        wait(&one, 2),
+        "page1 1 counter undefined true 1,again 3 counter undefined true 3"
+    );
+    // A page that goes away closes its ports in the worker.
+    two.eval("worker.port.postMessage('open')", "test").unwrap();
+    assert_eq!(wait(&two, 2), "page2 2 counter undefined true 2,3");
+    drop(one);
+    two.eval("worker.port.postMessage('open')", "test").unwrap();
+    assert_eq!(wait(&two, 3), "page2 2 counter undefined true 2,3,1");
+    // The worker ends with its last page, so a new page gets a new one.
+    drop(two);
+    let three = open(3);
+    assert_eq!(wait(&three, 1), "page3 1 counter undefined true 1");
+    three
+        .eval(
+            "new SharedWorker('apps:///missing.js').onerror=e=>replies.push(e.message);new SharedWorker('apps:///echo.js',{name:'echo'}).port.onmessage=e=>replies.push(e.data)",
+            "test",
+        )
+        .unwrap();
+    assert_eq!(
+        wait(&three, 3),
+        "page3 1 counter undefined true 1,Missing bundled worker: missing.js,echo"
+    );
+}
+
+#[test]
 fn page_workers_from_strings_need_js_execute() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().update_app(|app| {

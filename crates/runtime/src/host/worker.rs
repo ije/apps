@@ -8,6 +8,7 @@ use crate::{
     web::worker::Job,
 };
 use anyhow::Result;
+use serde_json::Value;
 use std::{
     cell::RefCell,
     rc::Rc,
@@ -81,9 +82,20 @@ pub(crate) fn run(mut job: Job) -> Result<()> {
         match message {
             Ok(message) => {
                 for message in std::iter::once(message).chain(job.inbox.try_iter().take(63)) {
-                    if let Some(text) = message.value[0].as_str() {
-                        job.receive(message.buffers);
-                        engine.call("__appsWorkerReceive", &[text])?;
+                    // A message has its text and, from a shared worker connection, its port. A port alone connects.
+                    let port = message.value[1].as_u64().unwrap_or(0).to_string();
+                    match &message.value[0] {
+                        Value::String(text) => {
+                            job.receive(message.buffers);
+                            engine.call("__appsWorkerReceive", &[text, &port])?;
+                        }
+                        Value::Number(port) => {
+                            engine.call("__appsWorkerConnect", &[&port.to_string()])?;
+                        }
+                        Value::Null if message.value[1].is_u64() => {
+                            engine.call("__appsWorkerDisconnect", &[&port])?;
+                        }
+                        _ => {}
                     }
                 }
             }

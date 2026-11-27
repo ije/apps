@@ -168,9 +168,9 @@ globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes, take, jsE
       for (const listener of [...this._listeners.get(type) ?? []]) try { listener(value); } catch (error) { fail(error); }
     }
   }
-  const info = call('web.worker.info'), parentPort = info.main ? null : new Endpoint();
+  const info = call('web.worker.info'), sharedScope = typeof info.name === 'string', parentPort = info.main || sharedScope ? null : new Endpoint();
   if (parentPort) {
-    parentPort.postMessage = (value, options) => { call('web.worker.post', ...message(value, options)); };
+    parentPort.postMessage = (value, options) => { call('web.worker.post', 0, ...message(value, options)); };
     parentPort.close = () => call('web.worker.close');
     globalThis.postMessage = parentPort.postMessage;
     globalThis.close = parentPort.close;
@@ -242,6 +242,55 @@ globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes, take, jsE
     close() { this._closed = true; this._pending.length = 0; }
     on(type, listener) { super.on(type, listener); if (type === 'message') this.start(); return this; }
   }
+  // A port of a connection to a shared worker, on either side.
+  class RemotePort extends MessagePort {
+    _queue = [];
+    constructor(op, id) { super(); this._op = op; this._id = id; }
+    postMessage(value, options) {
+      if (this._closed) return;
+      const wire = message(value, options, this._id === undefined && 'wait');
+      if (this._id === undefined) this._queue.push(wire); else call(this._op, this._id, ...wire);
+    }
+    _receive(data) { if (this._closed) return; this._pending.push(data); if (this._started) this._deliver(); }
+  }
+  const links = new Map();
+  if (sharedScope) {
+    const ports = new Map();
+    let onconnect = null;
+    Object.assign(globalThis, { name: info.name, close: () => call('web.worker.close') });
+    Object.defineProperty(globalThis, 'onconnect', { configurable: true, enumerable: true, get: () => onconnect, set: value => { onconnect = typeof value === 'function' ? value : null; } });
+    globalThis.__appsWorkerConnect = id => {
+      const port = new RemotePort('web.worker.post', id), event = new MessageEvent('connect', { data: '', ports: [port], source: port });
+      ports.set(id, port); dispatchEvent(event);
+      try { onconnect?.call(globalThis, event); } catch (error) { fail(error); }
+    };
+    globalThis.__appsWorkerDisconnect = id => { ports.get(id)?.close(); ports.delete(id); };
+    globalThis.__appsWorkerReceive = (wire, id) => { const data = decode(wire, () => call('web.worker.buffers')); ports.get(id)?._receive(data); };
+  }
+  // As in browsers, all pages of the app that make a SharedWorker with the same URL and name connect to one worker.
+  class SharedWorker extends EventTarget {
+    constructor(source, options) {
+      super();
+      const url = String(source), name = String((options !== null && typeof options === 'object' ? options.name : options) ?? ''), port = this.port = new RemotePort('web.worker.send');
+      const start = (text, bundled = false) => {
+        if (port._closed) return;
+        const id = port._id = call('web.worker.shared', url, name, text, bundled);
+        links.set(id, port); port._worker = this;
+        for (const wire of port._queue.splice(0)) call('web.worker.send', id, ...wire);
+      };
+      const failed = error => { port._queue.length = 0; this.dispatchEvent(new ErrorEvent('error', { error, message: error.message })); };
+      if (url.startsWith('apps:')) try { start(url, true); } catch (error) { Promise.resolve().then(() => failed(error)); }
+      else if (/^(?:data|blob):/.test(url)) {
+        if (!jsExecute) throw new DOMException(`Workers from ${url.slice(0, url.indexOf(':'))} URLs need the jsExecute feature. Add "jsExecute" to "features" in package.json`, 'SecurityError');
+        Promise.resolve().then(async () => {
+          if (url.startsWith('blob:')) return start(await (await fetch(url)).text());
+          const comma = url.indexOf(','); start(url.slice(0, comma).endsWith(';base64') ? new TextDecoder().decode(Uint8Array.fromBase64(url.slice(comma + 1))) : decodeURIComponent(url.slice(comma + 1)));
+        }).catch(failed);
+      }
+      else throw new DOMException('Workers can only load bundled scripts', 'SecurityError');
+    }
+  }
+  if (!nativeAccess && info.main) globalThis.SharedWorker = SharedWorker;
   class MessageChannel { constructor() { this.port1 = new MessagePort(); this.port2 = new MessagePort(); this.port1._peer = this.port2; this.port2._peer = this.port1; } }
   const channels = new Map();
   let subscriber = null;
@@ -274,8 +323,15 @@ globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes, take, jsE
   return {
     poll() {
       if (subscriber !== null && channels.size) for (const event of call('web.worker.channel.poll', subscriber)) { const [text, ...buffers] = event.data; for (const channel of channels.get(event.name) ?? []) channel.dispatchEvent(new MessageEvent('message', { data: decode(parse(text), () => buffers) })); }
-      if (!workers.size) return;
+      if (!workers.size && !links.size) return;
       for (const event of call('web.worker.poll')) {
+        const link = links.get(event.id);
+        if (link) {
+          if (event.kind === 'message') { const [wire, ...buffers] = event.data; link._receive(decode(wire, () => buffers)); }
+          else if (event.kind === 'error') link._worker.dispatchEvent(new ErrorEvent('error', { error: new Error(event.message), message: event.message, filename: event.filename, lineno: event.lineno, colno: event.colno }));
+          else if (event.kind === 'exit') links.delete(event.id);
+          continue;
+        }
         const worker = workers.get(event.id); if (!worker) continue;
         if (event.kind === 'message') { const [wire, ...buffers] = event.data; worker._emit('message', decode(wire, () => buffers)); }
         else if (event.kind === 'error') {

@@ -967,7 +967,9 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                 _ => None,
             };
             let script = match expression {
-                Expression::NewExpression(worker) if name(&worker.callee) == Some("Worker") => {
+                Expression::NewExpression(worker)
+                    if matches!(name(&worker.callee), Some("Worker" | "SharedWorker")) =>
+                {
                     Some(&mut worker.arguments)
                 }
                 Expression::CallExpression(fork)

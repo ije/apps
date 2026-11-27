@@ -93,7 +93,7 @@ On macOS, the main thread owns AppKit and each `BrowserWindow` has a render thre
 | Rust handler pool | `ipcRenderer.invoke()` handlers registered with `App::handle()`, on up to four threads |
 | Shared blocking pool | Async file, DNS lookup, crypto, zlib, and Node-API work, on up to four threads |
 | Network | A shared Tokio runtime for HTTP, WebSocket, TCP, and server I/O |
-| JavaScript workers | One thread and JavaScriptCore VM per worker |
+| JavaScript workers | One thread and JavaScriptCore VM per worker. A shared worker is one thread for all pages that connect to it, and each connection has its own port |
 | Terminal programs | Three threads per program of a terminal session: one reads its output into the terminal, one writes its input, and one waits for its exit |
 
 On Windows and Linux, main code and window pages share the main thread. A busy script can delay all page frames there. The handler pool, blocking pool, network thread, and workers remain separate.
