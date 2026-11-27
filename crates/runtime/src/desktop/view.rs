@@ -43,6 +43,9 @@ pub(crate) struct Input {
     origin: Cell<Option<Point<Pixels>>>,
     dropped: RefCell<Vec<PathBuf>>,
     select: RefCell<Option<Select>>,
+    // The node under the pointer when a trackpad scroll began, and its revision then. Like in Chrome, the wheel
+    // events of the gesture go to it while it stays the same node in the document.
+    wheel_target: Cell<Option<(usize, u64)>>,
 }
 
 #[derive(Clone)]
@@ -72,6 +75,7 @@ impl PageView {
             origin: Cell::new(None),
             dropped: RefCell::default(),
             select: RefCell::default(),
+            wheel_target: Cell::new(None),
         });
         let page = ViewState::new(id, input.clone(), store);
         VIEWS.with_borrow_mut(|views| {
@@ -1086,10 +1090,18 @@ fn events(data: PageView) -> renderer::Node {
                 if let Some(page) = store.pages.get(&view.id) {
                     let state = &page.state;
                     let seen = state.layout.cull.seen.as_ref().map(|seen| seen.2.clone()).or_else(|| state.styles.computed.clone());
-                    target = seen.as_ref().and_then(|computed| {
-                        let at = [position.x, position.y].map(f32::from);
-                        crate::render::hit::hit_test(&page.doc, state, computed, viewport, at, crate::render::hit::Hit::First).first().copied()
-                    });
+                    let nodes = &page.doc.nodes;
+                    let latched = !matches!(phase, renderer::WheelPhase::None | renderer::WheelPhase::Began);
+                    let up = |id: usize| nodes[id].parent.or_else(|| state.tree.hosts.get(&id).copied());
+                    target = match view.wheel_target.get() {
+                        Some((node, revision)) if latched && node < nodes.len() && nodes.revision(node) == revision && std::iter::successors(Some(node), |&id| up(id)).last() == Some(0) => Some(node),
+                        _ => seen.as_ref().and_then(|computed| {
+                            let at = [position.x, position.y].map(f32::from);
+                            crate::render::hit::hit_test(&page.doc, state, computed, viewport, at, crate::render::hit::Hit::First).first().copied()
+                        }),
+                    };
+                    let ends = matches!(phase, renderer::WheelPhase::None | renderer::WheelPhase::MomentumEnded);
+                    view.wheel_target.set(target.filter(|_| !ends).map(|node| (node, nodes.revision(node))));
                     if let Some(target) = target {
                         let mut chain = Vec::new();
                         let mut node = Some(target);

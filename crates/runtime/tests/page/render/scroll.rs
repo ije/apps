@@ -902,6 +902,39 @@ fn scroll_listeners_draw_in_the_frame_of_their_scroll() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn wheel_events_of_a_gesture_go_to_the_node_where_it_began() {
+    run_hidden(
+        &format!(
+            r#"{INPUT}
+        await load('page.html');
+        const at = (y, delta_y, phase) => input({{ action: 'scroll', x: 20, y, delta_y, phase }});
+        await at(20, 10, 'began');
+        await at(80, 10, 'changed');
+        await at(80, 0, 'ended');
+        await at(80, 10, 'momentum');
+        await at(80, 0, 'momentum_ended');
+        await at(80, 10, 'began');
+        await at(20, 0, 'ended');
+        await at(20, 10);
+        await at(20, 10, 'began');
+        await run('a.remove()');
+        await frames(5);
+        await at(20, 10, 'changed');
+        const got = await run('log.join()');
+        if (got !== 'a,a,a,a,a,b,b,a,a,b') fail('targets: ' + got);
+        "#
+        ),
+        &[(
+            "page.html",
+            "<body style='margin:0'><div id=a style='height:50px'></div><div id=b style='height:50px'></div>\
+             <script>globalThis.log = []; globalThis.a = document.getElementById('a');\
+             addEventListener('wheel', event => { log.push(event.target.id); document.body.dataset.n = log.length; });</script></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn scrollend_fires_when_each_kind_of_scroll_ends() {
     run_hidden(
         &format!(
