@@ -393,24 +393,12 @@ fn scroll_sizes_hold_the_out_of_flow_boxes_whose_containing_block_is_inside() {
     )
     .unwrap();
     engine.eval("document.body.offsetWidth", "test").unwrap();
-    {
+    let place = |rects: &[(&str, [f32; 4])]| {
         let store = host.borrow().store.clone();
         let mut store = store.borrow_mut();
         let page = store.pages.get_mut(&1).unwrap();
         let (doc, state) = (&page.doc, &mut page.state);
-        for (name, rect) in [
-            ("s", [0., 0., 100., 20.]),
-            ("a", [150., 30., 40., 60.]),
-            ("r", [0., 20., 100., 20.]),
-            ("b", [150., 50., 40., 60.]),
-            ("n", [0., 40., 100., 20.]),
-            ("p", [0., 40., 100., 10.]),
-            ("c", [150., 70., 40., 60.]),
-            ("t", [0., 60., 100., 20.]),
-            ("f", [500., 360., 40., 60.]),
-            ("u", [0., 80., 100., 20.]),
-            ("g", [500., 300., 40., 60.]),
-        ] {
+        for &(name, rect) in rects {
             let id = doc
                 .nodes
                 .iter()
@@ -418,11 +406,28 @@ fn scroll_sizes_hold_the_out_of_flow_boxes_whose_containing_block_is_inside() {
                 .unwrap();
             state.geometry.mirror.insert(id, rect);
         }
-    }
+    };
+    place(&[
+        ("s", [0., 0., 100., 20.]),
+        ("a", [150., 30., 40., 60.]),
+        ("r", [0., 20., 100., 20.]),
+        ("b", [150., 50., 40., 60.]),
+        ("n", [0., 40., 100., 20.]),
+        ("p", [0., 40., 100., 10.]),
+        ("c", [150., 70., 40., 60.]),
+        ("t", [0., 60., 100., 20.]),
+        ("f", [500., 360., 40., 60.]),
+        ("u", [0., 80., 100., 20.]),
+        ("g", [500., 300., 40., 60.]),
+    ]);
     engine.eval(r#"
-        const sizes = ['s', 'r', 'n', 't', 'u'].map(id => { const e = document.getElementById(id); return e.scrollWidth + 'x' + e.scrollHeight; }).join();
-        if (sizes !== '100x20,190x90,190x90,540x360,100x20') throw Error(sizes);
+        const sizes = () => ['s', 'r', 'n', 't', 'u'].map(id => { const e = document.getElementById(id); return e.scrollWidth + 'x' + e.scrollHeight; }).join();
+        if (sizes() !== '100x20,190x90,190x90,540x360,100x20' || sizes() !== '100x20,190x90,190x90,540x360,100x20') throw Error(sizes());
+        document.getElementById('s').style.position = 'relative';
+        if (sizes() !== '190x90,190x90,190x90,540x360,100x20') throw Error('style ' + sizes());
     "#, "test").unwrap();
+    place(&[("b", [150., 50., 40., 100.])]);
+    engine.eval(r#"if (sizes() !== '190x90,190x130,190x90,540x360,100x20') throw Error('layout ' + sizes());"#, "test").unwrap();
 }
 
 #[test]

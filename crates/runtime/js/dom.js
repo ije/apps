@@ -122,9 +122,15 @@
     // The bounds of the children of a scaled box are scaled too, so its own size is used.
     if (marks[node._id] & 128 && (box[8] !== geometry[i + 2] || box[9] !== geometry[i + 3])) return Math.round(box[2 + axis] / z);
     if (!box[2] && !box[3] && !box[4] && !box[5] && !box[6] && !box[7] && /^(inline|contents)$/.test(getComputedStyle(node).display)) return 0;
-    const start = geometry[i + axis] + box[axis];
-    // A right-to-left box overflows to its left, so its width counts from its right side.
-    const end = call('dom.overflow', node._id, axis, start, !axis && getComputedStyle(node).direction === 'rtl' ? start + box[2] : null);
+    // The overflow holds until the page, a layout or a style changes.
+    let seen = node._extent;
+    if (seen?.[0] !== version || seen[1] !== moves[0] || seen[2] !== moves[1]) seen = node._extent = [version, moves[0], moves[1]];
+    if (seen[3 + axis] === undefined) {
+      const start = geometry[i + axis] + box[axis];
+      // A right-to-left box overflows to its left, so its width counts from its right side.
+      seen[3 + axis] = call('dom.overflow', node._id, axis, start, !axis && getComputedStyle(node).direction === 'rtl' ? start + box[2] : null);
+    }
+    const end = seen[3 + axis];
     return Math.round(Math.max(box[2 + axis], end && end + box[5 + axis]) / z);
   };
   const offset = (node, axis) => {

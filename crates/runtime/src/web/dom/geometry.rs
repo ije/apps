@@ -224,16 +224,27 @@ pub(super) fn overflow(
             if [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
                 .into_iter()
                 .any(|prop| style.get(prop).is_some_and(|value| value != "visible"))
+                || style.get(Prop::CONTAIN).is_some_and(|value| {
+                    ["paint", "strict", "content"]
+                        .iter()
+                        .any(|kind| value.contains(kind))
+                })
             {
                 continue;
             }
         }
-        let made = crate::render::effects::establishes(style);
-        pending.extend(
-            kids(kid)
-                .iter()
-                .map(|&next| (next, absolute || made.absolute, fixed || made.fixed)),
-        );
+        let next = kids(kid);
+        if next.is_empty() {
+            continue;
+        }
+        let (absolute, fixed) = match absolute && fixed {
+            true => (true, true),
+            false => {
+                let made = crate::render::effects::establishes(style);
+                (absolute || made.absolute, fixed || made.fixed)
+            }
+        };
+        pending.extend(next.iter().map(|&next| (next, absolute, fixed)));
     }
     Ok(json!(end))
 }
