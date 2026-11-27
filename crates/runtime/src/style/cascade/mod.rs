@@ -159,8 +159,9 @@ impl StyleCache {
                 joined.sort_unstable();
                 let last = walk.trees.len() as u32 - 1;
                 for (_, id) in joined {
-                    tree[id as usize] =
-                        doc.nodes[id as usize].parent.map_or(0, |parent| tree[parent].min(last));
+                    tree[id as usize] = doc.nodes[id as usize]
+                        .parent
+                        .map_or(0, |parent| tree[parent].min(last));
                 }
             }
             if patched.is_none() || cfg!(debug_assertions) {
@@ -196,7 +197,8 @@ impl StyleCache {
                     "patched style walk lists differ"
                 );
                 if patched.is_none() {
-                    let mut listed: Vec<usize> = lists.iter().flatten().chain(&tables).copied().collect();
+                    let mut listed: Vec<usize> =
+                        lists.iter().flatten().chain(&tables).copied().collect();
                     listed.sort_unstable();
                     walk.listed = listed;
                     walk.tree = Rc::new(tree);

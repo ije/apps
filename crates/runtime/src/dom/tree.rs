@@ -227,6 +227,46 @@ impl Tree {
     }
 }
 
+// The slots of `slots`, from all slot nodes of the arena. None when a tree has two slots with one name, which need
+// the tree order.
+pub(crate) fn known_slots(
+    doc: &Document,
+    known: &[usize],
+    shadows: &rustc_hash::FxHashMap<usize, usize>,
+    hosts: &rustc_hash::FxHashMap<usize, usize>,
+) -> Option<rustc_hash::FxHashMap<usize, Vec<usize>>> {
+    let mut slots = rustc_hash::FxHashMap::default();
+    let mut names = rustc_hash::FxHashMap::default();
+    for &slot in known {
+        let (mut root, mut template) = (slot, false);
+        while let Some(parent) = doc.nodes[root].parent {
+            template |= doc.nodes[parent].tag == "template";
+            root = parent;
+        }
+        if template || !hosts.contains_key(&root) {
+            continue;
+        }
+        slots.insert(slot, Vec::new());
+        let name = doc.nodes[slot].attrs.get("name").map_or("", String::as_str);
+        if names.insert((root, name), slot).is_some() {
+            return None;
+        }
+    }
+    for (&host, &root) in shadows {
+        for &child in &doc.nodes[host].children {
+            let node = &doc.nodes[child];
+            if (node.tag == "#text" || !node.tag.starts_with('#'))
+                && let Some(slot) =
+                    names.get(&(root, node.attrs.get("slot").map_or("", String::as_str)))
+                && let Some(assigned) = slots.get_mut(slot)
+            {
+                assigned.push(child);
+            }
+        }
+    }
+    Some(slots)
+}
+
 pub(crate) fn slots(
     doc: &Document,
     roots: impl IntoIterator<Item = (usize, usize)>,

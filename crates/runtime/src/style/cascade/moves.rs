@@ -68,7 +68,8 @@ pub(crate) fn mark_moves(
                             && (doc.nodes[id]
                                 .parent
                                 .map_or(id != 0, |parent| shadows.roots.contains_key(&parent))
-                                || root(&old.tree, &old.trees, id) != root(&walk.tree, &walk.trees, id))
+                                || root(&old.tree, &old.trees, id)
+                                    != root(&walk.tree, &walk.trees, id))
                     {
                         matches.touch(id);
                         if let Some(&host) = shadows.hosts.get(&id) {

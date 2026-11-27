@@ -51,6 +51,8 @@ pub(crate) struct ShadowWalk {
     pub(crate) count: usize,
     pub(crate) slots: FxHashMap<usize, Vec<usize>>,
     pub(crate) shadows: Rc<Shadows>,
+    // The slot nodes of the arena, while the page has shadow roots.
+    pub(crate) known: Option<Vec<usize>>,
 }
 
 // The select marks of a node: hidden, editable, inert, and inert by its own attribute.
@@ -150,10 +152,35 @@ impl Styles {
         let animating = !animated.is_empty();
         if self.shadow_walk.tree != doc.nodes.tree() || self.shadow_walk.count != page.shadows.len()
         {
-            let slots = crate::dom::tree::slots(
-                doc,
-                page.shadows.iter().map(|(&host, &root)| (host, root)),
-            );
+            // A node gets a revision when it is placed, so the new slot nodes are among the changed ones.
+            let known = match &self.shadow_walk.known {
+                _ if page.shadows.is_empty() => None,
+                Some(known) => {
+                    let mut known = known.clone();
+                    for id in doc.nodes.changed_since(self.shadow_walk.tree) {
+                        if doc.nodes[id].tag == "slot" && !known.contains(&id) {
+                            known.push(id);
+                        }
+                    }
+                    known.retain(|&id| doc.nodes.get(id).is_some_and(|node| node.tag == "slot"));
+                    Some(known)
+                }
+                None => Some(
+                    (0..doc.nodes.len())
+                        .filter(|&id| doc.nodes[id].tag == "slot")
+                        .collect(),
+                ),
+            };
+            let all = || {
+                crate::dom::tree::slots(doc, page.shadows.iter().map(|(&host, &root)| (host, root)))
+            };
+            let slots = known
+                .as_deref()
+                .and_then(|known| {
+                    crate::dom::tree::known_slots(doc, known, page.shadows, page.hosts)
+                })
+                .unwrap_or_else(all);
+            debug_assert!(slots == all(), "slots of the known slot nodes differ");
             let assigned: rustc_hash::FxHashSet<usize> =
                 slots.values().flatten().copied().collect();
             let mut composed = rustc_hash::FxHashMap::default();
@@ -203,6 +230,7 @@ impl Styles {
                 tree: doc.nodes.tree(),
                 count: page.shadows.len(),
                 slots,
+                known,
                 shadows: Rc::new(super::Shadows {
                     roots: page.shadows.clone(),
                     hosts,
