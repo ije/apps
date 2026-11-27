@@ -609,3 +609,45 @@ fn worker_query_imports_bundle_the_worker() {
         );
     }
 }
+
+#[test]
+fn shared_workers_bundle_their_scripts() {
+    for production in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("page.ts");
+        fs::write(&entry, "import S from './s.ts?sharedworker'; globalThis.s = new S({ name: 'a' }); globalThis.t = new SharedWorker(new URL('./t.ts', import.meta.url), { type: 'module' });").unwrap();
+        fs::write(
+            dir.path().join("s.ts"),
+            "globalThis.S_MARKER = 1 as number;",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("t.ts"),
+            "globalThis.T_MARKER = 1 as number;",
+        )
+        .unwrap();
+        let files = compile(
+            &entry,
+            Realm::Renderer,
+            None,
+            Rc::default(),
+            production,
+            None,
+        )
+        .unwrap();
+        for marker in ["S_MARKER", "T_MARKER"] {
+            assert!(
+                files
+                    .iter()
+                    .any(|(name, source)| name.starts_with("script-") && source.contains(marker)),
+                "production={production} {marker}"
+            );
+        }
+        let code: String = files
+            .iter()
+            .filter(|(name, _)| !name.starts_with("script-"))
+            .map(|(_, source)| source.as_str())
+            .collect();
+        assert_eq!(code.matches("apps:///script-").count(), 2, "{code}");
+    }
+}
