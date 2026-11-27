@@ -422,6 +422,49 @@ fn boxes_that_never_cull_keep_the_boxes_around_them() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn fields_that_a_scroll_moves_take_clicks_and_draw_their_selection() {
+    // The page scrolls the field without a prepaint of it. Debug builds prepaint all boxes in every third pass, so
+    // each check runs three times with one frame before it.
+    let text = run_hidden(
+        &format!(
+            r#"{INPUT}
+        const capture = () => win.webContents.capturePage({{ x: 0, y: 0, width: 400, height: 300 }});
+        const pixel = async (x, y) => [...(await win.webContents.capturePage({{ x, y, width: 1, height: 1 }})).toBitmap()].slice(0, 3).join();
+        const place = async () => JSON.parse(await run("(r => JSON.stringify([Math.round(r.x), Math.round(r.y + r.height / 2)]))(document.getElementById('f').getBoundingClientRect())"));
+        await load('field.html');
+        await frames(50);
+        const seen = [];
+        for (let n = 0; n < 3; n++) {{
+            await run("document.getElementById('f').blur(); scrollBy(0, 20)");
+            await capture();
+            const [x, y] = await place();
+            await fetch(MCP + '/input', {{ method: 'POST', body: JSON.stringify({{ window: win.id, action: 'click', x: x + 48, y }}) }});
+            seen.push(await run("[document.activeElement.id, document.getElementById('f').selectionStart].join()"));
+            for (const [end, color] of [[11, 'blue'], [0, 'white']]) {{
+                await run(`document.getElementById('f').setSelectionRange(0, ${{end}})`);
+                seen.push(color + ':' + await pixel(x + 4, y));
+            }}
+        }}
+        console.log('SEEN ' + seen.join(' '));
+        "#
+        ),
+        &[(
+            "field.html",
+            "<body style='margin:0;background:#fff'><div style='height:150px'></div><div style='padding:10px'>\
+             <input id=f value='hello world' style='font:16px monospace;width:200px;border:0;padding:0;outline:0;background:#fff;color:#fff;caret-color:#fff'>\
+             </div><div style='height:3000px'></div><style>#f::selection{background:#00f}</style></body>",
+        )],
+    );
+    let seen = (text.lines()).find_map(|line| line.strip_prefix("SEEN "));
+    assert_eq!(
+        seen,
+        Some(["f,5 blue:255,0,0 white:255,255,255"; 3].join(" ").as_str()),
+        "{text}"
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn far_tiles_place_the_items_of_a_flexed_grid_at_its_new_size() {
     // The grid of a tile takes the rest of its column, so a taller caption moves its item up.
     let mut page = String::from(

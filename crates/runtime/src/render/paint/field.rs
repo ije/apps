@@ -28,6 +28,8 @@ pub(crate) struct FieldText {
     pub(crate) selection: (Option<u32>, u32),
     pub(crate) handle: renderer::ScrollRef,
     pub(crate) selected: std::cell::Cell<Option<[usize; 2]>>,
+    // What the last prepaint gave `text_layouts`, which each frame clears.
+    pub(crate) laid: std::cell::RefCell<Option<crate::render::layout::TextLayout>>,
 }
 
 impl From<FieldText> for renderer::Node {
@@ -142,27 +144,17 @@ impl renderer::Hooks for FieldText {
         let view = &*self.view;
         let mut store = view.store.borrow_mut();
         let dom = store.state(view.id);
-        let selected = dom
-            .interaction
-            .selection
-            .get(&self.id)
-            .filter(|_| dom.interaction.focus == Some(self.id))
-            .map(|&selected| match &self.password {
-                _ if self.placeholder => [0; 2],
-                Some(value) => selected.map(|offset| crate::dom::text::bullets(value, offset)),
-                None => selected,
-            });
+        let selected = self.selection(dom);
         if !self.placeholder {
-            dom.layout.text_layouts.insert(
-                self.id,
-                (
-                    layout.clone(),
-                    self.text.clone(),
-                    0..self.text.len(),
-                    rows.clone(),
-                    [px(0.), layout.line_height()],
-                ),
+            let laid = (
+                layout.clone(),
+                self.text.clone(),
+                0..self.text.len(),
+                rows.clone(),
+                [px(0.), layout.line_height()],
             );
+            dom.layout.text_layouts.insert(self.id, laid.clone());
+            *self.laid.borrow_mut() = Some(laid);
         }
         drop(store);
         let state = (selected, self.text.len());
@@ -209,6 +201,49 @@ impl renderer::Hooks for FieldText {
 
     fn volatile(&self) -> bool {
         false
+    }
+
+    fn skippable(&self) -> bool {
+        true
+    }
+
+    fn skips_inside(&self) -> bool {
+        true
+    }
+
+    // A field with the focus, or one that just lost it, moves its scroll offset and draws its caret.
+    fn rests(&self) -> bool {
+        let mut store = self.view.store.borrow_mut();
+        self.selected.get().is_none() && self.selection(store.state(self.view.id)).is_none()
+    }
+
+    fn skip(&self, _: renderer::Rect<Pixels>, _: &mut Window) -> bool {
+        if !self.rests() {
+            return false;
+        }
+        if let Some(laid) = &*self.laid.borrow() {
+            let mut store = self.view.store.borrow_mut();
+            let dom = store.state(self.view.id);
+            dom.layout.text_layouts.insert(self.id, laid.clone());
+        }
+        true
+    }
+
+    fn skip_inside(&self, exact: renderer::Rect<Pixels>, window: &mut Window) {
+        self.skip(exact, window);
+    }
+
+    // The renderer moved the text layout, which the layouts in `text_layouts` share.
+    fn shifts(&self) -> bool {
+        true
+    }
+
+    fn shift(&self, _: Point<Pixels>, exact: renderer::Rect<Pixels>, window: &mut Window) -> bool {
+        self.skip(exact, window)
+    }
+
+    fn shift_inside(&self, by: Point<Pixels>, exact: renderer::Rect<Pixels>, window: &mut Window) {
+        self.shift(by, exact, window);
     }
 
     fn kept(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
@@ -324,6 +359,18 @@ impl renderer::Hooks for FieldText {
         if !behind {
             caret(window);
         }
+    }
+}
+
+impl FieldText {
+    // The selection of the field while it has the focus.
+    fn selection(&self, dom: &crate::render::PageState) -> Option<[usize; 2]> {
+        let selected = dom.interaction.selection.get(&self.id)?;
+        (dom.interaction.focus == Some(self.id)).then(|| match &self.password {
+            _ if self.placeholder => [0; 2],
+            Some(value) => selected.map(|offset| crate::dom::text::bullets(value, offset)),
+            None => *selected,
+        })
     }
 }
 

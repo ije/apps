@@ -282,6 +282,7 @@ pub(super) fn controls(
             single_line,
             rtl: rtl && line_justify == Some(renderer::AlignContent::End),
             rows: Default::default(),
+            laid: Default::default(),
             caret: crate::render::paint::text::CaretLook::new(style),
             selection: selection_colors,
             handle: handle.clone(),
