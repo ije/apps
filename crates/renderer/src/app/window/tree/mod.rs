@@ -88,13 +88,8 @@ struct Slot {
     // Scroll viewports between its stacking context and its containing block cut the mask of the box.
     cuts: bool,
     reach: Option<Rect<Pixels>>,
-    escaped: Option<Clip<Pixels>>,
     // The size that the measure function gave in the last layout, which can overflow the box.
     measured: taffy::Size<f32>,
-    // An out-of-flow box that escapes its parent: the room its containing block gave it in the last layout.
-    room: Option<[f32; 2]>,
-    // The near and far corners that `far` found, from the origin of the box. Cleared up the tree when a box changes.
-    far: [Option<[Point<f32>; 2]>; 2],
     split: Option<Rc<Split>>,
     // Floats are in the box, or below it in blocks of its formatting context.
     floats: bool,
@@ -102,20 +97,14 @@ struct Slot {
     banded: bool,
     // A layout beside floats emptied the cache, so the caches of the parents can still be full.
     uncached: bool,
-    // The inputs of the last full layout of the box, which a layout boundary uses to lay out again alone, and
-    // whether it waits for that layout.
-    inputs: Option<LayoutInput>,
+    // Whether a layout boundary waits for a layout of its own.
     held: bool,
-    // The floats that the box placed in the context of its parent when no other float reached it, from its origin.
-    spill: Option<Box<Spill>>,
-    // The content height of a box with floats, and what it depends on, for one layout.
-    natural: Option<Box<(Vec<f32>, f32)>>,
     // The prepaint pass that kept the box and all boxes in it where they were, and the first pass of the run
     // of such passes.
     calm: u32,
     since: u32,
-    // What the last paint of the box drew, which a paint of a calm box copies.
-    chunk: Option<Chunk>,
+    // What the last paint of the box drew, which a paint of a calm box copies: an index in `Tree.chunks`.
+    chunk: u32,
     // The window regions of the last prepaint of the box, which a calm box copies when `skips`, and the boxes
     // in `touched` of that pass.
     regions: Option<(u32, [u32; 2])>,
@@ -152,6 +141,26 @@ struct Slot {
     lag: Point<Pixels>,
     // The part of `lag` that a skip of an ancestor already gave the box, because it is listed outside that ancestor.
     ahead: Point<Pixels>,
+    // Fields that few boxes use.
+    cold: Option<Box<Cold>>,
+}
+
+// The tree keeps a slot for each box, so the size of a slot is the size of the tree.
+const _: () = assert!(mem::size_of::<Slot>() <= 1080);
+
+#[derive(Default)]
+struct Cold {
+    escaped: Option<Clip<Pixels>>,
+    // An out-of-flow box that escapes its parent: the room its containing block gave it in the last layout.
+    room: Option<[f32; 2]>,
+    // The near and far corners that `far` found, from the origin of the box. Cleared up the tree when a box changes.
+    far: [Option<[Point<f32>; 2]>; 2],
+    // The inputs of the last full layout of the box, which a layout boundary uses to lay out again alone.
+    inputs: Option<LayoutInput>,
+    // The floats that the box placed in the context of its parent when no other float reached it, from its origin.
+    spill: Option<Spill>,
+    // The content height of a box with floats, and what it depends on, for one layout.
+    natural: Option<(Vec<f32>, f32)>,
     // The boxes inside that the box listed in the stacking context around it, which a skip of the box lists again.
     listing: Box<[u32]>,
     // The content mask of the box where it was listed.
@@ -238,21 +247,15 @@ impl Slot {
             viewport: None,
             cuts: false,
             reach: None,
-            escaped: None,
             measured: taffy::Size::ZERO,
-            room: None,
-            far: [None; 2],
             split: None,
             floats: false,
             banded: false,
             uncached: false,
-            inputs: None,
             held: false,
-            spill: None,
-            natural: None,
             calm: 0,
             since: 0,
-            chunk: None,
+            chunk: NONE,
             regions: None,
             touched: [0; 2],
             base_regions: None,
@@ -271,8 +274,7 @@ impl Slot {
             flat: false,
             lag: Point::default(),
             ahead: Point::default(),
-            listing: Box::new([]),
-            list_mask: Clip::default(),
+            cold: None,
         }
     }
 }
@@ -304,18 +306,22 @@ impl Slot {
         self.text = inherited.clone();
         self.layout = Layout::new();
         self.baselines = Baselines::NONE;
-        self.room = None;
+        if let Some(cold) = &mut self.cold {
+            let (listing, list_mask) = (mem::take(&mut cold.listing), cold.list_mask);
+            **cold = Cold {
+                listing,
+                list_mask,
+                ..Cold::default()
+            };
+        }
         (self.unscroll, self.shift, self.turned) = Default::default();
         self.origin = Point::default();
         (self.bounds, self.painted, self.exact) = Default::default();
-        self.far = [None; 2];
         self.floats = false;
         self.banded = false;
         self.uncached = false;
-        self.inputs = None;
         self.held = false;
         self.skipped = 0;
-        self.spill = None;
         self.region = None;
         self.listed = false;
         self.free = [true; 2];
@@ -324,9 +330,7 @@ impl Slot {
         self.volatile = false;
         self.lively = false;
         self.culled = u32::MAX;
-        self.escaped = None;
         self.split = None;
-        self.chunk = None;
         self.regions = None;
         self.base_regions = None;
         self.own_regions = None;
@@ -334,6 +338,42 @@ impl Slot {
 
     fn taffy(&self) -> &taffy::Style {
         self.stretched.as_deref().unwrap_or(&self.style.taffy)
+    }
+
+    fn cold_mut(&mut self) -> &mut Cold {
+        self.cold.get_or_insert_default()
+    }
+
+    fn escaped(&self) -> Option<Clip<Pixels>> {
+        self.cold.as_ref().and_then(|cold| cold.escaped)
+    }
+
+    fn far(&self) -> [Option<[Point<f32>; 2]>; 2] {
+        self.cold.as_ref().map_or([None; 2], |cold| cold.far)
+    }
+
+    fn clear_far(&mut self) -> bool {
+        match &mut self.cold {
+            Some(cold) if cold.far != [None; 2] => {
+                cold.far = [None; 2];
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn inputs(&self) -> Option<LayoutInput> {
+        self.cold.as_ref().and_then(|cold| cold.inputs)
+    }
+
+    fn list_mask(&self) -> Clip<Pixels> {
+        self.cold
+            .as_ref()
+            .map_or_else(Clip::default, |cold| cold.list_mask)
+    }
+
+    fn listing(&self) -> &[u32] {
+        self.cold.as_ref().map_or(&[], |cold| &cold.listing)
     }
 
     // A float with a fixed size is a layout boundary: what changes in it can't move or size the boxes around it,
@@ -429,6 +469,9 @@ pub struct Tree {
     // The next paint can copy spans of the last one.
     copies: bool,
     graveyard: Vec<Remains>,
+    // The chunks of `Slot.chunk`, and the free ones, since most boxes have none.
+    chunks: Vec<Chunk>,
+    spare_chunks: Vec<u32>,
     refined: FxHashMap<usize, Refined>,
     // Floats wait to paint after the blocks of their formatting context, like in CSS.
     deferred: Vec<u32>,
@@ -472,9 +515,43 @@ pub(crate) fn identity(id: Option<NodeKey>, scope: u64) -> u64 {
 }
 
 impl Tree {
+    fn chunk(&self, index: u32) -> Option<Chunk> {
+        let at = self.slots[index as usize].chunk;
+        (at != NONE).then(|| self.chunks[at as usize])
+    }
+
+    fn set_chunk(&mut self, index: u32, chunk: Option<Chunk>) {
+        let at = &mut self.slots[index as usize].chunk;
+        match (chunk, *at) {
+            (Some(chunk), NONE) => {
+                *at = match self.spare_chunks.pop() {
+                    Some(spare) => {
+                        self.chunks[spare as usize] = chunk;
+                        spare
+                    }
+                    None => {
+                        // Grow by a quarter, since the list lives as long as the tree.
+                        if self.chunks.len() == self.chunks.capacity() {
+                            self.chunks.reserve_exact(self.chunks.len() / 4 + 64);
+                        }
+                        self.chunks.push(chunk);
+                        self.chunks.len() as u32 - 1
+                    }
+                }
+            }
+            (Some(chunk), old) => self.chunks[old as usize] = chunk,
+            (None, NONE) => {}
+            (None, old) => {
+                self.spare_chunks.push(old);
+                *at = NONE;
+            }
+        }
+    }
+
     pub(crate) fn begin(&mut self, scale: f32, fonts: usize) {
         if mem::replace(&mut self.measured_with, (scale, fonts)) != (scale, fonts) {
             self.slots.clear();
+            (self.chunks, self.spare_chunks) = Default::default();
             self.free.clear();
             self.keys.clear();
             self.escaping.clear();
@@ -810,7 +887,9 @@ impl Tree {
         slot.placed = None;
         unfar(&mut self.slots, index as usize);
         if scoped {
-            self.slots.iter_mut().for_each(|slot| slot.far = [None; 2]);
+            self.slots.iter_mut().for_each(|slot| {
+                slot.clear_far();
+            });
         }
         let slot = &mut self.slots[index as usize];
         slot.events = events;
@@ -908,7 +987,7 @@ impl Tree {
         while index != NONE {
             let slot = &mut self.slots[index as usize];
             let parent = slot.parent;
-            if !outer && slot.inputs.is_some() && slot.boundary() {
+            if !outer && slot.inputs().is_some() && slot.boundary() {
                 slot.cache.clear();
                 if !mem::replace(&mut slot.held, true) {
                     self.bounded.push(index);
@@ -939,6 +1018,7 @@ impl Tree {
             self.keys.remove(&slot.key);
             pending.extend(slot.children.iter().copied().map(index_of));
             slot.release(&self.blank, &mut self.graveyard);
+            self.set_chunk(index, None);
             self.free.push(index);
         }
         self.orphans = pending;
@@ -949,6 +1029,7 @@ impl Tree {
 
     pub(crate) fn bury(&mut self) {
         self.graveyard.clear();
+        self.graveyard.shrink_to(1024);
         if self.free.len() > 1024 && self.free.len() * 2 > self.slots.len() {
             self.compact();
         }
@@ -964,7 +1045,12 @@ impl Tree {
             }
         }
         let map = |node: &mut NodeId| *node = NodeId::from(moved[usize::from(*node)] as usize);
+        let mut chunks = Vec::with_capacity(self.chunks.len() - self.spare_chunks.len());
         for slot in &mut slots {
+            if slot.chunk != NONE {
+                chunks.push(self.chunks[slot.chunk as usize]);
+                slot.chunk = chunks.len() as u32 - 1;
+            }
             slot.placed = None;
             slot.children.iter_mut().for_each(map);
             if slot.parent != NONE {
@@ -986,6 +1072,7 @@ impl Tree {
             *index != NONE
         });
         self.slots = slots;
+        (self.chunks, self.spare_chunks) = (chunks, Vec::new());
         self.free.clear();
         self.layers.clear();
     }
@@ -1224,8 +1311,7 @@ fn unsplit(slots: &mut [Slot], index: usize) {
 type Block = (u8, Clip<Pixels>, u32, Point<Pixels>, Option<Point<Pixels>>);
 
 fn unfar(slots: &mut [Slot], mut index: usize) {
-    while slots[index].far != [None; 2] {
-        slots[index].far = [None; 2];
+    while slots[index].clear_far() {
         match slots[index].parent {
             NONE => break,
             parent => index = parent as usize,
@@ -1493,7 +1579,9 @@ fn place_region(window: &mut Window, style: &Style, first: Rect, old: Option<&Re
 impl LayoutTree<'_> {
     fn forget(&mut self) {
         for index in mem::take(&mut self.naturals) {
-            self.slots[index as usize].natural = None;
+            if let Some(cold) = &mut self.slots[index as usize].cold {
+                cold.natural = None;
+            }
         }
     }
 
@@ -1537,7 +1625,8 @@ impl LayoutTree<'_> {
                         key.extend([f[0] - x, f[1] - y, f[2] - x, f[3] - y, f[4]]);
                     }
                 }
-                if let Some(found) = tree.slots[index].natural.as_deref()
+                if let Some(found) =
+                    (tree.slots[index].cold.as_ref()).and_then(|cold| cold.natural.as_ref())
                     && found.0 == key
                 {
                     return found.1;
@@ -1570,7 +1659,7 @@ impl LayoutTree<'_> {
                 .max(ratio.map_or(0., |ratio| output.size.width / ratio));
             if floating {
                 tree.naturals.push(index as u32);
-                tree.slots[index].natural = Some(Box::new((key, height)));
+                tree.slots[index].cold_mut().natural = Some((key, height));
             }
             height
         };
@@ -1652,7 +1741,14 @@ impl LayoutTree<'_> {
         if inputs.run_mode == RunMode::PerformLayout {
             let slot = &mut self.slots[usize::from(node)];
             slot.held = false;
-            slot.inputs = slot.boundary().then_some(inputs);
+            match slot.boundary() {
+                true => slot.cold_mut().inputs = Some(inputs),
+                false => {
+                    if let Some(cold) = &mut slot.cold {
+                        cold.inputs = None;
+                    }
+                }
+            }
         }
         let slot = &self.slots[usize::from(node)];
         let style = slot.taffy();
@@ -1779,7 +1875,7 @@ impl LayoutTree<'_> {
                             rest.push(candidate);
                             continue;
                         };
-                        tree.slots[child].room = Some(room);
+                        tree.slots[child].cold_mut().room = Some(room);
                         tree.roomed.push(child as u32);
                         let area = taffy::OofPositioningArea {
                             size: taffy::Size {
@@ -1835,8 +1931,15 @@ impl LayoutTree<'_> {
             let [x, y] = self.origin;
             self.floats.clear();
             match self.cache_get(node, &inputs) {
-                Some(output) if self.slots[index].spill.is_some() => {
-                    let (floats, ceiling, reach) = self.slots[index].spill.as_deref().unwrap();
+                Some(output)
+                    if (self.slots[index].cold.as_ref())
+                        .is_some_and(|cold| cold.spill.is_some()) =>
+                {
+                    let spill = self.slots[index]
+                        .cold
+                        .as_ref()
+                        .and_then(|cold| cold.spill.as_ref());
+                    let (floats, ceiling, reach) = spill.unwrap();
                     self.floats.extend(
                         floats
                             .iter()
@@ -1855,8 +1958,8 @@ impl LayoutTree<'_> {
                         .iter()
                         .map(|f| [f[0] - x, f[1] - y, f[2] - x, f[3] - y, f[4]])
                         .collect();
-                    self.slots[index].spill =
-                        Some(Box::new((floats, self.ceiling - y, self.reach - y)));
+                    self.slots[index].cold_mut().spill =
+                        Some((floats, self.ceiling - y, self.reach - y));
                     (self.ceiling, self.reach) =
                         (outer.0.max(self.ceiling), outer.1.max(self.reach));
                     self.cache_store(node, &inputs, output.clone());

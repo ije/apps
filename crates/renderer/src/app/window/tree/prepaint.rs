@@ -201,13 +201,10 @@ impl Tree {
         if let Some(order) = slot.style.z_index
             && let Some(list) = self.stacks.last_mut()
         {
-            slot.list_mask = window.content_mask();
+            let mask = window.content_mask();
+            slot.cold_mut().list_mask = mask;
             let depth = self.depths.last().map_or(0, |&(depth, _)| depth);
-            list.push((
-                order,
-                index,
-                window.cut_between(slot.list_mask, depth, usize::MAX),
-            ));
+            list.push((order, index, window.cut_between(mask, depth, usize::MAX)));
         }
         let [bounds, exact] = self.bounds(index, origin, window);
         let slot = &mut self.slots[index as usize];
@@ -225,7 +222,7 @@ impl Tree {
         self.lags.pop();
         self.flatten(index, mark, shifting, window);
         self.reach(index, window.scale_factor());
-        if self.slots[index as usize].escaped.is_some() {
+        if self.slots[index as usize].escaped().is_some() {
             self.unescape(window);
         }
         self.recorded(index, [regions, touched], listed, outer, window);
@@ -283,8 +280,16 @@ impl Tree {
             self.hidden.push(window.hide_viewports(cut as usize));
         }
         let slot = &mut self.slots[index as usize];
-        (slot.escaped, slot.cut, slot.unscroll) = (escaped, cut, unscroll);
+        (slot.cut, slot.unscroll) = (cut, unscroll);
         slot.cuts = cuts;
+        match escaped {
+            Some(_) => slot.cold_mut().escaped = escaped,
+            None => {
+                if let Some(cold) = &mut slot.cold {
+                    cold.escaped = None;
+                }
+            }
+        }
         depth
     }
 
@@ -313,7 +318,8 @@ impl Tree {
     // not go through the box. Below a transform or an effect, paint leaves out no box.
     fn unpainted(&self, slot: &Slot) -> bool {
         slot.culled == self.paints.0
-            || slot.culled != u32::MAX && slot.chunk.is_none_or(|chunk| chunk.pass != self.paints.0)
+            || slot.culled != u32::MAX
+                && (slot.chunk == NONE || self.chunks[slot.chunk as usize].pass != self.paints.0)
     }
 
     // The box was calm in the last pass, or in the pass `visited` that last went through it: a skip or a shift of
@@ -357,14 +363,14 @@ impl Tree {
             (Some(list), Some(at)) => &list[at.min(list.len())..],
             _ => &[],
         };
-        if slot.listing.len() != list.len()
+        if slot.listing().len() != list.len()
             || slot
-                .listing
+                .listing()
                 .iter()
                 .zip(list)
                 .any(|(&at, entry)| at != entry.1)
         {
-            slot.listing = list.iter().map(|entry| entry.1).collect();
+            slot.cold_mut().listing = list.iter().map(|entry| entry.1).collect();
         }
         // A scroll container drives its offset in each prepaint, so a skip of a box around it asks if it rests.
         // The listed boxes in it take the cut of its viewport, which only its own prepaint gives.
@@ -503,7 +509,7 @@ impl Tree {
                 point(location.x + far.x, location.y + far.y),
             ]
         };
-        if let Some(corners) = slot.far[nested as usize].filter(|_| !self.full) {
+        if let Some(corners) = slot.far()[nested as usize].filter(|_| !self.full) {
             return placed(corners);
         }
         let visible = slot
@@ -528,7 +534,7 @@ impl Tree {
         let outset = slot.style.clips_past_padding().cloned();
         if !visible.x && !visible.y && outset.is_none() {
             let corners = self.painted(index, nested, scale, [near, far]);
-            self.slots[index as usize].far[nested as usize] = Some(corners);
+            self.slots[index as usize].cold_mut().far[nested as usize] = Some(corners);
             return placed(corners);
         }
         // Without `nested`, only anonymous line boxes, which have no hooks, hold content of the scroll container.
@@ -598,7 +604,7 @@ impl Tree {
             },
         );
         let corners = self.painted(index, nested, scale, [near, far]);
-        self.slots[index as usize].far[nested as usize] = Some(corners);
+        self.slots[index as usize].cold_mut().far[nested as usize] = Some(corners);
         placed(corners)
     }
 
@@ -788,7 +794,7 @@ impl Tree {
             }
             _ => None,
         };
-        let chunk = match (above.chunk, slot.chunk) {
+        let chunk = match (self.chunk(parent), self.chunk(index)) {
             (Some(outer), Some(chunk))
                 if outer.pass == self.paints.0
                     && chunk.pass != outer.pass
@@ -815,9 +821,11 @@ impl Tree {
             _ => None,
         };
         // No prepaint went through the box since the one of its regions, or its chunk, as the copies of its parent show.
+        if chunk.is_some() {
+            self.set_chunk(index, chunk);
+        }
         let slot = &mut self.slots[index as usize];
         if let Some(chunk) = chunk {
-            slot.chunk = Some(chunk);
             (slot.calm, slot.since) = (
                 self.prepaints.wrapping_sub(1),
                 chunk.prepass.wrapping_add(1),
@@ -923,7 +931,7 @@ impl Tree {
             && let Some(list) = self.stacks.last_mut()
         {
             let mask = window.content_mask();
-            self.slots[index as usize].list_mask = mask;
+            self.slots[index as usize].cold_mut().list_mask = mask;
             let depth = self.depths.last().map_or(0, |&(depth, _)| depth);
             list.push((order, index, window.cut_between(mask, depth, usize::MAX)));
         }
@@ -948,7 +956,7 @@ impl Tree {
             // Paint copies the box, or leaves it out, as it left it out in the last paint. Below a transform or an
             // effect, paint leaves out no box.
             && (slot.hooks.is_none() && slot.children.is_empty()
-                || (slot.chunk).is_some_and(|chunk| {
+                || self.chunk(index).is_some_and(|chunk| {
                 let since = match self.ran(index, visited) {
                     true => slot.since,
                     false => self.prepaints,
@@ -1028,7 +1036,7 @@ impl Tree {
                     false => slot.lag += by,
                 }
                 self.shifting &= slot.flat;
-                if slot.escaped.is_some() {
+                if slot.escaped().is_some() {
                     self.unescape(window);
                 }
                 let min = |a: Option<usize>, b: Option<usize>| {
@@ -1082,7 +1090,7 @@ impl Tree {
                 self.remap(index, first..last, None, (pass, regions[0], start), touched);
                 let slot = &mut self.slots[index as usize];
                 self.shifting &= slot.flat;
-                if slot.escaped.is_some() {
+                if slot.escaped().is_some() {
                     self.unescape(window);
                 }
                 let min = |a: Option<usize>, b: Option<usize>| {
@@ -1129,7 +1137,7 @@ impl Tree {
         if moved || self.slots[index as usize].lively {
             self.reach(index, window.scale_factor());
         }
-        if self.slots[index as usize].escaped.is_some() {
+        if self.slots[index as usize].escaped().is_some() {
             self.unescape(window);
         }
         self.delta = parent;
@@ -1313,7 +1321,7 @@ impl Tree {
         window: &Window,
     ) -> bool {
         let depth = self.depths.last().map_or(0, |&(depth, _)| depth);
-        let listing = &self.slots[index as usize].listing;
+        let listing = self.slots[index as usize].listing();
         (listing.is_empty() || !self.stacks.is_empty())
             && listing.iter().all(|&at| {
                 let slot = &self.slots[at as usize];
@@ -1326,16 +1334,16 @@ impl Tree {
                     false => self.prepaints,
                 };
                 // Paint leaves out a box outside its mask, and an out-of-flow box has the mask of its containing block.
-                let mask = match slot.escaped {
+                let mask = match slot.escaped() {
                     Some(mask) => moved_mask(mask, by, Clip::default(), Clip::default()),
                     None => window.cut_between(
-                        moved_mask(slot.list_mask, by, was, now),
+                        moved_mask(slot.list_mask(), by, was, now),
                         depth,
                         usize::MAX,
                     ),
                 };
                 slot.listed
-                    && (slot.chunk.is_some_and(|chunk| {
+                    && (self.chunk(at).is_some_and(|chunk| {
                         chunk.translates
                             && chunk.pass == self.paints.0
                             && since <= chunk.prepass.wrapping_add(1)
@@ -1346,7 +1354,8 @@ impl Tree {
 
     // Lists again the boxes that a skip of a box kept, and moves them as `relists` checked.
     fn relist(&mut self, index: u32, visited: Option<u32>, (by, was, now): Mv, window: &Window) {
-        let listing = mem::take(&mut self.slots[index as usize].listing);
+        let listing = (self.slots[index as usize].cold.as_mut())
+            .map_or_else(Default::default, |cold| mem::take(&mut cold.listing));
         let depth = self.depths.last().map_or(0, |&(depth, _)| depth);
         for &at in &listing {
             if by != Point::default() {
@@ -1355,18 +1364,21 @@ impl Tree {
             let slot = &mut self.slots[at as usize];
             if by != Point::default() {
                 slot.ahead += by;
-                slot.list_mask = moved_mask(slot.list_mask, by, was, now);
-                slot.escaped = slot
+                let cold = slot.cold_mut();
+                cold.list_mask = moved_mask(cold.list_mask, by, was, now);
+                cold.escaped = cold
                     .escaped
                     .map(|mask| moved_mask(mask, by, Clip::default(), Clip::default()));
             }
-            let mask = window.cut_between(slot.list_mask, depth, usize::MAX);
+            let mask = window.cut_between(slot.list_mask(), depth, usize::MAX);
             if let (Some(order), Some(list)) = (slot.style.z_index, self.stacks.last_mut()) {
                 list.push((order, at, mask));
             }
             self.calm(at, visited);
         }
-        self.slots[index as usize].listing = listing;
+        if !listing.is_empty() {
+            self.slots[index as usize].cold_mut().listing = listing;
+        }
     }
 
     // `kept`: the box and its mask stayed since the last pass, or moved together by a scroll offset.

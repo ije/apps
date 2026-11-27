@@ -16,7 +16,7 @@ impl Tree {
     // An out-of-flow box escapes the clips of the scroll viewports inside its containing block.
     fn paint_node(&mut self, index: u32, listed: bool, window: &mut Window) {
         let slot = &self.slots[index as usize];
-        if slot.escaped.is_some() && (slot.cut as usize) < window.depth() {
+        if slot.escaped().is_some() && (slot.cut as usize) < window.depth() {
             let depth = slot.cut as usize;
             window.with_cuts_paused(depth, |window| self.paint_box_node(index, listed, window));
             return;
@@ -27,8 +27,8 @@ impl Tree {
     fn paint_box_node(&mut self, index: u32, listed: bool, window: &mut Window) {
         let slot = &self.slots[index as usize];
         let escaped = match slot.style.escape == Escape::OUTLINE {
-            true => self.masks.last().copied().or(slot.escaped),
-            false => slot.escaped,
+            true => self.masks.last().copied().or(slot.escaped()),
+            false => slot.escaped(),
         }
         .map(|mask| window.group_clipped(mask));
         // A layers node paints the z-indexed boxes of its stacking context, whose reach holds them.
@@ -54,8 +54,8 @@ impl Tree {
         let foreign = slot.style.escape & !Escape::OUTLINE != 0;
         // No prepaint since the chunk's paint went through the box. A layers node paints boxes that are not in it,
         // so they copy their own chunks.
-        let copy = slot
-            .chunk
+        let copy = self
+            .chunk(index)
             .filter(|chunk| {
                 !matches!(slot.kind, Kind::Layers(_))
                     && !self.checked()
@@ -113,16 +113,19 @@ impl Tree {
                 mask,
                 area,
             };
-            self.slots[index as usize].chunk = Some(Chunk {
-                pass: self.paints.0,
-                span,
-                key,
-                at,
-                mask,
-                area,
-                origin: output,
-                ..chunk
-            });
+            self.set_chunk(
+                index,
+                Some(Chunk {
+                    pass: self.paints.0,
+                    span,
+                    key,
+                    at,
+                    mask,
+                    area,
+                    origin: output,
+                    ..chunk
+                }),
+            );
             if foreign {
                 window.cull();
             }
@@ -203,7 +206,7 @@ impl Tree {
         #[cfg(debug_assertions)]
         if copy.is_some() {
             for (at, chunk) in self.copied.pop().unwrap_or_default().into_iter().rev() {
-                self.slots[at as usize].chunk = chunk;
+                self.set_chunk(at, chunk);
             }
         }
         #[cfg(not(debug_assertions))]
@@ -259,10 +262,13 @@ impl Tree {
             _ => fresh,
         };
         #[cfg(debug_assertions)]
-        if let Some(copied) = self.copied.last_mut() {
-            copied.push((index, self.slots[index as usize].chunk));
+        {
+            let chunk = self.chunk(index);
+            if let Some(copied) = self.copied.last_mut() {
+                copied.push((index, chunk));
+            }
         }
-        self.slots[index as usize].chunk = fresh;
+        self.set_chunk(index, fresh);
         if foreign {
             window.cull();
         }

@@ -760,7 +760,7 @@ pub(crate) fn css_background(
             let tiled = (axis.is_none()
                 && plain
                 && repeats.contains(&true)
-                && radii.is_zero()
+                && (radii.is_zero() || window.content_mask().radii.is_zero())
                 && (canvas && repeated
                     || [[tw, x], [th, y]]
                         .into_iter()
@@ -807,7 +807,12 @@ pub(crate) fn css_background(
             }
             super::super::effects::gradient::push_bits(&mut inputs, [width, height], &units);
             let exact = [tw, th, offset[0], offset[1]];
-            for value in within.iter().chain(if explicit { &exact[..] } else { &[] }) {
+            // With the scale, the inputs give the size of the raster.
+            for value in within
+                .iter()
+                .chain(if explicit { &exact[..] } else { &[] })
+                .chain([&scale])
+            {
                 inputs.push_str(&value.to_bits().to_string());
                 inputs.push('\0');
             }
@@ -815,11 +820,8 @@ pub(crate) fn css_background(
             let mut store = view.store.borrow_mut();
             let dom = store.state(view.id);
             let key = (id, slot * 64 + raster);
-            let fits = |image: &renderer::RenderImage| {
-                [image.size().width, image.size().height].map(|side| side as u32) == [rw, rh]
-            };
             let entry = dom.rasters.backgrounds.get(&key);
-            if entry.is_none_or(|(old, image)| old != &inputs || !fits(image)) {
+            if entry.is_none_or(|(old, _)| old != &inputs) {
                 let texts = explicit.then(|| {
                     (
                         format!("{tw}px {th}px"),
@@ -838,7 +840,7 @@ pub(crate) fn css_background(
                             .rasters
                             .gradients
                             .iter()
-                            .rposition(|(old, image)| old == &inputs && fits(image))?;
+                            .rposition(|(old, _)| old == &inputs)?;
                         let cached = dom.rasters.gradients.remove(at);
                         dom.rasters.gradients.push(cached.clone());
                         Some(cached.1)
@@ -861,14 +863,23 @@ pub(crate) fn css_background(
                         false => super::super::effects::gradient::gradient_svg(
                             &kind, &body, size, position, &repeat, units, width, height, within,
                         )
-                        .and_then(|source| super::super::raster::svg::svg_gradient(source, rw, rh)),
+                        .and_then(|(svg, p3, step)| {
+                            // A smooth gradient rasters at fewer pixels, and the GPU scales it up.
+                            let coarse = match axis.is_none() && tiled.is_none() {
+                                true => (step * scale).clamp(1., 8.),
+                                false => 1.,
+                            };
+                            let [rw, rh] =
+                                [rw, rh].map(|side| (side as f32 / coarse).ceil() as u32);
+                            super::super::raster::svg::svg_gradient((svg, p3), rw, rh)
+                        }),
                     }?;
                     const LIMIT: u32 = 8 << 20;
-                    if new && rw * rh * 4 <= LIMIT / 4 {
+                    let bytes = |image: &renderer::RenderImage| {
+                        image.size().width as u32 * (image.size().height as u32) * 4
+                    };
+                    if new && bytes(&image) <= LIMIT / 4 {
                         dom.rasters.gradients.push((inputs.clone(), image.clone()));
-                        let bytes = |image: &renderer::RenderImage| {
-                            image.size().width as u32 * (image.size().height as u32) * 4
-                        };
                         let mut total: u32 = dom
                             .rasters
                             .gradients
@@ -910,30 +921,39 @@ pub(crate) fn css_background(
                     let at = (at * scale).round() / scale;
                     px(at + cell * ((f32::from(low) - at) / cell).floor())
                 };
-                let mut top = match repeats[1] {
+                let top = match repeats[1] {
                     true => start(bounds.top(), y, th, ch, visible.top()),
                     false => px(snapped[1]),
                 };
-                while top < visible.bottom() {
-                    let mut left = match repeats[0] {
-                        true => start(bounds.left(), x, tw, cw, visible.left()),
-                        false => px(snapped[0]),
-                    };
-                    while left < visible.right() {
-                        let target = renderer::Rect::new(
-                            renderer::point(left, top),
-                            renderer::size(px(cw), px(ch)),
-                        );
-                        window.draw_image(clip, target, radii, image.clone(), false, false);
-                        if !repeats[0] {
+                // A rounded box clips its tiles as a whole.
+                let draw = |window: &mut renderer::Window| {
+                    let mut top = top;
+                    while top < visible.bottom() {
+                        let mut left = match repeats[0] {
+                            true => start(bounds.left(), x, tw, cw, visible.left()),
+                            false => px(snapped[0]),
+                        };
+                        while left < visible.right() {
+                            let target = renderer::Rect::new(
+                                renderer::point(left, top),
+                                renderer::size(px(cw), px(ch)),
+                            );
+                            let square = renderer::Radii::<renderer::Pixels>::default();
+                            window.draw_image(clip, target, square, image.clone(), false, false);
+                            if !repeats[0] {
+                                break;
+                            }
+                            left += px(cw);
+                        }
+                        if !repeats[1] {
                             break;
                         }
-                        left += px(cw);
+                        top += px(ch);
                     }
-                    if !repeats[1] {
-                        break;
-                    }
-                    top += px(ch);
+                };
+                match radii.is_zero() {
+                    true => draw(window),
+                    false => window.with_content_mask(renderer::Clip::rounded(bounds, radii), draw),
                 }
             } else if let Some((_, image)) = dom.rasters.backgrounds.get(&key) {
                 let (origin, size) = (bounds.origin, bounds.size);
@@ -1299,7 +1319,9 @@ pub(crate) fn border_image(
                             h,
                             [0., 0., w, h],
                         )
-                        .and_then(|source| super::super::raster::svg::svg_gradient(source, rw, rh))
+                        .and_then(|(svg, p3, _)| {
+                            super::super::raster::svg::svg_gradient((svg, p3), rw, rh)
+                        })
                     }
                     // Each part draws at the size of its tiles, into one image of three rows and columns, so
                     // tiles show no pixels of other parts at their edges, and SVG stays sharp.

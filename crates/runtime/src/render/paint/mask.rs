@@ -351,7 +351,7 @@ pub(crate) fn mask_svg<'a>(
                 });
             match svg
                 .as_ref()
-                .and_then(|(svg, _)| Some((svg, svg.find('>')?, svg.rfind("</svg>")?)))
+                .and_then(|(svg, ..)| Some((svg, svg.find('>')?, svg.rfind("</svg>")?)))
             {
                 Some((svg, start, end)) => svg[start + 1..end].to_owned(),
                 None => String::new(),
