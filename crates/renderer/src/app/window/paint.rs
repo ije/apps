@@ -324,7 +324,10 @@ impl Window {
         let caster = self.cover_bounds(bounds).to_array();
         let caster_radii = radii.scale(scale).to_array();
         let [top, bottom] = radii.shape_array();
-        for shadow in shadows.iter().filter(|shadow| shadow.inset == inset) {
+        // A shadow without color, like the default ring of Tailwind, draws nothing.
+        let shadows =
+            (shadows.iter()).filter(|shadow| shadow.inset == inset && shadow.color.a > 0.);
+        for shadow in shadows {
             let spread = shadow.spread_radius;
             let (shape, shape_radii) = if inset {
                 (
