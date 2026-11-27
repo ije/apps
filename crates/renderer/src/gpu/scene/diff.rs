@@ -420,19 +420,28 @@ impl Scene {
         }
     }
 
-    // A snapshot layer is read only when it draws otherwise than in the last frame: `last` holds the digest and
-    // the size of each snapshot layer of the last frame.
-    pub(crate) fn read_shots(&mut self, last: &mut FxHashMap<u64, (u64, [i32; 2])>) {
+    // A snapshot layer is read only when it draws otherwise than in the last frame: `last` holds the digest, the
+    // size and the paint pass of each snapshot layer of the last frame.
+    pub(crate) fn read_shots(&mut self, last: &mut FxHashMap<u64, (u64, [i32; 2], Option<u32>)>) {
         let mut shots = FxHashMap::default();
         for at in 0..self.shots.len() {
             let (key, layer) = (self.shots[at].key, self.shots[at].layer);
             let [x, y, width, height] = self.shots[at].region;
-            let mut hasher = rustc_hash::FxHasher::default();
-            let region = crate::rect(x as f32, y as f32, width as f32, height as f32);
-            self.digest(layer, region, &mut hasher);
-            let now = (hasher.finish(), [width, height]);
-            self.shots[at].read = last.get(&key) != Some(&now);
-            shots.insert(key, now);
+            let digest = || {
+                let mut hasher = rustc_hash::FxHasher::default();
+                let region = crate::rect(x as f32, y as f32, width as f32, height as f32);
+                self.digest(layer, region, &mut hasher);
+                hasher.finish()
+            };
+            // A layer that draws as the shot of the last paint keeps its digest.
+            let kept = (last.get(&key))
+                .filter(|(_, _, pass)| self.shots[at].same && *pass == self.last_pass)
+                .map(|&(digest, ..)| digest);
+            debug_assert!(kept.is_none_or(|kept| kept == digest()));
+            let now = (kept.unwrap_or_else(digest), [width, height]);
+            self.shots[at].read =
+                last.get(&key).map(|&(digest, size, _)| (digest, size)) != Some(now);
+            shots.insert(key, (now.0, now.1, self.pass));
         }
         *last = shots;
     }
@@ -441,7 +450,7 @@ impl Scene {
     pub(crate) fn keep_unread(
         &mut self,
         read: &[crate::Snapshot],
-        last: &mut FxHashMap<u64, (u64, [i32; 2])>,
+        last: &mut FxHashMap<u64, (u64, [i32; 2], Option<u32>)>,
     ) {
         for shot in &mut self.shots {
             if mem::take(&mut shot.read) && !read.iter().any(|read| read.key == shot.key) {

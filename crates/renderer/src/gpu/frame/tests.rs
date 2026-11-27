@@ -37,7 +37,7 @@ fn snapshot_layers_draw_into_their_own_target_when_they_are_read() {
     let mask = Clip::from(bounds([0., 0., 100., 100.]));
     let mut scene: Scene = Default::default();
     scene.push(Instance::new(BOX, bounds([0., 0., 10., 10.]), mask));
-    scene.push_offscreen();
+    scene.push_offscreen(None);
     scene.push(Instance::new(BOX, bounds([20., 20., 30., 10.]), mask));
     scene.pop_offscreen(Some((7, bounds([20., 20., 30., 10.]))));
     let mut frame = RenderFrame::default();

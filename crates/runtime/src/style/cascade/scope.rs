@@ -648,7 +648,7 @@ impl StyleCache {
                 continue;
             }
             let mut collected = blank();
-            let tailwind = self.tailwind.update(&mut sheets, doc, walk.walk.order());
+            let tailwind = self.tailwind.update(&mut sheets, doc, &walk.walk);
             if let Some(update) = &tailwind
                 && !(update.replaced.is_empty() && update.added.is_empty())
             {

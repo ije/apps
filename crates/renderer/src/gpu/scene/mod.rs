@@ -31,6 +31,10 @@ pub struct Scene {
     spare: Vec<SceneLayer>,
     keyed: Vec<(u64, usize)>,
     pub(crate) shots: Vec<Shot>,
+    // The shots of `last`, and for each open offscreen layer: its layer, the layer of `last` that the same shot
+    // had while this one draws the same so far, and how many instances and nested layers it checked.
+    last_shots: Vec<Shot>,
+    copying: Vec<(usize, Option<usize>, [usize; 2])>,
     // The window region that changed since the last drawn frame.
     pub(crate) damage: Damage,
     // What each layer draws, with its effects and its nested layers. 0 for a layer that the window doesn't show.
@@ -177,12 +181,14 @@ pub(crate) fn within(area: Rect<f32>, clip: Rect<f32>) -> bool {
     area.is_empty() || area.intersect(clip) == area
 }
 
-// A layer of `push_offscreen` whose pixels the backend reads when `read` is set.
+// A layer of `push_offscreen` whose pixels the backend reads when `read` is set. `same` when it draws as the shot
+// of the last paint with its key, in the same region.
 pub(crate) struct Shot {
     pub key: u64,
     pub layer: usize,
     pub region: [i32; 4],
     pub read: bool,
+    pub same: bool,
 }
 
 #[derive(Default)]
@@ -280,6 +286,8 @@ impl Default for Scene {
             spare: Vec::new(),
             keyed: Vec::new(),
             shots: Vec::new(),
+            last_shots: Vec::new(),
+            copying: Vec::new(),
             damage: Damage {
                 rects: Vec::new(),
                 whole: true,
@@ -336,7 +344,7 @@ impl Scene {
         self.unbake();
         self.active.clear();
         self.keyed.clear();
-        self.shots.clear();
+        self.copying.clear();
         self.damage.clear();
         self.damage.whole = true;
         self.shift = None;
@@ -352,6 +360,8 @@ impl Scene {
             mem::swap(&mut self.last_cuts, &mut self.cuts);
             self.cuts.clear();
             mem::swap(&mut self.last, &mut self.layers);
+            mem::swap(&mut self.last_shots, &mut self.shots);
+            self.shots.clear();
             // In reverse, so the next paint takes each layer's buffers back in order and the large root buffer
             // goes to the root. Else large buffers move to small layers and all spare layers grow to the largest.
             for mut layer in self.layers.drain(..).rev() {
@@ -362,6 +372,7 @@ impl Scene {
             self.layers.push(self.spare.pop().unwrap_or_default());
             return;
         }
+        self.shots.clear();
         for mut layer in self.layers.drain(1..).rev() {
             layer.clear();
             self.spare.push(layer);
@@ -799,20 +810,65 @@ impl Scene {
         });
     }
 
-    // A layer that no parent shows. Pair with pop_offscreen.
-    pub(crate) fn push_offscreen(&mut self) {
-        self.active.push(self.layers.len());
+    // A layer that no parent shows, for the shot `key`. Pair with pop_offscreen.
+    pub(crate) fn push_offscreen(&mut self, key: Option<u64>) {
+        let source = key
+            .filter(|_| self.last_pass.is_some())
+            .and_then(|key| self.last_shots.iter().find(|shot| shot.key == key));
+        let layer = self.layers.len();
+        self.copying
+            .push((layer, source.map(|shot| shot.layer), [0, 0]));
+        self.active.push(layer);
         self.layers.push(self.spare.pop().unwrap_or_default());
     }
 
     pub(crate) fn pop_offscreen(&mut self, shot: Option<(u64, Rect<f32>)>) {
+        self.follow(None);
+        let (_, source, _) = self.copying.pop().unwrap_or_default();
         if let (Some(layer), Some((key, bounds))) = (self.active.pop(), shot) {
+            let region = crate::geometry::region(bounds);
+            let (now, last) = (&self.layers[layer], source.and_then(|at| self.last.get(at)));
+            let same = last.is_some_and(|last| {
+                (last.instances.len(), last.nested.len()) == (now.instances.len(), now.nested.len())
+            }) && (self.last_shots.iter())
+                .any(|shot| (shot.key, Some(shot.layer), shot.region) == (key, source, region));
             self.shots.push(Shot {
                 key,
                 layer,
-                region: crate::geometry::region(bounds),
+                region,
                 read: false,
+                same,
             });
+        }
+    }
+
+    // Checks that the open offscreen layer still draws as the layer of `last` that it follows: what it drew since
+    // the last check equals that layer there, and `copy`, a span about to be copied into it, comes next there.
+    fn follow(&mut self, copy: Option<&Span>) {
+        let Some(&mut (layer, Some(source), [start, nested])) = self.copying.last_mut() else {
+            return;
+        };
+        if Some(&layer) != self.active.last() {
+            return;
+        }
+        let (now, last) = (&self.layers[layer], &self.last[source]);
+        let end = now.instances.len();
+        let same = now.nested.len() == nested
+            && (last.instances.get(start..end)).is_some_and(|old| {
+                crate::gpu::bytes(old) == crate::gpu::bytes(&now.instances[start..])
+            })
+            && copy.is_none_or(|span| {
+                (
+                    span.layer as usize,
+                    span.instances[0] as usize,
+                    span.nested[0] as usize,
+                ) == (source, end, nested)
+            });
+        let checked = copy.map_or([end, nested], |span| {
+            [span.instances[1], span.nested[1]].map(|at| at as usize)
+        });
+        if let Some(copying) = self.copying.last_mut() {
+            *copying = (layer, same.then_some(source), checked);
         }
     }
 
@@ -828,6 +884,7 @@ impl Scene {
                 layer,
                 region: crate::geometry::region(bounds),
                 read: false,
+                same: false,
             });
         }
     }
