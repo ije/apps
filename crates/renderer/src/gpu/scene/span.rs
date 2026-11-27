@@ -265,6 +265,7 @@ impl Scene {
         {
             return None;
         }
+        self.follow(Some(span));
         let mark = self.mark();
         let shift = |layer: usize| layer + mark.layers as usize - span.layers[0] as usize;
         for at in span.layers[0]..span.layers[1] {
@@ -377,6 +378,11 @@ impl Scene {
             || self.reads_removed(span)
         {
             return None;
+        }
+        if let Some(copying) = self.copying.last_mut()
+            && Some(&copying.0) == self.active.last()
+        {
+            copying.1 = None;
         }
         let mark = self.mark();
         let shift = |layer: usize| layer + mark.layers as usize - span.layers[0] as usize;

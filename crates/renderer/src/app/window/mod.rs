@@ -600,8 +600,8 @@ pub struct Window {
     planes: Vec<Vec<PlaneStart>>,
     // The transforms and the clip of each `with_hit_base` around the current box.
     hit_bases: Vec<(Option<Rc<HitTransform>>, Rect)>,
-    // The digest and the size of each snapshot layer of the last frame.
-    shots: FxHashMap<u64, (u64, [i32; 2])>,
+    // The digest, the size and the paint pass of each snapshot layer of the last frame.
+    shots: FxHashMap<u64, (u64, [i32; 2], Option<u32>)>,
     opacity: f32,
     // The scale of the transforms of the effects around the current paint.
     transform_scale: f32,
@@ -1898,7 +1898,7 @@ impl Window {
             }
             key
         });
-        self.scene.push_offscreen();
+        self.scene.push_offscreen(key);
         // The layer is no part of the page, so the clips and the opacity around it don't apply.
         self.push_content_mask(unbounded_mask());
         let (opacity, text_clip) = (mem::replace(&mut self.opacity, 1.), self.text_clip.take());

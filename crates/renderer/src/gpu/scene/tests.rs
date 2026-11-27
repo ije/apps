@@ -533,7 +533,7 @@ fn digests_follow_what_a_layer_draws_and_not_where() {
         // Like the window, the layer has an open clip.
         let mask = Clip::from(bounds([-1e6, -1e6, 2e6, 2e6]));
         let mut scene: Scene = Default::default();
-        scene.push_offscreen();
+        scene.push_offscreen(None);
         let mut instance = Instance::new(BOX, bounds([at + 5., 5., 10., 10.]), mask);
         instance.color = [red, 0., 0., 1.];
         scene.push(instance);
@@ -549,6 +549,61 @@ fn digests_follow_what_a_layer_draws_and_not_where() {
     };
     assert_eq!(digest(0., 1.), digest(40., 1.));
     assert_ne!(digest(0., 1.), digest(0., 0.5));
+}
+
+#[test]
+fn shots_that_draw_as_in_the_last_paint_are_the_same() {
+    let mask = Clip::from(bounds([-1e6, -1e6, 2e6, 2e6]));
+    let at = |x: f32| Instance::new(BOX, bounds([x, 5., 10., 10.]), mask);
+    let mut scene = Scene::default();
+    let mut spans: Vec<Span> = Vec::new();
+    let mut last = FxHashMap::default();
+    // Each paint gives the order of the spans to copy, or `None` to paint them again, and the region.
+    let mut paint = |pass: u32, order: Option<[usize; 2]>, color: f32, x: f32| {
+        scene.begin_paint(pass, &mut Vec::new());
+        scene.push_offscreen(Some(1));
+        let mut own = at(0.);
+        own.color = [color, 0., 0., 1.];
+        scene.push(own);
+        let old = mem::take(&mut spans);
+        for index in 0..2 {
+            let mark = scene.mark();
+            let span = match order {
+                Some(order) => scene.replay(&old[order[index]]).unwrap(),
+                None => {
+                    scene.push(at(20. + index as f32 * 20.));
+                    scene.span(mark).unwrap()
+                }
+            };
+            spans.push(span);
+        }
+        scene.pop_offscreen(Some((1, bounds([x, 0., 100., 100.]))));
+        scene.read_shots(&mut last);
+        let same = (scene.shots[0].same, scene.shots[0].read);
+        scene.diff(Some(&[]));
+        scene.drawn();
+        scene.clear();
+        same
+    };
+    assert_eq!(paint(1, None, 1., 0.), (false, true));
+    assert_eq!(paint(2, Some([0, 1]), 1., 0.), (true, false), "copies");
+    assert_eq!(paint(3, None, 1., 0.), (true, false), "the same paint");
+    assert_eq!(
+        paint(4, Some([1, 0]), 1., 0.),
+        (false, true),
+        "copies in another order"
+    );
+    assert_eq!(
+        paint(5, Some([0, 1]), 0.5, 0.),
+        (false, true),
+        "another color"
+    );
+    assert_eq!(
+        paint(6, Some([0, 1]), 0.5, 10.),
+        (false, true),
+        "another region"
+    );
+    assert_eq!(paint(7, Some([0, 1]), 0.5, 10.), (true, false));
 }
 
 #[test]
