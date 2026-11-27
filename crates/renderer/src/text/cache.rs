@@ -165,6 +165,11 @@ impl Cache {
         if let Some(old) = state.entries.insert(hash, entry) {
             state.bytes -= old.bytes;
         }
+        // No frame sweeps the cache of a worker canvas, so a limit keeps it bounded.
+        if state.bytes > 4 * BUDGET {
+            state.entries.clear();
+            state.bytes = 0;
+        }
         (text, line, breaks)
     }
 }
@@ -292,6 +297,34 @@ mod tests {
         }
         assert!(cache.0.borrow().entries.is_empty());
         assert_eq!(cache.0.borrow().bytes, 0);
+    }
+
+    #[test]
+    fn a_cache_without_frames_stays_bounded() {
+        let text = crate::TextSystem::new();
+        let (cache, fonts) = (&text.cache, &*text.fonts);
+        let font = text.face(&crate::Font::new("Helvetica"));
+        let word = "x".repeat(4096);
+        let spans = [Span {
+            len: word.len() + 8,
+            font,
+            size: px(16.),
+            letter_spacing: px(0.),
+            word_spacing: px(0.),
+            inset: [px(0.); 2],
+            nowrap: false,
+        }];
+        for index in 0..256 {
+            cache.get(
+                fonts,
+                &format!("{word}{index:08}"),
+                px(16.),
+                &spans,
+                None,
+                None,
+            );
+            assert!(cache.0.borrow().bytes <= 4 * BUDGET);
+        }
     }
 
     #[test]
