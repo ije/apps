@@ -15,3 +15,7 @@ see @COMPATIBILITY_ELECTRON.md
 ## Node Integration
 
 see @COMPATIBILITY_NODEJS.md
+
+## Windows
+
+see @COMPATIBILITY_WINDOWS.md
