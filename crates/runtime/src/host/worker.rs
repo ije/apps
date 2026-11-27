@@ -45,7 +45,7 @@ pub(crate) fn run(mut job: Job) -> Result<()> {
     }
     *job.running
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = api.terminator();
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(api.terminator());
     let _clear = Clear(job.running.clone());
     engine.eval("for (const name of ['document', 'window', 'screen', 'screenX', 'screenY', 'screenLeft', 'screenTop', 'outerWidth', 'outerHeight', 'localStorage', 'sessionStorage']) delete globalThis[name]; globalThis.self=globalThis;", "apps:worker-scope")?;
     if job.native {

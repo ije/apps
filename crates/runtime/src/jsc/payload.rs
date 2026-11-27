@@ -60,7 +60,7 @@ impl Drop for Taken {
 // or a WebAssembly.Module. Returns the ID that the next operation passes to `held`.
 pub(crate) fn take(api: &JavaScriptCore, ctx: Ptr, buffer: Ptr) -> Option<u64> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let functions = api.contents?;
+    let functions = api.contents;
     let contents = unsafe { (functions.take)(ctx, buffer) };
     if contents.is_null() {
         return None;
@@ -398,10 +398,10 @@ pub(crate) fn output(api: &JavaScriptCore, ctx: Ptr, mut payload: Payload) -> Pt
 fn buffer_object(api: &JavaScriptCore, ctx: Ptr, bytes: bytes::Bytes) -> (Ptr, bool) {
     let taken = taken(&bytes);
     unsafe {
-        if let (Some((contents, kind)), Some(functions)) = (taken, api.contents)
+        if let Some((contents, kind)) = taken
             && kind != MOVED
         {
-            let object = (functions.make)(ctx, contents);
+            let object = (api.contents.make)(ctx, contents);
             if !object.is_null() {
                 return (object, kind == SHARED_BUFFER);
             }

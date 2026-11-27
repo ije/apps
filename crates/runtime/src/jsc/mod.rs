@@ -162,8 +162,8 @@ pub struct JavaScriptCore {
     inspectable: unsafe extern "C" fn(Ptr, bool),
     pub(crate) extra_memory: unsafe extern "C" fn(Ptr, usize),
     // An older library has no such functions. Buffers are then copied, and shared buffers can't be sent.
-    contents: Option<payload::Contents>,
-    terminate: Option<unsafe extern "C" fn(Ptr)>,
+    contents: payload::Contents,
+    terminate: unsafe extern "C" fn(Ptr),
     set_name: unsafe extern "C" fn(Ptr, Ptr),
     execution_limit: Limit,
     create: unsafe extern "C" fn(Ptr, Ptr) -> Ptr,
@@ -386,6 +386,7 @@ impl JavaScriptCore {
         } else {
             path.with_file_name(aot::image_name(std::env::consts::OS))
         };
+        // The AOT runtime library is built without the inspector.
         INSPECTOR.get_or_init(|| unsafe {
             Some(Inspector {
                 connect: *library.get(b"JSGlobalContextConnectInspector\0").ok()?,
@@ -451,18 +452,13 @@ impl JavaScriptCore {
                 group: group.unwrap_or_else(|| group_create()),
                 inspectable: *library.get(b"JSGlobalContextSetInspectable\0")?,
                 extra_memory: *library.get(b"JSReportExtraMemoryCost\0")?,
-                terminate: library
-                    .get(b"JSContextGroupTerminate\0")
-                    .ok()
-                    .map(|function| *function),
-                contents: (|| {
-                    Some(payload::Contents {
-                        take: *library.get(b"JSObjectTakeContents\0").ok()?,
-                        bytes: *library.get(b"JSContentsGetBytes\0").ok()?,
-                        make: *library.get(b"JSObjectMakeWithContents\0").ok()?,
-                        release: *library.get(b"JSContentsRelease\0").ok()?,
-                    })
-                })(),
+                terminate: *library.get(b"JSContextGroupTerminate\0")?,
+                contents: payload::Contents {
+                    take: *library.get(b"JSObjectTakeContents\0")?,
+                    bytes: *library.get(b"JSContentsGetBytes\0")?,
+                    make: *library.get(b"JSObjectMakeWithContents\0")?,
+                    release: *library.get(b"JSContentsRelease\0")?,
+                },
                 set_name: *library.get(b"JSGlobalContextSetName\0")?,
                 execution_limit: *library.get(b"JSContextGroupSetExecutionTimeLimit\0")?,
                 group_release: *library.get(b"JSContextGroupRelease\0")?,
@@ -652,9 +648,8 @@ impl JavaScriptCore {
         over
     }
 
-    pub(crate) fn terminator(&self) -> Option<Terminator> {
-        self.terminate
-            .map(|terminate| Terminator(self.group as usize, terminate))
+    pub(crate) fn terminator(&self) -> Terminator {
+        Terminator(self.group as usize, self.terminate)
     }
 
     pub(crate) fn shrink_pending(&self) -> bool {
