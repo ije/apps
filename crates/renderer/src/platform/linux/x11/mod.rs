@@ -4,10 +4,7 @@ mod window;
 use super::input::{self, Clicks, Composer, Ime, NOTCH_LINES};
 use super::{Display, Opened};
 use crate::{Button, Cursor, Event, Modifiers, Pixels, Point, Rect, WindowOptions};
-use crate::{
-  platform::{Callbacks, events},
-  point, px, size,
-};
+use crate::{platform::Callbacks, point, px, size};
 use anyhow::{Context as _, Result, ensure};
 use rustc_hash::FxHashMap;
 use std::os::fd::{AsRawFd as _, RawFd};
@@ -232,6 +229,8 @@ pub(super) struct Client {
   root: xproto::Window,
   scale: f32,
   refresh: Duration,
+  // In points, the primary monitor first.
+  monitors: RefCell<Vec<Rect>>,
   live: RefCell<Live>,
   clipboard: clipboard::Selection,
 }
@@ -312,6 +311,31 @@ fn refresh_of(xcb: &XCBConnection, root: xproto::Window) -> Duration {
     }
     _ => Duration::from_micros(16_667),
   }
+}
+
+// The RandR monitors, primary first, or else the whole screen.
+fn monitors_of(xcb: &XCBConnection, screen: usize, scale: f32) -> Vec<Rect> {
+  let root = &xcb.setup().roots[screen];
+  let reply = xcb
+    .randr_get_monitors(root.root, true)
+    .ok()
+    .and_then(|cookie| cookie.reply().ok());
+  let mut monitors = reply.map(|reply| reply.monitors).unwrap_or_default();
+  monitors.sort_by_key(|monitor| !monitor.primary);
+  let mut rects: Vec<Rect> = monitors
+    .iter()
+    .map(|monitor| {
+      let [x, y] = [monitor.x, monitor.y].map(f32::from);
+      let [width, height] = [monitor.width, monitor.height].map(f32::from);
+      Rect::new(point(px(x), px(y)), size(px(width), px(height))).map(|side| side / scale)
+    })
+    .collect();
+  if rects.is_empty() {
+    let [width, height] =
+      [root.width_in_pixels, root.height_in_pixels].map(|side| px(f32::from(side) / scale));
+    rects.push(Rect::new(point(px(0.), px(0.)), size(width, height)));
+  }
+  rects
 }
 
 // Xft.dpi when set, else the density of the primary monitor in twelfths, from 1 to 20.
@@ -401,6 +425,12 @@ impl Client {
     let database = x11rb::resource_manager::new_from_default(&xcb)?;
     let themes = x11rb::cursor::Handle::new(&xcb, screen, &database)?.reply()?;
     let (scale, refresh) = (scale_of(&xcb, root), refresh_of(&xcb, root));
+    let monitors = RefCell::new(monitors_of(&xcb, screen, scale));
+    let changes = randr::NotifyMask::SCREEN_CHANGE
+      | randr::NotifyMask::CRTC_CHANGE
+      | randr::NotifyMask::OUTPUT_CHANGE;
+    // Without RandR the screen stays one monitor.
+    let _ = xcb.randr_select_input(root, changes);
     let found = scrollers(&xcb, &FxHashMap::default());
     let xcb = Rc::new(xcb);
     let clipboard = clipboard::Selection::open()?;
@@ -438,7 +468,22 @@ impl Client {
       root,
       scale,
       refresh,
+      monitors,
     }))
+  }
+
+  // The monitor with most of the window, or else the primary one.
+  fn monitor(&self, window: Rect) -> Rect {
+    let monitors = self.monitors.borrow();
+    let area = |monitor: &Rect| {
+      let shared = monitor.intersect(window).size;
+      shared.width.0 * shared.height.0
+    };
+    let best = monitors.iter().max_by(|a, b| area(a).total_cmp(&area(b)));
+    let best = best
+      .filter(|monitor| area(monitor) > 0.)
+      .or(monitors.first());
+    best.copied().unwrap_or_default()
   }
 
   fn window(&self, id: xproto::Window) -> Option<Rc<Toplevel>> {
@@ -714,7 +759,7 @@ impl Client {
           live.drag.read = true;
           live.drag.at
         };
-        events().input(window.calls, Event::FileEnter { at, paths });
+        super::send(window.calls, Event::FileEnter { at, paths });
       }
       XEvent::FocusIn(focus) => {
         let window = self.window(focus.event)?;
@@ -756,7 +801,7 @@ impl Client {
         }
         let focus = live.focus?;
         drop(live);
-        events().input(
+        super::send(
           self.window(focus)?.calls,
           Event::ModifiersChanged { modifiers: now.0 },
         );
@@ -824,7 +869,7 @@ impl Client {
           detail => {
             let button = button(detail)?;
             let clicks = self.live.borrow_mut().clicks.press(button, at);
-            events().input(
+            super::send(
               window.calls,
               Event::PointerDown {
                 at,
@@ -841,7 +886,7 @@ impl Client {
           .flags
           .contains(xinput::PointerEventFlags::POINTER_EMULATED)
         {
-          events().input(window.calls, wheel_event(at, wheel, modifiers));
+          super::send(window.calls, wheel_event(at, wheel, modifiers));
         }
       }
       XEvent::XinputButtonRelease(release) => {
@@ -850,7 +895,7 @@ impl Client {
         let clicks = self.live.borrow().clicks.count;
         let at = self.at(release.event_x, release.event_y);
         let modifiers = mask_modifiers(release.mods.effective as u16);
-        events().input(
+        super::send(
           window.calls,
           Event::PointerUp {
             at,
@@ -881,7 +926,7 @@ impl Client {
           let held = pressed
             .into_iter()
             .find_map(|(bit, button)| (buttons & bit != 0).then_some(button));
-          events().input(
+          super::send(
             window.calls,
             Event::PointerMove {
               at,
@@ -891,7 +936,7 @@ impl Client {
           );
         }
         if let Some(scroll) = scroll {
-          events().input(window.calls, wheel_event(at, scroll, modifiers));
+          super::send(window.calls, wheel_event(at, scroll, modifiers));
         }
       }
       XEvent::XinputEnter(enter) if enter.mode == xinput::NotifyMode::NORMAL => {
@@ -902,7 +947,10 @@ impl Client {
         self.forget_scrolls();
         self.live.borrow_mut().hover = None;
         let at = self.at(leave.event_x, leave.event_y);
-        events().input(self.window(leave.event)?.calls, Event::PointerLeave { at });
+        super::send(self.window(leave.event)?.calls, Event::PointerLeave { at });
+      }
+      XEvent::RandrScreenChangeNotify(_) | XEvent::RandrNotify(_) => {
+        *self.monitors.borrow_mut() = monitors_of(&self.xcb, self.screen, self.scale);
       }
       XEvent::XinputHierarchy(_) => {
         let old = std::mem::take(&mut self.live.borrow_mut().scrollers);
@@ -997,11 +1045,11 @@ impl Client {
         atoms.DndStatus,
         [message.window, u32::from(files), 0, 0, action],
       );
-      events().input(window.calls, Event::FileOver { at });
+      super::send(window.calls, Event::FileOver { at });
     } else if kind == atoms.DndLeave {
       let at = std::mem::take(&mut self.live.borrow_mut().drag).at;
-      events().input(window.calls, Event::FileOver { at });
-      events().input(window.calls, Event::FileLeave);
+      super::send(window.calls, Event::FileOver { at });
+      super::send(window.calls, Event::FileLeave);
     } else if kind == atoms.DndDrop {
       let drag = std::mem::take(&mut self.live.borrow_mut().drag);
       self.tell(
@@ -1009,7 +1057,7 @@ impl Client {
         atoms.DndFinished,
         [message.window, u32::from(drag.read), atoms.DndCopy, 0, 0],
       );
-      events().input(
+      super::send(
         window.calls,
         if drag.read {
           Event::FileDrop { at: drag.at }
@@ -1178,10 +1226,7 @@ impl Display for Client {
   }
 
   fn display_bounds(&self) -> Option<Rect> {
-    let screen = &self.xcb.setup().roots[self.screen];
-    let [width, height] = [screen.width_in_pixels, screen.height_in_pixels]
-      .map(|side| px(f32::from(side) / self.scale));
-    Some(Rect::new(point(px(0.), px(0.)), size(width, height)))
+    self.monitors.borrow().first().copied()
   }
 
   fn open(self: Rc<Self>, options: &WindowOptions, calls: Callbacks) -> Result<Opened> {

@@ -1,6 +1,6 @@
 use super::Client;
 use crate::platform::linux::gpu::{Atlas, Capture, Drawn, Renderer};
-use crate::platform::linux::{Action, Display as _, Native, run_after};
+use crate::platform::linux::{Action, Native, run_after};
 use crate::{
   Pixels, Rect, Scene, Size, WindowOptions, WindowState,
   platform::{Callbacks, events},
@@ -405,8 +405,8 @@ impl Native for Toplevel {
     let display = self
       .client
       .upgrade()
-      .and_then(|client| client.display_bounds());
-    let display = display.unwrap_or_default();
+      .map(|client| client.monitor(shape.bounds))
+      .unwrap_or_default();
     WindowState {
       frame: shape.bounds,
       content: shape.bounds,
@@ -442,8 +442,13 @@ impl Native for Toplevel {
       let _ = sync::set_counter(&*client.xcb, counter, value);
       let _ = client.xcb.flush();
     }
-    if drawn == Drawn::Again {
-      events().appearance_changed(self.calls);
+    match drawn {
+      Drawn::Again => events().appearance_changed(self.calls),
+      Drawn::Retry(wait) => {
+        let calls = self.calls;
+        run_after(wait, move || events().appearance_changed(calls));
+      }
+      _ => {}
     }
     capture
   }

@@ -74,9 +74,9 @@ pub(super) fn press(
     repeat,
     ime: !changes.is_empty(),
   };
+  super::send_motion();
   let composing = || events().composition(callbacks).is_some();
-  let taken =
-    crate::native::key(callbacks.id, &event, &composing) || events().input(callbacks, event);
+  let taken = crate::native::key(callbacks.id, &event, &composing) || super::send(callbacks, event);
   for change in changes {
     change.apply(callbacks);
   }
@@ -91,9 +91,10 @@ pub(super) fn release(callbacks: Callbacks, key: Key, modifiers: Modifiers) {
     modifiers,
     ime: false,
   };
+  super::send_motion();
   let composing = || events().composition(callbacks).is_some();
   if !crate::native::key(callbacks.id, &event, &composing) {
-    events().input(callbacks, event);
+    super::send(callbacks, event);
   }
 }
 

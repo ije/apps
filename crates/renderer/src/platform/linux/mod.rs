@@ -8,7 +8,7 @@ mod wayland;
 mod x11;
 
 use super::single::Task;
-use crate::{Cursor, Pixels, Point, Rect, Scene, Size, WindowChange, WindowOptions};
+use crate::{Cursor, Event, Pixels, Point, Rect, Scene, Size, WindowChange, WindowOptions};
 use crate::{
   WindowState,
   platform::{Callbacks, events, lock},
@@ -41,6 +41,8 @@ struct Turn {
   // The call is `None` while it runs.
   watches: RefCell<Vec<(RawFd, i16, Option<Watcher>)>>,
   windows: RefCell<FxHashMap<u64, Weak<dyn Native>>>,
+  // The last pointer move, held until other input or the end of the turn, so a burst of moves dispatches once.
+  motion: RefCell<Option<(Callbacks, Event)>>,
 }
 
 thread_local! {
@@ -85,6 +87,41 @@ pub(crate) fn on_main() -> bool {
 /// Runs `f` in the next turn of the loop, outside the event being handled.
 pub(super) fn soon(f: impl FnOnce() + 'static) {
   TURN.with(|turn| turn.soon.borrow_mut().push_back(Box::new(f)));
+}
+
+/// Sends input to the window. Pointer moves merge until other input comes or the turn ends.
+pub(super) fn send(calls: Callbacks, event: Event) -> bool {
+  TURN.with(|turn| {
+    let held = turn.motion.take();
+    if let Event::PointerMove {
+      held: buttons,
+      modifiers,
+      ..
+    } = &event
+    {
+      let merges = held.as_ref().is_some_and(|(kept, last)| {
+        kept.id == calls.id
+          && matches!(last, Event::PointerMove { held, modifiers: before, .. }
+                        if held == buttons && before == modifiers)
+      });
+      if !merges && let Some((kept, last)) = held {
+        events().input(kept, last);
+      }
+      turn.motion.replace(Some((calls, event)));
+      return false;
+    }
+    if let Some((kept, last)) = held {
+      events().input(kept, last);
+    }
+    events().input(calls, event)
+  })
+}
+
+/// Sends the held pointer move.
+pub(super) fn send_motion() {
+  if let Some((calls, event)) = TURN.with(|turn| turn.motion.take()) {
+    events().input(calls, event);
+  }
 }
 
 pub(super) fn watch(fd: RawFd, write: bool, f: impl FnMut() -> bool + 'static) {
@@ -223,6 +260,7 @@ impl Platform {
           };
           task();
         }
+        send_motion();
         let now = Instant::now();
         loop {
           let task = match turn.due.borrow_mut().first_entry() {
@@ -234,7 +272,9 @@ impl Platform {
         if turn.done.get() || !display.prepare() {
           break;
         }
-        let busy = !turn.soon.borrow().is_empty() || !lock(&INBOX).is_empty();
+        let busy = turn.motion.borrow().is_some()
+          || !turn.soon.borrow().is_empty()
+          || !lock(&INBOX).is_empty();
         let next = turn
           .due
           .borrow()

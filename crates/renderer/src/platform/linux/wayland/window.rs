@@ -1,6 +1,6 @@
 use super::{Client, Hub, route};
 use crate::platform::linux::gpu::{Atlas, Capture, Drawn, Renderer};
-use crate::platform::linux::{Action, Display as _, Native, run_after, soon};
+use crate::platform::linux::{Action, Native, run_after, soon};
 use crate::{
   Pixels, Rect, Scene, Size, WindowOptions, WindowState,
   platform::{Callbacks, events},
@@ -377,7 +377,7 @@ impl Native for Surface {
     let display = self
       .client
       .upgrade()
-      .and_then(|client| client.display_bounds());
+      .and_then(|client| client.screen(&shape.outputs));
     let display = display.unwrap_or_default();
     WindowState {
       frame: bounds,
@@ -442,8 +442,13 @@ impl Native for Surface {
       _ if pace.presented.get() => self.roles.surface.commit(),
       _ => pace.waiting.set(false),
     }
-    if drawn == Drawn::Again {
-      events().appearance_changed(self.calls);
+    match drawn {
+      Drawn::Again => events().appearance_changed(self.calls),
+      Drawn::Retry(wait) => {
+        let calls = self.calls;
+        run_after(wait, move || events().appearance_changed(calls));
+      }
+      _ => {}
     }
     capture
   }
@@ -510,24 +515,26 @@ impl Client {
   }
 
   fn on_surface(&self, surface: &WlSurface, message: wl_surface::Event, _: &()) {
-    let Some(window) = self
-      .window_of(&surface.id())
-      .filter(|window| window.roles.fraction.is_none())
-    else {
+    let Some(window) = self.window_of(&surface.id()) else {
       return;
     };
+    // With fractional scales, the scale comes from its own object.
+    let integer = window.roles.fraction.is_none();
     let entered = matches!(message, wl_surface::Event::Enter { .. });
     match message {
-      wl_surface::Event::PreferredBufferScale { factor } => window.integer_scale(factor),
-      // Before version 6 the scale is the largest of the outputs the surface is on.
-      wl_surface::Event::Enter { output } | wl_surface::Event::Leave { output }
-        if surface.version() < 6 =>
-      {
+      wl_surface::Event::PreferredBufferScale { factor } if integer => {
+        window.integer_scale(factor);
+      }
+      wl_surface::Event::Enter { output } | wl_surface::Event::Leave { output } => {
         let largest = {
           let mut shape = window.shape.borrow_mut();
           shape.outputs.retain(|kept| *kept != output.id());
           if entered {
             shape.outputs.push(output.id());
+          }
+          // Before version 6 the scale is the largest of the outputs the surface is on.
+          if !integer || surface.version() >= 6 {
+            return;
           }
           let live = self.live.borrow();
           let on = live

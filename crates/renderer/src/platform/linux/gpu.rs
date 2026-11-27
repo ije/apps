@@ -14,6 +14,7 @@ use std::{
   num::NonZeroU64,
   rc::Rc,
   sync::Arc,
+  time::{Duration, Instant},
 };
 use wgpu::{BindGroup, BindGroupLayout, BindGroupLayoutEntry, BindingResource, BindingType};
 use wgpu::{Buffer, BufferUsages, Color, CurrentSurfaceTexture as Next, Device, Queue};
@@ -31,6 +32,8 @@ pub(super) type Capture = Option<Result<([u32; 2], Vec<u8>)>>;
 pub(super) enum Drawn {
   Shown,
   Again,
+  // Draw again after this wait.
+  Retry(Duration),
   Skipped,
 }
 
@@ -469,6 +472,8 @@ pub(super) struct Renderer {
   last: Option<Texture>,
   // The layers of the last frame that drew the whole window.
   whole_layers: usize,
+  // Failed recoveries in a row, and when the next one may run.
+  recovery: (u32, Instant),
 }
 
 // Copies of the last frame that start a frame: the offset of the source, and the region of the window.
@@ -505,6 +510,7 @@ impl Renderer {
       frame: RenderFrame::default(),
       last: None,
       whole_layers: 0,
+      recovery: (0, Instant::now()),
     })
   }
 
@@ -545,10 +551,27 @@ impl Renderer {
     let failed = |message: &str| capture.then(|| Err(anyhow!("{message}")));
     let lost = self.gpu.lost.load(Relaxed);
     let Some(surface) = self.surface.as_ref().filter(|_| !lost) else {
-      if let Err(error) = self.recover() {
-        eprintln!("apps: the GPU can't recover: {error:#}");
+      let (failures, next) = self.recovery;
+      let now = Instant::now();
+      if next > now {
+        return (Drawn::Skipped, failed("The GPU was lost"));
       }
-      return (Drawn::Again, failed("The GPU was lost"));
+      let drawn = match self.recover() {
+        Ok(()) => {
+          self.recovery.0 = 0;
+          Drawn::Again
+        }
+        // Each failure waits longer, from 250 ms up to 8 s.
+        Err(error) => {
+          if failures == 0 {
+            eprintln!("apps: the GPU can't recover: {error:#}");
+          }
+          let wait = Duration::from_millis(250 << failures.min(5));
+          self.recovery = (failures + 1, now + wait);
+          Drawn::Retry(wait)
+        }
+      };
+      return (drawn, failed("The GPU was lost"));
     };
     let window = [self.config.width, self.config.height];
     // The window keeps a copy of each frame, so a frame draws only its damage regions over the last one.

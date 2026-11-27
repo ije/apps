@@ -285,7 +285,7 @@ pub(super) struct Client {
 fn later(calls: Option<Callbacks>, event: Event) {
   if let Some(calls) = calls {
     soon(move || {
-      events().input(calls, event);
+      super::send(calls, event);
     });
   }
 }
@@ -598,7 +598,7 @@ impl Client {
       let calls = live.window(Some(&window)).map(|target| target.calls);
       drop(live);
       if let Some(calls) = calls {
-        events().input(calls, Event::FileEnter { at, paths });
+        super::send(calls, Event::FileEnter { at, paths });
       }
       false
     });
@@ -1057,7 +1057,7 @@ impl Client {
           } else if let Some(text) = pending {
             Ime::Commit(text).apply(calls);
           }
-          events().input(
+          super::send(
             calls,
             Event::PointerDown {
               at,
@@ -1254,6 +1254,37 @@ impl Client {
   }
 }
 
+impl Client {
+  // The first of `on` that the surface entered, or else the output at the origin, or else the first one announced.
+  pub(super) fn screen(&self, on: &[ObjectId]) -> Option<Rect> {
+    // Window states ask for this inside other calls, so it gives up instead of panicking on a borrow.
+    let live = self.live.try_borrow().ok()?;
+    let bounds = |screen: &Screen| {
+      let (at, pixels) = (screen.at?, screen.pixels?);
+      let scale = screen.scale.max(1) as f32;
+      let extent = size(
+        px(pixels.width as f32 / scale),
+        px(pixels.height as f32 / scale),
+      );
+      Some(Rect::new(point(px(at.x as f32), px(at.y as f32)), extent))
+    };
+    let entered = on.iter().find_map(|id| {
+      let (_, screen) = live
+        .screens
+        .values()
+        .find(|(output, _)| output.id() == *id)?;
+      bounds(screen)
+    });
+    entered.or_else(|| {
+      let known = live.screens.iter().filter_map(|(name, (_, screen))| {
+        let rect = bounds(screen)?;
+        Some(((rect.origin != Point::default(), *name), rect))
+      });
+      known.min_by_key(|(key, _)| *key).map(|(_, rect)| rect)
+    })
+  }
+}
+
 impl Display for Client {
   fn fd(&self) -> RawFd {
     self.conn.backend().poll_fd().as_raw_fd()
@@ -1387,17 +1418,7 @@ impl Display for Client {
   }
 
   fn display_bounds(&self) -> Option<Rect> {
-    // Window states ask for this inside other calls, so it gives up instead of panicking on a borrow.
-    let live = self.live.try_borrow().ok()?;
-    live.screens.values().find_map(|(_, screen)| {
-      let (at, pixels) = (screen.at?, screen.pixels?);
-      let scale = screen.scale.max(1) as f32;
-      let extent = size(
-        px(pixels.width as f32 / scale),
-        px(pixels.height as f32 / scale),
-      );
-      Some(Rect::new(point(px(at.x as f32), px(at.y as f32)), extent))
-    })
+    self.screen(&[])
   }
 
   fn open(self: Rc<Self>, options: &WindowOptions, calls: Callbacks) -> Result<Opened> {
