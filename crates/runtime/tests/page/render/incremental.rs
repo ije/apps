@@ -422,6 +422,43 @@ fn boxes_that_never_cull_keep_the_boxes_around_them() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn far_tiles_place_the_items_of_a_flexed_grid_at_its_new_size() {
+    // The grid of a tile takes the rest of its column, so a taller caption moves its item up.
+    let mut page = String::from(
+        "<style>body{margin:0;font:14px sans-serif}#g{display:grid;grid-template-columns:1fr 1fr;\
+         grid-auto-rows:200px;gap:10px}.t{display:flex;flex-direction:column}\
+         .s{flex:1;display:grid;place-items:center}</style><body><main id=g>",
+    );
+    for index in 0..30 {
+        page.push_str(&format!(
+            "<article class=t id=t{index}><div class=s><span id=r{index}>R</span></div>\
+             <p id=c{index} style='margin:0'>tile</p></article>"
+        ));
+    }
+    page.push_str("</main></body>");
+    let text = run_hidden(
+        r#"
+        const top = () => run("Math.round(document.getElementById('r25').getBoundingClientRect().y - document.getElementById('t25').getBoundingClientRect().y)");
+        await load('tiles.html');
+        await win.webContents.capturePage();
+        await run("document.getElementById('c25').style.height = '40px'");
+        for (let n = 0; n < 3; n++) await win.webContents.capturePage();
+        console.log('FAR ' + await top());
+        await run("document.getElementById('t25').scrollIntoView()");
+        for (let n = 0; n < 3; n++) await win.webContents.capturePage();
+        console.log('NEAR ' + await top());
+        "#,
+        &[("tiles.html", &page)],
+    );
+    let line = |prefix: &str| (text.lines()).find_map(|line| line.strip_prefix(prefix));
+    assert!(
+        line("FAR ").is_some() && line("FAR ") == line("NEAR "),
+        "the item of a far tile takes the new size of its grid: {text}"
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn cleared_blocks_far_below_floats_stay_spacers() {
     let mut page =
         String::from("<body id=body style='margin:0'><p id=o style='margin:0'>x</p><div>");

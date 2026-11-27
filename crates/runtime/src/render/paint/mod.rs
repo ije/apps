@@ -1327,7 +1327,7 @@ impl Hooks for DomBox {
                     })
                     .flatten()
                     .unwrap_or_default();
-                let dom = store.state(view.id);
+                let (doc, dom, _) = store.page_parts(view.id);
                 // Grid tracks are sized before transforms, so they compare with the untransformed box.
                 if let Some(axes) = dom.layout.flexed_grids.get(&self.id)
                     && axes
@@ -1340,6 +1340,14 @@ impl Hooks for DomBox {
                             })
                         })
                 {
+                    // The boxes around must not become spacers before a build places the items at this size.
+                    let mut at = doc.and_then(|doc| doc.nodes[self.id].parent);
+                    while let Some(id) = at {
+                        if let Some(placed) = dom.layout.cull.placed.get_mut(id) {
+                            placed.0 = 0;
+                        }
+                        at = doc.and_then(|doc| doc.nodes[id].parent);
+                    }
                     window.redraw();
                 }
                 self.mirror(dom, window_bounds, shape, bounds.size, &parts);
