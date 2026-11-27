@@ -1257,6 +1257,37 @@ fn content_visibility_and_intrinsic_sizes_parse_like_chrome() {
 }
 
 #[test]
+fn registered_syntax_idents_are_case_sensitive() {
+    let doc = Document::parse(
+        "<style>@property --a{syntax:'Foo';inherits:false;initial-value:Foo}@property --b{syntax:'foo+';inherits:false;initial-value:foo}@property --c{syntax:'<length> | Auto';inherits:false;initial-value:1px}#t{--a:foo;--b:foo FOO;--c:auto}#u{--a:Foo;--b:foo foo;--c:Auto}</style><div id=t></div><div id=u></div>",
+    );
+    let styles = styles(&doc, 800., 600.);
+    let get = |selector, name| styles[element(&doc, selector)].get(name).cloned();
+    assert_eq!(get("#t", "--a").as_deref(), Some("Foo"));
+    assert_eq!(get("#t", "--b").as_deref(), Some("foo"));
+    assert_eq!(get("#t", "--c").as_deref(), Some("1px"));
+    assert_eq!(get("#u", "--a").as_deref(), Some("Foo"));
+    assert_eq!(get("#u", "--b").as_deref(), Some("foo foo"));
+    assert_eq!(get("#u", "--c").as_deref(), Some("Auto"));
+    for (syntax, initial, valid) in [
+        ("Foo", "foo", false),
+        ("foo", "FOO", false),
+        ("Foo+", "Foo foo", false),
+        ("foo | <length>", "FOO", false),
+        ("Foo-Bar", "Foo-Bar", true),
+        ("Foo#", "Foo,Foo", true),
+    ] {
+        let rule =
+            format!("@property --x{{syntax:'{syntax}';inherits:false;initial-value:{initial}}}");
+        assert_eq!(
+            Stylesheet::parse(&rule).source().contains("@property --x"),
+            valid,
+            "{rule}"
+        );
+    }
+}
+
+#[test]
 fn registered_values_compute_as_their_first_matching_type() {
     use crate::css::value::grammar::computed;
     let of = |syntax: &str, value: &str| computed(syntax, value, None).0;

@@ -2,7 +2,7 @@ use crate::css::{
     properties::Prop, properties::Registry, properties::Style, properties::Vars,
     properties::physical, value::color::serialize as serialize_color,
     value::color::system as system_color, value::grammar::computed, value::grammar::fold,
-    value::grammar::syntax_matches, value::shorthand::expand,
+    value::grammar::registered_matches, value::shorthand::expand,
 };
 use crate::style::used::dark;
 use std::rc::Rc;
@@ -199,7 +199,7 @@ impl Substitution<'_> {
                 }
                 match (value, registered) {
                     (Some(value), Some((syntax, ..))) if syntax.trim() != "*" => {
-                        match syntax_matches(syntax, &value) {
+                        match registered_matches(syntax, &value) {
                             true => Some(computed(syntax, &value, None).0.into()),
                             false => unset(),
                         }

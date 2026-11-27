@@ -893,6 +893,15 @@ pub(crate) fn computed_names() -> impl Iterator<Item = &'static str> {
 }
 
 pub(crate) fn syntax_matches(syntax: &str, value: &str) -> bool {
+    matches(syntax, value, false)
+}
+
+// The idents of a registered syntax are case-sensitive, as in Chrome.
+pub(crate) fn registered_matches(syntax: &str, value: &str) -> bool {
+    matches(syntax, value, true)
+}
+
+fn matches(syntax: &str, value: &str, exact: bool) -> bool {
     let units = Lengths::new(16., 100., 100.);
     let syntax = syntax.trim();
     let mut rest = syntax;
@@ -919,7 +928,10 @@ pub(crate) fn syntax_matches(syntax: &str, value: &str) -> bool {
         if !alternative.starts_with(['<', '[', '*']) && !alternative.ends_with(['(', '+', '#', '}'])
         {
             return (value.split_ascii_whitespace())
-                .map(str::to_ascii_lowercase)
+                .map(|word| match exact {
+                    true => word.to_owned(),
+                    false => word.to_ascii_lowercase(),
+                })
                 .eq(alternative.split(' ').map(str::to_owned));
         }
         let mut range = 1..=usize::MAX;
@@ -947,7 +959,7 @@ pub(crate) fn syntax_matches(syntax: &str, value: &str) -> bool {
             kinds.split('|').any(|kind| {
                 let (kind, value) = (kind.trim(), value.trim());
                 if !kind.starts_with('<') && !kind.ends_with('(') && kind != "*" {
-                    return value.eq_ignore_ascii_case(kind);
+                    return value == kind || !exact && value.eq_ignore_ascii_case(kind);
                 }
                 let (kind, sign) = match kind {
                     "<non-negative-length>" => ("<length>", true),
@@ -1113,7 +1125,7 @@ pub(crate) fn registrable(syntax: &str) -> bool {
 pub(crate) fn matched<'a>(syntax: &'a str, value: &str) -> &'a str {
     match syntax.contains('|') {
         true => (syntax.split('|'))
-            .find(|kind| syntax_matches(kind, value))
+            .find(|kind| registered_matches(kind, value))
             .unwrap_or(syntax),
         false => syntax,
     }
