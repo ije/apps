@@ -106,6 +106,7 @@ pub fn call(
         "dom.scroll" => geometry::scroll(id()?, args, doc, state, viewport),
         "dom.fragments" => geometry::fragments(id()?, state),
         "dom.client" => geometry::client(id()?, args, doc, state, viewport),
+        "dom.overflow" => geometry::overflow(id()?, args, doc, state, viewport),
         "dom.skipped" => geometry::skipped(id()?, args, doc, state, viewport),
         "dom.decoded" => media::decoded(state),
         "dom.frames" => media::frames(state),

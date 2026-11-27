@@ -122,16 +122,9 @@
     // The bounds of the children of a scaled box are scaled too, so its own size is used.
     if (marks[node._id] & 128 && (box[8] !== geometry[i + 2] || box[9] !== geometry[i + 3])) return Math.round(box[2 + axis] / z);
     if (!box[2] && !box[3] && !box[4] && !box[5] && !box[6] && !box[7] && /^(inline|contents)$/.test(getComputedStyle(node).display)) return 0;
-    const start = geometry[i + axis] + box[axis], pending = [...(node._m.shadow ?? node._m).kids];
+    const start = geometry[i + axis] + box[axis];
     // A right-to-left box overflows to its left, so its width counts from its right side.
-    const right = !axis && getComputedStyle(node).direction === 'rtl' ? start + box[2] : null;
-    let end = 0;
-    while (pending.length) {
-      const kid = pending.pop(), j = 4 + kid.id * 8;
-      if (j >= limit || (marks[kid.id] & 49) !== 1) continue;
-      if (geometry[j + 2] || geometry[j + 3]) end = Math.max(end, right === null ? geometry[j + axis] + geometry[j + 2 + axis] - start : right - geometry[j]);
-      else if (kid.tag[0] !== '#') pending.push(...(kid.shadow ?? kid).kids);
-    }
+    const end = call('dom.overflow', node._id, axis, start, !axis && getComputedStyle(node).direction === 'rtl' ? start + box[2] : null);
     return Math.round(Math.max(box[2 + axis], end && end + box[5 + axis]) / z);
   };
   const offset = (node, axis) => {

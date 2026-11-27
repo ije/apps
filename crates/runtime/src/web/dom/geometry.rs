@@ -179,6 +179,65 @@ pub(super) fn fragments(id: usize, state: &mut PageState) -> Result<Value> {
         .map_or(Value::Null, |parts| json!(parts)))
 }
 
+// The far edge of the scrollable overflow of a box that doesn't scroll, from `start`, or from the left of `right`.
+// As in Chrome, it holds the boxes in it and the boxes in those that don't clip, but not the out-of-flow boxes whose
+// containing block is outside it.
+pub(super) fn overflow(
+    id: usize,
+    args: &Value,
+    doc: &mut Document,
+    state: &mut PageState,
+    viewport: [f32; 2],
+) -> Result<Value> {
+    let axis = usize::from(args[1].as_u64() == Some(1));
+    let start = args[2].as_f64().context("Expected a start")? as f32;
+    let right = args[3].as_f64().map(|right| right as f32);
+    let styles = state.restyle(doc, viewport);
+    let mirror = &state.geometry.mirror;
+    let kids = |id: usize| styles.children.get(&id).unwrap_or(&doc.nodes[id].children);
+    let own = crate::render::effects::establishes(&styles.values[id]);
+    let mut pending: Vec<_> = (kids(id).iter())
+        .map(|&kid| (kid, own.absolute, own.fixed))
+        .collect();
+    let mut end = 0f32;
+    while let Some((kid, absolute, fixed)) = pending.pop() {
+        let Some(style) = styles.values.get(kid) else {
+            continue;
+        };
+        if !doc.nodes[kid].tag.starts_with('#')
+            && match style.get(Prop::POSITION) {
+                Some("absolute") => !absolute,
+                Some("fixed") => !fixed,
+                _ => style.get(Prop::DISPLAY) == Some("none"),
+            }
+        {
+            continue;
+        }
+        if let Some(&[x, y, width, height]) = mirror.get(&kid).filter(|_| mirror.shown(kid))
+            && (width != 0. || height != 0.)
+        {
+            end = end.max(
+                right.map_or([x, y][axis] + [width, height][axis] - start, |right| {
+                    right - x
+                }),
+            );
+            if [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+                .into_iter()
+                .any(|prop| style.get(prop).is_some_and(|value| value != "visible"))
+            {
+                continue;
+            }
+        }
+        let made = crate::render::effects::establishes(style);
+        pending.extend(
+            kids(kid)
+                .iter()
+                .map(|&next| (next, absolute || made.absolute, fixed || made.fixed)),
+        );
+    }
+    Ok(json!(end))
+}
+
 pub(super) fn client(
     id: usize,
     args: &Value,
