@@ -120,8 +120,10 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
+# Cargo drops the profile's `strip` for a package with its own settings.
 [profile.release.package.apps-runtime]
 opt-level = 2
+strip = true
 
 # Optimize these crates for size. None runs per frame.
 
@@ -207,6 +209,39 @@ opt-level = "s"
 opt-level = "s"
 
 [profile.release.package.data-url]
+opt-level = "s"
+
+[profile.release.package.brotli-decompressor]
+opt-level = "s"
+
+[profile.release.package.encoding_rs]
+opt-level = "s"
+
+[profile.release.package.wuff]
+opt-level = "s"
+
+[profile.release.package.avif-parse]
+opt-level = "s"
+
+[profile.release.package.x11rb]
+opt-level = "s"
+
+[profile.release.package.x11rb-protocol]
+opt-level = "s"
+
+[profile.release.package.xim]
+opt-level = "s"
+
+[profile.release.package.wayland-client]
+opt-level = "s"
+
+[profile.release.package.wayland-protocols]
+opt-level = "s"
+
+[profile.release.package.cpal]
+opt-level = "s"
+
+[profile.release.package.alsa]
 opt-level = "s"
 
 # avif-parse asserts on truncated input before returning its decoding error.

@@ -19,6 +19,10 @@ fn main() {
         ("windows", _) => {
             println!("cargo:rustc-link-arg-bin=apps-runtime=-Wl,--stack,67108864")
         }
+        // Packed relative relocations (glibc 2.36) save about 850 KB.
+        ("linux", Ok("gnu")) => {
+            println!("cargo:rustc-link-arg-bin=apps-runtime=-Wl,-z,pack-relative-relocs")
+        }
         _ => {}
     }
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());

@@ -616,6 +616,16 @@ impl Scene {
         self.pass = None;
     }
 
+    // Text or images, as in the first contentful paint of browsers.
+    pub(crate) fn contentful(&self) -> bool {
+        (self.layers.iter()).any(|layer| {
+            layer
+                .instances
+                .iter()
+                .any(|instance| instance.page().is_some())
+        })
+    }
+
     // Spans of the last paint can't be copied anymore.
     pub(crate) fn forget(&mut self) {
         self.last_pass = None;

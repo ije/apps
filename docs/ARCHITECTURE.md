@@ -259,6 +259,8 @@ The allocator belongs to `apps-runtime`, so a Rust app cannot define another glo
 
 `apps run` compiles a development bundle and sends it to the app over stdin as a JSON line. With `--watch`, changes to pages and chunks used only by pages reload the open bundled pages. Main code, shared chunks, and other bundle changes restart the app. Rust source, Cargo manifest, or lockfile changes also rebuild the executable.
 
+With `APPS_TRACE_FCP=1`, the first frame with text or images prints its time. [fcp.mjs](scripts/fcp.mjs) starts a built app several times and prints the median time from process start to that frame.
+
 `ELECTRON_RUN_AS_NODE=1` selects the [headless script runner](crates/runtime/src/script.rs). It runs JavaScript with the supported Node APIs and no desktop windows. This also lets an app launch a bundled server chunk as a child process. `child_process.fork()` and `utilityProcess.fork()` start such a child with a JSON message channel on an extra descriptor.
 
 The runtime implements Node compatibility through [JavaScript modules](crates/runtime/js/node) and [Rust services](crates/runtime/src/node). Node-API addons and `node:ffi` call native code in the same process. There is no Node.js or libuv runtime.

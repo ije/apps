@@ -143,74 +143,89 @@ impl Gpu {
         let kept = GPU
             .with(|slot| slot.borrow().clone())
             .filter(|gpu| !gpu.lost.load(Relaxed));
-        let api = match &kept {
-            Some(gpu) => gpu.api.clone(),
-            None => {
-                let connection = Box::new(Connection(display));
-                let mut options = wgpu::InstanceDescriptor::new_with_display_handle(connection);
-                options.backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
-                wgpu::Instance::new(options)
-            }
+        let make_surface = |api: &wgpu::Instance| {
+            let target = wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: None,
+                raw_window_handle: window,
+            };
+            // SAFETY: the window owns the renderer, which drops the surface first.
+            unsafe { api.create_surface_unsafe(target) }
+                .map_err(|error| anyhow!("making the window surface: {error}"))
         };
-        let raw_window_handle = window;
-        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
-            raw_display_handle: None,
-            raw_window_handle,
-        };
-        // SAFETY: the window owns the renderer, which drops the surface first.
-        let surface = unsafe { api.create_surface_unsafe(target) }
-            .map_err(|error| anyhow!("making the window surface: {error}"))?;
         if let Some(gpu) = kept {
+            let surface = make_surface(&gpu.api)?;
             let formats = surface.get_capabilities(&gpu.adapter).formats;
             ensure!(!formats.is_empty(), "the GPU can't draw to this window");
             return Ok((gpu, surface));
         }
-        // Integrated GPUs first, as they save power, and Vulkan before GL.
-        let rank = |info: wgpu::AdapterInfo| {
-            use wgpu::DeviceType::*;
-            let order = [IntegratedGpu, DiscreteGpu, Other];
-            let kind = order
-                .iter()
-                .position(|kind| *kind == info.device_type)
-                .unwrap_or(3);
-            (kind, info.backend != wgpu::Backend::Vulkan)
-        };
-        let mut found = pollster::block_on(api.enumerate_adapters(wgpu::Backends::all()));
-        found.sort_by_cached_key(|candidate| rank(candidate.get_info()));
+        // GL starts only without a Vulkan GPU: EGL loads Mesa's GL driver and LLVM, about 25 MB. A software
+        // Vulkan comes after GL, which can still have a GPU.
         let mut refusals = Vec::new();
-        for adapter in found {
-            let name = adapter.get_info().name;
-            let Some(probe) = surface.get_default_config(&adapter, 64, 64) else {
-                continue;
-            };
-            // GL ES 3 has no storage buffers, so the limits stay at what WebGL 2 has.
-            let limits = adapter.limits();
-            let wanted = wgpu::DeviceDescriptor {
-                required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                    .using_resolution(limits.clone())
-                    .using_alignment(limits),
-                required_features: adapter.features()
-                    & wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF,
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
-                ..Default::default()
-            };
-            let (device, queue) = match pollster::block_on(adapter.request_device(&wanted)) {
-                Ok(pair) => pair,
+        let passes = [
+            (wgpu::Backends::VULKAN, Some(false)),
+            (wgpu::Backends::GL, None),
+            (wgpu::Backends::VULKAN, Some(true)),
+        ];
+        for (backends, software) in passes {
+            let connection = Box::new(Connection(display));
+            let mut options = wgpu::InstanceDescriptor::new_with_display_handle(connection);
+            options.backends = backends;
+            let api = wgpu::Instance::new(options);
+            let surface = match make_surface(&api) {
+                Ok(surface) => surface,
                 Err(error) => {
-                    refusals.push(format!("{name}: {error}"));
+                    refusals.push(format!("{error:#}"));
                     continue;
                 }
             };
-            // Hybrid GPUs can list a surface that they then fail to configure.
-            let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-            surface.configure(&device, &probe);
-            if let Some(error) = pollster::block_on(scope.pop()) {
-                refusals.push(format!("{name}: {error}"));
-                continue;
+            // Integrated GPUs first, as they save power.
+            let rank = |info: wgpu::AdapterInfo| {
+                use wgpu::DeviceType::*;
+                let order = [IntegratedGpu, DiscreteGpu, Other];
+                (order.iter().position(|kind| *kind == info.device_type)).unwrap_or(3)
+            };
+            let mut found = pollster::block_on(api.enumerate_adapters(backends));
+            found.sort_by_cached_key(|candidate| rank(candidate.get_info()));
+            for adapter in found {
+                let info = adapter.get_info();
+                if software
+                    .is_some_and(|software| (info.device_type == wgpu::DeviceType::Cpu) != software)
+                {
+                    continue;
+                }
+                let name = info.name;
+                let Some(probe) = surface.get_default_config(&adapter, 64, 64) else {
+                    continue;
+                };
+                // GL ES 3 has no storage buffers, so the limits stay at what WebGL 2 has.
+                let limits = adapter.limits();
+                let wanted = wgpu::DeviceDescriptor {
+                    required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                        .using_resolution(limits.clone())
+                        .using_alignment(limits),
+                    required_features: adapter.features()
+                        & wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF,
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    ..Default::default()
+                };
+                let (device, queue) = match pollster::block_on(adapter.request_device(&wanted)) {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        refusals.push(format!("{name}: {error}"));
+                        continue;
+                    }
+                };
+                // Hybrid GPUs can list a surface that they then fail to configure.
+                let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                surface.configure(&device, &probe);
+                if let Some(error) = pollster::block_on(scope.pop()) {
+                    refusals.push(format!("{name}: {error}"));
+                    continue;
+                }
+                let gpu = Rc::new(Self::build(api, adapter, device, queue));
+                GPU.with(|slot| *slot.borrow_mut() = Some(gpu.clone()));
+                return Ok((gpu, surface));
             }
-            let gpu = Rc::new(Self::build(api, adapter, device, queue));
-            GPU.with(|slot| *slot.borrow_mut() = Some(gpu.clone()));
-            return Ok((gpu, surface));
         }
         bail!("no GPU can draw to the window: {}", refusals.join("; "))
     }

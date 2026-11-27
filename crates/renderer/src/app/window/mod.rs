@@ -22,11 +22,17 @@ use std::{
     mem,
     ops::Range,
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering::Relaxed},
+    },
     time::{Duration, Instant},
 };
 
 const REBARS: u8 = 4;
+// With `APPS_TRACE_FCP`, the first frame with text or images prints its Unix time in ms, for `scripts/fcp.mjs`.
+static TRACE_FCP: LazyLock<AtomicBool> =
+    LazyLock::new(|| AtomicBool::new(std::env::var_os("APPS_TRACE_FCP").is_some()));
 
 pub(crate) mod node;
 mod paint;
@@ -1307,6 +1313,13 @@ impl Window {
         self.scene.diff(fresh.as_deref());
         let (mut frame, snapshots) =
             (self.platform).draw(&self.scene, Some(self.native), !captures.is_empty());
+        if TRACE_FCP.load(Relaxed) && self.scene.contentful() && TRACE_FCP.swap(false, Relaxed) {
+            let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+            eprintln!(
+                "apps: first contentful paint at {:.3}",
+                at.unwrap_or_default().as_secs_f64() * 1000.
+            );
+        }
         self.scene.drawn();
         self.scene.keep_unread(&snapshots, &mut self.shots);
         if let Some(tree) = &mut self.tree {
