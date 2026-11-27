@@ -37,6 +37,28 @@ fn utility_classes_follow_dom_changes() {
 }
 
 #[test]
+fn utility_classes_of_subtrees_that_join_later_apply() {
+    let (_, engine) = css_page(
+        "<html><head><style>@import 'tailwindcss';</style></head><body><div id='a'></div></body></html>",
+    );
+    engine.eval(r#"
+        const a = document.getElementById('a');
+        for (let i = 0; i < 100; i++) document.body.append(document.createElement('p'));
+        getComputedStyle(a).color;
+        const outer = document.createElement('div');
+        const inner = document.createElement('div');
+        inner.className = 'pt-7';
+        outer.append(inner);
+        a.title = 'x';
+        getComputedStyle(a).color;
+        a.append(outer);
+        if (getComputedStyle(inner).paddingTop !== '28px') throw Error('joined ' + getComputedStyle(inner).paddingTop);
+        a.className = 'pb-5';
+        if (getComputedStyle(a).paddingBottom !== '20px') throw Error('changed ' + getComputedStyle(a).paddingBottom);
+    "#, "test").unwrap();
+}
+
+#[test]
 fn media_queries_follow_viewport_changes() {
     let (host, engine) = css_page(
         "<html><head><style>@media (min-width:40em) { #target { color:red; } }</style></head><body><div id='target'></div></body></html>",

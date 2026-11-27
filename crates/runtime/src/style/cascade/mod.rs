@@ -779,6 +779,7 @@ fn check_incremental(
     out: &ComputedStyles,
 ) {
     style_cache.incremental += 1;
+    let seen = style_cache.tailwind.seen();
     let mut fresh = StyleCache {
         cssom: style_cache.cssom.clone(),
         constructed: style_cache.constructed.clone(),
@@ -792,6 +793,7 @@ fn check_incremental(
     };
     let full = compute_styles(doc, width, height, text_system, cache, &mut fresh, context);
     style_cache.tailwind = fresh.tailwind;
+    style_cache.tailwind.keep_seen(seen);
     let groups = |a: Option<&Shadowed>, b: Option<&Shadowed>| match (a, b) {
         (Some(a), Some(b)) => {
             a.len() == b.len()

@@ -1,6 +1,6 @@
 use super::{Declaration, Declarations, Prop, Rule, Style, Stylesheet};
 use crate::css::value::color::color;
-use crate::dom::Document;
+use crate::dom::{Document, Walk};
 use crate::style::tailwind::tables::{BASE, DEFAULTS, KEYFRAMES, ORDER_INDEX, TEXT};
 use crate::style::tailwind::value::{braces, calls, escape, escape_name, removes, split};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -235,6 +235,9 @@ struct Config {
     nested: std::cell::Cell<u8>,
     classes: FxHashMap<String, bool>,
     scanned: Vec<u64>,
+    // The serial of the walk and the latest node revision of the last scan, so the next one reads only the nodes
+    // that joined or changed since.
+    seen: Option<(u64, u64)>,
     // The attribute values with variables that `vars` has read.
     read: FxHashSet<Box<str>>,
     applied: Vec<(Rc<Stylesheet>, Rc<Stylesheet>)>,
@@ -258,7 +261,7 @@ impl Compiler {
         &mut self,
         sheets: &mut Vec<Rc<Stylesheet>>,
         doc: &Document,
-        order: &[(u32, u32)],
+        walk: &Walk,
     ) -> Option<Update<'_>> {
         let index = sheets
             .iter()
@@ -289,7 +292,24 @@ impl Compiler {
         };
         self.0[at..].rotate_left(1);
         let config = self.0.last_mut()?;
-        Some(config.update(sheets, index, doc, order))
+        Some(config.update(sheets, index, doc, walk))
+    }
+
+    // A debug pass that styles the page again keeps the marks of the scans, so they still test the next pass.
+    #[cfg(debug_assertions)]
+    pub(crate) fn seen(&self) -> Vec<(String, Option<(u64, u64)>)> {
+        self.0
+            .iter()
+            .map(|config| (config.key.clone(), config.seen))
+            .collect()
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn keep_seen(&mut self, seen: Vec<(String, Option<(u64, u64)>)>) {
+        for config in &mut self.0 {
+            config.seen =
+                (seen.iter()).find_map(|(key, seen)| (*key == config.key).then_some(*seen)?);
+        }
     }
 }
 
@@ -465,7 +485,7 @@ impl Config {
         sheets: &mut Vec<Rc<Stylesheet>>,
         index: usize,
         doc: &Document,
-        order: &[(u32, u32)],
+        walk: &Walk,
     ) -> Update<'_> {
         let mut used = String::new();
         let first = self.header.is_none();
@@ -517,8 +537,20 @@ impl Config {
         if self.scanned.len() < doc.nodes.len() {
             self.scanned.resize(doc.nodes.len(), 0);
         }
-        for &(id, _) in order {
-            let id = id as usize;
+        let since = self.seen.and_then(|(serial, latest)| {
+            let joined = match serial == walk.serial {
+                true => &[][..],
+                false => walk.since(serial)?,
+            };
+            let changed = doc.nodes.changed_since(latest);
+            Some(joined.iter().map(|&id| id as usize).chain(changed))
+        });
+        let ids: Box<dyn Iterator<Item = usize>> = match since {
+            Some(ids) => Box::new(ids.filter(|&id| walk.contains(id))),
+            None => Box::new(walk.order().iter().map(|&(id, _)| id as usize)),
+        };
+        self.seen = Some((walk.serial, doc.nodes.latest()));
+        for id in ids {
             let revision = doc.nodes.revision(id);
             if std::mem::replace(&mut self.scanned[id], revision) == revision {
                 continue;
@@ -1074,9 +1106,10 @@ pub(crate) fn page_css(css: &str, text: &str) -> String {
     let stop = |c: char| c.is_whitespace() || "\"'`<>=;,&".contains(c);
     let words: Vec<_> = text.split(stop).filter(|word| !word.is_empty()).collect();
     let doc = Document::parse(&format!("<p class=\"{}\">", words.join(" ")));
-    let order: Vec<_> = (0..doc.nodes.len() as u32).map(|id| (id, 0)).collect();
+    let mut walk = Walk::default();
+    walk.update(&doc, &Default::default(), None);
     let mut sheets = vec![Rc::new(Stylesheet::parse(css))];
-    Compiler::default().update(&mut sheets, &doc, &order);
+    Compiler::default().update(&mut sheets, &doc, &walk);
     // A web view does not know the rules that only configure Tailwind.
     let plain = |rule: &&Rc<Rule>| matches!(***rule, Rule::Layer(..)) || !configures(rule);
     let rules = sheets.iter().flat_map(|sheet| &sheet.0).filter(plain);

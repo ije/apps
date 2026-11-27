@@ -34,7 +34,7 @@ fn generated(author: &str, classes: &[&str]) -> Vec<String> {
     let mut sheets = vec![Rc::new(super::Stylesheet::parse(&format!(
         "@import 'tailwindcss/theme';@import 'tailwindcss/utilities';{author}"
     )))];
-    compiler.update(&mut sheets, &Document::parse(""), &[]);
+    compiler.update(&mut sheets, &Document::parse(""), &Default::default());
     let config = compiler.0.last().unwrap();
     classes
         .iter()
@@ -55,7 +55,7 @@ fn dump() {
     let (list, author) = (read("TW_LIST"), read("TW_CSS"));
     let mut compiler = super::Compiler::default();
     let mut sheets = vec![Rc::new(super::Stylesheet::parse(&author))];
-    compiler.update(&mut sheets, &Document::parse(""), &[]);
+    compiler.update(&mut sheets, &Document::parse(""), &Default::default());
     let config = compiler.0.last().unwrap();
     let start = std::time::Instant::now();
     let mut compiled: Vec<_> = list
@@ -447,7 +447,7 @@ fn utilities_and_variants_sort_like_tailwind() {
     let mut sheets = vec![Rc::new(super::Stylesheet::parse(
         "@import 'tailwindcss/theme';@import 'tailwindcss/utilities';",
     ))];
-    compiler.update(&mut sheets, &Document::parse(""), &[]);
+    compiler.update(&mut sheets, &Document::parse(""), &Default::default());
     let config = compiler.0.last().unwrap();
     for chain in [
         "z-9 z-10",
@@ -485,7 +485,7 @@ fn configs_are_kept_per_theme() {
     ));
     let shadow = Rc::new(super::Stylesheet::parse("@import 'tailwindcss';"));
     let doc = Document::parse("<p class='bg-brand p-3'></p>");
-    let order: Vec<_> = (0..doc.nodes.len() as u32).map(|id| (id, 0)).collect();
+    let order = walk(&doc);
     let mut compiler = super::Compiler::default();
     for _ in 0..3 {
         for sheet in [&document, &shadow] {
@@ -845,12 +845,12 @@ fn attribute_variables_are_read_again_by_a_new_theme() {
     let doc = Document::parse(
         "<p style='color: var(--color-brand)'>a</p><b style='color: var(--color-brand)'>b</b>",
     );
-    let order: Vec<(u32, u32)> = (0..doc.nodes.len() as u32).map(|id| (id, 0)).collect();
+    let walk = walk(&doc);
     let mut compiler = super::Compiler::default();
     let defined = |compiler: &mut super::Compiler, theme: &str| {
         let source = format!("@import 'tailwindcss';{theme}");
         let mut sheets = vec![Rc::new(super::Stylesheet::parse(&source))];
-        compiler.update(&mut sheets, &doc, &order);
+        compiler.update(&mut sheets, &doc, &walk);
         compiler
             .0
             .last()
@@ -1627,9 +1627,7 @@ fn fanned_out_utilities_expand_once_and_stay_bounded() {
 fn inserts_at_one_spot_keep_the_generated_sheets() {
     let mut doc = Document::parse("<p class='w-[000px] w-[999px]'></p>");
     let p = id(&doc, "p");
-    let order: Vec<(u32, u32)> = (0..doc.nodes.len() as u32)
-        .map(|id| (id, u32::MAX))
-        .collect();
+    let order = walk(&doc);
     let base = Rc::new(super::Stylesheet::parse(
         "@import 'tailwindcss/theme';@import 'tailwindcss/utilities' layer(utilities);",
     ));
@@ -1665,9 +1663,7 @@ fn incremental_inserts_match_a_fresh_compile() {
         let nodes: Vec<_> = (0..doc.nodes.len())
             .filter(|&id| doc.nodes[id].tag == "p")
             .collect();
-        let all: Vec<(u32, u32)> = (0..doc.nodes.len() as u32)
-            .map(|id| (id, u32::MAX))
-            .collect();
+        let all = walk(&doc);
         let mut compiler = super::Compiler::default();
         compiler.update(&mut vec![base.clone()], &doc, &all);
         let mut rest = order;
@@ -2175,4 +2171,10 @@ fn variant_blocks_and_definitions_parse_apart() {
             "@variant e{ color: red }",
         ]
     );
+}
+
+fn walk(doc: &Document) -> crate::dom::Walk {
+    let mut walk = crate::dom::Walk::default();
+    walk.update(doc, &Default::default(), None);
+    walk
 }

@@ -222,22 +222,24 @@ pub struct Nodes {
     revisions: Vec<u64>,
     latest: u64,
     tree: u64,
-    // The nodes that got a revision after `logged`, with duplicates, so readers need no scan of all nodes.
-    log: Vec<u32>,
+    // The nodes that got a revision after `logged`, with duplicates, so readers need no scan of all nodes. Each
+    // with `latest` before its change, so the entries after a revision are found without a scan of all entries.
+    log: Vec<(u32, u64)>,
     logged: u64,
 }
 
 impl Nodes {
     // Call this before a node gets its new revision.
     fn note(&mut self, id: usize) {
-        if self.log.last() == Some(&(id as u32)) {
+        if let Some(last) = self.log.last_mut().filter(|last| last.0 == id as u32) {
+            last.1 = self.latest;
             return;
         }
         if self.log.len() == 4096 {
             self.log.clear();
             self.logged = self.latest;
         }
-        self.log.push(id as u32);
+        self.log.push((id as u32, self.latest));
     }
 
     pub(crate) fn truncate(&mut self, len: usize) {
@@ -319,7 +321,10 @@ impl Nodes {
                 .get(id)
                 .is_some_and(|&stamp| stamp > revision)
         };
-        let logged = (revision >= self.logged).then(|| self.log.iter().map(|&id| id as usize));
+        let logged = (revision >= self.logged).then(|| {
+            let start = self.log.partition_point(|&(_, before)| before < revision);
+            self.log[start..].iter().map(|&(id, _)| id as usize)
+        });
         let every = (revision < self.logged).then_some(0..self.revisions.len());
         logged
             .into_iter()
