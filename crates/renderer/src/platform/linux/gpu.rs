@@ -472,8 +472,8 @@ pub(super) struct Renderer {
   last: Option<Texture>,
   // The layers of the last frame that drew the whole window.
   whole_layers: usize,
-  // Failed recoveries in a row, and when the next one may run.
-  recovery: (u32, Instant),
+  // Failed frames in a row, and when the next frame may try.
+  failures: (u32, Instant),
 }
 
 // Copies of the last frame that start a frame: the offset of the source, and the region of the window.
@@ -510,7 +510,7 @@ impl Renderer {
       frame: RenderFrame::default(),
       last: None,
       whole_layers: 0,
-      recovery: (0, Instant::now()),
+      failures: (0, Instant::now()),
     })
   }
 
@@ -549,29 +549,21 @@ impl Renderer {
     snapshots: &mut Vec<crate::Snapshot>,
   ) -> (Drawn, Capture) {
     let failed = |message: &str| capture.then(|| Err(anyhow!("{message}")));
+    // After a failure, frames wait before they try again.
+    if self.failures.1 > Instant::now() {
+      return (Drawn::Skipped, failed("The GPU failed"));
+    }
     let lost = self.gpu.lost.load(Relaxed);
     let Some(surface) = self.surface.as_ref().filter(|_| !lost) else {
-      let (failures, next) = self.recovery;
-      let now = Instant::now();
-      if next > now {
-        return (Drawn::Skipped, failed("The GPU was lost"));
-      }
-      let drawn = match self.recover() {
-        Ok(()) => {
-          self.recovery.0 = 0;
-          Drawn::Again
-        }
-        // Each failure waits longer, from 250 ms up to 8 s.
+      return match self.recover() {
+        Ok(()) => (Drawn::Again, failed("The GPU was lost")),
         Err(error) => {
-          if failures == 0 {
+          if self.failures.0 == 0 {
             eprintln!("apps: the GPU can't recover: {error:#}");
           }
-          let wait = Duration::from_millis(250 << failures.min(5));
-          self.recovery = (failures + 1, now + wait);
-          Drawn::Retry(wait)
+          (self.wait(), failed("The GPU was lost"))
         }
       };
-      return (drawn, failed("The GPU was lost"));
     };
     let window = [self.config.width, self.config.height];
     // The window keeps a copy of each frame, so a frame draws only its damage regions over the last one.
@@ -662,13 +654,16 @@ impl Renderer {
     {
       Ok(reads) => reads,
       Err(error) => {
-        eprintln!("apps: drawing failed: {error:#}");
+        if self.failures.0 == 0 {
+          eprintln!("apps: drawing failed: {error:#}");
+        }
         // Queue writes wait for a submit, which also releases them when the frame fails.
         self.gpu.queue.submit(None);
-        return (Drawn::Again, capture.then_some(Err(error)));
+        return (self.wait(), capture.then_some(Err(error)));
       }
     };
     self.gpu.queue.present(output);
+    self.failures.0 = 0;
     self.last = last;
     for (key, size, buffer) in shots {
       match self.read(buffer, size) {
@@ -677,6 +672,13 @@ impl Renderer {
       }
     }
     (Drawn::Shown, read.map(|buffer| self.read(buffer?, size)))
+  }
+
+  // Each failure in a row waits longer, from 250 ms up to 8 s.
+  fn wait(&mut self) -> Drawn {
+    let wait = Duration::from_millis(250 << self.failures.0.min(5));
+    self.failures = (self.failures.0 + 1, Instant::now() + wait);
+    Drawn::Retry(wait)
   }
 
   fn recover(&mut self) -> Result<()> {

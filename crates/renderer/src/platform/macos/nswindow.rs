@@ -3,7 +3,7 @@ use super::{
   events::{
     BUTTONS, NOT_FOUND, TISCopyCurrentKeyboardInputSource, TISGetInputSourceProperty,
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
-    merge, ns_range, plain, span, translate,
+    ns_range, plain, span, translate,
   },
   glass, lock, native_after,
   screen::{Shared, Snapshot, cg_size, flip, primary_top},
@@ -13,7 +13,7 @@ use super::{
 use crate::{
   Button, Cursor, Event, Key, Modifiers, Pixels, Point, Size, WindowChange, WindowOptions,
   WindowState,
-  platform::{Callbacks, Motion, events},
+  platform::{Callbacks, Motion, events, merge},
   point, px, size,
 };
 use anyhow::{Context as _, Result};

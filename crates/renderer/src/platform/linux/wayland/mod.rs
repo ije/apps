@@ -674,15 +674,15 @@ fn scroll(delta: &mut Option<Point<f32>>, axis: WEnum<wl_pointer::Axis>, amount:
 }
 
 impl Client {
-  // The time of one refresh of the fastest screen.
-  pub(super) fn period(&self) -> Duration {
+  // The time of one refresh of the fastest output that the window is on, or else of all outputs.
+  pub(super) fn period(&self, on: &[ObjectId]) -> Duration {
     let live = self.live.borrow();
-    let fastest = live
-      .screens
-      .values()
-      .map(|(_, screen)| screen.refresh)
-      .max();
-    match fastest {
+    let rate = |only: bool| {
+      let screens = live.screens.values();
+      let screens = screens.filter(|(output, _)| !only || on.contains(&output.id()));
+      screens.map(|(_, screen)| screen.refresh).max()
+    };
+    match rate(true).or_else(|| rate(false)) {
       Some(rate @ 1_000..) => Duration::from_secs(1000) / rate as u32,
       _ => Duration::from_micros(16_667),
     }

@@ -70,6 +70,57 @@ pub(crate) struct Callbacks {
 #[cfg(target_os = "macos")]
 pub(crate) type Motion = std::sync::Arc<std::sync::Mutex<Option<(Event, std::time::Instant)>>>;
 
+// A merge keeps the order of events: only moves with the same buttons and modifiers, and wheel deltas of
+// one gesture, combine.
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn merge(waiting: &mut Event, next: &Event) -> bool {
+  if let (
+    Event::PointerMove {
+      held, modifiers, ..
+    },
+    Event::PointerMove {
+      held: next_held,
+      modifiers: next_modifiers,
+      ..
+    },
+  ) = (&*waiting, next)
+  {
+    if held != next_held || modifiers != next_modifiers {
+      return false;
+    }
+    *waiting = next.clone();
+    return true;
+  }
+  match (waiting, next) {
+    (
+      Event::Wheel {
+        at,
+        delta,
+        lines,
+        phase,
+        modifiers,
+      },
+      Event::Wheel {
+        at: next_at,
+        delta: next_delta,
+        lines: next_lines,
+        phase: next_phase,
+        modifiers: next_modifiers,
+      },
+    ) => {
+      let same_gesture = *phase == *next_phase
+        || (*phase == crate::WheelPhase::Began && *next_phase == crate::WheelPhase::Changed);
+      if modifiers != next_modifiers || lines != next_lines || !same_gesture {
+        return false;
+      }
+      *at = *next_at;
+      *delta += *next_delta;
+      true
+    }
+    _ => false,
+  }
+}
+
 /// What native windows ask of the app that owns them. The app sets it once, with `set_events`.
 pub(crate) trait WindowEvents: Sync {
   fn input(&self, at: Callbacks, event: Event) -> bool;

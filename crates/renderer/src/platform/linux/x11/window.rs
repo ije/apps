@@ -379,7 +379,8 @@ fn tick(window: Weak<Toplevel>, round: u64, at: Instant) {
       strong.stop();
       return;
     }
-    let Some(refresh) = strong.client.upgrade().map(|client| client.refresh) else {
+    let bounds = strong.shape.borrow().bounds;
+    let Some((_, refresh)) = strong.client.upgrade().map(|client| client.monitor(bounds)) else {
       return;
     };
     let now = Instant::now();
@@ -405,8 +406,7 @@ impl Native for Toplevel {
     let display = self
       .client
       .upgrade()
-      .map(|client| client.monitor(shape.bounds))
-      .unwrap_or_default();
+      .map_or_else(Rect::default, |client| client.monitor(shape.bounds).0);
     WindowState {
       frame: shape.bounds,
       content: shape.bounds,

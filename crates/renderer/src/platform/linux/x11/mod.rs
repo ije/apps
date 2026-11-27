@@ -228,9 +228,8 @@ pub(super) struct Client {
   screen: usize,
   root: xproto::Window,
   scale: f32,
-  refresh: Duration,
-  // In points, the primary monitor first.
-  monitors: RefCell<Vec<Rect>>,
+  // In points with their refresh times, the primary monitor first.
+  monitors: RefCell<Vec<(Rect, Duration)>>,
   live: RefCell<Live>,
   clipboard: clipboard::Selection,
 }
@@ -285,36 +284,8 @@ fn scrollers(
     .collect()
 }
 
-fn refresh_of(xcb: &XCBConnection, root: xproto::Window) -> Duration {
-  let resources = xcb
-    .randr_get_screen_resources_current(root)
-    .ok()
-    .and_then(|cookie| cookie.reply().ok());
-  let mode = resources.and_then(|resources| {
-    resources.crtcs.iter().find_map(|&crtc| {
-      let info = xcb
-        .randr_get_crtc_info(crtc, x11rb::CURRENT_TIME)
-        .ok()?
-        .reply()
-        .ok()?;
-      resources
-        .modes
-        .iter()
-        .find(|mode| mode.id == info.mode)
-        .copied()
-    })
-  });
-  match mode {
-    Some(mode) if mode.dot_clock > 0 && mode.htotal > 0 && mode.vtotal > 0 => {
-      let pixels = u64::from(mode.htotal) * u64::from(mode.vtotal);
-      Duration::from_nanos(pixels * 1_000_000_000 / u64::from(mode.dot_clock))
-    }
-    _ => Duration::from_micros(16_667),
-  }
-}
-
-// The RandR monitors, primary first, or else the whole screen.
-fn monitors_of(xcb: &XCBConnection, screen: usize, scale: f32) -> Vec<Rect> {
+// The RandR monitors and their refresh times, primary first, or else the whole screen.
+fn monitors_of(xcb: &XCBConnection, screen: usize, scale: f32) -> Vec<(Rect, Duration)> {
   let root = &xcb.setup().roots[screen];
   let reply = xcb
     .randr_get_monitors(root.root, true)
@@ -322,21 +293,54 @@ fn monitors_of(xcb: &XCBConnection, screen: usize, scale: f32) -> Vec<Rect> {
     .and_then(|cookie| cookie.reply().ok());
   let mut monitors = reply.map(|reply| reply.monitors).unwrap_or_default();
   monitors.sort_by_key(|monitor| !monitor.primary);
-  let mut rects: Vec<Rect> = monitors
+  let resources = xcb
+    .randr_get_screen_resources_current(root.root)
+    .ok()
+    .and_then(|cookie| cookie.reply().ok());
+  let refresh = |output| {
+    let resources = resources.as_ref()?;
+    let time = resources.config_timestamp;
+    let info = xcb.randr_get_output_info(output, time).ok()?.reply().ok()?;
+    let crtc = xcb
+      .randr_get_crtc_info(info.crtc, time)
+      .ok()?
+      .reply()
+      .ok()?;
+    let mode = resources.modes.iter().find(|mode| mode.id == crtc.mode)?;
+    let pixels = u64::from(mode.htotal) * u64::from(mode.vtotal);
+    (mode.dot_clock > 0 && pixels > 0)
+      .then(|| Duration::from_nanos(pixels * 1_000_000_000 / u64::from(mode.dot_clock)))
+  };
+  let mut found: Vec<(Rect, Duration)> = monitors
     .iter()
     .map(|monitor| {
       let [x, y] = [monitor.x, monitor.y].map(f32::from);
       let [width, height] = [monitor.width, monitor.height].map(f32::from);
-      Rect::new(point(px(x), px(y)), size(px(width), px(height))).map(|side| side / scale)
+      let bounds = Rect::new(point(px(x), px(y)), size(px(width), px(height)));
+      // A monitor over several outputs draws at the pace of its fastest one.
+      let fastest = monitor
+        .outputs
+        .iter()
+        .filter_map(|&output| refresh(output))
+        .min();
+      (
+        bounds.map(|side| side / scale),
+        fastest.unwrap_or(DEFAULT_REFRESH),
+      )
     })
     .collect();
-  if rects.is_empty() {
+  if found.is_empty() {
     let [width, height] =
       [root.width_in_pixels, root.height_in_pixels].map(|side| px(f32::from(side) / scale));
-    rects.push(Rect::new(point(px(0.), px(0.)), size(width, height)));
+    found.push((
+      Rect::new(point(px(0.), px(0.)), size(width, height)),
+      DEFAULT_REFRESH,
+    ));
   }
-  rects
+  found
 }
+
+const DEFAULT_REFRESH: Duration = Duration::from_micros(16_667);
 
 // Xft.dpi when set, else the density of the primary monitor in twelfths, from 1 to 20.
 fn scale_of(xcb: &XCBConnection, root: xproto::Window) -> f32 {
@@ -424,7 +428,7 @@ impl Client {
     let xkb = keymap_state(&context, &xcb, device);
     let database = x11rb::resource_manager::new_from_default(&xcb)?;
     let themes = x11rb::cursor::Handle::new(&xcb, screen, &database)?.reply()?;
-    let (scale, refresh) = (scale_of(&xcb, root), refresh_of(&xcb, root));
+    let scale = scale_of(&xcb, root);
     let monitors = RefCell::new(monitors_of(&xcb, screen, scale));
     let changes = randr::NotifyMask::SCREEN_CHANGE
       | randr::NotifyMask::CRTC_CHANGE
@@ -467,15 +471,14 @@ impl Client {
       screen,
       root,
       scale,
-      refresh,
       monitors,
     }))
   }
 
-  // The monitor with most of the window, or else the primary one.
-  fn monitor(&self, window: Rect) -> Rect {
+  // The monitor with most of the window, or else the primary one, and its refresh time.
+  fn monitor(&self, window: Rect) -> (Rect, Duration) {
     let monitors = self.monitors.borrow();
-    let area = |monitor: &Rect| {
+    let area = |(monitor, _): &(Rect, Duration)| {
       let shared = monitor.intersect(window).size;
       shared.width.0 * shared.height.0
     };
@@ -483,7 +486,7 @@ impl Client {
     let best = best
       .filter(|monitor| area(monitor) > 0.)
       .or(monitors.first());
-    best.copied().unwrap_or_default()
+    best.copied().unwrap_or((Rect::default(), DEFAULT_REFRESH))
   }
 
   fn window(&self, id: xproto::Window) -> Option<Rc<Toplevel>> {
@@ -733,7 +736,18 @@ impl Client {
         self.window(seen.window)?.set_obscured(covered);
       }
       XEvent::ConfigureNotify(change) => {
-        let [x, y] = [change.x, change.y].map(i32::from);
+        let [mut x, mut y] = [change.x, change.y].map(i32::from);
+        // A real event has the place in the parent, which is the frame of a reparenting window manager.
+        // The window manager's own events have the place on the screen.
+        if change.response_type & 0x80 == 0
+          && let Some(place) = self
+            .xcb
+            .translate_coordinates(change.window, self.root, 0, 0)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+        {
+          [x, y] = [place.dst_x, place.dst_y].map(i32::from);
+        }
         let [width, height] = [change.width, change.height].map(i32::from);
         self.window(change.window)?.configure(x, y, width, height);
       }
@@ -1226,7 +1240,7 @@ impl Display for Client {
   }
 
   fn display_bounds(&self) -> Option<Rect> {
-    self.monitors.borrow().first().copied()
+    self.monitors.borrow().first().map(|(bounds, _)| *bounds)
   }
 
   fn open(self: Rc<Self>, options: &WindowOptions, calls: Callbacks) -> Result<Opened> {

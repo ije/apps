@@ -245,7 +245,7 @@ impl Surface {
     let period = self
       .client
       .upgrade()
-      .map_or(RETRY, |client| client.period());
+      .map_or(RETRY, |client| client.period(&self.shape.borrow().outputs));
     // The compositor sends the frame callback only after the GPU drew the frame, so one frame
     // draws ahead of it after a refresh, and the CPU works while the GPU draws.
     let due = pace

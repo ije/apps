@@ -11,7 +11,7 @@ use super::single::Task;
 use crate::{Cursor, Event, Pixels, Point, Rect, Scene, Size, WindowChange, WindowOptions};
 use crate::{
   WindowState,
-  platform::{Callbacks, events, lock},
+  platform::{Callbacks, events, lock, merge},
 };
 use anyhow::Result;
 pub(crate) use gpu::Atlas;
@@ -41,7 +41,7 @@ struct Turn {
   // The call is `None` while it runs.
   watches: RefCell<Vec<(RawFd, i16, Option<Watcher>)>>,
   windows: RefCell<FxHashMap<u64, Weak<dyn Native>>>,
-  // The last pointer move, held until other input or the end of the turn, so a burst of moves dispatches once.
+  // The last pointer move or wheel, held until other input or the end of the turn, so a burst dispatches once.
   motion: RefCell<Option<(Callbacks, Event)>>,
 }
 
@@ -89,35 +89,28 @@ pub(super) fn soon(f: impl FnOnce() + 'static) {
   TURN.with(|turn| turn.soon.borrow_mut().push_back(Box::new(f)));
 }
 
-/// Sends input to the window. Pointer moves merge until other input comes or the turn ends.
+/// Sends input to the window. Pointer moves and wheel steps merge until other input comes or the turn ends.
 pub(super) fn send(calls: Callbacks, event: Event) -> bool {
   TURN.with(|turn| {
-    let held = turn.motion.take();
-    if let Event::PointerMove {
-      held: buttons,
-      modifiers,
-      ..
-    } = &event
-    {
-      let merges = held.as_ref().is_some_and(|(kept, last)| {
-        kept.id == calls.id
-          && matches!(last, Event::PointerMove { held, modifiers: before, .. }
-                        if held == buttons && before == modifiers)
-      });
-      if !merges && let Some((kept, last)) = held {
+    let mut held = turn.motion.take();
+    if !matches!(event, Event::PointerMove { .. } | Event::Wheel { .. }) {
+      if let Some((kept, last)) = held {
         events().input(kept, last);
       }
-      turn.motion.replace(Some((calls, event)));
-      return false;
+      return events().input(calls, event);
     }
-    if let Some((kept, last)) = held {
+    let merged = held
+      .as_mut()
+      .is_some_and(|(kept, last)| kept.id == calls.id && merge(last, &event));
+    if !merged && let Some((kept, last)) = held.replace((calls, event)) {
       events().input(kept, last);
     }
-    events().input(calls, event)
+    turn.motion.replace(held);
+    false
   })
 }
 
-/// Sends the held pointer move.
+/// Sends the held pointer move or wheel.
 pub(super) fn send_motion() {
   if let Some((calls, event)) = TURN.with(|turn| turn.motion.take()) {
     events().input(calls, event);
