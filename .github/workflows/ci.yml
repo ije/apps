@@ -15,8 +15,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The same Linux and Windows images as release.yml, so both workflows share the native library caches.
-        os: [macos-15, ubuntu-24.04, windows-2025]
+        # Linux runs in linux.yml. The same Windows image as release.yml, so both workflows share the native library caches.
+        os: [macos-15, windows-2025]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
@@ -32,10 +32,5 @@ jobs:
       - uses: ./.github/actions/native
       - run: cargo test --workspace --locked --no-fail-fast
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - if: runner.os == 'Linux'
-        run: dbus-run-session -- xvfb-run -a cargo test -p apps-webview --lib wry::tests::system_webview --locked -- --ignored --test-threads=1
-        env:
-          GDK_BACKEND: x11
-          LIBGL_ALWAYS_SOFTWARE: "1"
       - if: runner.os == 'Windows'
         run: cargo test -p apps-webview --lib wry::tests::system_webview --locked -- --ignored --test-threads=1
