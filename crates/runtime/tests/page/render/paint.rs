@@ -245,6 +245,38 @@ fn scrolled_copies_follow_offsets_outlines_and_moving_interest_areas() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn gradients_that_scroll_into_view_draw_while_the_rest_copies() {
+    // Each box rasters its gradient in its first paint, while the boxes above copy their last paint. Debug builds
+    // check each copied paint against a fresh one.
+    let rows = (0..40)
+        .map(|i| {
+            let [r, b] = [i * 6, 255 - i * 6];
+            format!("<div id=b{i} style='height:60px;background:linear-gradient(rgb({r},0,{b}),rgb({r},0,{b}))'></div>")
+        })
+        .collect::<String>();
+    run_hidden(
+        r#"
+        const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap()].slice(0, 3).join();
+        await load('rows.html');
+        const seen = [];
+        for (let step = 0; step < 12; step++) {
+            await run('scrollBy(0, 53)');
+            await win.webContents.capturePage();
+            const want = await run("(i => [255 - i * 6, 0, i * 6].join())(Math.floor((scrollY + 250) / 60))");
+            const got = await pixel(20, 250);
+            if (got !== want) seen.push(step + ':' + got + '!=' + want);
+        }
+        if (seen.length) fail('gradients: ' + seen.join(' '));
+        "#,
+        &[(
+            "rows.html",
+            &format!("<body style='margin:0'>{rows}</body>"),
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn z_indexed_boxes_keep_the_cuts_of_scrolls_between_them_and_their_context() {
     // The red boxes paint in the root context, cut by the viewports of the scrolls around them. A page scroll moves
     // the viewport of #a with them, and a scroll of #b moves #c but not the viewport of #b. Debug builds check each

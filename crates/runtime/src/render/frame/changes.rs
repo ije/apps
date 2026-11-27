@@ -636,7 +636,8 @@ pub(super) fn remeasure(
     dom.layout.text_layouts.clear();
 }
 
-// Images that load or decode later, and the selection, change paint without a new box.
+// Images that load or decode later, and the selection, change paint without a new box. Background rasters are made
+// by the paint of their box, which draws them, so they are no such change.
 pub(super) fn repaint(state: &mut PageState, window: &mut renderer::Window) {
     let hash = |value: &dyn Fn(&mut rustc_hash::FxHasher)| {
         let mut hasher = rustc_hash::FxHasher::default();
@@ -649,14 +650,6 @@ pub(super) fn repaint(state: &mut PageState, window: &mut renderer::Window) {
             state
                 .rasters
                 .bitmaps
-                .values()
-                .map(|image| Arc::as_ptr(image) as u64),
-        )
-        .chain((state.rasters.backgrounds.values()).map(|(_, image)| Arc::as_ptr(image) as u64))
-        .chain(
-            state
-                .rasters
-                .layer_sources
                 .values()
                 .map(|image| Arc::as_ptr(image) as u64),
         )
