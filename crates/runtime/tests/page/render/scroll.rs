@@ -32,13 +32,7 @@ fn scroll_anchors_keep_the_content_in_view() {
     run_hidden(
         r#"
         await load('page.html');
-        // The scroll events of a frame run at the start of the next frame, so a step whose events count draws one more.
-        const step = async (code, events = true) => {
-            const out = await run(code);
-            await win.webContents.capturePage();
-            if (events) await win.webContents.capturePage({ x: 0, y: 0, width: 1, height: 1 });
-            return out;
-        };
+        const step = async code => { const out = await run(code); await win.webContents.capturePage(); return out; };
         const read = () => run(`[...'abcde'].map(id => document.getElementById(id).scrollTop).join()`);
         await step(`for (const id of 'abcd') document.getElementById(id).scrollTop = 60`);
         const sync = await step(`for (const id of 'abcde') document.getElementById(id + '1').style.height = '30px';
@@ -47,16 +41,17 @@ fn scroll_anchors_keep_the_content_in_view() {
         if (sync !== 70) fail('a layout for a script: ' + sync);
         const grown = await read();
         if (grown !== '70,60,60,70,0') fail('grown: ' + grown);
-        await step(`for (const id of 'abcd') document.getElementById(id + '2').style.height = '0'`, false);
+        await step(`for (const id of 'abcd') document.getElementById(id + '2').style.height = '0'`);
         const shrunk = await read();
         if (shrunk !== '50,60,60,50,0') fail('shrunk: ' + shrunk);
-        await step(`document.getElementById('a').scrollTop = 0; document.getElementById('a3').style.height = '50px'`, false);
+        await step(`document.getElementById('a').scrollTop = 0; document.getElementById('a3').style.height = '50px'`);
         const top = await read();
         if (top !== '0,60,60,50,0') fail('at the top: ' + top);
         await step('scrollTo(0, 300)');
         const page = await step(`document.getElementById('p1').style.height = '30px'; scrollY`);
         if (page !== 310) fail('the page: ' + page);
-        // As in Chrome, a move for an anchor fires a scroll event.
+        // As in Chrome, a move for an anchor fires a scroll event, at the start of the next frame.
+        await win.webContents.capturePage({ x: 0, y: 0, width: 1, height: 1 });
         const events = await run(`events.join()`);
         if (!events.startsWith('a60,a70,') || !events.endsWith(',p300,p310')) fail('scroll events: ' + events);
         "#,
@@ -847,6 +842,60 @@ fn vertical_scroll_boxes_scroll_on_their_block_axis_like_chrome() {
              div{width:100px;height:100px;overflow:auto;scrollbar-width:none}</style></head><body>\
              <div id=rl style='writing-mode:vertical-rl'><p>1</p><p>2</p><p>3</p><p>4</p><p>5</p><p>6</p><p>7</p><p id=end>8</p></div>\
              <div id=lr style='writing-mode:vertical-lr'><p>1</p><p>2</p><p>3</p><p>4</p><p>5</p><p>6</p><p>7</p><p>8</p></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn scroll_listeners_draw_in_the_frame_of_their_scroll() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+        const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap()].slice(0, 3).join();
+        const send = body => fetch(MCP + '/input', { method: 'POST', body: JSON.stringify({ window: win.id, ...body }) }).then(response => response.text());
+        const red = await pixel(5, 1), blue = await pixel(155, 1), green = await pixel(35, 1);
+        // As in Chrome, the scroll events of a frame run before its animation frames, and the frame draws what they change.
+        const check = async (step, x, y, color) => {
+            const got = await pixel(x, y);
+            if (got !== color) fail(step + ': the frame draws the box where the listener put it before: ' + got + ' ' + await run('log.join()'));
+        };
+        await wait(50);
+        await run(`document.getElementById('s').scrollTop = 100`);
+        await check('script', 5, 1, red);
+        await wait(50);
+        await run(`document.getElementById('s').scrollTo({ top: 400, behavior: 'smooth' })`);
+        for (let i = 0; i < 100 && await run(`document.getElementById('s').scrollTop`) !== 400; i++) await check('smooth ' + i, 5, 1, red);
+        await wait(50);
+        const sent = await send({ action: 'scroll', x: 50, y: 20, delta_x: 0, delta_y: -50 });
+        if (!sent.startsWith('Sent')) fail('input: ' + sent);
+        await check('wheel', 5, 1, red);
+        if (await run(`document.getElementById('s').scrollTop`) !== 350) fail('wheel offset');
+        // A callback that a listener requests runs in the same frame, also when no other callback runs.
+        await run('stop = true');
+        await pixel(0, 0);
+        await wait(50);
+        await run(`document.getElementById('s').scrollTop = 200`);
+        await check('callback', 35, 1, green);
+        await wait(50);
+        await run(`scrollTo(0, 50)`);
+        await check('page', 155, 1, blue);
+        const log = await run('log.join()');
+        if (log.split(',').some(entry => entry.startsWith('raf') && entry.split(':')[1] !== entry.split(':')[2])) fail('order: ' + log);
+        "#,
+        &[(
+            "page.html",
+            "<head><style>body{margin:0;height:2000px;background:#fff}#s{position:relative;width:100px;height:100px;overflow:auto}\
+             #m{position:absolute;left:0;top:0;width:20px;height:3px;background:red}#h{position:absolute;left:150px;top:0;width:20px;height:3px;background:blue}\
+             #n{position:absolute;left:30px;top:0;width:20px;height:3px;background:lime}</style></head>\
+             <body><div id=s><div id=m></div><div id=n></div><div style='height:1000px'></div></div><div id=h></div>\
+             <script>const s = document.getElementById('s'), m = document.getElementById('m'), h = document.getElementById('h');\
+             globalThis.log = []; globalThis.stop = false; let seen = ''; const n = document.getElementById('n');\
+             s.addEventListener('scroll', () => { log.push('scroll:' + Math.round(s.scrollTop)); m.style.top = s.scrollTop + 'px'; requestAnimationFrame(() => n.style.top = s.scrollTop + 'px'); });\
+             addEventListener('scroll', () => { h.style.top = scrollY + 'px'; });\
+             const frame = () => { const now = Math.round(s.scrollTop) + ':' + Math.round(parseFloat(m.style.top || 0)); if (now !== seen) { seen = now; log.push('raf:' + now); } if (!stop) requestAnimationFrame(frame); };\
+             requestAnimationFrame(frame);</script></body>",
         )],
     );
 }

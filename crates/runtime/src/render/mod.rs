@@ -36,7 +36,7 @@ type MaskSources = Vec<(String, background::Source)>;
 // The window glue of a page view, in the desktop: it runs the page scripts that a frame calls for.
 pub(crate) trait Pages {
     fn drive(&self, cx: &mut App);
-    // Runs `__appsLayout` after the next frame.
+    // Runs `__appsLayout` at the start of the next frame.
     fn queue_layout(self: Rc<Self>, window: &mut Window);
     fn animation_events(&self, events: Vec<(usize, &'static str, String, f64)>, cx: &mut App);
     fn lint(&self, warnings: Vec<String>);

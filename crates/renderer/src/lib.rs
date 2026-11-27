@@ -13,7 +13,7 @@ pub use app::window::node::{
     shared, text,
 };
 pub use app::window::scroll::ScrollEvent;
-pub use app::window::scroll::ScrollRef;
+pub use app::window::scroll::{ScrollRef, scroll_moves};
 pub use app::window::snap::{ScrollSnaps, Snap, SnapAlign, SnapArea};
 pub use app::window::tree::Tree;
 pub use app::window::*;

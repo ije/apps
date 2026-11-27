@@ -203,6 +203,12 @@ pub enum ScrollEvent {
 
 thread_local! {
     static ORDER: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+    static MOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts the moves of all scroll offsets on this thread, so a page can tell that it has scroll events to fire.
+pub fn scroll_moves() -> u64 {
+    MOVES.get()
 }
 
 // The scroll anchor: a box that keeps its place in the scroll viewport when the content above it changes size.
@@ -280,6 +286,13 @@ impl Animation {
 }
 
 impl ScrollState {
+    fn set(&mut self, offset: Point<Pixels>) {
+        if offset != self.offset {
+            self.offset = offset;
+            MOVES.set(MOVES.get() + 1);
+        }
+    }
+
     fn pan(&mut self, delta: Point<Pixels>, sent: Option<Instant>) -> (bool, Point<Pixels>) {
         let axis = |offset: &mut Pixels,
                     stretch: &mut Pixels,
@@ -337,7 +350,10 @@ impl ScrollState {
                     pace,
                 });
             }
-            None => (self.offset, self.glide) = (aim, None),
+            None => {
+                self.set(aim);
+                self.glide = None;
+            }
         }
         (moved, point(x, y))
     }
@@ -375,7 +391,7 @@ impl ScrollState {
             start: now,
             duration,
         });
-        self.offset = from;
+        self.set(from);
         self.glide = None;
         self.moved = true;
     }
@@ -430,7 +446,8 @@ impl ScrollState {
     }
 
     fn place(&mut self, offset: Point<Pixels>) {
-        (self.offset, self.stretch) = (offset, Point::default());
+        self.set(offset);
+        self.stretch = Point::default();
         (self.animation, self.spring, self.loose) = (None, None, false);
         self.glide = None;
     }
@@ -467,7 +484,7 @@ impl ScrollState {
             };
             // The snap events wait for a frame at rest.
             moved = offset != self.offset || self.animation.is_none() && self.snaps.is_some();
-            self.offset = offset;
+            self.set(offset);
         }
         if let Some(glide) = &mut self.glide
             && glide.to != self.offset
@@ -475,7 +492,7 @@ impl ScrollState {
             let span = (glide.until - glide.from).as_secs_f32();
             let done = now.saturating_duration_since(glide.from).as_secs_f32();
             let (from, to) = (self.offset, glide.to);
-            self.offset = match done < span {
+            let next = match done < span {
                 true => point(
                     from.x + (to.x - from.x) * (done / span),
                     from.y + (to.y - from.y) * (done / span),
@@ -483,6 +500,7 @@ impl ScrollState {
                 false => to,
             };
             glide.from = glide.from.max(now);
+            self.set(next);
             moved |= self.offset != from;
         }
         let resting = self.animation.is_none()
@@ -794,7 +812,7 @@ impl ScrollRef {
     // on from the new offset.
     pub(crate) fn anchor_by(&self, by: Pixels) {
         let scroll = &mut *self.0.borrow_mut();
-        scroll.offset.y += by;
+        scroll.set(scroll.offset + point(px(0.), by));
         if let Some(glide) = &mut scroll.glide {
             glide.to.y += by;
         }
@@ -868,15 +886,18 @@ impl ScrollRef {
             }
             scroll.driven = true;
         }
-        let handle = self.clone();
-        window.next_frame(move |window, _| {
-            let now = window.frame_at.unwrap_or_else(Instant::now);
-            let idle = now.saturating_duration_since(window.rails.1) > Duration::from_millis(100);
-            if handle.0.borrow_mut().advance(now, idle) {
-                window.refresh();
-            }
-            handle.drive(window);
-        });
+        window.drives.push(self.clone());
+        window.platform.request_frame();
+    }
+
+    // A step of a running scroll at the start of a frame, before the page sees its offset.
+    pub(crate) fn step(&self, window: &mut Window) {
+        let now = window.frame_at.unwrap_or_else(Instant::now);
+        let idle = now.saturating_duration_since(window.rails.1) > Duration::from_millis(100);
+        if self.0.borrow_mut().advance(now, idle) {
+            window.refresh();
+        }
+        self.drive(window);
     }
 
     pub(crate) fn clamp(
@@ -931,7 +952,7 @@ impl ScrollRef {
         {
             anchor.offset = offset;
         }
-        scroll.offset = offset;
+        scroll.set(offset);
         if let Some(glide) = &mut scroll.glide {
             glide.to = within(range, glide.to);
         }

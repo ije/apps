@@ -36,7 +36,9 @@ pub(crate) struct Input {
     id: u64,
     window: WindowId,
     queued: Cell<bool>,
+    // `__appsLayout` runs at the start of the next frame, and the scroll moves it last saw.
     layout_queued: Cell<bool>,
+    moves: Cell<u64>,
     buttons: Cell<u8>,
     origin: Cell<Option<Point<Pixels>>>,
     dropped: RefCell<Vec<PathBuf>>,
@@ -65,6 +67,7 @@ impl PageView {
             window,
             queued: Cell::new(false),
             layout_queued: Cell::new(false),
+            moves: Cell::new(0),
             buttons: Cell::new(0),
             origin: Cell::new(None),
             dropped: RefCell::default(),
@@ -80,6 +83,32 @@ impl PageView {
 }
 
 impl Input {
+    // As in the HTML rendering steps, the scroll events of a frame run before its animation frame callbacks, so the
+    // frame draws what their listeners change with the new offsets. The observers of the last layout run first.
+    fn frame(self: &Rc<Self>, window: &mut Window, cx: &mut App) {
+        let moves = renderer::scroll_moves();
+        if !self.layout_queued.replace(false) && self.moves.get() == moves {
+            return;
+        }
+        self.moves.set(moves);
+        if let Some(renderer) = self.try_renderer()
+            && let Err(error) = scripted(cx, Some(window), || {
+                renderer.eval("__appsLayout()", "apps:layout")
+            })
+        {
+            eprintln!("apps: {error}");
+        }
+        // A callback that a listener requests runs in this frame.
+        if self.store.try_borrow_mut().ok().is_some_and(|mut store| {
+            store
+                .page_state_mut(self.id)
+                .is_some_and(|dom| std::mem::take(&mut dom.frame_requested))
+        }) {
+            queue_animation_frame(self.clone(), window);
+        }
+        self.defer_drive(cx);
+    }
+
     fn renderer(&self) -> Option<Rc<JsContext>> {
         self.desktop.borrow().views.get(&self.id)?.renderer.clone()
     }
@@ -231,20 +260,9 @@ impl Pages for Input {
     }
 
     fn queue_layout(self: Rc<Self>, window: &mut Window) {
-        if self.layout_queued.replace(true) {
-            return;
+        if !self.layout_queued.replace(true) {
+            window.request_frame();
         }
-        window.next_frame(move |window, cx| {
-            self.layout_queued.set(false);
-            if let Some(renderer) = self.renderer()
-                && let Err(error) = scripted(cx, Some(window), || {
-                    renderer.eval("__appsLayout()", "apps:layout")
-                })
-            {
-                eprintln!("apps: {error}");
-            }
-            self.defer_drive(cx);
-        });
     }
 
     // Animation handlers can hide or remove a popup, so run them before its final frame is painted.
@@ -571,6 +589,10 @@ impl renderer::View for PageView {
         }
         self.page
             .render_page(tree, window, cx, events(self.clone()))
+    }
+
+    fn frame(&mut self, window: &mut Window, cx: &mut App) {
+        self.input.frame(window, cx);
     }
 
     fn suppressed(&self) -> bool {

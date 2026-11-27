@@ -50,6 +50,8 @@ pub trait View: 'static {
     fn event(&mut self, event: &Event, window: &mut Window, app: &mut App);
     /// Runs after each frame, with the layers of `Window::with_snapshot` that changed.
     fn drawn(&mut self, _snapshots: Vec<Snapshot>, _window: &mut Window, _app: &mut App) {}
+    /// Runs at the start of each frame, after the steps of running scrolls and before the frame callbacks.
+    fn frame(&mut self, _window: &mut Window, _app: &mut App) {}
     /// While true, frames draw nothing, so the window keeps its last frame.
     fn suppressed(&self) -> bool {
         false
@@ -603,6 +605,7 @@ pub struct Window {
     states: FxHashMap<(NodeKey, TypeId), Box<dyn Any>>,
     next_states: FxHashMap<(NodeKey, TypeId), Box<dyn Any>>,
     frame_callbacks: Vec<FrameCallback>,
+    pub(super) drives: Vec<ScrollRef>,
     // A patch frame waits for the end of the frame, where a full draw can take its place.
     patch: bool,
     captures: Vec<CaptureCallback>,
@@ -697,6 +700,7 @@ impl Window {
             states: FxHashMap::default(),
             next_states: FxHashMap::default(),
             frame_callbacks: Vec::new(),
+            drives: Vec::new(),
             patch: false,
             captures: Vec::new(),
             ime_key: None,
@@ -1007,6 +1011,10 @@ impl Window {
         self.platform.request_frame();
     }
 
+    pub fn request_frame(&mut self) {
+        self.platform.request_frame();
+    }
+
     pub fn frames_drawn(&self) -> u64 {
         self.frames_drawn
     }
@@ -1063,6 +1071,13 @@ impl Window {
 
     // The frame of a display tick or a forced frame.
     pub(crate) fn frame(&mut self, app: &mut App) {
+        for handle in mem::take(&mut self.drives) {
+            handle.step(self);
+        }
+        if let Some(mut view) = self.view.take() {
+            view.frame(self, app);
+            self.view.get_or_insert(view);
+        }
         for callback in mem::take(&mut self.frame_callbacks) {
             callback(self, app);
         }
@@ -1152,7 +1167,7 @@ impl Window {
     }
 
     pub(crate) fn wants_frame(&self) -> bool {
-        self.dirty || self.patch || !self.frame_callbacks.is_empty()
+        self.dirty || self.patch || !self.frame_callbacks.is_empty() || !self.drives.is_empty()
     }
 
     // Core Animation avoids about 126 MB of Metal memory for caret blinking. Use it only without effects,

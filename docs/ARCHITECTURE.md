@@ -102,7 +102,7 @@ A page and its preload have separate globals but share a VM and host. On macOS, 
 
 ### Events and communication
 
-[bootstrap.js](crates/runtime/js/bootstrap.js) manages timers and task phases. Native completion events wake the thread that owns the context. The desktop loop arms the next timer and requests a frame only when the page needs one. Each task has a microtask checkpoint.
+[bootstrap.js](crates/runtime/js/bootstrap.js) manages timers and task phases. Native completion events wake the thread that owns the context. The desktop loop arms the next timer and requests a frame only when the page needs one. Each task has a microtask checkpoint. A frame first moves the running scrolls by a step. Then the page runs the resize and intersection observers of the last layout, the scroll events, and the animation frame callbacks, and then the frame draws. So, as in Chrome, the frame that shows a new scroll offset also shows what the scroll listeners changed.
 
 [bridge.js](crates/runtime/js/bridge.js) implements IPC and `contextBridge`. IPC values follow structured clone semantics. The context bridge also supports function and promise proxies between page and preload contexts. Rust handlers accept JSON values. `AppHandle` lets Rust threads send events to pages or request app exit.
 
