@@ -606,6 +606,8 @@ pub struct Window {
     next_states: FxHashMap<(NodeKey, TypeId), Box<dyn Any>>,
     frame_callbacks: Vec<FrameCallback>,
     pub(super) drives: Vec<ScrollRef>,
+    // A view asked for the next frame, for its `frame` hook.
+    wanted: bool,
     // A patch frame waits for the end of the frame, where a full draw can take its place.
     patch: bool,
     captures: Vec<CaptureCallback>,
@@ -701,6 +703,7 @@ impl Window {
             next_states: FxHashMap::default(),
             frame_callbacks: Vec::new(),
             drives: Vec::new(),
+            wanted: false,
             patch: false,
             captures: Vec::new(),
             ime_key: None,
@@ -1012,6 +1015,7 @@ impl Window {
     }
 
     pub fn request_frame(&mut self) {
+        self.wanted = true;
         self.platform.request_frame();
     }
 
@@ -1071,6 +1075,7 @@ impl Window {
 
     // The frame of a display tick or a forced frame.
     pub(crate) fn frame(&mut self, app: &mut App) {
+        self.wanted = false;
         for handle in mem::take(&mut self.drives) {
             handle.step(self);
         }
@@ -1167,7 +1172,11 @@ impl Window {
     }
 
     pub(crate) fn wants_frame(&self) -> bool {
-        self.dirty || self.patch || !self.frame_callbacks.is_empty() || !self.drives.is_empty()
+        self.dirty
+            || self.patch
+            || self.wanted
+            || !self.frame_callbacks.is_empty()
+            || !self.drives.is_empty()
     }
 
     // Core Animation avoids about 126 MB of Metal memory for caret blinking. Use it only without effects,
