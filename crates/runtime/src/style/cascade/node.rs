@@ -268,15 +268,26 @@ impl NodePass<'_> {
         // the root elements are in the list because they set the root font size.
         let mut seeds: Vec<u32> = Vec::new();
         if fast {
-            let dirty = matches.dirty_nodes();
             let animated = context.filter(|_| !stored);
             let animated = animated
                 .into_iter()
                 .flat_map(|context| context.animated.keys().copied());
             let roots = std::iter::once(0).chain(html.iter().copied());
-            let places = roots.chain(dirty).chain(animated);
-            seeds = places.filter_map(|id| walk.walk.place(id)).collect();
+            let mut gone = Vec::new();
+            let dirty = matches.dirty_nodes().filter_map(|id| {
+                let at = walk.walk.place(id);
+                if at.is_none() && stored {
+                    gone.push(id);
+                }
+                at
+            });
+            let places = roots.chain(animated).filter_map(|id| walk.walk.place(id));
+            seeds = places.chain(dirty).collect();
             seeds.sort_unstable();
+            // A node that joins the walk gets a dirty mark again, so the nodes outside it need none.
+            for id in gone {
+                matches.clean(id);
+            }
         }
         let (mut next, mut seed, mut scan) = (0, 0, 0);
         let mut visited: Option<(usize, usize)> = None;
