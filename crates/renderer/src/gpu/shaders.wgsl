@@ -27,6 +27,7 @@ const LINE: u32 = 2u;
 const GLYPH: u32 = 3u;
 // A box without radii, borders or a rounded clip, set by the vertex stage.
 const FILL: u32 = 5u;
+const GRADIENT: u32 = 6u;
 
 const DASHED: u32 = 1u;
 const DOTTED: u32 = 2u;
@@ -608,8 +609,14 @@ fn draw_vertex(@builtin(vertex_index) index: u32, instance: Instance) -> Varying
     out.rect = instance.rect;
     out.rx = instance.rx;
     out.ry = instance.ry;
-    out.color = target_color(instance.color);
-    out.border_color = target_color(instance.border_color);
+    // A gradient keeps its shape and ramp in the color slots.
+    if kind == GRADIENT {
+        out.color = instance.color;
+        out.border_color = instance.border_color;
+    } else {
+        out.color = target_color(instance.color);
+        out.border_color = target_color(instance.border_color);
+    }
     out.aux = instance.aux;
     out.aux_rx = instance.aux_rx;
     out.aux_ry = instance.aux_ry;
@@ -668,6 +675,66 @@ fn draw_fragment(v: Varyings) -> @location(0) vec4<f32> {
             let ink = dot(v.color.rgb, REC709) * 2.0 - 1.0;
             coverage = saturate(coverage + coverage * (1.0 - coverage) * ink * globals.text_contrast);
             color = premultiply(v.color) * coverage;
+        }
+        case GRADIENT: {
+            // The place in the tile. Gaps of `space` and the outside of a tile that doesn't repeat draw nothing.
+            // Tiles without gaps cover all, also where float error puts a pixel past the tile.
+            let size = v.aux_rx.zw;
+            let step = v.aux_ry.xy;
+            let repeats = step > vec2<f32>(0.0);
+            var q = p - v.rect.xy - v.aux_rx.xy;
+            q = select(q, q - floor(q / step) * step, repeats);
+            let open = repeats & (step <= size + 0.01);
+            if any(!open & ((q < vec2<f32>(0.0)) | (q >= size))) {
+                return vec4<f32>(0.0);
+            }
+            let d = q - v.color.xy;
+            var s: f32;
+            switch flags & 3u {
+                case 0u: {
+                    s = dot(d, v.color.zw);
+                }
+                case 1u: {
+                    s = length(vec2<f32>(d.x, d.y * v.color.z));
+                }
+                default: {
+                    s = fract((atan2(d.x, -d.y) - v.color.z) / (2.0 * PI)) * 360.0;
+                }
+            }
+            var t = s * v.border_color.x + v.border_color.y;
+            t = select(saturate(t), fract(t), (flags & 4u) != 0u);
+            // Two texels of the ramp, which wraps into rows, mixed by hand. Each has 16 bits: the high bytes, and
+            // the low bytes in as many rows below them.
+            let last = v.aux_ry.z - 1.0;
+            let at = t * last;
+            let low = min(floor(at), last - 1.0);
+            let width = u32(v.aux_ry.w);
+            let rows = (u32(v.aux_ry.z) + width - 1u) / width;
+            let a = u32(low);
+            let b = a + 1u;
+            let base = vec2<i32>(v.aux.xy);
+            let ta = base + vec2<i32>(vec2<u32>(a % width, a / width));
+            let tb = base + vec2<i32>(vec2<u32>(b % width, b / width));
+            let below = vec2<i32>(0, i32(rows));
+            let pa = textureLoad(t1, ta, 0) * 256.0 + textureLoad(t1, ta + below, 0);
+            let pb = textureLoad(t1, tb, 0) * 256.0 + textureLoad(t1, tb + below, 0);
+            var pixel = mix(pa, pb, at - low) / 257.0;
+            let wide = globals.wide != 0.0;
+            if wide != ((flags & 8u) != 0u) && pixel.a > 0.0 {
+                let c = pixel.rgb / pixel.a;
+                pixel = vec4<f32>(select(gamut(c, P3_TO_SRGB), to_p3(c), wide) * pixel.a, pixel.a);
+            }
+            var alpha = v.info.z;
+            if any(v.rx != vec4<f32>(0.0)) {
+                alpha *= saturate(0.5 - box_distance(p, v.rect, v.rx, v.ry, v.shape.xy));
+            }
+            color = pixel * alpha;
+            // Like Chrome, gradients dither with Skia's 8x8 ordered pattern, by less than half a level.
+            let x = u32(p.x);
+            let y = u32(p.y) ^ x;
+            let m = ((y & 1u) << 5u) | ((x & 1u) << 4u) | ((y & 2u) << 2u) | ((x & 2u) << 1u) | ((y & 4u) >> 1u) | ((x & 4u) >> 2u);
+            let dither = (f32(m) * (2.0 / 128.0) - 63.0 / 128.0) / 255.0;
+            color = vec4<f32>(clamp(color.rgb + dither, vec3<f32>(0.0), vec3<f32>(color.a)), color.a);
         }
         default: {
             // A pixelated image samples the center of its nearest texel. Edges sample only their own

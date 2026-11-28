@@ -255,7 +255,7 @@ The runtime reuses data across frames and releases temporary resources after act
 - After about one second without frames, a window releases spare GPU resources. Its last frame remains visible.
 - An inline SVG rasters at the size that its transforms show, and keeps its raster while that size stays within half of it, so an animated transform doesn't raster it in each frame. Boxes with the same mask inputs and size share one mask image.
 - An SVG more than two window sizes outside the window drops its raster, by its place in the layout mirror, so also in layers that paint without the clips around them. It rasters again within one window size.
-- A smooth CSS gradient rasters with fewer pixels, as far as the GPU's linear filtering stays within two color levels of the full raster. Hard stops and tile edges keep full pixels.
+- A CSS background gradient has no raster. Its stops become a ramp: a texel of color for each device pixel along the gradient, or four near hard stops, in rows of up to 1024 texels in the atlas. The shader finds the place of each pixel in its tile and on the gradient, mixes two texels of the ramp, and dithers like Chrome. Gradients in masks and border images still raster.
 - The box tree keeps the paint chunks of its boxes in one shared list and rarely used fields in a box of their own, so a box takes about 1 KB.
 
 The allocator belongs to `apps-runtime`, so a Rust app cannot define another global allocator. Memory policy lives in [malloc.rs](../crates/runtime/src/malloc.rs), [jsc/mod.rs](../crates/runtime/src/jsc/mod.rs), and the platform renderer.

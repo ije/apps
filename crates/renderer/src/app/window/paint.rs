@@ -1,5 +1,5 @@
 use super::*;
-use crate::gpu::{BOX, GLYPH, IMAGE, Instance, LINE, SHADOW};
+use crate::gpu::{BOX, GLYPH, GRADIENT, IMAGE, Instance, LINE, SHADOW};
 
 // A border around a box. `sides` limits it to some sides, bit 0 top, 1 right, 2 bottom, 3 left; 0 draws
 // all of them.
@@ -9,6 +9,32 @@ pub struct Border {
   pub color: Color,
   pub style: BorderStyle,
   pub sides: u8,
+}
+
+/// The shape of a gradient, with points from the origin of its tile in pixels. Each point has a value `s` along
+/// the shape, which picks a color of the ramp.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GradientShape {
+  /// The point where `s` is 0, and the unit direction in which `s` grows by one per pixel.
+  Linear([f32; 2], [f32; 2]),
+  /// The center, and the ratio of the x radius to the y radius. `s` is the distance on the x radius.
+  Radial([f32; 2], f32),
+  /// The center, and the angle in radians where `s` is 0. `s` is the angle from there in degrees, clockwise.
+  Conic([f32; 2], f32),
+}
+
+/// A CSS gradient for `Window::draw_gradient`. Its ramp is an image of `texels` premultiplied colors, row by row,
+/// spread evenly over `range` of `s`. Outside the range the end colors pad, or the ramp repeats.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Gradient {
+  pub shape: GradientShape,
+  pub repeating: bool,
+  /// The first tile, in window pixels.
+  pub tile: Rect<Pixels>,
+  /// The step from one tile to the next on each axis, or `None` where the tile doesn't repeat.
+  pub steps: [Option<f32>; 2],
+  pub range: [f32; 2],
+  pub texels: u32,
 }
 
 impl crate::text::TextCanvas for Window {
@@ -851,6 +877,82 @@ impl Window {
         | u8::from(pixelated) << 2
         | u8::from(image.is_display_p3()) << 3,
     );
+    self.scene.push(instance);
+  }
+
+  /// Fills `bounds` with the tiles of a gradient, from the colors of its ramp, without a raster.
+  pub fn draw_gradient(
+    &mut self,
+    bounds: Rect<Pixels>,
+    radii: impl Into<Radii<Pixels>>,
+    ramp: &Arc<RenderImage>,
+    gradient: &Gradient,
+  ) {
+    let radii = radii.into().fit(bounds.size);
+    let tile = gradient.tile;
+    // A tile that doesn't repeat draws only at its place, unless corners need the whole box.
+    let area = match radii.is_zero() {
+      true => bounds.intersect(Rect::between(
+        point(
+          if gradient.steps[0].is_none() {
+            tile.left()
+          } else {
+            bounds.left()
+          },
+          if gradient.steps[1].is_none() {
+            tile.top()
+          } else {
+            bounds.top()
+          },
+        ),
+        point(
+          if gradient.steps[0].is_none() {
+            tile.right()
+          } else {
+            bounds.right()
+          },
+          if gradient.steps[1].is_none() {
+            tile.bottom()
+          } else {
+            bounds.bottom()
+          },
+        ),
+      )),
+      false => bounds,
+    };
+    let [start, end] = gradient.range;
+    if self.opacity <= 0. || area.is_empty() || end <= start || gradient.texels < 2 {
+      return;
+    }
+    let Some(atlas) = self.image_tile(ramp) else {
+      return;
+    };
+    let scale = self.scale_factor;
+    let rect = self.snap_bounds(area);
+    let mut instance = self.sprite(GRADIENT, rect, self.snapped_content_mask(), atlas);
+    instance.radii = radii.scale(scale).to_array();
+    [instance.shape[0], instance.shape[1]] = radii.shape_array();
+    let step = |step: Option<f32>| step.map_or(0., |step| step * scale);
+    instance.aux_radii = [
+      tile.left().0 * scale - rect.origin.x,
+      tile.top().0 * scale - rect.origin.y,
+      tile.size.width.0 * scale,
+      tile.size.height.0 * scale,
+      step(gradient.steps[0]),
+      step(gradient.steps[1]),
+      gradient.texels as f32,
+      ramp.size().width as f32,
+    ];
+    let (shape, geometry, unit) = match gradient.shape {
+      GradientShape::Linear([x, y], [dx, dy]) => (0, [x * scale, y * scale, dx, dy], scale),
+      GradientShape::Radial([x, y], ratio) => (1, [x * scale, y * scale, ratio, 0.], scale),
+      GradientShape::Conic([x, y], from) => (2, [x * scale, y * scale, from, 0.], 1.),
+    };
+    instance.color = geometry;
+    let length = (end - start) * unit;
+    instance.border_color = [1. / length, -start * unit / length, 0., 0.];
+    instance.info[1] =
+      f32::from(shape | u8::from(gradient.repeating) << 2 | u8::from(ramp.is_display_p3()) << 3);
     self.scene.push(instance);
   }
 

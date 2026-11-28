@@ -28,28 +28,6 @@ fn first_argument(body: &str) -> (String, Option<String>) {
   }
 }
 
-pub(crate) fn gradient_axis(kind: &str, body: &str, units: &Lengths) -> Option<usize> {
-  if kind.trim_start_matches("repeating-") != "linear-gradient" {
-    return None;
-  }
-  let (first, _) = first_argument(body);
-  let degrees = match first.strip_prefix("to ") {
-    Some(side) => match side.trim() {
-      "top" => 0.,
-      "right" => 90.,
-      "bottom" => 180.,
-      "left" => 270.,
-      _ => return None,
-    },
-    None => angle(&first, units).unwrap_or(180.),
-  };
-  match degrees.rem_euclid(180.) {
-    0. => Some(1),
-    90. => Some(0),
-    _ => None,
-  }
-}
-
 // The size and offset of a background tile in its positioning area. `natural` is the size of an image.
 pub(crate) fn tile(
   size: &str,
@@ -439,66 +417,6 @@ struct Gradient<'a> {
 }
 
 impl Gradient<'_> {
-  // The longest step in CSS px between the pixels of a raster that the GPU scales up, with at most 2 levels of
-  // error. Linear filtering is exact between stops, and at a stop errs by a quarter of the step times the change
-  // of slope. Hard stops and tile edges need full pixels, so they give 0.
-  fn coarse_step(&self, covers: bool) -> f32 {
-    let offsets = &self.offsets;
-    if !covers || self.kind == "conic-gradient" || offsets.len() < 2 {
-      return 0.;
-    }
-    let (shifts, mask) = self.channels();
-    let unit = 255. / mask as f32;
-    // Premultiplied, so the colors of transparent stops don't count.
-    let levels = |(ink, alpha): (u32, u8)| {
-      let unit = unit * alpha as f32 / 255.;
-      [
-        (ink >> shifts[0] & mask) as f32 * unit,
-        (ink >> shifts[1] & mask) as f32 * unit,
-        (ink >> shifts[2] & mask) as f32 * unit,
-        alpha as f32,
-      ]
-    };
-    let mut slopes = Vec::with_capacity(offsets.len() + 1);
-    for pair in offsets.windows(2) {
-      let [a, b] = [levels(pair[0].1), levels(pair[1].1)];
-      let length = pair[1].0 - pair[0].0;
-      if length <= 0. {
-        if a != b {
-          return 0.;
-        }
-        continue;
-      }
-      slopes.push(std::array::from_fn::<f32, 4, _>(|at| {
-        (b[at] - a[at]) / length
-      }));
-    }
-    let (Some(&first), Some(&last)) = (slopes.first(), slopes.last()) else {
-      return f32::INFINITY;
-    };
-    let radial = self.kind == "radial-gradient";
-    let (before, after) = match self.repeating {
-      true if levels(offsets[0].1) != levels(offsets[offsets.len() - 1].1) => return 0.,
-      true => (last, first),
-      // The center of a radial gradient mirrors its first slope.
-      false if radial && offsets[0].0 <= 0. => (first.map(|slope| -slope), [0.; 4]),
-      false => ([0.; 4], [0.; 4]),
-    };
-    let mut bend = 0f32;
-    let mut previous = before;
-    for slope in slopes.into_iter().chain([after]) {
-      for at in 0..4 {
-        bend = bend.max((slope[at] - previous[at]).abs());
-      }
-      previous = slope;
-    }
-    let stretch = match radial {
-      true => (self.radii.0 / self.radii.1.max(0.01)).max(1.),
-      false => self.direction.0.abs() + self.direction.1.abs(),
-    };
-    8. / bend / stretch
-  }
-
   fn channels(&self) -> ([u32; 3], u32) {
     match self.wide {
       true => ([20, 10, 0], 1023),
@@ -556,7 +474,7 @@ fn stop_css(wide: bool, ink: u32, alpha: u8) -> String {
   }
 }
 
-// The SVG of a gradient, whether it is Display P3, and the longest pixel step in CSS px that a raster of it can take.
+// The SVG of a gradient, and whether it is Display P3.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gradient_svg(
   kind: &str,
@@ -568,7 +486,7 @@ pub(crate) fn gradient_svg(
   width: f32,
   height: f32,
   area: [f32; 4],
-) -> Option<(String, bool, f32)> {
+) -> Option<(String, bool)> {
   let gradient = gradient(kind, body, size, position, repeat, units, area)?;
   let Gradient {
     tile: [tw, th],
@@ -672,163 +590,140 @@ pub(crate) fn gradient_svg(
       )
     }
   };
-  // One tile covers the raster, so it shows no tile edges.
-  let covers = x <= 0.01 && y <= 0.01 && x + tw >= width - 0.01 && y + th >= height - 0.01;
-  let step = gradient.coarse_step(covers);
   let body = tiled(gradient.steps, [tw, th], [x, y], [width, height], &content);
   Some((
     format!(
       "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{body}</svg>"
     ),
     wide,
-    step,
   ))
 }
 
-// The pixels of a conic gradient over a `width` by `height` area, at `rw` by `rh` pixels. Each pixel takes the color
-// at the angle of its center, like Skia: a scripted angle that changes each frame then costs one pass, not an SVG
-// of wedges.
+/// A gradient for `renderer::Window::draw_gradient`, with its tile from the origin of the painting area, and its
+/// ramp of colors. `scale` is the device pixel ratio.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn conic_image(
+pub(crate) fn gradient_ramp(
   kind: &str,
   body: &str,
   size: &str,
   position: &str,
   repeat: &str,
   units: Lengths,
-  [width, height]: [f32; 2],
   area: [f32; 4],
-  [rw, rh]: [u32; 2],
-  previous: Option<&std::sync::Arc<renderer::RenderImage>>,
-) -> Option<std::sync::Arc<renderer::RenderImage>> {
+  scale: f32,
+) -> Option<(renderer::RenderImage, renderer::Gradient)> {
   let gradient = gradient(kind, body, size, position, repeat, units, area)?;
-  let [[tw, th], [x, y]] = [gradient.tile, gradient.at];
-  if tw <= 0. || th <= 0. {
+  let offsets = &gradient.offsets;
+  let [first, last] = [offsets[0].0, offsets[offsets.len() - 1].0];
+  // As in CSS, a repeating gradient repeats from its first stop to its last, also a radial one.
+  let period = match gradient.repeating {
+    true => last - first,
+    false => (last - first).max(1e-3),
+  };
+  let start = first;
+  if period <= 0. {
     return None;
   }
-  let [rw, rh] = [rw, rh].map(|side| side.clamp(1, super::super::raster::RASTER_MAX));
-  let [sx, sy] = [width / rw as f32, height / rh as f32];
-  // One entry per half device pixel at the far corner, so hard stops stay sharp.
-  let reach = (tw / sx).hypot(th / sy);
-  let steps = ((reach * std::f32::consts::TAU * 2.).ceil() as usize).clamp(720, 1 << 16);
-  // Runs of one color are common, and a Display P3 conversion is slow, so the last one is kept.
-  let (mut last, mut next) = ((u32::MAX, 0, 0), 0);
-  let table: Vec<[u8; 4]> = (0..steps)
-    .map(|step| {
-      let (ink, alpha) = gradient.conic_at((step as f32 + 0.5) * 360. / steps as f32, &mut next);
-      let byte = (alpha * 255.) as u8;
-      if (last.0, last.1) != (ink, byte) {
-        last = (ink, byte, gradient.output(ink, byte));
-      }
-      let [r, g, b] = [16, 8, 0].map(|shift| ((last.2 >> shift & 255) as f32 * alpha + 0.5) as u8);
-      [b, g, r, (alpha * 255. + 0.5) as u8]
+  let [tw, th] = gradient.tile;
+  let (cx, cy) = gradient.center;
+  let (shape, reach) = match gradient.kind {
+    "linear-gradient" => {
+      let (dx, dy) = gradient.direction;
+      let extent = gradient.extent;
+      (
+        renderer::GradientShape::Linear(
+          [tw / 2. - dx * extent / 2., th / 2. - dy * extent / 2.],
+          [dx, dy],
+        ),
+        period,
+      )
+    }
+    "radial-gradient" => {
+      let ratio = gradient.radii.0 / gradient.radii.1.max(0.01);
+      (
+        renderer::GradientShape::Radial([cx, cy], ratio),
+        period * ratio.max(1.),
+      )
+    }
+    _ => {
+      let far = [[0., 0.], [tw, 0.], [0., th], [tw, th]]
+        .map(|[x, y]| (x - cx).hypot(y - cy))
+        .into_iter()
+        .fold(0., f32::max);
+      (
+        renderer::GradientShape::Conic([cx, cy], gradient.from.to_radians()),
+        period / 360. * std::f32::consts::TAU * far,
+      )
+    }
+  };
+  // Colors in the space of the ramp, premultiplied.
+  let colors: Vec<[f32; 4]> = offsets
+    .iter()
+    .map(|&(_, (ink, alpha))| {
+      let ink = gradient.output(ink, alpha);
+      let alpha = alpha as f32 / 255.;
+      let [r, g, b] = [16, 8, 0].map(|shift| (ink >> shift & 255) as f32 * alpha);
+      [r, g, b, alpha * 255.]
     })
     .collect();
-  let mode = repeat.split_whitespace().next().unwrap_or("repeat");
-  let [wrap_x, wrap_y] = match mode {
-    "no-repeat" => [false; 2],
-    "repeat-x" => [true, false],
-    "repeat-y" => [false, true],
-    _ => [true; 2],
-  };
-  let (cx, cy) = gradient.center;
-  let turn = steps as f32 / std::f32::consts::TAU;
-  let from = gradient.from.to_radians().rem_euclid(std::f32::consts::TAU);
-  // A scripted angle moves less than a table step in most frames, and then the pixels are the same.
-  let digest = {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = rustc_hash::FxHasher::default();
-    table.hash(&mut hasher);
-    [
-      rw,
-      rh,
-      u32::from(wrap_x),
-      u32::from(wrap_y),
-      u32::from(gradient.wide),
-    ]
-    .hash(&mut hasher);
-    [sx, sy, x, y, tw, th, cx, cy, from]
-      .map(f32::to_bits)
-      .hash(&mut hasher);
-    hasher.finish()
-  };
-  if let Some(previous) = previous
-    && DRAWN.with_borrow(|drawn| drawn.get(&previous.id) == Some(&digest))
-  {
-    return Some(previous.clone());
-  }
-  let mut bytes = SPARE.take();
-  bytes.clear();
-  bytes.resize(rw as usize * rh as usize * 4, 0);
-  for (row, line) in bytes.chunks_exact_mut(rw as usize * 4).enumerate() {
-    // `rem_euclid` calls `fmodf`, so only rows and columns outside the first tile take it.
-    let mut v = (row as f32 + 0.5) * sy - y;
-    if !(0. ..th).contains(&v) {
-      match wrap_y {
-        true => v = v.rem_euclid(th),
-        false => continue,
-      }
-    }
-    let dy = v - cy;
-    for (column, pixel) in line.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-      let mut u = (column as f32 + 0.5) * sx - x;
-      if !(0. ..tw).contains(&u) {
-        match wrap_x {
-          true => u = u.rem_euclid(tw),
-          false => continue,
+  // A texel for each device pixel, and four where colors change within a pixel, so hard stops stay sharp.
+  let hard = (offsets.windows(2).zip(colors.windows(2)))
+    .any(|(pair, inks)| (pair[1].0 - pair[0].0) * scale < 1. && inks[0] != inks[1]);
+  let density = if hard { 4. } else { 1. };
+  let texels = ((reach * scale * density).ceil() as u32 + 1).clamp(2, 1 << 16);
+  let width = texels.min(1024);
+  let rows = texels.div_ceil(width);
+  // 16 bits per channel, so smooth gradients keep the levels between bytes for the dither: the high bytes in
+  // the first rows, the low bytes in as many rows below them.
+  let half = (width * rows * 4) as usize;
+  let mut bytes = vec![0; half * 2];
+  let (high, low) = bytes.split_at_mut(half);
+  let mut next = 0;
+  let end = offsets.len() - 1;
+  let pixels = high.as_chunks_mut::<4>().0.iter_mut();
+  for (texel, (high, low)) in pixels.zip(low.as_chunks_mut::<4>().0).enumerate() {
+    let texel = (texel as u32).min(texels - 1);
+    let color = match texel {
+      0 => colors[0],
+      _ if texel == texels - 1 => colors[end],
+      _ => {
+        let at = start + period * texel as f32 / (texels - 1) as f32;
+        while next < end && offsets[next].0 <= at {
+          next += 1;
         }
+        let (a, b) = (next.saturating_sub(1), next);
+        let span = offsets[b].0 - offsets[a].0;
+        let t = match span > 0. {
+          true => ((at - offsets[a].0) / span).clamp(0., 1.),
+          false => 1.,
+        };
+        std::array::from_fn(|channel| {
+          colors[a][channel] + (colors[b][channel] - colors[a][channel]) * t
+        })
       }
-      // atan2(u - cx, -dy) by a polynomial: libm's is most of the time of this loop.
-      let (y, x) = (u - cx, -dy);
-      let (ax, ay) = (x.abs(), y.abs());
-      let a = ax.min(ay) / ax.max(ay).max(f32::MIN_POSITIVE);
-      let q = a * a;
-      let mut angle = ((-0.046_496_47 * q + 0.159_314_22) * q - 0.327_622_76) * q * a + a;
-      if ay > ax {
-        angle = std::f32::consts::FRAC_PI_2 - angle;
-      }
-      if x < 0. {
-        angle = std::f32::consts::PI - angle;
-      }
-      if y < 0. {
-        angle = -angle;
-      }
-      // `angle - from` is within two turns of the range.
-      let mut angle = angle - from;
-      while angle < 0. {
-        angle += std::f32::consts::TAU;
-      }
-      while angle >= std::f32::consts::TAU {
-        angle -= std::f32::consts::TAU;
-      }
-      *pixel = table[((angle * turn) as usize).min(steps - 1)];
-    }
+    };
+    let wide = [2, 1, 0, 3].map(|channel| (color[channel] * 257. + 0.5).min(65535.) as u16);
+    *high = wide.map(|value| (value >> 8) as u8);
+    *low = wide.map(|value| value as u8);
   }
-  let image = renderer::RenderImage::new_premultiplied(rw, rh, bytes);
-  let image = std::sync::Arc::new(match gradient.wide {
-    true => image.display_p3(),
-    false => image,
-  });
-  DRAWN.with_borrow_mut(|drawn| {
-    if drawn.len() >= 256 {
-      drawn.clear();
-    }
-    drawn.insert(image.id, digest);
-  });
-  Some(image)
-}
-
-thread_local! {
-    // The pixels of the last released gradient image, for the next one. New pages cost more than a memset.
-    static SPARE: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
-    // The digests of the table and place of conic images, by image.
-    static DRAWN: std::cell::RefCell<rustc_hash::FxHashMap<u64, u64>> = Default::default();
-}
-
-pub(crate) fn recycle(bytes: Vec<u8>) {
-  if bytes.capacity() <= 4 << 20 {
-    SPARE.set(bytes);
-  }
+  let image = renderer::RenderImage::new_premultiplied(width, rows * 2, bytes);
+  Some((
+    match gradient.wide {
+      true => image.display_p3(),
+      false => image,
+    },
+    renderer::Gradient {
+      shape,
+      repeating: gradient.repeating,
+      tile: renderer::Rect::new(
+        renderer::point(renderer::px(gradient.at[0]), renderer::px(gradient.at[1])),
+        renderer::size(renderer::px(tw), renderer::px(th)),
+      ),
+      steps: gradient.steps,
+      range: [start, start + period],
+      texels,
+    },
+  ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1213,29 +1108,6 @@ mod tests {
   }
 
   #[test]
-  fn linear_gradients_along_an_axis_are_found() {
-    for (kind, body, axis) in [
-      ("linear-gradient", "red, blue", Some(1)),
-      ("linear-gradient", "to right, red, blue", Some(0)),
-      ("linear-gradient", "in oklch to left, red, blue", Some(0)),
-      ("linear-gradient", "-90deg, red, blue", Some(0)),
-      ("linear-gradient", "0.5turn in srgb, red, blue", Some(1)),
-      (
-        "repeating-linear-gradient",
-        "to top, red, blue 9px",
-        Some(1),
-      ),
-      ("linear-gradient", "calc(0.25 * 360deg), red, blue", Some(0)),
-      ("linear-gradient", "45deg, red, blue", None),
-      ("linear-gradient", "to bottom right, red, blue", None),
-      ("radial-gradient", "red, blue", None),
-    ] {
-      let units = Lengths::new(16., 800., 600.);
-      assert_eq!(gradient_axis(kind, body, &units), axis, "{kind}({body})");
-    }
-  }
-
-  #[test]
   fn gradient_stops_take_math_angles() {
     let units = Lengths::new(16., 800., 600.);
     let offsets = |parts: &[&str]| {
@@ -1274,9 +1146,58 @@ mod tests {
   }
 
   #[test]
-  fn conic_images_draw_like_their_svg() {
+  fn gradient_ramps_draw_like_their_svg() {
     let units = Lengths::new(16., 800., 600.);
     for (kind, body, size, position, repeat) in [
+      (
+        "linear-gradient",
+        "red, yellow, blue",
+        "",
+        "0% 0%",
+        "no-repeat",
+      ),
+      (
+        "linear-gradient",
+        "70deg, red 10%, #0f08 40%, blue 120%",
+        "",
+        "0% 0%",
+        "no-repeat",
+      ),
+      (
+        "linear-gradient",
+        "to top left, red, blue",
+        "",
+        "0% 0%",
+        "no-repeat",
+      ),
+      (
+        "repeating-linear-gradient",
+        "45deg, red 0 5px, blue 5px 10px",
+        "",
+        "0% 0%",
+        "no-repeat",
+      ),
+      (
+        "radial-gradient",
+        "circle at 30% 25%, #fff, #08f 40%, transparent 70%",
+        "",
+        "0% 0%",
+        "no-repeat",
+      ),
+      (
+        "radial-gradient",
+        "ellipse, red, blue",
+        "",
+        "0% 0%",
+        "no-repeat",
+      ),
+      (
+        "repeating-radial-gradient",
+        "circle, red 0 4px, blue 4px 8px",
+        "",
+        "0% 0%",
+        "no-repeat",
+      ),
       (
         "conic-gradient",
         "red, yellow, blue",
@@ -1313,70 +1234,86 @@ mod tests {
         "repeat",
       ),
       (
-        "conic-gradient",
+        "linear-gradient",
         "red, blue",
         "25px 20px",
         "5px 5px",
         "repeat-x",
       ),
+      ("radial-gradient", "red, blue", "16px 16px", "0 0", "space"),
     ] {
       let area = [0., 0., 60., 40.];
-      let image = conic_image(
-        kind,
-        body,
-        size,
-        position,
-        repeat,
-        units,
-        [60., 40.],
-        area,
-        [120, 80],
-        None,
-      )
-      .unwrap();
-      let (svg, p3, _) =
+      let (ramp, gradient) =
+        gradient_ramp(kind, body, size, position, repeat, units, area, 2.).unwrap();
+      let (svg, p3) =
         gradient_svg(kind, body, size, position, repeat, units, 60., 40., area).unwrap();
       let svg = super::super::super::raster::svg::svg_gradient((svg, p3), 120, 80).unwrap();
-      let far = (image.bytes().as_chunks::<4>().0.iter())
-        .zip(svg.bytes().as_chunks::<4>().0)
-        .filter(|(a, b)| a.iter().zip(*b).any(|(a, b)| a.abs_diff(*b) > 24))
-        .count();
-      // The SVG draws wedges of 2deg at most, so pixels differ only along hard stops.
-      assert!(far < 120 * 80 / 100, "{body}: {far} pixels differ");
+      let texels = gradient.texels;
+      // Rows of the ramp follow each other in its bytes.
+      let half = ramp.bytes().len() / 2;
+      let texel = |at: u32| {
+        let at = at as usize * 4;
+        let [high, low] = [at, half + at].map(|at| &ramp.bytes()[at..at + 4]);
+        (high.iter().zip(low))
+          .map(|(&high, &low)| (high as f32 * 256. + low as f32) / 257.)
+          .collect::<Vec<_>>()
+      };
+      let tile = gradient.tile;
+      let mut far = 0;
+      for (index, pixel) in svg.bytes().as_chunks::<4>().0.iter().enumerate() {
+        // What the shader draws at the center of this pixel.
+        let p = [(index % 120) as f32 + 0.5, (index / 120) as f32 + 0.5].map(|at| at / 2.);
+        let mut q = [p[0] - tile.left().0, p[1] - tile.top().0];
+        let sides = [tile.size.width.0, tile.size.height.0];
+        let mut outside = false;
+        for axis in 0..2 {
+          match gradient.steps[axis] {
+            Some(step) => {
+              q[axis] = q[axis].rem_euclid(step);
+              outside |= step > sides[axis] + 0.01 && q[axis] >= sides[axis];
+            }
+            None => outside |= q[axis] < 0. || q[axis] >= sides[axis],
+          }
+        }
+        let drawn = if outside {
+          vec![0.; 4]
+        } else {
+          let s = match gradient.shape {
+            renderer::GradientShape::Linear(at, d) => (q[0] - at[0]) * d[0] + (q[1] - at[1]) * d[1],
+            renderer::GradientShape::Radial(at, ratio) => {
+              (q[0] - at[0]).hypot((q[1] - at[1]) * ratio)
+            }
+            renderer::GradientShape::Conic(at, from) => {
+              let angle = (q[0] - at[0]).atan2(at[1] - q[1]) - from;
+              angle.rem_euclid(std::f32::consts::TAU).to_degrees()
+            }
+          };
+          let [start, end] = gradient.range;
+          let t = (s - start) / (end - start);
+          let t = if gradient.repeating {
+            t.rem_euclid(1.)
+          } else {
+            t.clamp(0., 1.)
+          };
+          let at = t * (texels - 1) as f32;
+          let low = at.floor().min((texels - 2) as f32);
+          let (a, b) = (texel(low as u32), texel(low as u32 + 1));
+          a.iter()
+            .zip(&b)
+            .map(|(a, b)| a + (b - a) * (at - low))
+            .collect()
+        };
+        if drawn
+          .iter()
+          .zip(pixel)
+          .any(|(a, b)| (a - *b as f32).abs() > 24.)
+        {
+          far += 1;
+        }
+      }
+      // The SVG draws conic wedges of 2deg at most, and its hard stops alias, so pixels differ only there.
+      assert!(far < 120 * 80 / 50, "{kind}({body}): {far} pixels differ");
     }
-  }
-
-  #[test]
-  fn conic_images_draw_again_only_when_their_pixels_change() {
-    let units = Lengths::new(16., 800., 600.);
-    let draw = |turn: f32, previous| {
-      let body = format!("red {turn}turn, transparent 0");
-      let area = [0., 0., 100., 100.];
-      conic_image(
-        "conic-gradient",
-        &body,
-        "",
-        "0% 0%",
-        "",
-        units,
-        [100., 100.],
-        area,
-        [200, 200],
-        previous,
-      )
-      .unwrap()
-    };
-    let first = draw(0.3, None);
-    let still = draw(0.30001, Some(&first));
-    assert!(
-      std::sync::Arc::ptr_eq(&first, &still),
-      "a move within a table step keeps the image"
-    );
-    let moved = draw(0.31, Some(&first));
-    assert!(
-      !std::sync::Arc::ptr_eq(&first, &moved),
-      "a visible move draws again"
-    );
   }
 
   #[test]
@@ -1414,69 +1351,6 @@ mod tests {
           [0., 0., 10., 10.],
         );
       }
-    }
-  }
-
-  #[test]
-  fn smooth_gradients_raster_coarse_within_two_levels() {
-    let units = Lengths::new(16., 800., 600.);
-    let [width, height, scale] = [300., 200., 2.];
-    for (kind, body, coarse) in [
-      (
-        "radial-gradient",
-        "circle at 30% 25%, oklch(0.82 0.14 70), transparent 60%",
-        true,
-      ),
-      (
-        "linear-gradient",
-        "140deg, oklch(0.62 0.2 30), oklch(0.42 0.16 300)",
-        true,
-      ),
-      (
-        "radial-gradient",
-        "ellipse at 70% 40%, #fff, #08f 40%, #024",
-        true,
-      ),
-      ("linear-gradient", "20deg, transparent 60%, red 60%", false),
-      (
-        "repeating-linear-gradient",
-        "45deg, red 0 10px, blue 10px 20px",
-        false,
-      ),
-    ] {
-      let area = [0., 0., width, height];
-      let (svg, p3, step) = gradient_svg(
-        kind, body, "", "0% 0%", "repeat", units, width, height, area,
-      )
-      .unwrap();
-      let factor = (step * scale).clamp(1., 8.);
-      assert_eq!(factor > 1., coarse, "{body}: {step}");
-      let [fw, fh] = [width * scale, height * scale].map(|side| side as u32);
-      let [cw, ch] = [fw, fh].map(|side| (side as f32 / factor).ceil() as u32);
-      let svg_image =
-        |w, h| super::super::super::raster::svg::svg_gradient((svg.clone(), p3), w, h).unwrap();
-      let (full, small) = (svg_image(fw, fh), svg_image(cw, ch));
-      let (full, small) = (full.bytes(), small.bytes());
-      // The GPU samples the small image bilinearly, with the edges clamped to its texel centers.
-      let mut worst = 0f32;
-      for y in 0..fh {
-        for x in 0..fw {
-          let [sx, sy] = [(x, fw, cw), (y, fh, ch)].map(|(at, full, small)| {
-            ((at as f32 + 0.5) * small as f32 / full as f32 - 0.5).clamp(0., small as f32 - 1.)
-          });
-          let [x0, y0] = [sx.floor() as u32, sy.floor() as u32];
-          let [x1, y1] = [(x0 + 1).min(cw - 1), (y0 + 1).min(ch - 1)];
-          let [tx, ty] = [sx.fract(), sy.fract()];
-          for channel in 0..4 {
-            let at = |x: u32, y: u32| small[((y * cw + x) * 4) as usize + channel] as f32;
-            let top = at(x0, y0) * (1. - tx) + at(x1, y0) * tx;
-            let bottom = at(x0, y1) * (1. - tx) + at(x1, y1) * tx;
-            let value = top * (1. - ty) + bottom * ty;
-            worst = worst.max((value - full[((y * fw + x) * 4) as usize + channel] as f32).abs());
-          }
-        }
-      }
-      assert!(worst <= 4., "{body}: {worst} levels off at {factor}x");
     }
   }
 }

@@ -12,6 +12,8 @@ pub(crate) const SHADOW: u32 = 1;
 pub(crate) const LINE: u32 = 2;
 pub(crate) const GLYPH: u32 = 3;
 pub(crate) const IMAGE: u32 = 4;
+// 5 is the fill of the vertex stage.
+pub(crate) const GRADIENT: u32 = 6;
 
 // One box, shadow, line, glyph or image in device pixels. The shader reads it as 14 `vec4` vertex
 // attributes, one step per instance. Radii hold the x radius of the four corners, then the y radius,
@@ -27,10 +29,11 @@ pub(crate) struct Instance {
   pub radii: [f32; 8],
   pub color: [f32; 4],
   pub border_color: [f32; 4],
-  // Box: border widths top, right, bottom, left. Glyph and image: the tile in texels. Shadow: the
-  // caster box.
+  // Box: border widths top, right, bottom, left. Glyph, image and gradient: the tile in texels. Shadow: the
+  // caster box. Gradient: `color` holds its shape and `border_color` the scale and bias of its ramp, as is.
   pub aux: [f32; 4],
-  // Shadow: the caster radii.
+  // Shadow: the caster radii. Gradient: the first tile from `rect`, the steps between tiles (0 where they don't
+  // repeat), the ramp length and the ramp width in texels.
   pub aux_radii: [f32; 8],
   // Kind, flags, then two values that depend on the kind:
   // box: flags 0-7 border style, 8-11 sides to draw (0 draws all)
@@ -39,6 +42,7 @@ pub(crate) struct Instance {
   // glyph: -, atlas page
   // image: flag 2 premultiplied source, flag 4 pixelated, flag 8 Display P3 source, opacity,
   // atlas page
+  // gradient: flags 3 the shape (0 linear, 1 radial, 2 conic), 4 repeating, 8 Display P3 ramp, opacity, atlas page
   pub info: [f32; 4],
   // Corner shapes from `Radii::shape_array`: of `radii` (and `aux_radii`), then of `round_radii`.
   pub shape: [f32; 4],
@@ -68,7 +72,7 @@ impl Instance {
   pub fn page(&self) -> Option<(bool, u32)> {
     match self.kind() {
       GLYPH => Some((false, self.info[3] as u32)),
-      IMAGE => Some((true, self.info[3] as u32)),
+      IMAGE | GRADIENT => Some((true, self.info[3] as u32)),
       _ => None,
     }
   }

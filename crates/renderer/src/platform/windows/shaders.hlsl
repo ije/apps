@@ -14,6 +14,7 @@ static const uint SHADOW = 1u;
 static const uint LINE = 2u;
 static const uint GLYPH = 3u;
 static const uint FILL = 5u;
+static const uint GRADIENT = 6u;
 
 static const uint DASHED = 1u;
 static const uint DOTTED = 2u;
@@ -530,9 +531,9 @@ Varyings draw_vertex(uint index : SV_VertexID, Instance instance) {
     o.rect = instance.rect;
     o.rx = instance.rx;
     o.ry = instance.ry;
-    // Colors outside the sRGB gamut clip to it.
-    o.color = saturate(instance.color);
-    o.border_color = saturate(instance.border_color);
+    // Colors outside the sRGB gamut clip to it. A gradient keeps its shape and ramp in the color slots.
+    o.color = kind == GRADIENT ? instance.color : saturate(instance.color);
+    o.border_color = kind == GRADIENT ? instance.border_color : saturate(instance.border_color);
     o.aux = instance.aux;
     o.aux_rx = instance.aux_rx;
     o.aux_ry = instance.aux_ry;
@@ -585,6 +586,57 @@ float4 draw_fragment(Varyings v) : SV_Target {
         float ink = dot(v.color.rgb, REC709) * 2.0 - 1.0;
         coverage = saturate(coverage + coverage * (1.0 - coverage) * ink * globals.text_contrast);
         color = premultiply(v.color) * coverage;
+    } else if (kind == GRADIENT) {
+        // The place in the tile. Gaps of `space` and the outside of a tile that doesn't repeat draw nothing.
+        // Tiles without gaps cover all, also where float error puts a pixel past the tile.
+        float2 size = v.aux_rx.zw;
+        float2 step = v.aux_ry.xy;
+        bool2 repeats = step > 0.0;
+        float2 q = p - v.rect.xy - v.aux_rx.xy;
+        q = repeats ? q - floor(q / max(step, 1e-6)) * step : q;
+        bool2 open = repeats && step <= size + 0.01;
+        if (any(!open && (q < 0.0 || q >= size))) {
+            return float4(0.0, 0.0, 0.0, 0.0);
+        }
+        float2 d = q - v.color.xy;
+        float s;
+        uint shape = flags & 3u;
+        if (shape == 0u) {
+            s = dot(d, v.color.zw);
+        } else if (shape == 1u) {
+            s = length(float2(d.x, d.y * v.color.z));
+        } else {
+            s = frac((atan2(d.x, -d.y) - v.color.z) / (2.0 * PI)) * 360.0;
+        }
+        float t = s * v.border_color.x + v.border_color.y;
+        t = (flags & 4u) != 0u ? frac(t) : saturate(t);
+        // Two texels of the ramp, which wraps into rows, mixed by hand. Each has 16 bits: the high bytes, and
+        // the low bytes in as many rows below them.
+        float last = v.aux_ry.z - 1.0;
+        float at = t * last;
+        float low = min(floor(at), last - 1.0);
+        uint width = (uint)v.aux_ry.w;
+        uint rows = ((uint)v.aux_ry.z + width - 1u) / width;
+        uint a = (uint)low;
+        uint b = a + 1u;
+        int2 base = (int2)v.aux.xy;
+        int2 ta = base + int2(a % width, a / width);
+        int2 tb = base + int2(b % width, b / width);
+        int2 below = int2(0, (int)rows);
+        float4 pa = t1.Load(int3(ta, 0)) * 256.0 + t1.Load(int3(ta + below, 0));
+        float4 pb = t1.Load(int3(tb, 0)) * 256.0 + t1.Load(int3(tb + below, 0));
+        float4 pixel = lerp(pa, pb, at - low) / 257.0;
+        float alpha = v.info.z;
+        if (any(v.rx != 0.0)) {
+            alpha *= saturate(0.5 - box_distance(p, v.rect, v.rx, v.ry, v.shape.xy));
+        }
+        color = pixel * alpha;
+        // Like Chrome, gradients dither with Skia's 8x8 ordered pattern, by less than half a level.
+        uint x = (uint)p.x;
+        uint y = (uint)p.y ^ x;
+        uint m = ((y & 1u) << 5u) | ((x & 1u) << 4u) | ((y & 2u) << 2u) | ((x & 2u) << 1u) | ((y & 4u) >> 1u) | ((x & 4u) >> 2u);
+        float dither = ((float)m * (2.0 / 128.0) - 63.0 / 128.0) / 255.0;
+        color = float4(clamp(color.rgb + dither, 0.0, color.a), color.a);
     } else {
         // A pixelated image samples the center of its nearest texel. Edges sample only their own
         // image, not the atlas around it, so a scaled image keeps solid edges.

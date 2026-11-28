@@ -680,13 +680,9 @@ pub(crate) fn css_background(
     else {
       continue;
     };
-    let strip = super::super::effects::gradient::gradient_axis(&kind, &body, &units);
-    let modes = super::super::effects::gradient::repeat_modes(&repeat);
-    let repeats = modes.map(|mode| mode == "repeat");
-    let plain = modes
-      .iter()
-      .all(|mode| matches!(*mode, "repeat" | "no-repeat"));
     let view = view.clone();
+    // The gradient of the last inputs, and its ramp in `rasters.backgrounds`.
+    let made = std::cell::RefCell::new(None::<(String, Option<renderer::Gradient>)>);
     layers.push(layer(paint(canvas, move |bounds, _, window| {
       let (bounds, clip) = areas(bounds, window);
       let area = if fixed { [0.; 4] } else { area };
@@ -695,101 +691,17 @@ pub(crate) fn css_background(
       if !canvas && (width <= 0. || height <= 0.) {
         return;
       }
-      // Keep the gradient strip's outer pixels outside the box so filtering cannot sample
-      // neighboring atlas tiles.
       let scale = window.scale_factor();
-      let repeated = repeats == [true; 2];
-      let axis = strip.filter(|_| {
-        !canvas
-          && matches!(size.as_str(), "" | "auto" | "auto auto")
-          && (area == [0.; 4] || repeated)
-          && css::value::tokens::components(&position, ' ')
-            .iter()
-            .all(|token| {
-              token.ends_with('%')
-                || matches!(*token, "left" | "right" | "top" | "bottom" | "center")
-            })
-      });
-      let whole = |value: f32| (value * scale - (value * scale).round()).abs() < 0.01;
-      let radii = corners(bounds);
-      let [aw, ah] = [width + area[2], height + area[3]];
-      let [[tw, th], at] =
-        super::super::effects::gradient::tile(&size, &position, &units, aw, ah, None);
-      let [x, y] = [at[0] + area[0], at[1] + area[1]];
-      let [cw, ch] = [tw, th].map(|side| side * (256. / (side * scale)).ceil().max(1.));
-      // A layer that repeats on one axis rasters one row or column of tiles. On the other axis the raster
-      // starts at a device pixel, with the tile at its offset in it.
-      let lone = !repeated && repeats.contains(&true);
-      let start = [f32::from(bounds.left()) + x, f32::from(bounds.top()) + y];
-      let snapped = start.map(|at| (at * scale).floor() / scale);
-      let offset = [0, 1].map(|axis| match repeats[axis] {
-        true => 0.,
-        false => start[axis] - snapped[axis],
-      });
-      let grouped = lone
-        || super::super::effects::gradient::tile(&size, "0 0", &units, cw, ch, None)[0] == [tw, th];
-      let [cw, ch] = if grouped { [cw, ch] } else { [tw, th] };
-      let [cw, ch] = [(0, cw, tw), (1, ch, th)].map(|(axis, cell, side)| match repeats[axis] {
-        true => cell,
-        false => ((offset[axis] + side) * scale).ceil() / scale,
-      });
-      // Repeated canvas layers always tile, since they cover more than the root box.
-      let tiled = (axis.is_none()
-        && plain
-        && repeats.contains(&true)
-        && (radii.is_zero() || window.content_mask().radii.is_zero())
-        && (canvas && repeated
-          || [[tw, x], [th, y]]
-            .into_iter()
-            .zip(repeats)
-            .all(|(pair, repeats)| !repeats || pair.into_iter().all(whole))
-            && (canvas || cw * ch < width * height)
-            && grouped))
-        .then_some([x.rem_euclid(tw), y.rem_euclid(th)]);
-      if tiled.is_none() && (width <= 0. || height <= 0.) {
-        return;
-      }
-      let explicit = lone && tiled.is_some();
-      let ((width, height), within) = match axis {
-        Some(1) => ((3., height), [0., area[1], 3., ah]),
-        Some(_) => ((width, 3.), [area[0], 0., aw, 3.]),
-        None if tiled.is_some() => ((cw, ch), [0., 0., cw, ch]),
-        None => ((width, height), [area[0], area[1], aw, ah]),
-      };
-      let limit = super::super::raster::RASTER_MAX as f32;
-      let rw = (width * scale).ceil().clamp(1., limit) as u32;
-      let rh = (height * scale).ceil().clamp(1., limit) as u32;
-      let [rw, rh] = match axis {
-        Some(1) => [3, rh],
-        Some(_) => [rw, 3],
-        None => [rw, rh],
-      };
-      let position = if tiled.is_some() {
-        "0 0"
-      } else {
-        position.as_str()
-      };
+      let within = [area[0], area[1], width + area[2], height + area[3]];
       let mut inputs = String::with_capacity(
         kind.len() + body.len() + size.len() + position.len() + repeat.len() + 200,
       );
-      for part in [
-        kind.as_str(),
-        body.as_str(),
-        size.as_str(),
-        position,
-        repeat.as_str(),
-      ] {
+      for part in [&kind, &body, &size, &position, &repeat] {
         inputs.push_str(part);
         inputs.push('\0');
       }
       super::super::effects::gradient::push_bits(&mut inputs, [width, height], &units);
-      let exact = [tw, th, offset[0], offset[1]];
-      // With the scale, the inputs give the size of the raster.
-      for value in within
-        .iter()
-        .chain(if explicit { &exact[..] } else { &[] })
-        .chain([&scale])
-      {
+      for value in within.iter().chain([&scale]) {
         inputs.push_str(&value.to_bits().to_string());
         inputs.push('\0');
       }
@@ -797,152 +709,68 @@ pub(crate) fn css_background(
       let mut store = view.store.borrow_mut();
       let dom = store.state(view.id);
       let key = (id, slot * 64 + raster);
+      let mut made = made.borrow_mut();
       let entry = dom.rasters.backgrounds.get(&key);
-      if entry.is_none_or(|(old, _)| old != &inputs) {
-        let texts = explicit.then(|| {
-          (
-            format!("{tw}px {th}px"),
-            format!("{}px {}px", offset[0], offset[1]),
-          )
-        });
-        let (size, position) = match &texts {
-          Some((size, position)) => (size.as_str(), position.as_str()),
-          None => (size.as_str(), position),
-        };
-        // Cache only on new boxes, or animated gradients retain old frames.
-        let new = entry.is_none();
-        let cached = new
+      if entry.is_none_or(|(old, _)| old != &inputs)
+        || made.as_ref().is_none_or(|(old, _)| old != &inputs)
+      {
+        // Boxes with the same gradient share a ramp. Only new boxes share, or animated gradients would
+        // fill the list.
+        let new = entry.is_none_or(|(old, _)| old == &inputs);
+        let shared = new
           .then(|| {
-            let at = dom
-              .rasters
-              .gradients
-              .iter()
-              .rposition(|(old, _)| old == &inputs)?;
-            let cached = dom.rasters.gradients.remove(at);
-            dom.rasters.gradients.push(cached.clone());
-            Some(cached.1)
+            let gradients = &dom.rasters.gradients;
+            let at = gradients.iter().rposition(|(old, ..)| old == &inputs)?;
+            Some((gradients[at].1.clone(), gradients[at].2))
           })
           .flatten();
-        let image = cached.or_else(|| {
-          let image = match kind.ends_with("conic-gradient") {
-            true => super::super::effects::gradient::conic_image(
-              &kind,
-              &body,
-              size,
-              position,
-              &repeat,
-              units,
-              [width, height],
-              within,
-              [rw, rh],
-              entry.map(|(_, image)| image),
-            ),
-            false => super::super::effects::gradient::gradient_svg(
-              &kind, &body, size, position, &repeat, units, width, height, within,
-            )
-            .and_then(|(svg, p3, step)| {
-              // A smooth gradient rasters at fewer pixels, and the GPU scales it up.
-              let coarse = match axis.is_none() && tiled.is_none() {
-                true => (step * scale).clamp(1., 8.),
-                false => 1.,
-              };
-              let [rw, rh] = [rw, rh].map(|side| (side as f32 / coarse).ceil() as u32);
-              super::super::raster::svg::svg_gradient((svg, p3), rw, rh)
-            }),
-          }?;
-          const LIMIT: u32 = 8 << 20;
-          let bytes = |image: &renderer::RenderImage| {
-            image.size().width as u32 * (image.size().height as u32) * 4
-          };
-          if new && bytes(&image) <= LIMIT / 4 {
-            dom.rasters.gradients.push((inputs.clone(), image.clone()));
-            let mut total: u32 = dom
-              .rasters
-              .gradients
-              .iter()
-              .map(|(_, image)| bytes(image))
-              .sum();
-            while total > LIMIT {
-              let (_, old) = dom.rasters.gradients.remove(0);
-              total -= bytes(&old);
+        let found = shared.or_else(|| {
+          let (ramp, gradient) = super::super::effects::gradient::gradient_ramp(
+            &kind, &body, &size, &position, &repeat, units, within, scale,
+          )?;
+          let ramp = Arc::new(ramp);
+          if new {
+            let gradients = &mut dom.rasters.gradients;
+            gradients.push((inputs.clone(), ramp.clone(), gradient));
+            if gradients.len() > 64 {
+              let (_, old, _) = gradients.remove(0);
               if Arc::strong_count(&old) == 1 {
                 window.release_image(old);
               }
             }
           }
-          Some(image)
+          Some((ramp, gradient))
         });
-        let old = match image {
-          Some(image) => dom.rasters.backgrounds.insert(key, (inputs, image)),
+        let old = match &found {
+          Some((ramp, _)) => dom
+            .rasters
+            .backgrounds
+            .insert(key, (inputs.clone(), ramp.clone())),
           None => dom.rasters.backgrounds.remove(&key),
         };
         if let Some((_, old)) = old
-          && let Ok(mut old) = Arc::try_unwrap(old)
+          && Arc::strong_count(&old) == 1
         {
-          // A gradient that changes on each frame draws into the pixels of its last image.
-          super::super::effects::gradient::recycle(old.take_bytes());
-          window.release_image(Arc::new(old));
+          window.release_image(old);
         }
+        *made = Some((inputs, found.map(|(_, gradient)| gradient)));
       }
-      if let Some((_, image)) = dom.rasters.backgrounds.get(&key)
-        && let Some([x, y]) = tiled
-      {
-        // Tiles snap to device pixels, so their edges never sample other atlas tiles.
-        let visible = window.content_mask().bounds.intersect(clip);
-        if visible != clip {
-          window.cull();
-        }
-        let start = |edge, at: f32, side: f32, cell: f32, low| {
-          let at = f32::from(edge) + at - if at > 0. { side } else { 0. };
-          let at = (at * scale).round() / scale;
-          px(at + cell * ((f32::from(low) - at) / cell).floor())
-        };
-        let top = match repeats[1] {
-          true => start(bounds.top(), y, th, ch, visible.top()),
-          false => px(snapped[1]),
-        };
-        // A rounded box clips its tiles as a whole.
-        let draw = |window: &mut renderer::Window| {
-          let mut top = top;
-          while top < visible.bottom() {
-            let mut left = match repeats[0] {
-              true => start(bounds.left(), x, tw, cw, visible.left()),
-              false => px(snapped[0]),
-            };
-            while left < visible.right() {
-              let target =
-                renderer::Rect::new(renderer::point(left, top), renderer::size(px(cw), px(ch)));
-              let square = renderer::Radii::<renderer::Pixels>::default();
-              window.draw_image(clip, target, square, image.clone(), false);
-              if !repeats[0] {
-                break;
-              }
-              left += px(cw);
-            }
-            if !repeats[1] {
-              break;
-            }
-            top += px(ch);
-          }
-        };
-        match radii.is_zero() {
-          true => draw(window),
-          false => window.with_content_mask(renderer::Clip::rounded(bounds, radii), draw),
-        }
-      } else if let Some((_, image)) = dom.rasters.backgrounds.get(&key) {
-        let (origin, size) = (bounds.origin, bounds.size);
-        let target = match axis {
-          Some(1) => renderer::Rect::new(
-            renderer::point(origin.x - size.width, origin.y),
-            renderer::size(size.width * 3., size.height),
-          ),
-          Some(_) => renderer::Rect::new(
-            renderer::point(origin.x, origin.y - size.height),
-            renderer::size(size.width, size.height * 3.),
-          ),
-          None => bounds,
-        };
-        window.draw_image(bounds, target, radii, image.clone(), false);
+      let (Some((_, Some(gradient))), Some((_, ramp))) =
+        (made.as_ref(), dom.rasters.backgrounds.get(&key))
+      else {
+        return;
+      };
+      let mut gradient = *gradient;
+      gradient.tile.origin += bounds.origin;
+      // The canvas has no corners, and paints all that its mask shows.
+      match canvas {
+        true => window.draw_gradient(
+          clip,
+          renderer::Radii::<renderer::Pixels>::default(),
+          ramp,
+          &gradient,
+        ),
+        false => window.draw_gradient(bounds, corners(bounds), ramp, &gradient),
       }
     })));
     indexes.push((index, *share));
@@ -1291,7 +1119,7 @@ pub(crate) fn border_image(
               h,
               [0., 0., w, h],
             )
-            .and_then(|(svg, p3, _)| super::super::raster::svg::svg_gradient((svg, p3), rw, rh))
+            .and_then(|(svg, p3)| super::super::raster::svg::svg_gradient((svg, p3), rw, rh))
           }
           // Each part draws at the size of its tiles, into one image of three rows and columns, so
           // tiles show no pixels of other parts at their edges, and SVG stays sharp.

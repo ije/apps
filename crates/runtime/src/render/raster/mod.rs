@@ -75,7 +75,8 @@ pub struct Rasters {
   pub(in crate::render) bitmaps: HashMap<String, Arc<renderer::RenderImage>>,
   // The decoded source of each background layer, kept while the layer keeps its raster, so `retire` keeps it.
   pub(in crate::render) layer_sources: HashMap<(usize, usize), Arc<renderer::RenderImage>>,
-  pub(in crate::render) gradients: Vec<(String, Arc<renderer::RenderImage>)>,
+  // The ramps of gradients that new boxes can share, by their inputs.
+  pub(in crate::render) gradients: Vec<(String, Arc<renderer::RenderImage>, renderer::Gradient)>,
 }
 
 impl Rasters {
