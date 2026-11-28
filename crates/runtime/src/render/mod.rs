@@ -72,6 +72,8 @@ pub(crate) struct ViewState {
   pub(crate) hud: RefCell<Option<hud::Hud>>,
   pub(crate) inspect: Cell<inspect::Inspect>,
   kept: RefCell<rustc_hash::FxHashMap<usize, element::kept::Kept>>,
+  // Text layouts of released hooks that a busy store kept, which the next frame takes out of `text_layouts`.
+  unlaid: RefCell<Vec<(usize, layout::TextLayout)>>,
   plans: RefCell<element::plan::Plans>,
   repaint: RefCell<rustc_hash::FxHashSet<usize>>,
   built: RefCell<rustc_hash::FxHashSet<usize>>,
@@ -121,6 +123,14 @@ type CompositedTransform = (renderer::Rect<renderer::Pixels>, Option<(f32, [f32;
 static LAYOUT_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl ViewState {
+  // Takes text layouts that released hooks gave out of `text_layouts`, unless other hooks gave the node another one.
+  pub(crate) fn unlay(&self, layouts: &[(usize, layout::TextLayout)]) {
+    match self.store.try_borrow_mut() {
+      Ok(mut store) => store.state(self.id).layout.unlay(layouts),
+      Err(_) => self.unlaid.borrow_mut().extend_from_slice(layouts),
+    }
+  }
+
   #[allow(clippy::too_many_arguments)]
   fn place(
     &self,
@@ -286,6 +296,7 @@ impl ViewState {
       hud: RefCell::default(),
       inspect: Cell::default(),
       kept: RefCell::default(),
+      unlaid: RefCell::default(),
       plans: RefCell::default(),
       repaint: RefCell::default(),
       built: RefCell::default(),

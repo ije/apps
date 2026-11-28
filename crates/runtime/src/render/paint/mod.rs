@@ -1545,24 +1545,8 @@ impl Hooks for DomBox {
     let [x, y] = [by.x, by.y].map(f32::from);
     let nodes = walk.snapshot();
     let mut reach = view.reach.borrow_mut();
-    for &(id, _) in &nodes[range] {
-      let id = id as usize;
-      if let Some(parts) = dom.geometry.fragments.get_mut(&id) {
-        parts
-          .iter_mut()
-          .for_each(|part| (part[0], part[1]) = (part[0] + x, part[1] + y));
-      }
-      if let Some(shape) = dom.geometry.shapes.get_mut(&id) {
-        shape.iter_mut().for_each(|corner| *corner += by);
-      }
-      if let Some(pieces) = dom.geometry.pieces.get_mut(&id) {
-        pieces
-          .iter_mut()
-          .for_each(|(_, part)| (part[0], part[1]) = (part[0] + x, part[1] + y));
-      }
-      if let Some(block) = dom.layout.blocks.get_mut(&id) {
-        block.origin += by;
-      }
+    let ids = || nodes[range.clone()].iter().map(|&(id, _)| id as usize);
+    for id in ids() {
       // A node without a box keeps an empty rectangle at the origin.
       if let Some(rect) = dom.geometry.mirror.get_mut(&id)
         && *rect != [0.; 4]
@@ -1574,6 +1558,54 @@ impl Hooks for DomBox {
       {
         (reach[0], reach[1]) = (reach[0] + y, reach[1] + y);
       }
+    }
+    // The maps hold few nodes, so a small one is walked instead of looked up for each node.
+    let (geometry, blocks) = (&mut dom.geometry, &mut dom.layout.blocks);
+    let len = range.len();
+    let moved = |part: &mut [f32; 4]| (part[0], part[1]) = (part[0] + x, part[1] + y);
+    if geometry.fragments.len() < len {
+      (geometry.fragments.iter_mut())
+        .filter(|(id, _)| inside(**id))
+        .for_each(|(_, parts)| parts.iter_mut().for_each(moved));
+    } else {
+      ids().for_each(|id| {
+        if let Some(parts) = geometry.fragments.get_mut(&id) {
+          parts.iter_mut().for_each(moved);
+        }
+      });
+    }
+    if geometry.shapes.len() < len {
+      (geometry.shapes.iter_mut())
+        .filter(|(id, _)| inside(**id))
+        .for_each(|(_, shape)| shape.iter_mut().for_each(|corner| *corner += by));
+    } else {
+      ids().for_each(|id| {
+        if let Some(shape) = geometry.shapes.get_mut(&id) {
+          shape.iter_mut().for_each(|corner| *corner += by);
+        }
+      });
+    }
+    if geometry.pieces.len() < len {
+      (geometry.pieces.iter_mut())
+        .filter(|(id, _)| inside(**id))
+        .for_each(|(_, pieces)| pieces.iter_mut().for_each(|(_, part)| moved(part)));
+    } else {
+      ids().for_each(|id| {
+        if let Some(pieces) = geometry.pieces.get_mut(&id) {
+          pieces.iter_mut().for_each(|(_, part)| moved(part));
+        }
+      });
+    }
+    if blocks.len() < len {
+      (blocks.iter_mut())
+        .filter(|(id, _)| inside(**id))
+        .for_each(|(_, block)| block.origin += by);
+    } else {
+      ids().for_each(|id| {
+        if let Some(block) = blocks.get_mut(&id) {
+          block.origin += by;
+        }
+      });
     }
     let reach = reach
       .get(self.id)

@@ -226,6 +226,8 @@ pub trait Hooks: 'static {
   // A box around this one moved by `by` without a prepaint of this one, with `shift`. What the hooks gave the page
   // moved with it, so only their own record of their place moves.
   fn lag(&self, _by: Point<Pixels>) {}
+  // The box left the tree, or took other hooks. What the hooks gave the page in their last prepaint goes.
+  fn release(&self) {}
   // The near and far corners of the rectangle between `corners` in a box of `size` where paint moves it, like a
   // transform. Scroll containers count it in their scrollable overflow.
   fn reach(&self, _size: Size<Pixels>, corners: [Point<Pixels>; 2]) -> [Point<Pixels>; 2] {
@@ -277,6 +279,10 @@ impl Chain {
 }
 
 impl Hooks for Chain {
+  fn release(&self) {
+    self.0.release();
+    self.1.release();
+  }
   fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
     self.nest(cx, inner, |hooks, cx, inner| hooks.prepaint(cx, inner))
   }

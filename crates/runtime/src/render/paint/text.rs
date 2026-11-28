@@ -1567,18 +1567,22 @@ impl renderer::Hooks for InlineText {
     self.skip(exact, window)
   }
 
+  // The layouts stay in `text_layouts`.
   fn skip(&self, _: Rect<Pixels>, _: &mut Window) -> bool {
-    let view = &*self.view;
-    let mut store = view.store.borrow_mut();
-    let dom = store.state(view.id);
-    for (id, entry) in self.prepainted.borrow().layouts.iter() {
-      dom.layout.text_layouts.insert(*id, entry.clone());
-    }
     true
+  }
+
+  fn release(&self) {
+    self.view.unlay(&self.prepainted.borrow().layouts);
   }
 
   fn prepaint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
     inner(cx.window);
+    {
+      let view = &*self.view;
+      let layouts = &self.prepainted.borrow().layouts;
+      view.store.borrow_mut().state(view.id).layout.unlay(layouts);
+    }
     let moves: Vec<_> = cx.row_moves().collect();
     let [top, right, bottom, left] = cx.inset;
     let inside = |bounds: Rect<Pixels>| {

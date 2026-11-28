@@ -42,52 +42,98 @@ enum Kind {
   Layers(bool),
 }
 
+// Prepaint and paint read the fields before `layout` for each box they keep, so they come first, in one block.
+#[repr(C)]
 struct Slot {
-  key: (u64, u32),
-  // The node has its own id, like the box of an element. Other boxes are anonymous.
-  keyed: bool,
-  // The prepaint pass that listed the box in `Tree.anchoring`.
-  anchoring: u32,
-  live: bool,
-  seen: u32,
-  parent: u32,
-  children: Vec<NodeId>,
   style: Rc<Styled>,
-  stretched: Option<Box<taffy::Style>>,
-  events: Option<Box<Events>>,
   hooks: Option<Rc<dyn Hooks>>,
-  kind: Kind,
-  measure: Option<Box<MeasureFn>>,
+  events: Option<Box<Events>>,
+  children: Vec<NodeId>,
+  // Fields that few boxes use.
+  cold: Option<Box<Cold>>,
+  split: Option<Rc<Split>>,
   state: Option<Rc<dyn Any>>,
-  inherited: Rc<TextStyle>,
   text: Rc<TextStyle>,
-  cache: Cache,
-  layout: Layout,
-  baselines: Baselines,
+  placed: Option<(u32, Point<f32>, Placement)>,
+  region: Option<Region>,
+  parent: u32,
+  // What the last paint of the box drew, which a paint of a calm box copies: an index in `Tree.chunks`.
+  chunk: u32,
+  // The prepaint pass that kept the box and all boxes in it where they were, and the first pass of the run
+  // of such passes.
+  calm: u32,
+  since: u32,
+  // The prepaint pass that skipped the box.
+  skipped: u32,
+  // The paint pass that left the box out, as it was outside its mask.
+  culled: u32,
+  // The count of scroll viewports around the containing block of an out-of-flow box, whose clips it escapes.
+  cut: u32,
+  // The outermost containing block around the box that an out-of-flow box in it reads, as `escape` counts them.
+  escaping: Option<u32>,
+  // The window regions of the last prepaint of the box, which a calm box copies when `skips`, and the boxes
+  // in `touched` of that pass.
+  regions: Option<(u32, [u32; 2])>,
+  touched: [u32; 2],
+  // The regions and touched boxes that the last prepaint of the box gave, which they relocate from with the
+  // copies of the regions of its parent.
+  own_regions: Option<(u32, [u32; 2])>,
+  own_touched: [u32; 2],
+  // The regions and touched boxes of the last prepaint that went through the boxes in it. Copies of the
+  // regions relocate them as a block.
+  base_regions: Option<(u32, [u32; 2])>,
+  base_touched: [u32; 2],
+  // How far scrolls moved the box without a prepaint of the boxes in it, since one last went through them.
+  lag: Point<Pixels>,
+  // The part of `lag` that a skip of an ancestor already gave the box, because it is listed outside that ancestor.
+  ahead: Point<Pixels>,
+  // How far the scrolls between an out-of-flow box and its containing block moved it.
+  unscroll: Point<Pixels>,
+  // Where the content of a containing block was in the last pass: the offset of the window in it.
+  inner: Point<Pixels>,
   origin: Point<f32>,
   bounds: Rect<Pixels>,
   painted: Rect<Pixels>,
   exact: Rect<Pixels>,
-  region: Option<Region>,
-  listed: bool,
-  free: [bool; 2],
-  placed: Option<(u32, Point<f32>, Placement)>,
-  below: bool,
-  volatile: bool,
-  // A volatile box is in it, so a keep of the box prepaints that box.
-  lively: bool,
-  // The paint pass that left the box out, as it was outside its mask.
-  culled: u32,
-  // A scroll container is in the box.
-  nests: bool,
+  reach: Option<Rect<Pixels>>,
   // The viewport that the box gave its content in the last prepaint, when it scrolls it in an interest area.
   viewport: Option<Rect<Pixels>>,
+  // All hooks in the box allow a skip, and all boxes in it that paint outside it are in `listing`.
+  skips: bool,
+  // No hit transform is in it, so its regions move with a scroll as they are.
+  flat: bool,
+  listed: bool,
+  volatile: bool,
+  below: bool,
+  // A volatile box is in it, so a keep of the box prepaints that box.
+  lively: bool,
+  // A scroll container is in the box.
+  nests: bool,
   // Scroll viewports between its stacking context and its containing block cut the mask of the box.
   cuts: bool,
-  reach: Option<Rect<Pixels>>,
+  // The containing blocks of the out-of-flow boxes in it are in it too, so its paint takes no clip from outside.
+  contained: bool,
+  kind: Kind,
+  // The direction of the text around a mark in a line, when it is mixed.
+  turned: Option<bool>,
+  layout: Layout,
+  key: (u64, u32),
+  stretched: Option<Box<taffy::Style>>,
+  measure: Option<Box<MeasureFn>>,
+  inherited: Rc<TextStyle>,
+  cache: Cache,
+  baselines: Baselines,
   // The size that the measure function gave in the last layout, which can overflow the box.
   measured: taffy::Size<f32>,
-  split: Option<Rc<Split>>,
+  // Where the text of a mark in a line puts it, from its layout.
+  shift: Point<f32>,
+  // The prepaint pass that listed the box in `Tree.anchoring`.
+  anchoring: u32,
+  seen: u32,
+  // The node has its own id, like the box of an element. Other boxes are anonymous.
+  keyed: bool,
+  live: bool,
+  free: [bool; 2],
   // Floats are in the box, or below it in blocks of its formatting context.
   floats: bool,
   // The last layout broke the lines of the box beside floats.
@@ -96,50 +142,6 @@ struct Slot {
   uncached: bool,
   // Whether a layout boundary waits for a layout of its own.
   held: bool,
-  // The prepaint pass that kept the box and all boxes in it where they were, and the first pass of the run
-  // of such passes.
-  calm: u32,
-  since: u32,
-  // What the last paint of the box drew, which a paint of a calm box copies: an index in `Tree.chunks`.
-  chunk: u32,
-  // The window regions of the last prepaint of the box, which a calm box copies when `skips`, and the boxes
-  // in `touched` of that pass.
-  regions: Option<(u32, [u32; 2])>,
-  touched: [u32; 2],
-  // The regions and touched boxes of the last prepaint that went through the boxes in it. Copies of the
-  // regions relocate them as a block.
-  base_regions: Option<(u32, [u32; 2])>,
-  base_touched: [u32; 2],
-  // The regions and touched boxes that the last prepaint of the box gave, which they relocate from with the
-  // copies of the regions of its parent.
-  own_regions: Option<(u32, [u32; 2])>,
-  own_touched: [u32; 2],
-  // All hooks in the box allow a skip, and all boxes in it that paint outside it are in `listing`.
-  skips: bool,
-  // The prepaint pass that skipped the box.
-  skipped: u32,
-  // The containing blocks of the out-of-flow boxes in it are in it too, so its paint takes no clip from outside.
-  contained: bool,
-  // The outermost containing block around the box that an out-of-flow box in it reads, as `escape` counts them.
-  escaping: Option<u32>,
-  // Where the content of a containing block was in the last pass: the offset of the window in it.
-  inner: Point<Pixels>,
-  // The count of scroll viewports around the containing block of an out-of-flow box, whose clips it escapes.
-  cut: u32,
-  // How far the scrolls between an out-of-flow box and its containing block moved it.
-  unscroll: Point<Pixels>,
-  // Where the text of a mark in a line puts it, from its layout.
-  shift: Point<f32>,
-  // The direction of the text around that mark, when it is mixed.
-  turned: Option<bool>,
-  // No hit transform is in it, so its regions move with a scroll as they are.
-  flat: bool,
-  // How far scrolls moved the box without a prepaint of the boxes in it, since one last went through them.
-  lag: Point<Pixels>,
-  // The part of `lag` that a skip of an ancestor already gave the box, because it is listed outside that ancestor.
-  ahead: Point<Pixels>,
-  // Fields that few boxes use.
-  cold: Option<Box<Cold>>,
 }
 
 // The tree keeps a slot for each box, so the size of a slot is the size of the tree.
@@ -166,29 +168,32 @@ struct Cold {
   list_mask: Clip<Pixels>,
 }
 
+// Prepaint reads only the passes and `translates` of most chunks, so they come first.
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct Chunk {
   pass: u32,
   // The prepaint pass that the paint followed.
   prepass: u32,
-  key: PaintKey,
+  // A copy can move with the box when its mask moves with it, as in a scroll.
+  translates: bool,
   unbounded: bool,
+  // The last paint of the box that went through the boxes in it. Copies relocate that span as a block, so the
+  // chunks of the boxes in it follow the copies.
+  base: Output,
+  key: PaintKey,
   span: PaintSpan,
   // Where the box was, the mask around it, and the area in device pixels of a span that can move with it.
   at: Point<Pixels>,
   mask: Clip<Pixels>,
   area: Option<Rect<f32>>,
-  // A copy can move with the box when its mask moves with it, as in a scroll.
-  translates: bool,
-  // The last paint of the box that went through the boxes in it. Copies relocate that span as a block, so the
-  // chunks of the boxes in it follow the copies.
-  base: Output,
   // The last paint or copy of the box, which the chunk relocates from with the copies of its parent.
   origin: Output,
 }
 
 // What a paint or a copy of a box drew, and where.
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct Output {
   pass: u32,
   span: PaintSpan,
@@ -286,6 +291,9 @@ impl Slot {
     self.children.clear();
     self.style = blank.clone();
     self.stretched = None;
+    if let Some(hooks) = &self.hooks {
+      hooks.release();
+    }
     graveyard.push((
       self.events.take(),
       self.hooks.take(),
@@ -519,9 +527,9 @@ pub(crate) fn identity(id: Option<NodeKey>, scope: u64) -> u64 {
 }
 
 impl Tree {
-  fn chunk(&self, index: u32) -> Option<Chunk> {
+  fn chunk(&self, index: u32) -> Option<&Chunk> {
     let at = self.slots[index as usize].chunk;
-    (at != NONE).then(|| self.chunks[at as usize])
+    (at != NONE).then(|| &self.chunks[at as usize])
   }
 
   fn set_chunk(&mut self, index: u32, chunk: Option<Chunk>) {
@@ -894,6 +902,11 @@ impl Tree {
     unfar(&mut self.slots, index as usize);
     let slot = &mut self.slots[index as usize];
     slot.events = events;
+    if let Some(old) = &slot.hooks
+      && hooks.as_ref().is_none_or(|hooks| !Rc::ptr_eq(old, hooks))
+    {
+      old.release();
+    }
     slot.hooks = hooks;
     slot.inherited = inherited.clone();
     slot.text = text;

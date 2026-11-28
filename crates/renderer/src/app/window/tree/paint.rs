@@ -66,6 +66,7 @@ impl Tree {
                     && Some(chunk.pass) == self.paints.1
                     && chunk.unbounded == outside
       })
+      .copied()
       .and_then(|chunk| {
         let by = window.snap_move(at - chunk.at);
         match chunk.area {
@@ -263,7 +264,7 @@ impl Tree {
     };
     #[cfg(debug_assertions)]
     {
-      let chunk = self.chunk(index);
+      let chunk = self.chunk(index).copied();
       if let Some(copied) = self.copied.last_mut() {
         copied.push((index, chunk));
       }

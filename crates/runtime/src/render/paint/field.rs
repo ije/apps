@@ -28,7 +28,7 @@ pub(crate) struct FieldText {
   pub(crate) selection: (Option<u32>, u32),
   pub(crate) handle: renderer::ScrollRef,
   pub(crate) selected: std::cell::Cell<Option<[usize; 2]>>,
-  // What the last prepaint gave `text_layouts`, which each frame clears.
+  // What the last prepaint gave `text_layouts`, which keeps it until the hooks release it.
   pub(crate) laid: std::cell::RefCell<Option<crate::render::layout::TextLayout>>,
 }
 
@@ -120,6 +120,10 @@ impl renderer::Hooks for FieldText {
 
   fn prepaint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
     inner(cx.window);
+    if let Some(laid) = self.laid.borrow_mut().take() {
+      let mut store = self.view.store.borrow_mut();
+      store.state(self.view.id).layout.unlay(&[(self.id, laid)]);
+    }
     let Some(layout) = cx.text_layout().cloned() else {
       return;
     };
@@ -215,15 +219,14 @@ impl renderer::Hooks for FieldText {
   }
 
   fn skip(&self, _: renderer::Rect<Pixels>, _: &mut Window) -> bool {
-    if !self.rests() {
-      return false;
+    // The layout stays in `text_layouts`.
+    self.rests()
+  }
+
+  fn release(&self) {
+    if let Some(laid) = self.laid.borrow_mut().take() {
+      self.view.unlay(&[(self.id, laid)]);
     }
-    if let Some(laid) = &*self.laid.borrow() {
-      let mut store = self.view.store.borrow_mut();
-      let dom = store.state(self.view.id);
-      dom.layout.text_layouts.insert(self.id, laid.clone());
-    }
-    true
   }
 
   fn skip_inside(&self, exact: renderer::Rect<Pixels>, window: &mut Window) {

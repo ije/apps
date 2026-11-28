@@ -648,6 +648,10 @@ impl Paragraph {
     state.layout
   }
 
+  pub fn same(&self, other: &Self) -> bool {
+    Rc::ptr_eq(&self.0, &other.0)
+  }
+
   pub fn shift(&self, by: Point<Pixels>) {
     if let Some(bounds) = self
       .0

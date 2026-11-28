@@ -129,6 +129,17 @@ impl Layout {
     self.pseudo_boxes.get(&key).copied()
   }
 
+  // Takes these text layouts out, unless other hooks gave their nodes other ones.
+  pub(crate) fn unlay(&mut self, layouts: &[(usize, TextLayout)]) {
+    for (id, layout) in layouts {
+      if (self.text_layouts.get(id))
+        .is_some_and(|entry| entry.0.same(&layout.0) && Rc::ptr_eq(&entry.3, &layout.3))
+      {
+        self.text_layouts.remove(id);
+      }
+    }
+  }
+
   pub(crate) fn text_layout(&self, id: usize) -> Option<&TextLayout> {
     self.text_layouts.get(&id)
   }

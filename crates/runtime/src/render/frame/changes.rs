@@ -628,7 +628,8 @@ pub(super) fn remeasure(
       }
     }
   }
-  dom.layout.text_layouts.clear();
+  // Text layouts stay while their hooks stay in the tree, so a box that skips or shifts gives them no copy.
+  dom.layout.unlay(&cx.view.unlaid.take());
 }
 
 // Images that load or decode later, and the selection, change paint without a new box. Background rasters are made

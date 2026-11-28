@@ -806,7 +806,7 @@ impl Tree {
             at: origin.at + by,
             mask,
             area: origin.area.map(|area| area + by.scale(scale)),
-            ..chunk
+            ..*chunk
           }
         })
       }
@@ -971,13 +971,13 @@ impl Tree {
       // The hooks of the scroll bars read the place of their scroll container.
       self.rested(index, first..last, Some(by));
       let slot = &self.slots[index as usize];
-      if (slot.hooks.clone()).is_none_or(|hooks| hooks.shift(by, slot.exact, window)) {
+      if (slot.hooks.as_ref()).is_none_or(|hooks| hooks.shift(by, slot.exact, window)) {
         let touched = self.touched.len() as u32;
         for at in first..last {
           let inside = self.last_touched.1[at];
           self.touched.push(inside);
           let slot = &self.slots[inside as usize];
-          let Some(hooks) = slot.hooks.clone().filter(|hooks| hooks.skips_inside()) else {
+          let Some(hooks) = slot.hooks.as_ref().filter(|hooks| hooks.skips_inside()) else {
             continue;
           };
           if let Some(state) =
@@ -1048,14 +1048,14 @@ impl Tree {
     {
       self.rested(index, first..last, None);
       let slot = &self.slots[index as usize];
-      if (slot.hooks.clone()).is_none_or(|hooks| hooks.skip(slot.exact, window)) {
+      if (slot.hooks.as_ref()).is_none_or(|hooks| hooks.skip(slot.exact, window)) {
         let touched = self.touched.len() as u32;
         for at in first..last {
           let inside = self.last_touched.1[at];
           self.touched.push(inside);
           let slot = &self.slots[inside as usize];
           if inside != index
-            && let Some(hooks) = slot.hooks.clone().filter(|hooks| hooks.skips_inside())
+            && let Some(hooks) = slot.hooks.as_ref().filter(|hooks| hooks.skips_inside())
           {
             hooks.skip_inside(slot.exact, window);
           }
