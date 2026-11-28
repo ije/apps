@@ -662,8 +662,9 @@ impl JavaScriptCore {
       return ran < Duration::from_millis(100)
         && now.duration_since(self.shrunk.get()) >= Duration::from_secs(300);
     }
+    // Short runs like clicks recompile code and leave garbage. Without a burst, shrink after 30 s of quiet.
     self.quiet.set(self.quiet.get() + 1);
-    self.burst.get() && self.quiet.get() >= 5
+    self.quiet.get() >= if self.burst.get() { 5 } else { 30 }
       || now.duration_since(self.shrunk.get()) >= Duration::from_secs(300)
   }
 
